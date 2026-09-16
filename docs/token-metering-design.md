@@ -22,7 +22,7 @@
 | 采集侧 | 不设置用于故障恢复的事件缓冲、落盘、积压或补传队列 |
 | 队列保留 | Kafka 中的事件保留 72 小时，供消费者恢复和重放 |
 | 正文 | 仅处理时临时使用，默认不持久化 |
-| 修正 | 常规自动补取/修正窗口为 24 小时；更晚数据采用可追溯补正 |
+| 修正 | 常规修正窗口为 24 小时；只有已验证提供历史用量查询的服务才启用自动补取，普通 Chat Completions 默认不支持；更晚数据采用可追溯补正 |
 | 时间归属 | 请求与用量归属请求开始时间；存储 UTC，报表首期默认 UTC |
 | 数据保留 | 在线明细 30 天，归档明细 1 年，小时/日汇总 2 年 |
 
@@ -94,7 +94,7 @@ flowchart LR
 3. 解析服务 usage；需要时在正文仍可见的时间内完成估算。
 4. 生成包含累计用量的事件并尝试发送 Kafka；结束或发送失败后释放状态，不保留等待恢复的副本。
 5. 消费者保存原始事件、更新最新有效明细，触发受影响汇总桶刷新。
-6. 后续独立用量查询或服务补报产生新修正事件，不依赖原采集进程补传。
+6. 若确有独立的可信补正来源，可产生新修正事件，不依赖原采集进程补传。首期普通 Chat Completions 不假设存在历史 usage 查询接口；没有新证据时保持原估算或未知。
 
 观察流终止不必然等于用户取消。HTTP 结果、Envoy 响应标志和解析流状态分别保存；无法区分平台故障、用户取消或观察链路故障时，原因标记未知。
 
@@ -205,7 +205,21 @@ ClickHouse 增量物化视图处理新插入的数据块，不能假设源表后
 
 原始计量事件和归一化修订归档为可分区读取的文件，保留 1 年；没有正文，不支持将来更换 tokenizer 后重算历史文本。
 
-自动补取只面向确有查询能力的服务，在 24 小时常规窗口内执行。缺失记录维持未知或估算状态，不能因窗口结束变为“已确认”。更晚的可信补正保留审计记录，并重建原归属时间的汇总。
+自动补取默认关闭，只面向确有查询能力且通过验证的服务，在 24 小时常规窗口内执行。24 小时是平台接受常规修正的窗口，不是推理框架保证保存历史请求 24 小时的承诺。缺失记录维持未知或估算状态，不能因窗口结束变为“已确认”。更晚的可信补正保留审计记录，并重建原归属时间的汇总。
+
+### 8.1 历史 usage 查询的实际适用范围
+
+2026-09-16 核查官方当前文档与 `main` 源码后，需要明确区分普通 Chat Completions 与有状态 Responses API：
+
+- vLLM 普通 `/v1/chat/completions`：核查的路由提供创建接口，未提供按该请求 ID 事后读取 usage 的接口。不能将存在请求 ID 等同于存在历史用量查询。[vLLM Chat 路由][10]。
+- vLLM `/v1/responses`：存在 `GET /v1/responses/{response_id}`，可读取已经存储的响应及其中可用的 usage。需启用 `VLLM_ENABLE_RESPONSES_API_STORE=1` 并保存该 Responses 请求；核查的实现以进程内字典存储，不能当作跨重启、跨 Pod 的持久化用量账本，也不保证取消请求一定有最终 usage。[vLLM Responses 路由][11]、[存储实现][12]。
+- SGLang SRT：当前源码同样有 Responses 的取回接口，存储需显式启用；这是 `/v1/responses` 对应的响应存储，不是普通 `/v1/chat/completions` 或 `/generate` 请求的通用 usage 查询接口。核查实现使用进程内字典，且服务模式存在限制。[SGLang HTTP 路由][13]、[Responses 实现][14]。
+
+这些能力不自动适用于已部署版本。首期已经限定 Chat Completions，因此补取不作为默认恢复路径。若以后接入 Responses 或平台自建历史计量查询，需要验证响应 ID 映射、存储启用条件、保留期、重启/多副本行为、取消后的 usage 完整性及权限。
+
+Responses 存储还可能保存输入/输出内容，不是纯 token 明细；不能仅为补查用量而自动启用，需重新评估与正文不持久化决策的关系。保留 `usage_corrected` 作为修正事件类型，不表示推理框架会自动补报，也不表示每个请求必然产生该事件。
+
+### 8.2 历史修正与查询
 
 历史补正超过 30 天时从归档重建受影响数据；超过 1 年、明细已删除后，不能承诺逐请求自动重算。两年汇总的第二年部分不具备完整的一年期明细下钻能力，应在产品中明确保留边界。
 
@@ -301,7 +315,7 @@ ClickHouse 增量物化视图处理新插入的数据块，不能假设源表后
 1. 接入验证：检查实际 Istio/Envoy 版本，验证观察模式、upstream 尝试、终态关联、故障放行及慢消费者行为。
 2. 最小闭环：一个 JSON 服务、一个 SSE 服务，打通可信身份、usage、Kafka、版本化明细和查询。
 3. 估算与异常：接入 tokenizer/模板登记，验证部分结果与资源上限，不启用正文持久化。
-4. 修正与汇总：补取接口、事件幂等、汇总快照发布、归档与历史补正。
+4. 修正与汇总：事件幂等、汇总快照发布、归档与历史补正；历史用量补取仅为经过服务能力验证后的可选适配，不作为普通 Chat Completions 的前提。
 5. 验收与灰度：故障注入、容量测算、对照入口统计，再逐步覆盖服务。
 
 尚需实测的项目是技术验证项，不是已经批准的性能事实：网关版本能力、各次 A 尝试可见性、独立入口事件可取得的终态信息、流量分布、查询并发、资源上限、写入截止时间和具体资源规格。
@@ -321,6 +335,11 @@ ClickHouse 增量物化视图处理新插入的数据块，不能假设源表后
 7. [Kafka 消息投递与跨系统语义](https://kafka.apache.org/41/design/design/)
 8. [ClickHouse ReplacingMergeTree 与查询时版本选择](https://clickhouse.com/docs/concepts/features/operations/update/replacing-merge-tree)
 9. [ClickHouse 增量物化视图](https://clickhouse.com/docs/concepts/features/materialized-views/incremental-materialized-view)
+10. [vLLM Chat Completions 路由源码](https://raw.githubusercontent.com/vllm-project/vllm/main/vllm/entrypoints/openai/chat_completion/api_router.py)
+11. [vLLM Responses 路由源码](https://raw.githubusercontent.com/vllm-project/vllm/main/vllm/entrypoints/openai/responses/api_router.py)
+12. [vLLM Responses 存储与用量实现](https://docs.vllm.ai/en/latest/api/vllm/entrypoints/openai/responses/serving/)
+13. [SGLang SRT HTTP 路由源码](https://raw.githubusercontent.com/sgl-project/sglang/main/python/sglang/srt/entrypoints/http_server.py)
+14. [SGLang SRT Responses 存储实现](https://raw.githubusercontent.com/sgl-project/sglang/main/python/sglang/srt/entrypoints/openai/serving_responses.py)
 
 [1]: https://www.envoyproxy.io/docs/envoy/latest/api-v3/extensions/filters/http/ext_proc/v3/ext_proc.proto
 [2]: https://www.envoyproxy.io/docs/envoy/latest/api-v3/extensions/filters/http/ext_proc/v3/processing_mode.proto
@@ -331,3 +350,8 @@ ClickHouse 增量物化视图处理新插入的数据块，不能假设源表后
 [7]: https://kafka.apache.org/41/design/design/
 [8]: https://clickhouse.com/docs/concepts/features/operations/update/replacing-merge-tree
 [9]: https://clickhouse.com/docs/concepts/features/materialized-views/incremental-materialized-view
+[10]: https://raw.githubusercontent.com/vllm-project/vllm/main/vllm/entrypoints/openai/chat_completion/api_router.py
+[11]: https://raw.githubusercontent.com/vllm-project/vllm/main/vllm/entrypoints/openai/responses/api_router.py
+[12]: https://docs.vllm.ai/en/latest/api/vllm/entrypoints/openai/responses/serving/
+[13]: https://raw.githubusercontent.com/sgl-project/sglang/main/python/sglang/srt/entrypoints/http_server.py
+[14]: https://raw.githubusercontent.com/sgl-project/sglang/main/python/sglang/srt/entrypoints/openai/serving_responses.py

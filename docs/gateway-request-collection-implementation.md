@@ -1,6 +1,6 @@
 # 网关请求采集开发实现方案
 
-版本：V1.3｜日期：2026-09-21｜状态：开发设计，尚未完成真实网关 PoC 和性能验收。
+版本：V1.4｜日期：2026-10-09｜状态：开发设计，尚未完成真实网关 PoC 和性能验收。
 
 依据：[原技术方案](token-metering-design.md)、[产品方案 V2](token-metering-design-v2.md)、[API Key Auth 服务方案](api-key-auth-service-implementation.md)。本文细化第一批“鉴权后采集到明细入库”工作，不代表原方案的一期功能全部交付。本文中的 SQL、协议和配置供后续实现使用；Go 代码标明为伪代码的部分不能直接编译。
 
@@ -91,7 +91,7 @@ SDK `GetProperty` 路径候选为 `metadata/filter_metadata/envoy.filters.http.e
 
 `logical_request_id` 是计量主键。匹配白名单后，插件在请求头回调生成并保存于 HTTP context；即使 Observer 无法接收，也应独立于旁路额度尝试在最终响应头写入 `X-Metering-Request-Id: <logical_request_id>`。该头由网关覆盖上游同名响应头，不改写 `X-Request-Id`。浏览器跨域调用如需读取此头，由网关 CORS 配置暴露；客户端应记录响应头以供一期查询接口使用。鉴权前拒绝、插件未执行或客户端未收到响应头时，不能保证取得计量 ID；返回了 ID 也只表示插件生成了标识，不保证事件成功入库。
 
-可选 `x_request_id` 是插件在请求头回调读取的**网关当时可见**的 `x-request-id`，只接受 1–128 字节且符合 `[A-Za-z0-9._:-]+` 的值；缺失、过长或非法时为 null，并计数，不截断。插件只读取这个指定头，不枚举或上报其他请求头；重复头如何呈现依赖固定 Envoy 的处理，联调须覆盖，但无论如何该值都只是非唯一辅助关联。它随 `Start` 和三类事件保存，供访问日志/链路追踪辅助关联。Envoy 是否生成、替换或保留客户端 `X-Request-Id` 取决于实际 HTTP Connection Manager 配置；它可能来自客户端，也可能跨多跳复用，因此不作为计量主键、幂等键或授权依据。阶段 0 要在固定网关 `config_dump` 和实际请求中验证该行为及响应头可见性。[Envoy 1.21 HTTP Connection Manager](https://www.envoyproxy.io/docs/envoy/v1.21.0/api-v3/extensions/filters/network/http_connection_manager/v3/http_connection_manager.proto)
+可选 `x_request_id` 是插件在请求头回调读取的**网关当时可见**的 `x-request-id`，只接受 1–128 字节且符合 `[A-Za-z0-9._:-]+` 的值；缺失、过长或非法时为 null，并计数，不截断。插件只读取这个指定头，不枚举或上报其他请求头；重复头如何呈现依赖固定 Envoy 的处理，联调须覆盖，但无论如何该值都只是非唯一辅助关联。它随 `Start` 和两类事件保存，供访问日志/链路追踪辅助关联。Envoy 是否生成、替换或保留客户端 `X-Request-Id` 取决于实际 HTTP Connection Manager 配置；它可能来自客户端，也可能跨多跳复用，因此不作为计量主键、幂等键或授权依据。阶段 0 要在固定网关 `config_dump` 和实际请求中验证该行为及响应头可见性。[Envoy 1.21 HTTP Connection Manager](https://www.envoyproxy.io/docs/envoy/v1.21.0/api-v3/extensions/filters/network/http_connection_manager/v3/http_connection_manager.proto)
 
 Consumer 校验 ID 时间前缀与 `request_started_at_ms` 完全一致，以 ID 时间计算存储分区，不使用 Observer/入库时间分区。这样同一事件不能通过更改时间字段逃离冲突检查。请求持续跨午夜时全部事件仍进入开始日期分区。
 
@@ -104,8 +104,8 @@ Consumer 校验 ID 时间前缀与 `request_started_at_ms` 完全一致，以 ID
 1. **默认忽略**：全局 enabled 必须为 true，且可信 route_name 对应规则显式 enabled=true、方法和路径同时命中，才标记 selected。缺少规则、规则禁用、属性读取失败均不采集，不得回退为全量采集。route_name 必须从 Envoy 可信路由属性取得，不接受客户端 Header 控制开关、路由名、service_id 或 adapter_id。
 2. **首批只允许 Chat Completions**：adapter_id 固定为 chat_completions_v1，methods 固定为 ["POST"]，paths 为非空精确路径列表，默认 ["/v1/chat/completions"]。部署使用自定义前缀时必须逐条配置并验证；禁止通配符、前缀、包含或正则匹配。GET、HEAD、OPTIONS、指标、健康检查和模型列表接口不得进入采集；未来其他协议需独立适配器和评审。
 3. **路径口径固定**：使用 Wasm 请求头回调当时可见的 :path，去掉第一个 ? 及其后的查询串后逐字节匹配；插件不额外 URL 解码、大小写折叠、合并斜杠或去除尾斜杠。网关此前已做的规范化以实际可见结果为准。路径和 query 不上报、不入库、不记日志或指标标签。规则按该观察位置配置，不使用上游重写后的路径猜测；路径重写、路由属性及执行顺序须在固定镜像 PoC 验证，读取不到可信属性时禁止扩大匹配范围。
-4. **先过滤再分配**：HTTP context 初始 selected=false，只保存必要标志。未命中时不生成 logical_request_id、不读取身份或正文、不申请改写/观察额度、不建立观察 gRPC 流、不发送 Start/BodyChunk/End、不添加计量响应头，所有后续回调直接 Continue（结束回调直接返回）。不得为这类请求产生三类 Kafka 事件，包括 unknown 占位事件；只增加本地忽略计数。Envoy/SDK 基础 HTTP context 的创建不等于分配计量状态。
-5. **请求内固定结果**：命中后固定规则、config_version 和 selected，后续配置更新、响应状态、usage 缺失不得改变本次选择。Content-Type、Content-Encoding、请求体中的 model/stream、是否携带 API Key 均不能替代入口白名单。内容类型/压缩不支持仅影响改写和解析；命中的失败响应、非法正文或断流仍按现有有界流程尝试产生可观察事件，未知用量不得补零，不承诺三事件必达。
+4. **先过滤再分配**：HTTP context 初始 selected=false，只保存必要标志。未命中时不生成 logical_request_id、不读取身份或正文、不申请改写/观察额度、不建立观察 gRPC 流、不发送 Start/BodyChunk/End、不添加计量响应头，所有后续回调直接 Continue（结束回调直接返回）。不得为这类请求产生两类 Kafka 事件，包括 unknown 占位事件；只增加本地忽略计数。Envoy/SDK 基础 HTTP context 的创建不等于分配计量状态。
+5. **请求内固定结果**：命中后固定规则、config_version 和 selected，后续配置更新、响应状态、usage 缺失不得改变本次选择。Content-Type、Content-Encoding、请求体中的 model/stream、是否携带 API Key 均不能替代入口白名单。内容类型/压缩不支持仅影响改写和解析；命中的失败响应、非法正文或断流仍按现有有界流程尝试产生可观察事件，未知用量不得补零，不承诺两事件必达。
 6. **鉴权独立**：不采集不代表免鉴权；普通查询按其自身鉴权策略处理。命中请求仍从 ext_authz 获取可信身份；鉴权前被拒绝的请求不在本观察位置的分母中。Observer/Consumer 的 schema、adapter_id/config_version 校验仅为防御性校验，不能替代入口过滤；现有事件不携带原始路径，不声称下游能重新验证全部匹配条件。
 
 规则匹配按全局禁用、路由缺失/不匹配、规则禁用、方法不匹配、路径不匹配的顺序判定；属性读取异常记 attribute_unavailable，其他首次失败原因分别为 disabled、route_not_allowed、route_disabled、method_not_allowed、path_not_allowed，每请求只计一次。路由规则上限 128 条，每路由最多 16 个路径，每路径最多 1024 UTF-8 字节；请求头读取上限同时由网关配置约束，禁止无界复制。
@@ -450,7 +450,7 @@ SSE 完整协议要求 `[DONE]`；缺少它但收到传输 EOS/End 时标 `proto
 
 普通 JSON 只有完整文档解析成功才能认定上报字段；已确认终结 SSE usage 即使后续流丢失也可以保留 reported 数值，但完整性标 partial，不进入有效统计候选。
 
-收到有效 End 时生成 usage 与 finish；明确流结束但无 End 时仅生成 usage，`request_finished_at_ms=null`、`terminal_observed=false`。finalize 先冻结结构化事件并释放解析正文，再独立尝试 Kafka 发送；ACK 写出和流关闭不等待 Kafka。任何 usage 一次定稿后不改写。Observer 进程退出可能连 usage 都没有，只能依赖已入队 start 显示缺失状态。
+收到有效 End 时，只生成一条同时包含用量和可观察终态的 `usage_observed`；明确流结束或超时但无 End 时仍尽力生成该结果事件，设置 `request_finished_at_ms=null`、`terminal_observed=false`，不伪造正常完成。finalize 先冻结结构化事件并释放解析正文，再尝试 Kafka 发送；ACK 写出和流关闭不等待 Kafka。每请求结果只定稿一次，之后不改写。Observer 进程退出可能连结果都没有，只能依赖已入队 start 显示缺失状态。
 
 ```mermaid
 sequenceDiagram
@@ -468,11 +468,9 @@ sequenceDiagram
     alt 收到 End
         W->>O: End + half close
         O-->>W: 最终 ACK
-        O->>K: usage_observed
-        O->>K: request_finished
-    else 断流或超限
-        O->>K: usage_observed(partial/unknown)
-        Note over O,K: 不制造 request_finished
+        O->>K: usage_observed(用量 + 终态)
+    else 未收到有效 End：断流或超时
+        O->>K: usage_observed(partial/unknown, terminal_observed=false)
     end
     K->>D: 可重复投递
     Note over D: 原始保留、查询去重、冲突隔离
@@ -484,7 +482,7 @@ sequenceDiagram
 
 Topic 固定 `llm-metering-events`，key 为 logical_request_id 的 UTF-8；初始 24 分区、3 副本、`min.insync.replicas=2`、保留 72 小时、`cleanup.policy=delete`。分区数属压测初值；同一部署周期不在线改分区数，变更需停采、排空在途后切换。Kafka 不接收正文片段。
 
-所有事件自带请求开始时间与身份快照，缺少 start 也能解释 usage/finish。模型等后续才知道的字段允许在不同事件类型之间不同，不属于同 ID 内容冲突。
+两类事件自带请求开始时间与身份快照，缺少 start 也能解释合并结果；缺少结果时，已入队的 start 只表示曾收到请求。模型等后续才知道的字段允许在不同事件类型之间不同，不属于同 ID 内容冲突。
 
 ```json
 {
@@ -534,7 +532,7 @@ Topic 固定 `llm-metering-events`，key 为 logical_request_id 的 UTF-8；初�
 }
 ```
 
-三类事件使用相同固定字段集；`x_request_id` 在同一请求的三类事件中相同，无法取得时显式为 null。start/finish 的 `usage=null`、`usage_status=not_applicable`、`usage_eligible=false`、`raw_usage_json="{}"`；start 的结束时间/终态为 null/false。未获得模型、HTTP 状态等字段显式写 null；不以空串、0 或 1970 时间代替未知。finish 的 observation_status 反映采集完整性，不能因 HTTP 200 强行标 complete。
+两类事件使用相同固定字段集；`x_request_id` 在同一请求的开始与结果事件中相同，无法取得时显式为 null。start 的 `usage=null`、`usage_status=not_applicable`、`usage_eligible=false`、`raw_usage_json="{}"`，结束时间为 null、`terminal_observed=false`。结果事件同时保存用量、`terminal_observed` 和可取得的结束时间；未收到有效 End 时结束时间为 null，不填零或虚构完成状态。未获得模型、HTTP 状态等字段显式写 null；结果事件的 observation_status 反映采集完整性，不能因 HTTP 200 强行标 complete。
 
 字段值由 Go 固定 struct 编码，字段顺序固定、无缩进，所有可选字段显式输出 null，字符串采用 Go encoding/json 默认转义；不接受同名重复 JSON key、未知顶层字段或自由扩展 map。Consumer 解码后按同一 schema struct 重编码为 `event_json`，计算 SHA-256 小写十六进制 `payload_hash`。摘要不含 Kafka 坐标/入库时间，包含 producer_id、事件时间和全部业务字段。重放保留原事件，不重新生成时间或 producer_id。
 
@@ -568,18 +566,18 @@ opts := []kgo.Opt{
 
 发送结果分 success、definite_failure、uncertain。超时/断连发生在已发送后通常不能证明 broker 未写入，标 uncertain，不补发。熔断恢复只恢复新采集；正常处理期限内的首次网络发送不算恢复补传。鉴权和 metadata 连接可重新建立，但不能携带已丢弃事件恢复发送。
 
-ACK 与 Kafka 发送完全解耦；即便三个事件只有一个成功入 Kafka，Consumer 也应处理。不要为了保持三个事件齐全引入同步等待或事务缓冲。
+ACK 与 Kafka 发送完全解耦；即便两条事件只有一条成功入 Kafka，Consumer 也应处理。不要为了保持两条事件齐全引入同步等待或事务缓冲。
 
 ## 7. ClickHouse 表结构与查询
 
 ### 7.1 存储选择与字段字典
 
-Consumer 在校验规范事件时一次解析字段，直接写入 `events_raw` 的类型化列；保留规范 `event_json` 仅供冲突核验，常规 SQL 不执行 JSONExtract。`event_id` 是事件级逻辑键，`logical_request_id` 是请求级逻辑键：一笔请求可有 start、usage、finish 三条事件。物理主键采用请求日期、请求 ID、事件 ID 的前缀，以支持请求精查；ClickHouse 主键不是唯一约束，排序键还必须包含 `payload_hash`，让同一 `event_id`、不同内容的变体都留下。相同事件重放由 `FINAL` 在查询时即时去重，不能只依赖后台 merge。[ReplacingMergeTree 机制](https://clickhouse.com/docs/engines/table-engines/mergetree-family/replacingmergetree)
+Consumer 在校验规范事件时一次解析字段，直接写入 `events_raw` 的类型化列；保留规范 `event_json` 仅供冲突核验，常规 SQL 不执行 JSONExtract。`event_id` 是事件级逻辑键，`logical_request_id` 是请求级逻辑键：一笔请求最多有 start 和合并后的 usage 两条事件。物理主键采用请求日期、请求 ID、事件 ID 的前缀，以支持请求精查；ClickHouse 主键不是唯一约束，排序键还必须包含 `payload_hash`，让同一 `event_id`、不同内容的变体都留下。相同事件重放由 `FINAL` 在查询时即时去重，不能只依赖后台 merge。[ReplacingMergeTree 机制](https://clickhouse.com/docs/engines/table-engines/mergetree-family/replacingmergetree)
 
 | 字段组 | 存储/逻辑类型 | 来源与说明 |
 | --- | --- | --- |
 | request_date | Date | 从请求 ID 的开始时间计算；分区键 |
-| logical_request_id / event_id / event_type | String / String / LowCardinality(String) | 插件生成请求 ID / Observer 固定后缀 / 三种固定事件类型；Consumer 校验三者一致 |
+| logical_request_id / event_id / event_type | String / String / LowCardinality(String) | 插件生成请求 ID / Observer 固定后缀 / 两种固定事件类型；Consumer 校验三者一致 |
 | x_request_id | Nullable(String) | 网关可见的 `X-Request-Id`，辅助关联；可能缺失或重复 |
 | payload_hash | FixedString(64) | Consumer 对规范事件计算 SHA-256 |
 | event_json | String | 规范化事件副本，仅供冲突证据和迁移核验，禁止正文；常规查询不读取 |
@@ -587,7 +585,7 @@ Consumer 在校验规范事件时一次解析字段，直接写入 `events_raw` 
 | ingested_at | DateTime64(3, UTC) | Consumer 写入时刻，不参与事件摘要 |
 | 身份/模型/诊断码 | String、Nullable(String)、Array(String) | 固定字段直接落列；原事件 null 对应 SQL NULL |
 | input/output/cache/reasoning/total | Nullable(Int64) | 有效服务上报，null 不等于零 |
-| 各 token source | Nullable(String) | reported / unknown；start/finish 的 `usage=null`，source 也为 NULL |
+| 各 token source | Nullable(String) | reported / unknown；start 的 `usage=null`，source 也为 NULL |
 | started/ended/finished/created | Int64 / Nullable(Int64) 毫秒 | finished/ended 可空；开始时间是统计归属 |
 | 状态/异常 | String、UInt8、Array(String) | 由协议/解析判断，见第 5 节 |
 
@@ -601,11 +599,11 @@ CREATE DATABASE IF NOT EXISTS metering;
 CREATE TABLE IF NOT EXISTS metering.events_raw
 (
     request_date Date COMMENT '请求开始时间对应的 UTC 日期，从 logical_request_id 提取，用于分区和保留期',
-    logical_request_id String COMMENT 'Wasm 生成的请求级唯一标识，同一请求的三类事件共用',
-    event_id String COMMENT '事件级逻辑标识，由请求 ID 和 start/usage/finish 后缀组成，不是数据库唯一约束',
+    logical_request_id String COMMENT 'Wasm 生成的请求级唯一标识，同一请求的两类事件共用',
+    event_id String COMMENT '事件级逻辑标识，由请求 ID 和 start/usage 后缀组成，不是数据库唯一约束',
     payload_hash FixedString(64) COMMENT 'Consumer 对规范事件计算的 SHA-256 十六进制摘要，区分重放与内容冲突',
     schema_version UInt32 COMMENT '规范事件结构版本，Consumer 据此校验和映射字段',
-    event_type LowCardinality(String) COMMENT '事件类型：request_started、usage_observed 或 request_finished',
+    event_type LowCardinality(String) COMMENT '事件类型：request_started 或 usage_observed；后者合并用量与终态',
     x_request_id Nullable(String) COMMENT '网关可见的 X-Request-Id，非唯一辅助关联值；缺失或非法为 NULL',
     observation_id String COMMENT '本次观察标识，本期与 logical_request_id 相同',
     observation_scope LowCardinality(String) COMMENT '观察范围，本期固定 gateway_response，仅统计网关可见响应',
@@ -632,20 +630,20 @@ CREATE TABLE IF NOT EXISTS metering.events_raw
     business_outcome Nullable(String) COMMENT '业务请求结果分类；尚未确定为 NULL，不代表观察完整性',
     terminal_observed UInt8 COMMENT '是否收到有效的网关 End：1 是、0 否',
     observation_status Nullable(String) COMMENT '观察完整性：complete、partial 或 unknown；start 尚未确定时为 NULL',
-    usage_status LowCardinality(String) COMMENT '用量状态：known、partial、unknown、conflict；start/finish 为 not_applicable',
+    usage_status LowCardinality(String) COMMENT '用量状态：known、partial、unknown、conflict；start 为 not_applicable',
     usage_eligible UInt8 COMMENT '是否满足本期有效统计候选条件：1 是、0 否；不表示可以收费，查询仍须排除请求冲突',
     input_tokens Nullable(Int64) COMMENT '输入总 token 数，来自 usage.prompt_tokens，包含缓存命中部分；未知为 NULL',
-    input_tokens_source Nullable(String) COMMENT '对应 token 数值来源：reported 为有效上游上报，unknown 为未知；start/finish 不携带 usage 时为 NULL',
+    input_tokens_source Nullable(String) COMMENT '对应 token 数值来源：reported 为有效上游上报，unknown 为未知；start 不携带 usage 时为 NULL',
     output_tokens Nullable(Int64) COMMENT '输出总 token 数，来自 usage.completion_tokens，包含推理部分；未知为 NULL',
-    output_tokens_source Nullable(String) COMMENT '对应 token 数值来源：reported 为有效上游上报，unknown 为未知；start/finish 不携带 usage 时为 NULL',
+    output_tokens_source Nullable(String) COMMENT '对应 token 数值来源：reported 为有效上游上报，unknown 为未知；start 不携带 usage 时为 NULL',
     cached_read_tokens Nullable(Int64) COMMENT '缓存命中 token 数，来自 usage.prompt_tokens_details.cached_tokens，已包含于输入；未知为 NULL',
-    cached_read_tokens_source Nullable(String) COMMENT '对应 token 数值来源：reported 为有效上游上报，unknown 为未知；start/finish 不携带 usage 时为 NULL',
+    cached_read_tokens_source Nullable(String) COMMENT '对应 token 数值来源：reported 为有效上游上报，unknown 为未知；start 不携带 usage 时为 NULL',
     cached_write_tokens Nullable(Int64) COMMENT '缓存写入 token 数；当前适配器尚未映射该字段，保存 NULL，不以零代替未知',
-    cached_write_tokens_source Nullable(String) COMMENT '对应 token 数值来源：reported 为有效上游上报，unknown 为未知；start/finish 不携带 usage 时为 NULL',
+    cached_write_tokens_source Nullable(String) COMMENT '对应 token 数值来源：reported 为有效上游上报，unknown 为未知；start 不携带 usage 时为 NULL',
     reasoning_tokens Nullable(Int64) COMMENT '推理 token 数，来自 usage.completion_tokens_details.reasoning_tokens，已包含于输出；未知为 NULL',
-    reasoning_tokens_source Nullable(String) COMMENT '对应 token 数值来源：reported 为有效上游上报，unknown 为未知；start/finish 不携带 usage 时为 NULL',
+    reasoning_tokens_source Nullable(String) COMMENT '对应 token 数值来源：reported 为有效上游上报，unknown 为未知；start 不携带 usage 时为 NULL',
     reported_total_tokens Nullable(Int64) COMMENT '上游 usage.total_tokens 原样上报的总量；缺失为 NULL，不用输入输出之和覆盖',
-    reported_total_tokens_source Nullable(String) COMMENT '对应 token 数值来源：reported 为有效上游上报，unknown 为未知；start/finish 不携带 usage 时为 NULL',
+    reported_total_tokens_source Nullable(String) COMMENT '对应 token 数值来源：reported 为有效上游上报，unknown 为未知；start 不携带 usage 时为 NULL',
     raw_usage_json String COMMENT '白名单保留的 usage JSON 依据，最多 4 KiB，不含正文；超限或不适用保存 {}',
     raw_usage_truncated UInt8 COMMENT 'usage 依据是否因过滤或大小限制丢弃内容：1 是、0 否，不表示回答被截断',
     anomaly_codes Array(String) COMMENT '采集、解析和校验的固定异常码列表，无异常为空数组',
@@ -712,7 +710,7 @@ FROM metering.events_valid;
 
 ### 7.4 请求关联视图与冲突隔离
 
-请求视图从全部变体生成三个槽，每槽有且只有一个变体才能展示该事件；没有事件及冲突事件都不选任意一份结果。`has_conflict` 还检查跨事件不应变化的身份快照。模型字段属于后续观察数据，不纳入身份快照比较。下面的 `any` 只选择同一请求中经校验应相同的字段；发生差异时 `has_conflict=1`，对外查询必须先排除该请求。
+请求视图从全部变体生成开始和结果两个槽，每槽有且只有一个变体才能展示该事件；没有事件及冲突事件都不选任意一份结果。`has_conflict` 还检查跨事件不应变化的身份快照。模型字段属于后续观察数据，不纳入身份快照比较。下面的 `any` 只选择同一请求中经校验应相同的字段；发生差异时 `has_conflict=1`，对外查询必须先排除该请求。
 
 ```sql
 CREATE VIEW IF NOT EXISTS metering.requests AS
@@ -720,7 +718,6 @@ SELECT
     v.request_date, v.logical_request_id,
     countIf(v.event_type = 'request_started') AS start_variants,
     countIf(v.event_type = 'usage_observed') AS usage_variants,
-    countIf(v.event_type = 'request_finished') AS finish_variants,
     any(v.request_started_at_ms) AS request_started_at_ms,
     any(v.x_request_id) AS x_request_id,
     any(v.customer_id) AS customer_id,
@@ -740,8 +737,17 @@ SELECT
     if(usage_variants = 1,
        anyIf(v.output_tokens, v.event_type = 'usage_observed'),
        CAST(NULL AS Nullable(Int64))) AS output_tokens,
+    if(usage_variants = 1,
+       anyIf(v.request_finished_at_ms, v.event_type = 'usage_observed'),
+       CAST(NULL AS Nullable(Int64))) AS request_finished_at_ms,
+    if(usage_variants = 1,
+       anyIf(v.terminal_observed, v.event_type = 'usage_observed'),
+       toUInt8(0)) AS terminal_observed,
+    if(usage_variants = 1,
+       anyIf(v.business_outcome, v.event_type = 'usage_observed'),
+       CAST(NULL AS Nullable(String))) AS business_outcome,
     toUInt8(
-      start_variants > 1 OR usage_variants > 1 OR finish_variants > 1
+      start_variants > 1 OR usage_variants > 1
       OR uniqExact(tuple(
         v.service_id, v.api_key_id, v.customer_id, v.application_id,
         v.identity_status, v.config_version, v.gateway_instance_id,
@@ -777,10 +783,11 @@ WHERE request_date = {day:Date}
   AND logical_request_id = {request_id:String};
 
 -- 客户查询用量：customer_id 由可信查询服务根据登录主体注入，不接受客户端指定。
--- 只有 start/finish 而无 usage 时仍返回请求，token 为 NULL，状态为 not_observed。
+-- 只有 start 而无结果时仍返回请求，token 为 NULL，状态为 not_observed。
 SELECT r.logical_request_id, r.x_request_id, r.request_started_at_ms,
        r.service_id, r.response_model, r.usage_status,
-       r.observation_status, r.input_tokens, r.output_tokens
+       r.observation_status, r.input_tokens, r.output_tokens,
+       r.terminal_observed, r.request_finished_at_ms, r.business_outcome
 FROM metering.requests AS r
 WHERE r.request_date = {day:Date}
   AND r.logical_request_id = {request_id:String}
@@ -805,11 +812,11 @@ WHERE request_date = {day:Date}
   AND logical_request_id = {request_id:String}
 ORDER BY event_id, payload_hash;
 
--- 有已记录开始但缺少明确结束；不据此断言业务仍在执行。
-SELECT logical_request_id, start_variants, usage_variants, finish_variants
+-- 有已记录开始但缺少结果；不据此断言业务仍在执行。
+SELECT logical_request_id, start_variants, usage_variants
 FROM metering.requests
 WHERE request_date = {day:Date}
-  AND start_variants = 1 AND finish_variants = 0
+  AND start_variants = 1 AND usage_variants = 0
 ORDER BY logical_request_id LIMIT 100;
 
 -- 内部联调分页：需回查请求冲突状态；调用方提供严格 30 天窗口。
@@ -840,14 +847,14 @@ WHERE request_date = {day:Date}
 
 一期客户查询接口按 `X-Metering-Request-Id` 提供的 `logical_request_id` 精查，先校验 ID 格式及 30 天在线窗口，再验证登录主体的客户身份并强制注入 `customer_id` 条件；对其他客户 ID 与不存在的 ID 给出相同未找到响应。按 `X-Request-Id` 查询是辅助入口，要求客户身份和有限时间窗口，允许零到多条结果，不据此跨客户查找或做结算幂等。接口展示 `usage_status`、各 token 的 null/有效值、完整性与数据水位：观察事件尚未入库时只能返回“暂未查到”，不能推断零消耗；旁路可丢采，超过水位仍无记录也不能保证原请求不存在。在线明细按 30 天窗口，过期按归档异步检索方案处理。按客户的正式对外查询必须排除 `requests.has_conflict=1` 的全部记录，并由可信服务注入客户条件；上面的明细 SQL 用于内部联调。数据库账号不直接发给客户。本批只有内部 SQL 验收，不声称已经实现租户隔离产品 API。
 
-日均约 1.5 亿事件意味着 30 天约 45 亿事件。类型化列将 JSON 解析成本移到写入阶段，也允许按列读取；但 `FINAL`、冲突检测、按请求关联及非排序键的客户筛选仍可能很贵。保留 `event_json` 会增加写入与存储成本，需与旧方案比较磁盘、写入 CPU 和查询延迟。首批验收先测请求 ID 精查、单客户 1 小时/24 小时分页，10 并发、返回 100 行，P95 目标 ≤3 秒。`X-Request-Id` 辅助查询的 SQL 先用于联调，一期客户接口上线前还须压测客户+时间+该字段的检索路径；如现有排序键不达标，建设以客户和时间为前缀的检索结构，候选结果仍回查 `requests.has_conflict`，不能用辅助索引绕过去重和租户隔离。若不达标，记录方案阻塞并单独设计物化检索明细或预聚合，不绕过去重来换性能。
+日均约 1 亿事件意味着 30 天约 30 亿事件。类型化列将 JSON 解析成本移到写入阶段，也允许按列读取；但 `FINAL`、冲突检测、按请求关联及非排序键的客户筛选仍可能很贵。保留 `event_json` 会增加写入与存储成本，需与旧方案比较磁盘、写入 CPU 和查询延迟。首批验收先测请求 ID 精查、单客户 1 小时/24 小时分页，10 并发、返回 100 行，P95 目标 ≤3 秒。`X-Request-Id` 辅助查询的 SQL 先用于联调，一期客户接口上线前还须压测客户+时间+该字段的检索路径；如现有排序键不达标，建设以客户和时间为前缀的检索结构，候选结果仍回查 `requests.has_conflict`，不能用辅助索引绕过去重和租户隔离。若不达标，记录方案阻塞并单独设计物化检索明细或预聚合，不绕过去重来换性能。
 
 ## 8. Consumer 落库与异常事件
 
 ### 8.1 消费处理顺序
 
 1. 使用独立 group `llm-metering-clickhouse-v1`，禁用自动提交。每分区顺序处理，允许不同分区并行。
-2. 校验大小、schema、白名单、ID/类型后缀、开始时间、身份类型、token 类型和来源组合；start/finish 出现非 null usage 一律拒绝。开始时间超出消费者当前时间 5 分钟以上进入拒绝诊断，不让远期分区无限保留；所有拒绝都有原因计数。
+2. 校验大小、schema、白名单、ID/类型后缀、开始时间、身份类型、token 类型和来源组合；只接受 `request_started`（:start）和 `usage_observed`（:usage）。start 出现非 null usage 一律拒绝；结果事件必须带有用量状态和终态标识，即使 token 未知也不能省略状态。若 `terminal_observed=false`，`request_finished_at_ms` 必须为 null。开始时间超出消费者当前时间 5 分钟以上进入拒绝诊断，不让远期分区无限保留；所有拒绝都有原因计数。
 3. 规范化并计算摘要，按 ID 时间确定 `request_date`，从同一个已校验的事件对象展开类型化列并准备 `events_raw` 行。校验 `event_id` 与 `logical_request_id`/`event_type` 一致，所有可空字段按原事件 null 写 SQL NULL，token source 不从数值猜测；类型化列与保留的 `event_json` 必须表达同一事件。不在 Consumer 中重新提取服务 usage、补估算或改变定稿。
 4. 每批最多 5000 行/4 MiB，或等待 1 秒即写入；同步 INSERT 确认后，才提交该分区连续成功记录的下一 offset。
 5. INSERT 部分成功或确认丢失时不提交，原批重试允许重复插入；查询去重保持结果一致。若使用 ClickHouse async insert，必须等待持久化确认，不能默认接纳即提交。
@@ -1101,7 +1108,7 @@ WASM 预置到带版本文件名的网关镜像或只读挂载，不运行时远
 {"model":"model-a","choices":[{"index":0,"message":{"role":"assistant","content":"ok"}}],"usage":{"prompt_tokens":1000,"completion_tokens":500,"total_tokens":1500}}
 ```
 
-对应结果：正常收到 End 时三事件、请求一行、input=1000、output=500、total=1500；再次消费同样三事件，有效用量保持不变。
+对应结果：正常收到 End 时两事件、请求一行；合并结果中 input=1000、output=500、total=1500、terminal_observed=true；再次消费相同两事件，有效用量保持不变。
 
 SSE 响应（测试时对每个字节位置切片，特别是 UTF-8 和 JSON 字符串）：
 
@@ -1140,29 +1147,30 @@ data: [DONE]
 | cache/reasoning 包含量、total 冲突 | 不重复相加；冲突保留依据并排除有效用量 |
 | 多个不同终结 usage | usage_conflict，一次定稿，不“最后覆盖” |
 | 身份伪造头、可信元数据缺失 | 不接受头；鉴权成功但缺 metadata 标 identity invalid 并报警，不跨客户猜归属 |
-| 正确/无效/吊销/越权 API Key | 正确 Key 的身份快照进入三类事件；其余请求在 WASM 前被拒绝 |
+| 正确/无效/吊销/越权 API Key | 正确 Key 的身份快照进入两类事件；其余请求在 WASM 前被拒绝 |
 | 请求体大于回调/累计上限 | 读取前判超限；业务字节不丢；采集有界放弃 |
 | 不支持压缩/协议 | 元数据可记录，usage 未知，不尝试业务改写 |
 | 重复帧/序号跳跃/End 总量错误 | 关闭观察，partial/unknown；不制造完整结果 |
 | HTTP context 删除后 ACK 到达 | 仅 Root 状态被访问；无 use-after-delete、重复释放 |
-| 无 End、End 丢失、Observer 崩溃 | 不生成虚假 finish；已有 start 仍可查询 |
+| 无 End、End 丢失、Observer 崩溃 | 已定稿结果标记 terminal_observed=false、结束时间为空；若结果未发出，已有 start 仍可查询 |
+| 有 End 且 usage 完整，或有 End 但 usage 缺失 | 均只发送一条 `usage_observed` 结果，分别标记用量已知或未知；两种情况都不发送独立 finish 事件 |
 | 客户端断开/网关隐藏重试 | 不猜取消责任；不宣称每次尝试的用量已覆盖 |
-| start 写 Kafka 失败但 usage/finish 成功 | 自带快照可查请求，start_variants=0 |
+| start 写 Kafka 失败但合并结果成功 | 结果自带快照可查请求，start_variants=0 |
 | 同 ID 同内容重复、INSERT 成功 commit 失败 | 事件/请求/有效 token 不增加，后台 merge 前也正确 |
 | 同 ID 不同内容，先后到达及后台 merge | 保留两个变体；有效视图排除；不能先筛客户藏掉冲突 |
-| 三事件身份快照不同 | requests.has_conflict=1，不选任意客户归属 |
-| 三事件 X-Request-Id 不同、同 X-Request-Id 多次请求 | 前者隔离为冲突；后者保持不同 logical_request_id，辅助查询返回多个候选 |
-| 空 usage / SQL Nullable / 只有 start | SQL 不把 null 变零，不把三个事件计三请求 |
+| 两事件身份快照不同 | requests.has_conflict=1，不选任意客户归属 |
+| 两事件 X-Request-Id 不同、同 X-Request-Id 多次请求 | 前者隔离为冲突；后者保持不同 logical_request_id，辅助查询返回多个候选 |
+| 空 usage / SQL Nullable / 只有 start | SQL 不把 null 变零，不把两条事件计为两次请求 |
 | 跨 UTC 午夜、TTL 边界、超过 30 天重放 | 分区按开始日；无冲突因单变体早到期而复活 |
 | 无效 schema/正文混入事件 | 拒绝表只有坐标/摘要/原因，不保存原 payload |
 | Producer 黑洞/metadata 故障/确认丢失 | 有界执行槽；watchdog 可释放；uncertain 不重发 |
-| 独立网关基数缺失 | 完整率未知，不用 start/finish 比例替代 |
+| 独立网关基数缺失 | 完整率未知，不用结果/开始比例替代 |
 
-SDK 单元测试验证 hostcall 签名和回调注册/清理；标准 Protobuf 与 WASM 编解码器做 golden 互操作测试；SQL 测试在目标 ClickHouse 版本执行全套 DDL、插入合成事件并在 merge 前后比较结果。数据库测试还须核对规范 JSON 与类型化列逐字段一致，覆盖合法 0、缺失/null、start/finish 无 usage、同 ID 同摘要重放及同 ID 不同摘要冲突，并用 EXPLAIN 核查请求 ID 精查、客户分页与冲突隔离的实际扫描量。不能只用 SDK mock 代替真实 Envoy 测试。
+SDK 单元测试验证 hostcall 签名和回调注册/清理；标准 Protobuf 与 WASM 编解码器做 golden 互操作测试；SQL 测试在目标 ClickHouse 版本执行全套 DDL、插入合成事件并在 merge 前后比较结果。数据库测试还须核对规范 JSON 与类型化列逐字段一致，覆盖合法 0、缺失/null、start 无 usage、同 ID 同摘要重放及同 ID 不同摘要冲突，并用 EXPLAIN 核查请求 ID 精查、客户分页与冲突隔离的实际扫描量。不能只用 SDK mock 代替真实 Envoy 测试。
 
 ### 11.3 容量与性能验收
 
-以下请求量仅指命中采集白名单的请求，不含普通 GET 等被过滤流量；网关总体负载另行压测。日均 5000 万请求约 579 RPS，正常三事件约 1736 events/s、1.5 亿 events/天。1 KiB/事件仅为示例，约 150 GB/天，在线 30 天约 4.5 TB 未压缩、未计副本；实际 JSON 事件大小需实测，不能用示例作为磁盘报价。
+以下请求量仅指命中采集白名单的请求，不含普通 GET 等被过滤流量；网关总体负载另行压测。日均 5000 万请求约 579 RPS，正常两事件约 1157 events/s、1 亿 events/天。若暂按 1 KiB/事件举例，则约 100 GB/天、在线 30 天约 3 TB 未压缩且未计副本；合并后的结果事件可能更大，实际 JSON 大小需分别实测，不能用示例作为磁盘报价。
 
 活跃观察流约 `峰值 RPS × 平均时长`。579 RPS、30 秒已约 17370 流，明显超过单 Root/单 Observer 初值，因此需要按网关 Worker 和 Observer 分片扩容；初值用于验证资源边界，不是全量接入配置。
 
@@ -1178,7 +1186,7 @@ SDK 单元测试验证 hostcall 签名和回调注册/清理；标准 Protobuf �
 | 2 | 真实镜像与身份接入核查 | 固定镜像/过滤器顺序/元数据/路由样例，提供最小 JSON/SSE 服务 |
 | 3 | SDK gRPC 扩展、TinyGo PoC | 编译、加载、Continue、ACK、Root 生命周期、取消与长时内存验证通过 |
 | 4 | 协议和插件 | 配置校验、白名单、ID、usage 参数改写与有界 Pause/恢复、分片、资源额度与指标实现，旁路故障不等待 |
-| 5 | Observer | 有界 JSON/SSE、usage 规则、一次定稿、三事件 golden 样例通过 |
+| 5 | Observer | 有界 JSON/SSE、usage 规则、一次定稿、两事件 golden 样例通过 |
 | 6 | Kafka 与 Consumer | producer 故障限制、offset 提交、非法事件隔离、重放验证通过 |
 | 7 | ClickHouse | DDL/视图/查询在目标版本执行；重复及冲突在 merge 前后均正确 |
 | 8 | 联调与灰度 | Auth/采集压测、故障演练、独立基数、回退验证和发布清单归档 |

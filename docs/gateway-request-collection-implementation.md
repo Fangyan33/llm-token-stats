@@ -1,24 +1,24 @@
 # 网关请求采集开发实现方案
 
-版本：V1.4｜日期：2026-10-09｜状态：开发设计，尚未完成真实网关 PoC 和性能验收。
+版本：V1.5｜日期：2026-10-09｜状态：开发设计，尚未完成真实网关 PoC 和性能验收。
 
-依据：[原技术方案](token-metering-design.md)、[产品方案 V2](token-metering-design-v2.md)、[API Key Auth 服务方案](api-key-auth-service-implementation.md)。本文细化第一批“鉴权后采集到明细入库”工作，不代表原方案的一期功能全部交付。本文中的 SQL、协议和配置供后续实现使用；Go 代码标明为伪代码的部分不能直接编译。
+依据：[原技术方案](token-metering-design.md)、[产品方案 V2](token-metering-design-v2.md)、[API Key Auth 服务方案](api-key-auth-service-implementation.md)。本文细化一期中“鉴权后采集到 ClickHouse 明细入库”的采集子项；一期的估算、汇总、归档、客户查询与看板在后续子项完成，不能以本文验收代替一期整体验收。本文中的 SQL、协议和配置供后续实现使用；Go 代码标明为伪代码的部分不能直接编译。
 
 ## 1. 范围与技术决策
 
-| 项目 | 本批决策 |
+| 项目 | 一期采集子项决策 |
 | --- | --- |
 | 业务环境 | Istio 1.13.5、Kubernetes 1.22，先在实际私有网关镜像验证 |
 | 网关插件 | Go + TinyGo，Proxy-Wasm，EnvoyFilter 加载本地固定文件 |
 | 接收与消费 | Go Observer、Go Consumer，独立部署 |
 | 数据路径 | WASM → 双向 gRPC → Observer → Kafka → Consumer → ClickHouse |
 | 协议 | 兼容 Chat Completions 的 JSON 和 SSE，包括工具调用、多候选 |
-| 用量 | 只提取有效服务 usage；缺失字段为 null/unknown，本批不估算 |
+| 用量 | 只提取有效服务 usage；缺失字段为 null/unknown；一期采集子项不估算，估算属于一期后续子项 |
 | 配置 | 采集参数使用版本化 JSON/YAML、ConfigMap；采集组件不建设管理 API，身份与 API Key 由独立 Auth + PostgreSQL 管理 |
 | 存储 | 类型化原始计量事件（保留规范 JSON 作冲突证据）、去重视图、请求关联视图，在线保留 30 天 |
 | 故障策略 | 业务不等待采集，采集超限或失败放弃，无落盘、重传及恢复队列 |
-| 查询交付 | 本批提供计量查询 ID、事件字段、SQL 和联调查询样例；客户查询 HTTP API、门户和导出任务仍属后续一期工作 |
-| 后续工作 | tokenizer、小时/日汇总、对象存储归档、看板、计费账单、A 侧逐尝试观察 |
+| 查询交付 | 一期采集子项提供计量查询 ID、事件字段、SQL 和联调查询样例；客户查询 HTTP API、门户和导出任务属于一期后续子项 |
+| 阶段衔接 | 一期后续子项：tokenizer 估算、小时/日汇总、对象存储归档（另行设计）、客户查询/导出和看板；二期：计费、账单发布与调整单；三期：对账和结算确认；A 侧逐尝试观察为可选扩展 |
 
 只观察入口直接访问的服务 A 及其最终响应；不还原 A 内部 B/C 调用、网关隐藏重试或客户端未收到的后端消耗。客户端重新发起请求形成新的采集请求 ID。
 
@@ -62,16 +62,16 @@ WASM 不解析业务 JSON、不运行 tokenizer、不使用 Go 网络库直连 K
 
 1. 在 ingressgateway HTTP filter chain 中，把插件放在 `envoy.filters.http.ext_authz` 之后、router 之前；顺序以真实 `config_dump` 确认。Auth 及 PostgreSQL 设计见独立文档。
 2. 必须在请求头阶段按第 2.3 节执行“可信路由显式启用 + 方法 + 路径”联合白名单，仅匹配 route_name 不足以启用采集。服务 ID 来自配置，不从客户端路径推断；Observer 服务路由永远排除。
-3. 本批统计基数为到达该观察位置且命中完整白名单的请求，不包含同路由上的普通查询。鉴权前被拒绝的请求可能不经过插件，单列网关指标，不混入完整率分母。
+3. 一期采集子项统计基数为到达该观察位置且命中完整白名单的请求，不包含同路由上的普通查询。鉴权前被拒绝的请求可能不经过插件，单列网关指标，不混入完整率分母。
 4. 可信身份来自 Auth 的 `CheckResponse.dynamic_metadata`，由 Envoy 写入 `filter_metadata.envoy.filters.http.ext_authz` namespace。
-5. 不信任客户端传入的 API Key ID、客户 ID、应用 ID；本批不支持把任意请求头配置为身份来源。
+5. 不信任客户端传入的 API Key ID、客户 ID、应用 ID；一期采集子项不支持把任意请求头配置为身份来源。
 
 | 逻辑字段 | 示例元数据叶子 | 处理规则 |
 | --- | --- | --- |
 | api_key_id | `envoy.filters.http.ext_authz.api_key_id` | Auth 返回的稳定 ID；不记录密钥原文 |
 | customer_id | `envoy.filters.http.ext_authz.customer_id` | 鉴权时的客户快照 |
 | application_id | `envoy.filters.http.ext_authz.application_id` | 鉴权时的应用快照 |
-| identity_status | 插件生成 | 三项齐全为 known；鉴权成功却缺失任一字段时标记 invalid 并报警，不猜归属 |
+| `identity_status` | 插件生成 | 三项齐全为 `known`；鉴权成功却缺失任一字段时标记 `invalid` 并记录 `identity_invalid` 异常码，不猜归属；业务按 ext_authz 结果继续 |
 | service_id / adapter_id | 路由配置 | 必填；不在配置中的路由不采集 |
 | config_version | 插件配置 | 开始时固定，同一请求后续不切换版本 |
 
@@ -86,8 +86,8 @@ SDK `GetProperty` 路径候选为 `metadata/filter_metadata/envoy.filters.http.e
 - `start_unix_ms`：网关进入请求头回调的 UTC 毫秒时间；所有事件携带相同值。
 - `root_nonce`：Root 初始化时用经 PoC 验证的 WASI `random_get` 生成 128 位随机值；不可用则禁用本 Root 采集并报警，不能退化为单独时间戳。
 - `counter`：Root 内从 1 递增的 uint64；用完则停止新采集，不回绕。多 Worker、重启、热更新由不同 nonce 隔离。
-- `observation_id` 本批等于 `logical_request_id`，`observation_scope` 固定 `gateway_response`。
-- `event_id` 分别为 `<logical_request_id>:start`、`:usage`、`:finish`；不复用客户端 request ID。
+- `observation_id` 一期采集子项等于 `logical_request_id`，`observation_scope` 固定 `gateway_response`。
+- 两类 Kafka 事件的 `event_id` 分别为 `<logical_request_id>:start` 和 `<logical_request_id>:usage`，对应 `request_started` 和 `usage_observed`；`request_finished_at_ms` 只是结果事件字段，gRPC `End` 只是观察消息，不复用客户端 request ID。
 
 `logical_request_id` 是计量主键。匹配白名单后，插件在请求头回调生成并保存于 HTTP context；即使 Observer 无法接收，也应独立于旁路额度尝试在最终响应头写入 `X-Metering-Request-Id: <logical_request_id>`。该头由网关覆盖上游同名响应头，不改写 `X-Request-Id`。浏览器跨域调用如需读取此头，由网关 CORS 配置暴露；客户端应记录响应头以供一期查询接口使用。鉴权前拒绝、插件未执行或客户端未收到响应头时，不能保证取得计量 ID；返回了 ID 也只表示插件生成了标识，不保证事件成功入库。
 
@@ -102,7 +102,7 @@ Consumer 校验 ID 时间前缀与 `request_started_at_ms` 完全一致，以 ID
 本节为实现和上线验收的强制约束；“白名单请求”均指命中以下完整条件的请求。
 
 1. **默认忽略**：全局 enabled 必须为 true，且可信 route_name 对应规则显式 enabled=true、方法和路径同时命中，才标记 selected。缺少规则、规则禁用、属性读取失败均不采集，不得回退为全量采集。route_name 必须从 Envoy 可信路由属性取得，不接受客户端 Header 控制开关、路由名、service_id 或 adapter_id。
-2. **首批只允许 Chat Completions**：adapter_id 固定为 chat_completions_v1，methods 固定为 ["POST"]，paths 为非空精确路径列表，默认 ["/v1/chat/completions"]。部署使用自定义前缀时必须逐条配置并验证；禁止通配符、前缀、包含或正则匹配。GET、HEAD、OPTIONS、指标、健康检查和模型列表接口不得进入采集；未来其他协议需独立适配器和评审。
+2. **一期采集子项只允许 Chat Completions**：adapter_id 固定为 chat_completions_v1，methods 固定为 ["POST"]，paths 为非空精确路径列表，默认 ["/v1/chat/completions"]。部署使用自定义前缀时必须逐条配置并验证；禁止通配符、前缀、包含或正则匹配。GET、HEAD、OPTIONS、指标、健康检查和模型列表接口不得进入采集；未来其他协议需独立适配器和评审。
 3. **路径口径固定**：使用 Wasm 请求头回调当时可见的 :path，去掉第一个 ? 及其后的查询串后逐字节匹配；插件不额外 URL 解码、大小写折叠、合并斜杠或去除尾斜杠。网关此前已做的规范化以实际可见结果为准。路径和 query 不上报、不入库、不记日志或指标标签。规则按该观察位置配置，不使用上游重写后的路径猜测；路径重写、路由属性及执行顺序须在固定镜像 PoC 验证，读取不到可信属性时禁止扩大匹配范围。
 4. **先过滤再分配**：HTTP context 初始 selected=false，只保存必要标志。未命中时不生成 logical_request_id、不读取身份或正文、不申请改写/观察额度、不建立观察 gRPC 流、不发送 Start/BodyChunk/End、不添加计量响应头，所有后续回调直接 Continue（结束回调直接返回）。不得为这类请求产生两类 Kafka 事件，包括 unknown 占位事件；只增加本地忽略计数。Envoy/SDK 基础 HTTP context 的创建不等于分配计量状态。
 5. **请求内固定结果**：命中后固定规则、config_version 和 selected，后续配置更新、响应状态、usage 缺失不得改变本次选择。Content-Type、Content-Encoding、请求体中的 model/stream、是否携带 API Key 均不能替代入口白名单。内容类型/压缩不支持仅影响改写和解析；命中的失败响应、非法正文或断流仍按现有有界流程尝试产生可观察事件，未知用量不得补零，不承诺两事件必达。
@@ -134,7 +134,7 @@ enum Direction {
 }
 
 message ObservationFrame {
-  uint32 schema_version = 1;       // 本批固定 1
+  uint32 schema_version = 1;       // 一期采集子项固定 1
   string logical_request_id = 2;
   uint64 frame_seq = 3;            // 从 1 开始，整个流严格递增
   oneof payload {
@@ -200,14 +200,14 @@ message ObservationAck {
 }
 ```
 
-`example.com` 仅为仓库尚无正式 Go module path 时的占位符；建工程时一次性替换。字段号发布后不复用，新增字段保持向后兼容；未知 `schema_version` 拒绝观察流，不影响业务。
+`example.com` 仅为仓库尚无正式 Go module path 时的占位符；建工程时一次性替换。字段号发布后不复用，新增字段保持向后兼容。WASM → Observer 的观察流使用未知协议 `schema_version` 时拒绝该观察流，不影响业务；Kafka 事件的未知 `schema_version` 由 Consumer 暂停相应分区且不提交 offset，按第 8 节处理。
 
 ### 3.2 消息顺序、ACK 与缺片
 
 - `Start` 必须为 frame 1，且每流仅一次；无有效 Start 的流直接关闭，不制造请求事件。
 - `ResponseHeaders` 发送最终业务响应头，忽略 1xx；请求和响应分片可交错，每方向独立累计偏移。
 - 无正文时头消息的 `end_stream=true`；trailers 回调只更新方向结束标志，不复制 trailers。`End` 仍是明确请求终态的唯一消息。
-- Observer 校验 frame 序号、方向 body_seq、offset 和 End 总量；序号跳跃、重复或不一致均判 `protocol_error` 并定稿 partial/unknown 后关闭。gRPC 本身有序，本批不尝试乱序缓存或正文重传。
+- Observer 校验 frame 序号、方向 body_seq、offset 和 End 总量；序号跳跃、重复或不一致均判 `protocol_error` 并定稿 partial/unknown 后关闭。gRPC 本身有序，一期采集子项不尝试乱序缓存或正文重传。
 - ACK 在 Observer 已接纳并处理该消息、释放其临时缓冲后产生，不等待 Kafka。请求 JSON 的有界解析状态仍受 Observer 总额度约束。
 - ACK 累计确认，最多每 8 帧或 10 毫秒发送一次，Start 与 End 立即确认。只保留一个可覆盖的“最新 ACK”槽；写阻塞超时即关闭流，不积压 ACK 队列。
 - 插件按本地发送账本释放 `<= accepted_frame_seq` 的字节/消息额度；忽略重复 ACK。ID 不符、确认未发送序号或超大 ACK 视为协议错误并取消旁路。
@@ -230,7 +230,7 @@ message ObservationAck {
 | 读取 ACK | `proxy_get_buffer_bytes`，buffer type 为 gRPC receive buffer |
 | 上下文切换 | `proxy_set_effective_context`，显式切到 Root 并恢复原 HTTP context |
 
-签名逐项按 Proxy-Wasm ABI 和固定 Envoy host 实现核对，特别检查指针、长度、token、状态码与空消息。`proxy_grpc_stream` 的 upstream 参数是序列化 `envoy.config.core.v3.GrpcService`，不是直接传 cluster 名字符串；本批只编码 `envoy_grpc.cluster_name`。[ABI 规范](https://github.com/proxy-wasm/spec/blob/main/abi-versions/v0.2.1/README.md)
+签名逐项按 Proxy-Wasm ABI 和固定 Envoy host 实现核对，特别检查指针、长度、token、状态码与空消息。`proxy_grpc_stream` 的 upstream 参数是序列化 `envoy.config.core.v3.GrpcService`，不是直接传 cluster 名字符串；一期采集子项只编码 `envoy_grpc.cluster_name`。[ABI 规范](https://github.com/proxy-wasm/spec/blob/main/abi-versions/v0.2.1/README.md)
 
 项目封装接口设计如下，均为新增接口：
 
@@ -384,7 +384,7 @@ func (p *PluginContext) OnTick() {
 
 每流总额度内预留 4 条、8 KiB 给 Start/响应头/End，正文不能占用；仍需同时满足 Root 总额度。控制消息没有无限通道。如果已取消旁路，不再另开流补报 End；Observer 通过断开或期限定稿。
 
-每个 Worker/VM 有独立 Root，本批每 Worker 每代仅装一个插件实例。改写预留为独立预算，最多另加 `worker_count × root_rewrite_budget_bytes`，热更新同样按代数放大。稳态实例理论在途上界为 `worker_count × root_inflight_bytes`，还需加 VM heap、gRPC/HTTP2、Envoy native buffer 和元数据。热更新旧新代共存时还要乘以存活代数；发布节流保证最多两代采集状态，旧代退出前不连续发布。发布模板固定并核验 worker 数；初始灰度用 2 Worker，对应稳态 32 MiB 记账在途，不能声称整个网关只增加 32 MiB。
+每个 Worker/VM 有独立 Root，一期采集子项每 Worker 每代仅装一个插件实例。改写预留为独立预算，最多另加 `worker_count × root_rewrite_budget_bytes`，热更新同样按代数放大。稳态实例理论在途上界为 `worker_count × root_inflight_bytes`，还需加 VM heap、gRPC/HTTP2、Envoy native buffer 和元数据。热更新旧新代共存时还要乘以存活代数；发布节流保证最多两代采集状态，旧代退出前不连续发布。发布模板固定并核验 worker 数；初始灰度用 2 Worker，对应稳态 32 MiB 记账在途，不能声称整个网关只增加 32 MiB。
 
 WASM 线性内存高水位未必返还操作系统；验收检查长时间复用是否有界，而不是要求 RSS 每次请求结束立即下降。给网关预算增加足够余量，比较 VM heap、native heap、RSS 和活跃 token 数。没有实测通过前不得靠提高限额解决丢采。
 
@@ -412,7 +412,7 @@ Observer 的绝对观察期限为 605 秒，比插件长 5 秒，覆盖正常结
 | SSE 结束 | `[DONE]` 是协议结束标记，不等于网关请求结束；是否有 End 分别记录 |
 | 多次 usage | 相同候选允许；不同终结候选标 `usage_conflict`，不取最大值，不相加 |
 | 非 2xx | 仍按适配器解析可见合法 usage；HTTP 错误不自动等于零 token |
-| 压缩正文 | 本批不解压；任一方向 Content-Encoding 非空且非 identity，标 `unsupported_encoding`，该方向用量/模型未知 |
+| 压缩正文 | 一期采集子项不解压；任一方向 Content-Encoding 非空且非 identity，标 `unsupported_encoding`，该方向用量/模型未知 |
 | 不支持 Content-Type | 记录元数据，标 `unsupported_content_type`，不猜测协议 |
 | SSE 中部分 UTF-8/JSON、超长事件 | 停止解析并关闭观察流，定稿 partial/unknown，不记录原始错误片段 |
 
@@ -420,7 +420,7 @@ Observer 的绝对观察期限为 605 秒，比插件长 5 秒，覆盖正常结
 
 `chat_completions_v1` 的终结 usage 语义要求服务样例验证。不符合上述语义的服务使用新的 adapter_id 和独立测试，不能把流内占位 0 当最终用量。
 
-SSE 完整协议要求 `[DONE]`；缺少它但收到传输 EOS/End 时标 `protocol_incomplete`，仍可保留已解析的终结 usage，观察完整性降为 partial。`[DONE]` 后只允许空白/注释，出现额外业务 data 也判协议异常。同一次观察出现不同终结 usage 时，本批全部归一化用量置 null/unknown，usage_status=conflict；raw_usage_json 仅保留第一份白名单候选作为诊断依据，不把它作为选中的最终值。
+SSE 完整协议要求 `[DONE]`；缺少它但收到传输 EOS/End 时标 `protocol_incomplete`，仍可保留已解析的终结 usage，观察完整性降为 partial。`[DONE]` 后只允许空白/注释，出现额外业务 data 也判协议异常。同一次观察出现不同终结 usage 时，一期采集子项全部归一化用量置 null/unknown，usage_status=conflict；raw_usage_json 仅保留第一份白名单候选作为诊断依据，不把它作为选中的最终值。
 
 ### 5.3 字段归一化
 
@@ -433,7 +433,7 @@ SSE 完整协议要求 `[DONE]`；缺少它但收到传输 EOS/End 时标 `proto
 | reasoning_tokens | usage.completion_tokens_details.reasoning_tokens | 已包含于 output_tokens |
 | reported_total_tokens | usage.total_tokens | 原服务上报总量，不用推导值覆盖 |
 
-每字段保存 `{value, source}`，本批 source 仅 `reported` 或 `unknown`。接受整数 JSON 数字，范围 `[0, 9223372036854775807]`；解析用 `json.Number`，拒绝字符串、布尔、负数、小数、溢出，不能先转 float64。缺失、非法值转换为 null，分别打原因码；有效 0 保留。
+每字段保存 `{value, source}`，一期采集子项 source 仅 `reported` 或 `unknown`。接受整数 JSON 数字，范围 `[0, 9223372036854775807]`；解析用 `json.Number`，拒绝字符串、布尔、负数、小数、溢出，不能先转 float64。缺失、非法值转换为 null，分别打原因码；有效 0 保留。
 
 校验 `cached_read <= input`、`reasoning <= output`，以及两项都已知时 `input + output == reported_total`；加法用溢出检查。冲突保留合法数值和来源以便解释，但 `usage_status=conflict`、`usage_eligible=false`。禁止据总量倒推缺失字段。
 
@@ -445,7 +445,7 @@ SSE 完整协议要求 `[DONE]`；缺少它但收到传输 EOS/End 时标 `proto
 
 - `observation_status`：complete（两方向 EOS、序号/总量正确、有 End）、partial（有缺失/截断）、unknown（只获得有限元数据）。
 - `usage_status`：known（输入和输出均有效）、partial（只知道部分字段）、unknown、conflict。
-- `usage_eligible`：仅当服务适配成功、observation_status=complete、输入输出均已知、无用量/身份冲突且身份 known 时为 true；它只表示本批有效统计候选，不代表允许收费。
+- `usage_eligible`：仅当服务适配成功、observation_status=complete、输入输出均已知、无用量/身份冲突且身份 known 时为 true；它只表示一期采集子项有效统计候选，不代表允许收费。
 - `business_outcome`：response_complete、stream_incomplete、unknown；HTTP 成败由 http_status 另查。不能把所有断流归因为客户主动取消。
 
 普通 JSON 只有完整文档解析成功才能认定上报字段；已确认终结 SSE usage 即使后续流丢失也可以保留 reported 数值，但完整性标 partial，不进入有效统计候选。
@@ -536,7 +536,7 @@ Topic 固定 `llm-metering-events`，key 为 logical_request_id 的 UTF-8；初�
 
 字段值由 Go 固定 struct 编码，字段顺序固定、无缩进，所有可选字段显式输出 null，字符串采用 Go encoding/json 默认转义；不接受同名重复 JSON key、未知顶层字段或自由扩展 map。Consumer 解码后按同一 schema struct 重编码为 `event_json`，计算 SHA-256 小写十六进制 `payload_hash`。摘要不含 Kafka 坐标/入库时间，包含 producer_id、事件时间和全部业务字段。重放保留原事件，不重新生成时间或 producer_id。
 
-模型长度扩大后，两个模型字段在 JSON 转义情况下最多占约 12 KiB；单事件最大 **32 KiB**（按序列化后字节计），Observer 和 Consumer 使用同一上限，独立于 gRPC 单帧 32 KiB 限制；超限在发送前丢弃并计数。`anomaly_codes` 去重排序，最多 32 个固定枚举；不放异常堆栈、正文和密钥。首次版本至少包含 invalid_model、identity_unknown、invalid_usage、usage_conflict、missing_usage、missing_end、protocol_error、protocol_incomplete、unsupported_encoding、unsupported_content_type、parse_limit、transport_lost、observation_timeout、clock_anomaly。
+模型长度扩大后，两个模型字段在 JSON 转义情况下最多占约 12 KiB；单事件最大 **32 KiB**（按序列化后字节计），Observer 和 Consumer 使用同一上限，独立于 gRPC 单帧 32 KiB 限制；超限在发送前丢弃并计数。`anomaly_codes` 去重排序，最多 32 个固定枚举；不放异常堆栈、正文和密钥。首次版本至少包含 invalid_model、identity_invalid、invalid_usage、usage_conflict、missing_usage、missing_end、protocol_error、protocol_incomplete、unsupported_encoding、unsupported_content_type、parse_limit、transport_lost、observation_timeout、clock_anomaly。
 
 ### 6.2 Producer 策略
 
@@ -616,7 +616,7 @@ CREATE TABLE IF NOT EXISTS metering.events_raw
     api_key_id Nullable(String) COMMENT '可信鉴权元数据中的稳定 API Key ID，不是密钥；未知为 NULL',
     customer_id Nullable(String) COMMENT '可信鉴权元数据中的客户 ID，用于租户归属；未知为 NULL',
     application_id Nullable(String) COMMENT '可信鉴权元数据中的应用 ID；未知为 NULL',
-    identity_status LowCardinality(String) COMMENT '身份识别状态，known 表示具有可信身份，其他状态不进入有效统计',
+    identity_status LowCardinality(String) COMMENT '身份识别状态仅 known 或 invalid；invalid 不进入有效统计',
     request_started_at_ms Int64 COMMENT '请求开始时间，Unix 毫秒，也是统计归属时间',
     observation_ended_at_ms Nullable(Int64) COMMENT 'Observer 结束本次观察的 Unix 毫秒时间；尚未结束为 NULL',
     request_finished_at_ms Nullable(Int64) COMMENT '网关上报的请求结束时间，Unix 毫秒；未获得有效 End 为 NULL',
@@ -768,7 +768,7 @@ WHERE d.event_type = 'usage_observed'
   AND d.usage_eligible = 1;
 ```
 
-`requests` 中一行代表一个已记录请求，不能对 events 表 count 作为调用量。`usage_effective` 用于当前有效用量核验，不能把未满足条件的记录数当零用量请求；完整事件明细仍可查询 unknown/partial 等状态。冲突一旦到达即从有效视图排除，原记录不覆盖；本批不做物化累计，因此没有重复加法或冲突后减账问题。
+`requests` 中一行代表一个已记录请求，不能对 events 表 count 作为调用量。`usage_effective` 用于当前有效用量核验，不能把未满足条件的记录数当零用量请求；完整事件明细仍可查询 unknown/partial 等状态。冲突一旦到达即从有效视图排除，原记录不覆盖；一期采集子项不做物化累计，因此没有重复加法或冲突后减账问题。
 
 `event_conflicts` 是事件级隔离入口；跨事件身份冲突通过 `requests.has_conflict` 查询。每分钟按最近消费到的请求日期范围执行冲突检测并报警，日志只包含事件 ID/摘要，不输出 `event_json`。
 
@@ -836,7 +836,7 @@ WHERE d.request_date BETWEEN {from_day:Date} AND {to_day:Date}
   AND (d.request_started_at_ms, d.logical_request_id) > ({cursor_ms:Int64}, {cursor_id:String})
 ORDER BY d.request_started_at_ms, d.logical_request_id LIMIT 100;
 
--- 验证重复消费不会改变有效用量；不是本批要上线的全量汇总看板。
+-- 验证重复消费不会改变有效用量；不是一期采集子项要上线的全量汇总看板。
 SELECT count() AS eligible_requests,
        sum(toDecimal128(input_tokens, 0)) AS input_tokens,
        sum(toDecimal128(output_tokens, 0)) AS output_tokens
@@ -845,16 +845,16 @@ WHERE request_date = {day:Date}
   AND customer_id = {customer_id:String};
 ```
 
-一期客户查询接口按 `X-Metering-Request-Id` 提供的 `logical_request_id` 精查，先校验 ID 格式及 30 天在线窗口，再验证登录主体的客户身份并强制注入 `customer_id` 条件；对其他客户 ID 与不存在的 ID 给出相同未找到响应。按 `X-Request-Id` 查询是辅助入口，要求客户身份和有限时间窗口，允许零到多条结果，不据此跨客户查找或做结算幂等。接口展示 `usage_status`、各 token 的 null/有效值、完整性与数据水位：观察事件尚未入库时只能返回“暂未查到”，不能推断零消耗；旁路可丢采，超过水位仍无记录也不能保证原请求不存在。在线明细按 30 天窗口，过期按归档异步检索方案处理。按客户的正式对外查询必须排除 `requests.has_conflict=1` 的全部记录，并由可信服务注入客户条件；上面的明细 SQL 用于内部联调。数据库账号不直接发给客户。本批只有内部 SQL 验收，不声称已经实现租户隔离产品 API。
+一期客户查询接口按 `X-Metering-Request-Id` 提供的 `logical_request_id` 精查，先校验 ID 格式及 30 天在线窗口，再验证登录主体的客户身份并强制注入 `customer_id` 条件；对其他客户 ID 与不存在的 ID 给出相同未找到响应。按 `X-Request-Id` 查询是辅助入口，要求客户身份和有限时间窗口，允许零到多条结果，不据此跨客户查找或做结算幂等。接口展示 `usage_status`、各 token 的 null/有效值、完整性与数据水位：观察事件尚未入库时只能返回“暂未查到”，不能推断零消耗；旁路可丢采，超过水位仍无记录也不能保证原请求不存在。在线明细按 30 天窗口，过期按归档异步检索方案处理。按客户的正式对外查询必须排除 `requests.has_conflict=1` 的全部记录，并由可信服务注入客户条件；上面的明细 SQL 用于内部联调。数据库账号不直接发给客户。一期采集子项只有内部 SQL 验收，不声称已经实现租户隔离产品 API。
 
-日均约 1 亿事件意味着 30 天约 30 亿事件。类型化列将 JSON 解析成本移到写入阶段，也允许按列读取；但 `FINAL`、冲突检测、按请求关联及非排序键的客户筛选仍可能很贵。保留 `event_json` 会增加写入与存储成本，需与旧方案比较磁盘、写入 CPU 和查询延迟。首批验收先测请求 ID 精查、单客户 1 小时/24 小时分页，10 并发、返回 100 行，P95 目标 ≤3 秒。`X-Request-Id` 辅助查询的 SQL 先用于联调，一期客户接口上线前还须压测客户+时间+该字段的检索路径；如现有排序键不达标，建设以客户和时间为前缀的检索结构，候选结果仍回查 `requests.has_conflict`，不能用辅助索引绕过去重和租户隔离。若不达标，记录方案阻塞并单独设计物化检索明细或预聚合，不绕过去重来换性能。
+日均约 1 亿事件意味着 30 天约 30 亿事件。类型化列将 JSON 解析成本移到写入阶段，也允许按列读取；但 `FINAL`、冲突检测、按请求关联及非排序键的客户筛选仍可能很贵。保留 `event_json` 会增加写入与存储成本，需与旧方案比较磁盘、写入 CPU 和查询延迟。一期采集子项验收先测请求 ID 精查、单客户 1 小时/24 小时分页，10 并发、返回 100 行，P95 目标 ≤3 秒。`X-Request-Id` 辅助查询的 SQL 先用于联调，一期客户接口上线前还须压测客户+时间+该字段的检索路径；如现有排序键不达标，建设以客户和时间为前缀的检索结构，候选结果仍回查 `requests.has_conflict`，不能用辅助索引绕过去重和租户隔离。若不达标，记录方案阻塞并单独设计物化检索明细或预聚合，不绕过去重来换性能。
 
 ## 8. Consumer 落库与异常事件
 
 ### 8.1 消费处理顺序
 
-1. 使用独立 group `llm-metering-clickhouse-v1`，禁用自动提交。每分区顺序处理，允许不同分区并行。
-2. 校验大小、schema、白名单、ID/类型后缀、开始时间、身份类型、token 类型和来源组合；只接受 `request_started`（:start）和 `usage_observed`（:usage）。start 出现非 null usage 一律拒绝；结果事件必须带有用量状态和终态标识，即使 token 未知也不能省略状态。若 `terminal_observed=false`，`request_finished_at_ms` 必须为 null。开始时间超出消费者当前时间 5 分钟以上进入拒绝诊断，不让远期分区无限保留；所有拒绝都有原因计数。
+1. 使用独立 group `llm-metering-clickhouse-v1`，禁用自动提交。每分区顺序处理，允许不同分区并行。遇到 Consumer 尚不支持的 Kafka 事件 `schema_version`，立即暂停该分区，保留当前未提交 offset，报警并等待 Consumer 升级；其他分区可继续处理。
+2. 对已支持版本校验大小、schema、白名单、ID/类型后缀、开始时间、身份类型、token 类型和来源组合；只接受 `request_started`（:start）和 `usage_observed`（:usage）。start 出现非 null usage 一律拒绝；结果事件必须带有用量状态和终态标识，即使 token 未知也不能省略状态。若 `terminal_observed=false`，`request_finished_at_ms` 必须为 null。开始时间超出消费者当前时间 5 分钟以上进入拒绝诊断，不让远期分区无限保留；所有拒绝都有原因计数。
 3. 规范化并计算摘要，按 ID 时间确定 `request_date`，从同一个已校验的事件对象展开类型化列并准备 `events_raw` 行。校验 `event_id` 与 `logical_request_id`/`event_type` 一致，所有可空字段按原事件 null 写 SQL NULL，token source 不从数值猜测；类型化列与保留的 `event_json` 必须表达同一事件。不在 Consumer 中重新提取服务 usage、补估算或改变定稿。
 4. 每批最多 5000 行/4 MiB，或等待 1 秒即写入；同步 INSERT 确认后，才提交该分区连续成功记录的下一 offset。
 5. INSERT 部分成功或确认丢失时不提交，原批重试允许重复插入；查询去重保持结果一致。若使用 ClickHouse async insert，必须等待持久化确认，不能默认接纳即提交。
@@ -864,7 +864,7 @@ Consumer/ClickHouse 故障可以依赖 Kafka 72 小时保留恢复，与禁止�
 
 ### 8.2 不合法事件的安全隔离
 
-结构非法事件不放进 `events_raw`，防止类型化列产生默认 0、空串或错误租户归属。保存有限诊断表，仅含 Kafka 坐标、SHA-256 和固定原因；不保存原 payload，也不另建携带正文的死信 topic。诊断成功写入后提交该 offset；诊断写入失败则不提交。
+永久非法事件指已支持 schema 版本下经校验确定无法修复的字段、长度或类型错误；未知 `schema_version` 不属于此类。永久非法事件不放进 `events_raw`，防止类型化列产生默认 0、空串或错误租户归属。保存有限诊断表，仅含 Kafka 坐标、SHA-256 和固定原因；不保存原 payload，也不另建携带正文的死信 topic。仅永久非法事件的诊断成功写入后提交该 offset；诊断写入失败则不提交。未知版本分区在升级并通过兼容性验证后从原 offset 恢复；若停顿接近 Kafka 72 小时保留窗口，按 lag age 紧急告警并先阻止生产端发布新 schema，不能跳到最新位置声称完整。
 
 ```sql
 CREATE TABLE IF NOT EXISTS metering.ingest_rejections
@@ -883,7 +883,7 @@ ORDER BY (kafka_topic, kafka_partition, kafka_offset, payload_hash)
 TTL kafka_record_at + INTERVAL 30 DAY DELETE;
 ```
 
-合法但同 `event_id` 不同内容的事件进入 `events_raw` 保留各变体；无需在写入前逐条 SELECT 查重，也不靠进程内缓存判断全历史冲突。离线重放必须保留原内容及对应类型化字段，不以新的 schema struct 静默重编码旧 schema；不支持的版本进入拒绝诊断并告警。增加或改变字段时按 schema 版本迁移表和 Consumer，历史行不以新默认值冒充已知数据。
+合法但同 `event_id` 不同内容的事件进入 `events_raw` 保留各变体；无需在写入前逐条 SELECT 查重，也不靠进程内缓存判断全历史冲突。离线重放必须保留原内容及对应类型化字段，不以新的 schema struct 静默重编码旧 schema；不支持的版本暂停对应 Kafka 分区并报警，保留未提交 offset，待 Consumer 升级后按原事件内容重放。增加或改变字段时按 schema 版本迁移表和 Consumer，历史行不以新默认值冒充已知数据。
 
 ## 9. 配置、构建与部署
 
@@ -926,7 +926,7 @@ JSON 是插件的唯一配置输入；ConfigMap/Helm 只负责渲染同一结构
 
 `gateway_instance_id` 由插件读取已验证的 Envoy node metadata 中 Pod UID；配置示例的占位值用于联调替换，生产不得给多个 Pod 写同一个常量。若环境未暴露 Pod UID，通过网关启动配置注入 node metadata，插件读取后校验；不从 HTTP 请求头读。
 
-配置校验：路由 enabled 缺省为 false；空 routes 表示全部忽略。route_name 必须唯一；methods/paths 缺失、为空、重复、超限，路径不是以 / 开头、含查询串/片段标识或匹配模式，及非首批方法/适配器均为无效配置；不得把空列表解释为全匹配。遵循第 2.3 节的数量和长度上限。未知字段拒绝；ID、cluster、route 长度有界；每流额度必须小于等于 Root 额度；改写单次预留乘以并发上限不得大于 Root 改写预算；分片能装入 32 KiB gRPC 消息；控制预留不得大于总额度。预发布严格校验失败即阻止发布；运行时语义配置无效时进入 disabled 并返回初始化成功，暴露 config_invalid 指标。模块无法加载、ABI 不兼容等底层错误仍可能 NACK/启动失败，fail_open 无法兜底。
+配置校验：路由 enabled 缺省为 false；空 routes 表示全部忽略。route_name 必须唯一；methods/paths 缺失、为空、重复、超限，路径不是以 / 开头、含查询串/片段标识或匹配模式，及非一期采集子项方法/适配器均为无效配置；不得把空列表解释为全匹配。遵循第 2.3 节的数量和长度上限。未知字段拒绝；ID、cluster、route 长度有界；每流额度必须小于等于 Root 额度；改写单次预留乘以并发上限不得大于 Root 改写预算；分片能装入 32 KiB gRPC 消息；控制预留不得大于总额度。预发布严格校验失败即阻止发布；运行时语义配置无效时进入 disabled 并返回初始化成功，暴露 config_invalid 指标。模块无法加载、ABI 不兼容等底层错误仍可能 NACK/启动失败，fail_open 无法兜底。
 
 ### 9.2 Observer 和 Consumer 配置契约
 
@@ -1076,9 +1076,10 @@ WASM 预置到带版本文件名的网关镜像或只读挂载，不运行时远
 
 | 故障 | 业务 | 采集/存储 |
 | --- | --- | --- |
-| Auth/数据库超时或不可用 | ext_authz fail-closed，返回 503 | 请求不进入采集；单独统计鉴权错误，不计为采集丢失 |
+| Auth 超时或不可用；数据库故障且无有效正向缓存 | 返回 503 | 请求不进入采集；Auth 记录具体内部错误，单独统计鉴权错误 |
+| 数据库故障但未过期正向缓存命中 | 按缓存结果继续鉴权 | 鉴权允许的请求照常采集，缓存不得超出原 TTL |
 | Key 无效、吊销或越权 | 返回 401/403，不到达模型服务 | 请求不进入采集；鉴权指标保留固定原因码 |
-| 鉴权成功但身份 metadata 缺失 | 业务按 ext_authz 结果继续 | 标 identity invalid 并告警，不从客户端头补齐 |
+| 鉴权成功但身份 metadata 缺失 | 业务按 ext_authz 结果继续 | 标 `identity_status=invalid` 并告警，不从客户端头补齐；该用量不进入有效统计 |
 | Observer 拒绝/无 ACK | 原链路继续 | 额度/期限到达取消，不重连原请求 |
 | 单回调/正文超限 | 原链路继续 | 取消观察，已有内容只按 partial/unknown 定稿 |
 | 插件 trap | 按 fail_open 实际行为验证 | 本次数据可能全部缺失 |
@@ -1146,7 +1147,7 @@ data: [DONE]
 | prompt_tokens=0、缺失、负数、浮点、超 Int64 | 0 合法，缺失/非法为 null；异常原因可区分 |
 | cache/reasoning 包含量、total 冲突 | 不重复相加；冲突保留依据并排除有效用量 |
 | 多个不同终结 usage | usage_conflict，一次定稿，不“最后覆盖” |
-| 身份伪造头、可信元数据缺失 | 不接受头；鉴权成功但缺 metadata 标 identity invalid 并报警，不跨客户猜归属 |
+| 身份伪造头、可信元数据缺失 | 不接受头；鉴权成功但缺 metadata 标 `identity_status=invalid`、`identity_invalid` 异常码并报警，不跨客户猜归属 |
 | 正确/无效/吊销/越权 API Key | 正确 Key 的身份快照进入两类事件；其余请求在 WASM 前被拒绝 |
 | 请求体大于回调/累计上限 | 读取前判超限；业务字节不丢；采集有界放弃 |
 | 不支持压缩/协议 | 元数据可记录，usage 未知，不尝试业务改写 |
@@ -1162,8 +1163,10 @@ data: [DONE]
 | 两事件 X-Request-Id 不同、同 X-Request-Id 多次请求 | 前者隔离为冲突；后者保持不同 logical_request_id，辅助查询返回多个候选 |
 | 空 usage / SQL Nullable / 只有 start | SQL 不把 null 变零，不把两条事件计为两次请求 |
 | 跨 UTC 午夜、TTL 边界、超过 30 天重放 | 分区按开始日；无冲突因单变体早到期而复活 |
-| 无效 schema/正文混入事件 | 拒绝表只有坐标/摘要/原因，不保存原 payload |
+| 已支持 schema 下的永久非法事件/正文混入事件 | 拒绝表只有坐标/摘要/原因，不保存原 payload；未知版本须暂停分区 |
 | Producer 黑洞/metadata 故障/确认丢失 | 有界执行槽；watchdog 可释放；uncertain 不重发 |
+| Consumer 遇到未知 Kafka `schema_version` | 暂停对应分区、不提交该 offset 并报警；升级后原位恢复，其他分区可继续 |
+| Consumer 遇到永久非法事件 | 有限诊断成功落库后才提交 offset，不保存原 payload |
 | 独立网关基数缺失 | 完整率未知，不用结果/开始比例替代 |
 
 SDK 单元测试验证 hostcall 签名和回调注册/清理；标准 Protobuf 与 WASM 编解码器做 golden 互操作测试；SQL 测试在目标 ClickHouse 版本执行全套 DDL、插入合成事件并在 merge 前后比较结果。数据库测试还须核对规范 JSON 与类型化列逐字段一致，覆盖合法 0、缺失/null、start 无 usage、同 ID 同摘要重放及同 ID 不同摘要冲突，并用 EXPLAIN 核查请求 ID 精查、客户分页与冲突隔离的实际扫描量。不能只用 SDK mock 代替真实 Envoy 测试。
@@ -1177,6 +1180,16 @@ SDK 单元测试验证 hostcall 签名和回调注册/清理；标准 Protobuf �
 至少覆盖：实测峰值两倍、24 小时持续运行、最长 10 分钟 SSE、usage 全缺失、最大回调、慢 Observer、无 ACK、Kafka 黑洞、频繁网关配置更新。分别记录旁路消息/字节率、CPU、heap、RSS、连接、在途状态和业务吞吐。
 
 验收目标：正常结束后 ≤60 秒明细可查；相同业务负载下观察引入的首包额外 P99 ≤10 ms；规定范围/10 并发查询 P95 ≤3 秒；停止压力后活跃状态和在途计数按期限归零，内存高水位稳定；消费恢复速率大于生产速率且能在 72 小时窗口内追平。以上均为目标，不是文档编写阶段已测得结果。
+
+请求改写必须另做慢上传和大请求测试。以相同 Envoy、Auth、上游、并发和请求样本分别运行采集关闭与开启两组，按客户端发出请求头到收到响应首字节计算两组端到端首包延迟分布及对应分位数差值，同时记录网关收到最后一字节、向上游发出首字节和收到上游首字节的时间，区分客户端上传耗时与插件缓冲耗时。正常样本与实际生产流量混合样本均报告 P50/P95/P99，不得只剔除慢上传后宣称满足额外 P99 ≤10 ms。
+
+| 专项样本 | 固定测试口径 | 必须验证 |
+| --- | --- | --- |
+| 慢上传 | HTTP/1.1 chunked 与 HTTP/2；64 KiB、256 KiB JSON；分别按 32 KiB/s 匀速上传及正文中途停顿超过 2 秒 | 改写等待到 2000 ms 后按有界 tick 恢复原文透传，不无限 Pause；报告额外首包延迟、`rewrite_failed`、内存和上游收到的实际正文 |
+| 大请求 | 256 KiB 边界、256 KiB + 1 字节和 1 MiB JSON；覆盖 `stream=true`、`stream=false` 以及 `include_usage` 缺失/false/true | 界内合法请求只改目标字段；超限原文透传且计数；不截断、不重复发送正文，释放改写预算 |
+| 故障交叉 | 慢上传和大请求分别叠加 Observer 不可用、客户端断开与网关热更新 | 业务不因旁路网络等待；超时、断开和热更新后预算按期限释放，业务内容和状态与基线一致（允许约定的 usage 块及计量响应头差异），或明确记录已有业务失败 |
+
+慢上传和大请求结果单独列示，并按它们在实际流量中的占比计算总体 P99；若总体目标未达到，应调整改写实现或明确修订验收目标，不能只调整样本筛选口径。
 
 ### 11.4 开发任务与完成条件
 

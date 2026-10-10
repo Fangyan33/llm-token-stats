@@ -1,6 +1,6 @@
 # API Key Auth 服务开发实现方案
 
-版本：V1.0｜日期：2026-09-21｜状态：开发设计，尚未完成真实网关联调与性能验收。
+版本：V1.1｜日期：2026-10-09｜状态：开发设计，尚未完成真实网关联调与性能验收。
 
 依据：[整体功能设计](token-metering-design-v2.md)、[网关请求采集实现方案](gateway-request-collection-implementation.md)。本文设计新增的 API Key 鉴权与客户归属能力，解决当前网关没有鉴权、采集插件无法获得可信 `api_key_id` 和 `customer_id` 的问题。
 
@@ -14,10 +14,10 @@
 | 客户凭证 | `Authorization: Bearer <platform_api_key>`，不接受客户声明的身份 ID |
 | 密钥保存 | 只保存带服务端 pepper 的 HMAC-SHA-256，不保存或记录密钥原文 |
 | 身份传递 | ext_authz `CheckResponse.dynamic_metadata`，namespace 为 `envoy.filters.http.ext_authz` |
-| 故障策略 | 鉴权 fail-closed；Auth 超时或不可用返回 503，不绕过鉴权 |
+| 故障策略 | Auth 超时或不可用返回 503；仅 PostgreSQL 不可用时，未过期的正向缓存仍可完成鉴权，缓存未命中或过期返回 503 |
 | 采集关系 | ext_authz 在计量 WASM 前；只有鉴权成功请求进入采集和模型路由 |
 | 扩容方式 | Auth 服务无本地持久状态、可横向扩容；PostgreSQL 是事实源，本地仅有界缓存 |
-| 首期边界 | 支持 API Key 创建、查询、轮换、吊销、客户/应用归属和路由范围；不包含 OAuth、用户登录、余额或实时额度 |
+| 一期边界 | 支持 API Key 创建、查询、轮换、吊销、客户/应用归属和路由范围；不包含 OAuth、用户登录、余额或实时额度 |
 
 Auth 与 Observer 必须独立部署。Auth 位于业务同步链路，决定请求是否能继续；Observer 是旁路采集，故障不能阻断业务。两者不得共用进程、健康状态或故障策略。
 
@@ -49,7 +49,7 @@ flowchart LR
 
 ### 3.1 API Key 格式
 
-首期格式固定为：
+一期格式固定为：
 
 ```text
 skp_<public_prefix>_<secret>
@@ -282,7 +282,7 @@ JOIN auth_change_revisions r ON r.singleton = true
 WHERE v.public_prefix = $1;
 ```
 
-scope 使用 `api_key_pk + service_id + route_name` 精确查询并缓存。不存在任何 scope 时默认拒绝，不解释为全权限；如需全服务权限，必须使用受控的显式通配记录并在实现中固定语义，首期建议不支持通配。
+scope 使用 `api_key_pk + service_id + route_name` 精确查询并缓存。不存在任何 scope 时默认拒绝，不解释为全权限；如需全服务权限，必须使用受控的显式通配记录并在实现中固定语义，一期不支持通配。
 
 ## 5. Auth 服务接口与处理逻辑
 
@@ -325,7 +325,7 @@ Auth 只使用 Authorization、`:authority`/host、`:path` 和 `:method`。Istio
 
 ### 5.2 管理面
 
-管理面与数据面使用不同 Kubernetes Service、NetworkPolicy 和认证策略。首期提供内部管理 API 或等价 CLI：
+管理面与数据面使用不同 Kubernetes Service、NetworkPolicy 和认证策略。一期提供内部管理 API 或等价 CLI：
 
 | 操作 | 关键规则 |
 | --- | --- |
@@ -367,7 +367,7 @@ Auth Pod 使用有界内存缓存降低 PostgreSQL 读取压力：
 
 如业务要求“提交吊销后立即阻断”，不能依赖上述最终一致缓存，需要增加同步强失效通道或对已吊销 Key 绕过正向缓存查询主库，并重新评估可用性与时延。
 
-数据库不可用时：已有未过期正向缓存仍可在其原 TTL 内使用；缓存未命中或过期则返回 Auth 内部错误，由网关按 fail-closed 返回 503。不得无限延长缓存或把数据库故障当鉴权通过。
+数据库不可用时：已有未过期正向缓存仍可在其原 TTL 内完成鉴权；缓存未命中或过期则返回 Auth 内部错误，由网关按 fail-closed 返回 503。Auth 服务记录 SQLSTATE/驱动错误码、经脱敏的具体数据库错误及对应请求 ID、缓存命中状态，供内部排障；对外仍只返回固定的 `auth_service_unavailable`，日志不得包含 API Key、`secret_mac`、pepper 或请求头。不得无限延长缓存或把数据库故障当作未验证的鉴权通过。
 
 ## 7. 响应语义和失败策略
 
@@ -378,7 +378,7 @@ Auth Pod 使用有界内存缓存降低 PostgreSQL 读取压力：
 | 客户/应用/API Key 被禁用 | 401 | `invalid_api_key` | 保持相同外部语义 |
 | scope 不允许 | 403 | `permission_denied` | 凭证有效但无目标权限 |
 | 请求路由不在鉴权配置 | 403 | `permission_denied` | 防止配置遗漏放行 |
-| Auth/数据库内部错误或超时 | 503 | `auth_service_unavailable` | fail-closed，不伪装成无效 Key |
+| Auth 内部错误或超时；数据库错误且无有效正向缓存 | 503 | `auth_service_unavailable` | fail-closed，不伪装成无效 Key；有效正向缓存命中时按缓存结果鉴权 |
 
 错误正文最大 1 KiB，只包含固定 code、通用 message 和不敏感 request ID。禁止回显 API Key、prefix、客户或应用信息。
 
@@ -448,7 +448,7 @@ Auth 成功响应删除下游 Authorization。若模型服务需要独立凭证�
 | PostgreSQL | pool_active/idle/wait、query_latency、query_errors |
 | 网关 | ext_authz.ok/denied/error、业务入口总请求、401/403/503 |
 
-指标 label 只允许固定 route/service/reason/status，不使用 API Key、prefix、客户 ID 或应用 ID。普通运行日志不记录 Authorization、完整 header map、`secret_mac` 或动态元数据值。
+指标 label 只允许固定 route/service/reason/status，不使用 API Key、prefix、客户 ID 或应用 ID。数据库连接、查询和超时错误写入 Auth 服务结构化日志，包含 SQLSTATE/驱动错误码、经脱敏的具体错误、固定错误类别、请求 ID 和缓存状态，以便区分“缓存命中继续鉴权”和“无缓存返回 503”；对外响应不暴露内部错误。普通运行日志不记录 Authorization、完整 header map、`secret_mac`、pepper 或动态元数据值。
 
 审计日志记录创建、轮换、吊销、启停和 scope 变更，包含操作者、request_id、资源 ID、前后非敏感状态和结果。数据库审计记录是事实源；应用日志不能代替审计表。
 
@@ -463,7 +463,7 @@ Auth 成功响应删除下游 Authorization。若模型服务需要独立凭证�
 | 并发创建/轮换/吊销 | 唯一约束、行锁和 request_id 幂等有效，无半写审计 |
 | metadata | WASM 只能从 `envoy.filters.http.ext_authz` 读取可信身份，客户端同名头无效 |
 | Header 处理 | 成功后客户 Authorization 不到达模型服务，受信上游凭证按配置注入 |
-| Auth/数据库故障 | 缓存规则符合契约；未命中返回 503，不绕过鉴权 |
+| Auth/数据库故障 | Auth 不可用返回 503；仅数据库不可用时，有效正向缓存继续鉴权，未命中或过期返回 503；Auth 日志可定位具体数据库错误且无密钥泄漏 |
 | 缓存失效 | 吊销、禁用、scope 变更在承诺时间内对所有 Pod 生效 |
 | 扩缩容/重启 | 无会话迁移需求；请求可继续由其他 Pod 处理 |
 | 性能 | 峰值两倍持续压测；Auth P99、DB 连接、缓存命中和网关业务延迟达标 |

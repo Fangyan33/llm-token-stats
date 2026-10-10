@@ -1,10 +1,10 @@
 # LLM 请求用量计量与统计设计
 
-状态：评审稿。目标环境为 **Istio 1.13.5、Kubernetes 1.22**。本文不代表已部署或已通过性能验收。
+状态：评审稿｜修订日期：2026-10-09。目标环境为 **Istio 1.13.5、Kubernetes 1.22**。本文不代表已部署或已通过性能验收。
 
 ## 1. 目标与已确认边界
 
-首期建设用量明细与统计能力，为后续 token 计费提供数据，不执行扣款或 quota。
+一期建设用量明细与统计能力，为后续 token 计费提供数据，不执行扣款或 quota。
 
 | 项目 | 决策 |
 | --- | --- |
@@ -12,8 +12,8 @@
 | 归属主体 | 稳定的 api_key_id；密钥轮换不改变归属，撤销不删除历史 |
 | 身份来源 | 新建 API Key Auth 服务，以 PostgreSQL 为事实源，经 Envoy ext_authz 返回可信身份元数据 |
 | 服务范围 | 只统计入口直接访问的服务 A，不追踪 A 内部调用的 B、C |
-| 调用边界 | 首期网关观察逻辑请求及返回的 A 用量；隐藏重试不伪造成已测量执行，额外消耗不计给用户 |
-| 客户端重试 | 每次到达平台的请求分别记录；首期不提供通用客户端幂等，不按正文去重 |
+| 调用边界 | 一期网关观察逻辑请求及返回的 A 用量；隐藏重试不伪造成已测量执行，额外消耗不计给用户 |
+| 客户端重试 | 每次到达平台的请求分别记录；一期不提供通用客户端幂等，不按正文去重 |
 | 接口范围 | 兼容 Chat Completions 的 JSON / SSE，包括工具调用内容 |
 | 暂不覆盖 | Embedding、Rerank、多模态及未适配协议的 token 计量；可记录请求元数据 |
 | 用量来源 | 有效的服务 usage 优先，缺失字段分别估算或标记未知 |
@@ -71,7 +71,7 @@ istio/istio tag 1.13.5
 
 Envoy → gRPC ALS 接收器 → Kafka producer → Kafka 可以传递访问日志元数据，但普通 ALS 不提供用于估算的完整请求/响应正文。仅靠它不能完成本方案的 LLM token 计量。
 
-首期不增加 ALS 接收器作为必需组件，不采用 stdout → 节点日志文件 → 日志采集器的计量链路，避免引入已排除的落盘与补传。
+一期不增加 ALS 接收器作为必需组件，不采用 stdout → 节点日志文件 → 日志采集器的计量链路，避免引入已排除的落盘与补传。
 
 ## 3. 观察者架构：业务不经过统计服务
 
@@ -87,20 +87,19 @@ flowchart LR
     G --> A[服务 A]
     W -. 异步 gRPC，失败丢弃 .-> O[独立观察者服务]
     O -->|Kafka producer| K[Kafka：72 小时]
-    K --> C[去重与归一化消费者]
-    C --> D[ClickHouse 明细与汇总]
-    K --> S[对象存储归档]
+    K --> C[独立 ClickHouse Consumer]
+    C --> D[ClickHouse 明细与后续汇总]
 ~~~
 
 **业务：调用方 → ingressgateway ext_authz → 网关内 Wasm/router → A。**Auth 是新增同步鉴权调用，只接收请求头属性、不代理业务正文；Wasm 位于既有 Envoy 进程内，独立观察者服务不在业务路由中。
 
-**采集：Wasm 回调 → 异步 gRPC 观察流 → Observer 解析和估算 → Kafka producer → Kafka。**
+**计量数据链路：Wasm 回调 → 异步 gRPC 观察流 → Observer 解析和估算 → Kafka producer → Kafka → 独立 ClickHouse Consumer → ClickHouse。**归档属于一期后续设计，不在当前 Consumer 的职责中。
 
 不把 VirtualService 的业务目的地改为 Observer，不为统计修改上游重试、取消或超时策略，也不将镜像请求发送给模型再推理一次。鉴权结果决定请求是否进入业务路由；计量统计结果不参与鉴权、路由或响应生成。
 
 ### 3.2 Wasm 负责轻量观察，Observer 负责计量
 
-**入口过滤为强制约束**：默认不采集；必须同时满足全局启用、可信路由规则显式启用、HTTP 方法和精确路径匹配。首批只采集指定路由的 `POST /v1/chat/completions`，自定义前缀须显式登记。插件按请求头阶段可见路径去掉查询串后精确匹配，不额外解码或模糊匹配；路径重写顺序须实测固定。规则和配置版本在请求内不变。
+**入口过滤为强制约束**：默认不采集；必须同时满足全局启用、可信路由规则显式启用、HTTP 方法和精确路径匹配。一期只采集指定路由的 `POST /v1/chat/completions`，自定义前缀须显式登记。插件按请求头阶段可见路径去掉查询串后精确匹配，不额外解码或模糊匹配；路径重写顺序须实测固定。规则和配置版本在请求内不变。
 
 未命中的指标 GET、健康检查、模型列表、OPTIONS 等请求不生成计量 ID、不读取或改写正文、不申请观察额度、不建立旁路流、不添加计量响应头、不产生 Kafka 计量事件，仅增加本地固定原因计数。采集开关不控制鉴权，也不能由客户端 Header 控制。命中的失败响应和断流仍尝试记录可观察事件，未知 usage 不补零。完整率的独立分母和 Kafka 容量基数必须限定为同路由、方法、路径及观察位置的目标请求，不能用全网关流量。配置、回调和验收以[采集开发方案第 2.3 节](gateway-request-collection-implementation.md#23-入口采集过滤强制约束)为准。
 
@@ -114,19 +113,19 @@ flowchart LR
 | Wasm 结束回调 | 报告可观察的终态与最后序号；不等待观察者响应，不延长业务流生命周期 |
 | Observer | 接收片段、解析 JSON/SSE、检查缺段、提取 usage、执行有界 token 估算 |
 | Observer 内 producer | 只把结构化计量事件写入 Kafka；不把正文片段写入 Kafka |
-| 消费者 | 去重、归一化、落库、统计及归档 |
+| ClickHouse Consumer | 独立消费 Kafka，校验与规范化事件、计算内容摘要、写入 ClickHouse 并在确认后提交 offset；不负责归档或重新估算 |
 
 Wasm 不做重型 tokenizer 运算，不缓存完整长响应。除对目标流式请求设置 `stream_options.include_usage=true`、添加计量查询 ID 响应头外，不修改其他业务字段或响应正文，也不发送本地错误来代替业务响应。Observer 不承担转发业务、代替模型生成、管理重试或传播取消。
 
 请求头白名单排除 Authorization、Cookie 和密钥原文；`api_key_id/customer_id/application_id` 必须来自 `envoy.filters.http.ext_authz` 动态元数据。鉴权成功但元数据不全时标记身份无效并报警，不接受客户端伪造头。Auth、PostgreSQL、密钥生命周期和元数据契约见 [API Key Auth 服务开发实现方案](api-key-auth-service-implementation.md)。
 
-首期插件只作用于需统计的业务路由。Observer 的上报路由必须排除，避免插件观察自己的上报而形成递归。
+一期插件只作用于需统计的业务路由。Observer 的上报路由必须排除，避免插件观察自己的上报而形成递归。
 
 ### 3.3 异步 gRPC 不是新版 ext_proc
 
 这里使用 Wasm host 提供的通用 gRPC 异步能力，自定义观察消息协议；不是配置旧版尚未实现的 ext_proc.async_mode。固定源码中的 grpcSend 提交消息后返回，不等待服务端确认，但不代表数据已送达或内部没有缓冲。[固定 Wasm 实现][13]
 
-建议按请求建立逻辑 gRPC 观察流，底层 HTTP/2 连接复用；不要为每个 SSE/token 片段创建一次 HTTP 请求。消息包含开始、正文片段和结束标记，这些是临时观察消息，不是 Kafka 的三类业务事件。
+建议按请求建立逻辑 gRPC 观察流，底层 HTTP/2 连接复用；不要为每个 SSE/token 片段创建一次 HTTP 请求。消息包含开始、正文片段和结束标记，这些是临时观察消息，不是 Kafka 的两类计量事件。
 
 必须定义以下流控：
 
@@ -162,13 +161,17 @@ fail_open 不能覆盖所有安装错误：该版本说明 on_start/on_configure
 
 网关采集结果标记 observation_scope=gateway_response；未知重试消耗不计给用户，也不记成零。能取得的尝试总数只作为元数据，不能代替各次执行 usage。
 
-若必须保留对 A 的逐尝试计量，需要在 A 已有 inbound Envoy 等可见每次尝试的位置再部署只读观察插件，并验证现有请求关联信息。这里仍只观察 A，不展开 B、C；不能假设所有服务已有 sidecar，或未核查关联能力就宣称逐尝试已覆盖。该扩展是独立接入项，不是首期网关插件已经具备的能力。
+若必须保留对 A 的逐尝试计量，需要在 A 已有 inbound Envoy 等可见每次尝试的位置再部署只读观察插件，并验证现有请求关联信息。这里仍只观察 A，不展开 B、C；不能假设所有服务已有 sidecar，或未核查关联能力就宣称逐尝试已覆盖。该扩展是独立接入项，不是一期网关插件已经具备的能力。
 
 ### 3.7 Observer 到 Kafka
 
 Observer 以 Kubernetes 1.22 支持的普通 Deployment / Service 部署，用 Kafka 原生 producer 写 topic。配置 TLS/SASL、写权限，并确保能访问 bootstrap 及 broker 返回的 advertised.listeners 地址。[Kafka producer 配置][4]
 
 Observer/Kafka 不可用只丢计量，不改变业务流。业务没有新代理一跳，资源仍需为旁路正文吞吐、活跃解析状态和 tokenizer 计算单独测算。
+
+### 3.8 Kafka 到 ClickHouse
+
+ClickHouse Consumer 是与 Observer 分开部署的 Go Deployment，不在业务请求路径中。它使用独立消费组读取 `llm-metering-events`，校验 `schema_version` 与事件字段，规范化并计算 `payload_hash`，写入 ClickHouse；写入确认后才提交 Kafka offset。重放由事件 ID 与内容摘要识别重复或冲突。未知 schema 版本暂停对应分区、报警并等待 Consumer 升级，不能当永久非法事件跳过；永久非法事件按有限诊断规则处理。归档链路另行设计，不属于当前 Consumer。[采集开发方案第 8 节](gateway-request-collection-implementation.md#8-consumer-落库与异常事件)
 
 ## 4. 一次请求最多产生两条记录
 
@@ -179,7 +182,7 @@ Observer/Kafka 不可用只丢计量，不改变业务流。业务没有新代�
 | `request_started` | Observer 收到有效 Start 后立即尝试发送 | 请求 ID、可信身份、服务、网关观察到的开始时间；不含 token |
 | `usage_observed` | Observer 收到有效 End、核对片段并定稿时发送；无法继续观察而触发超时或断流定稿时也尽力发送一次 | **用量和网关终态合并在同一条记录中**：输入/输出 token 及来源、完整性、`terminal_observed`、可取得的结束时间、HTTP 结果和已知尝试数 |
 
-不再单独发送 `request_finished`。保留 `usage_observed` 事件名及 `event_id=请求ID:usage`；即使用量未知，该事件仍可记录可观察的终态或缺失原因。每个请求至多有一条定稿结果；Kafka 重放可能产生物理重复，由消费者按事件 ID 去重。
+不再单独发送 `request_finished`。本文的“请求 ID”统一指 `logical_request_id`；两个 Kafka 事件的 `event_id` 分别为 `<logical_request_id>:start` 与 `<logical_request_id>:usage`，对应 `request_started` 与 `usage_observed`。gRPC `End` 是观察消息，`request_finished_at_ms` 是结果事件字段，均不是第三种 Kafka 事件。即使用量未知，该事件仍可记录可观察的终态或缺失原因。每个请求至多有一条定稿结果；Kafka 重放可能产生物理重复，由消费者按事件 ID 去重。
 
 ### 4.1 流式请求的时间线
 
@@ -268,23 +271,25 @@ LiteLLM 的计数工具及部分流式聚合路径可作为分词兜底参考，
 
 | 字段组 | 核心字段 |
 | --- | --- |
-| 事件身份 | event_id、event_type、schema_version、producer_id |
-| 请求/观察 | logical_request_id、observation_id、observation_scope、service_id、api_key_id |
-| 模型 | 请求模型、实际模型、模型版本 |
-| 时间 | 网关观察开始、观察结束、可取得的请求结束、事件生成、入库时间 |
-| 结果 | HTTP 状态、观察结果、可取得的尝试数、缺片/终态缺失及可信程度 |
-| 用量 | 输入、输出、缓存读/写、推理、服务总量；仅合并结果事件携带，可空 |
-| 依据 | 字段来源、完整性、tokenizer/模板/估算器版本、原始 usage |
-| 归属准备 | 用户正常消耗、平台重试/故障消耗、待核对；首期不扣款 |
-| 扩展 | measurement_unit、多模态扩展项及平台元数据引用 |
+| 事件身份 | `event_id`、`event_type`、`schema_version`、`producer_id`；`event_type` 仅为 `request_started` 或 `usage_observed` |
+| 请求/观察 | `logical_request_id`、`x_request_id`、`observation_id`、`observation_scope`、`service_id`、`api_key_id`、`customer_id`、`application_id`、`identity_status` |
+| 模型 | `request_model`、`response_model`；独立模型版本字段如计费需要，在一期后续明确并升级 schema |
+| 时间 | `request_started_at_ms`、`request_finished_at_ms`、`observation_ended_at_ms`、`event_created_at_ms`、`ingested_at`；前四项为 Unix 毫秒，最后一项为 ClickHouse 入库时间 |
+| 结果 | `http_status`、`business_outcome`、`terminal_observed`、`observation_status`、`upstream_attempt_count`、`anomaly_codes` |
+| 用量 | `usage_status`、`usage_eligible`、`input_tokens`、`output_tokens`、`cached_read_tokens`、`cached_write_tokens`、`reasoning_tokens`、`reported_total_tokens`；仅 `usage_observed` 携带用量，可空 |
+| 依据 | Kafka `usage` 子对象中的 `{value, source}`，ClickHouse 中各 token 列及其 `_source` 列；`raw_usage_json`、`raw_usage_truncated`、`adapter_id`、`config_version`；tokenizer/模板/估算器版本为一期估算子项的待定扩展 |
+| 归属准备 | 用户正常消耗、平台重试/故障消耗、待核对；一期不扣款 |
+| 扩展 | `measurement_unit`、多模态扩展项及平台元数据引用 |
 
-每个观察结果不可变，不设置业务用量修订号、历史结果替换接口或后续补查任务。schema_version 和估算器版本只解释原记录结构及算法。
+`X-Metering-Request-Id` 响应头承载 `logical_request_id`；可选的 `X-Request-Id` 只映射到 `x_request_id`，不能作为主键。`identity_status` 仅用 `known` 或 `invalid` 表示当前接入结果，元数据缺失时标 `invalid` 并报警；`usage_eligible` 只表示有效用量统计候选，不表示收费资格。完整字段定义和类型以[采集开发方案第 6、7 节](gateway-request-collection-implementation.md#6-kafka-事件与发送)为准。
+
+每个观察结果不可变，不设置业务用量修订号、历史结果替换接口或后续补查任务。`schema_version` 和一期后续估算器版本只解释原记录结构及算法。
 
 ### 7.2 重放仍需去重
 
 消费者落库成功但提交消费位置失败后，可能重复读取事件。重放保持 event_id 和原内容不变，不能因为去掉事后变更功能就去掉幂等处理。
 
-首期使用一个原始事件 topic，例如 llm-metering-events，按 logical_request_id 选择分区；数据库和归档分别消费。开始和结果事件分别按 event_id 去重，token 只累计去重后的结果事件。
+一期使用一个原始事件 topic `llm-metering-events`，按 `logical_request_id` 选择分区；当前仅 ClickHouse Consumer 消费并落库。归档属于一期后续设计，届时另行定义其消费、offset 与故障恢复契约。开始和结果事件分别按 event_id 去重，token 只累计去重后的结果事件。
 
 同一 ID、相同内容视为重复；同一 ID、不同内容为冲突，隔离报警，不覆盖或重复相加。归一化结果也应在重放时确定一致。
 
@@ -298,7 +303,7 @@ Kafka 事务或 producer 去重不自动保证外部 ClickHouse 写入恰好一�
 
 小时统计从去重后的结果事件生成，日统计由有效小时统计生成；周期刷新受新到达事件影响的桶，查询只读完整发布的汇总批次。逻辑请求按请求 ID 计一次，不能把两条事件计为两次调用。
 
-不将可能重复的原始插入直接接到求和物化视图；源表后台去重不会自动抵消已累加的重复值。首期按去重明细生成汇总，刷新周期以 60 秒可见目标为约束。[物化视图机制][9]
+不将可能重复的原始插入直接接到求和物化视图；源表后台去重不会自动抵消已累加的重复值。一期按去重明细生成汇总，刷新周期以 60 秒可见目标为约束。[物化视图机制][9]
 
 三个口径分开：
 
@@ -306,11 +311,11 @@ Kafka 事务或 producer 去重不自动保证外部 ClickHouse 写入恰好一�
 - 服务可见用量：网关最终响应的上报/估算用量；明确不包括不可见的重试消耗，不能声称完整后端计算量。
 - 用户应收候选：排除平台重试额外消耗和平台故障应承担部分；不生成实际账单。
 
-用户取消只将已确认消耗列为应收候选，原因或用量不明时标记待核对。首期“待核对”只是标签，不包含自动补查或处理流程。未来收费默认接受服务上报及已验证模型匹配估算，通用估算不直接进入结算。
+用户取消只将已确认消耗列为应收候选，原因或用量不明时标记待核对。一期“待核对”只是标签，不包含自动补查或处理流程。未来收费默认接受服务上报及已验证模型匹配估算，通用估算不直接进入结算。
 
 ## 8. 归档与查询
 
-原始计量事件归档到对象存储，保留 1 年；没有正文，不支持重新分词。归档只能恢复已采集事件。
+一期后续归档能力计划将原始计量事件保存到对象存储 1 年；当前采集到 ClickHouse 的开发方案不包含归档 Consumer、归档写入或历史检索实现。归档事件没有正文，不能重新分词，也只能恢复已采集事件。
 
 提供：
 
@@ -330,8 +335,9 @@ Kafka 事务或 producer 去重不自动保证外部 ClickHouse 写入恰好一�
 | 场景 | 业务行为 | 采集行为 |
 | --- | --- | --- |
 | API Key 无效、吊销或越权 | ext_authz 返回 401/403，不进入 A | 不进入 Wasm 采集；使用独立鉴权指标统计 |
-| Auth/PostgreSQL 超时或不可用 | fail-closed 返回 503 | 不进入采集，不把鉴权故障算成采集丢失 |
-| 鉴权成功但身份元数据缺失 | 按 ext_authz 结果继续 | 标身份无效并报警，不从客户端头补齐 |
+| Auth 超时或不可用；PostgreSQL 故障且无有效正向缓存 | 返回 503 | 不进入采集；Auth 记录具体内部错误，对外只返回固定错误码 |
+| PostgreSQL 故障但未过期正向缓存命中 | 按缓存结果继续鉴权 | 鉴权允许的请求照常进入采集；缓存不得超出原 TTL |
+| 鉴权成功但身份元数据缺失 | 按 ext_authz 结果继续 | 标 `identity_status=invalid` 并报警，不从客户端头补齐，不进入有效用量统计 |
 | Observer 不可用/变慢 | 原路径继续，不等待旁路 | 达上限或超时后取消观察流，丢弃，不积压补传 |
 | Wasm 可被 fail_open 处理的运行故障 | 绕过插件，原链路继续 | 本次或后续观察缺失 |
 | Wasm 配置/初始化错误 | 可能导致配置拒绝或启动失败 | 不能用 fail_open 掩盖，必须发布前验证 |
@@ -403,7 +409,7 @@ Kafka 按 72 小时保留并配足磁盘，避免更小的字节上限提前清�
 
 两类事件均来自同一 Wasm → Observer 采集路径，不能用“已收到结果 / 已收到开始”证明没有漏采。独立基数不可靠时，真实完整率标记未知。
 
-展示网关同口径请求数、已记录逻辑请求数、观察结果覆盖情况、上报/估算/未知比例、发送失败/不确定计数、消费/归档延迟。请求有记录不代表用量已知，计数差也不能还原漏掉的 token。
+展示网关同口径请求数、已记录逻辑请求数、观察结果覆盖情况、上报/估算/未知比例、发送失败/不确定计数和 ClickHouse 消费延迟；归档上线后另展示归档延迟。请求有记录不代表用量已知，计数差也不能还原漏掉的 token。
 
 正常与故障时段分别展示并保留全日结果。日均 5,000 万的 0.01% 对应 5,000 次缺失预算，不等于允许重复累计。
 
@@ -431,6 +437,8 @@ Kafka 按 72 小时保留并配足磁盘，避免更小的字节上限提前清�
 
 ## 12. 实施顺序与待验证项
 
+以下 1–3 项为阶段 0 验证，4–6 项为一期实施；二期建设计费、账单发布与调整单，三期建设对账与结算确认。归档属于一期后续工作，当前采集开发方案不设计归档 Consumer。
+
 1. 固定版本鉴权 PoC：PostgreSQL + Auth + Istio CUSTOM/ext_authz，验证 API Key、401/403/503、动态元数据和 fail-closed。
 2. 固定版本采集 PoC：EnvoyFilter + 本地 Wasm，验证过滤器顺序、usage 参数改写、通用异步 gRPC 和 fail_open 的真实边界。
 3. 验证 root 持有旁路流、最终消息生命周期、有界流控与取消；Observer 故障时先证明业务不会等待统计。
@@ -442,7 +450,7 @@ Kafka 按 72 小时保留并配足磁盘，避免更小的字节上限提前清�
 
 网关单点观察不能完整测量隐藏重试；如业务仍要求 A 的逐尝试用量，需另确认 A 侧已有 Envoy 的观察位置及关联信息，不擅自改变业务链路实现该目标。
 
-未来计费另建价格、账单和余额账本；quota 另设有明确控制职责的同步检查，不能让本观察链路同时承担请求拦截。
+二期计费另建价格与账单能力，并与调整单同阶段交付；余额账本和 quota 属可选扩展，quota 如建设须另设有明确控制职责的同步检查，不能让本观察链路同时承担请求拦截。
 
 ## 参考资料
 

@@ -2,7 +2,7 @@
 
 版本：V1.1｜日期：2026-10-09｜状态：开发设计，尚未完成真实网关联调与性能验收。
 
-依据：[整体功能设计](token-metering-design-v2.md)、[网关请求采集实现方案](gateway-request-collection-implementation.md)。本文设计新增的 API Key 鉴权与客户归属能力，解决当前网关没有鉴权、采集插件无法获得可信 `api_key_id` 和 `customer_id` 的问题。
+依据：[功能设计概览及开发周期](token-metering-functional-overview-and-schedule.md)、[网关请求采集实现方案](gateway-request-collection-implementation.md)。本文设计新增的 API Key 鉴权与客户归属能力，解决当前网关没有鉴权、采集插件无法获得可信 `api_key_id` 和 `customer_id` 的问题。
 
 ## 1. 目标、范围与关键决策
 

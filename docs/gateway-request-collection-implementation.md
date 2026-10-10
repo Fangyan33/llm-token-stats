@@ -2,7 +2,7 @@
 
 版本：V1.5｜日期：2026-10-09｜状态：开发设计，尚未完成真实网关 PoC 和性能验收。
 
-依据：[原技术方案](token-metering-design.md)、[产品方案 V2](token-metering-design-v2.md)、[API Key Auth 服务方案](api-key-auth-service-implementation.md)。本文细化一期中“鉴权后采集到 ClickHouse 明细入库”的采集子项；一期的估算、汇总、归档、客户查询与看板在后续子项完成，不能以本文验收代替一期整体验收。本文中的 SQL、协议和配置供后续实现使用；Go 代码标明为伪代码的部分不能直接编译。
+依据：[原技术方案](token-metering-design.md)、[功能设计概览及开发周期](token-metering-functional-overview-and-schedule.md)、[API Key Auth 服务方案](api-key-auth-service-implementation.md)。本文细化一期中“鉴权后采集到 ClickHouse 明细入库”的采集子项；一期的估算、汇总、归档、客户查询与看板在后续子项完成，不能以本文验收代替一期整体验收。本文中的 SQL、协议和配置供后续实现使用；Go 代码标明为伪代码的部分不能直接编译。
 
 ## 1. 范围与技术决策
 

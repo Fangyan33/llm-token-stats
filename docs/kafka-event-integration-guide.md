@@ -1,0 +1,369 @@
+# Kafka 计量事件应用接入指南
+
+本文面向订阅计量事件的应用开发者，依据 [网关请求采集开发实现方案](gateway-request-collection-implementation.md) 中的 **schema_version=1 设计契约**编写。该方案目前是开发设计，尚未完成真实 Kafka 集群联调；实际 Broker 地址、认证方式、访问权限和上线版本由部署环境提供。
+
+## 1. 接入信息
+
+| 项目 | 约定 |
+| --- | --- |
+| Topic | `llm-metering-events` |
+| Kafka key | `logical_request_id` 的 UTF-8 字节；同一请求的事件使用同一个 key |
+| Kafka value | UTF-8 JSON，固定字段集，`schema_version=1` |
+| 事件类型 | `request_started` 与 `usage_observed`；不存在独立的 `request_finished` |
+| 事件大小 | JSON 序列化后最多 32 KiB |
+| 保留时间 | 设计初值 72 小时；应用应监控消费延迟，超出保留期无法靠 Kafka 补齐 |
+| 消费组 | 每个下游应用使用自己的 group ID；不要复用 ClickHouse Consumer 的 `llm-metering-clickhouse-v1` |
+| 权限与连接 | 申请 Topic 读取、消费组权限，以及实际集群的 Broker 地址和 TLS/SASL 配置；密钥通过环境或 Secret 注入 |
+
+一次符合采集条件的逻辑请求最多形成两种事件：
+
+1. `request_started`：Observer 接到有效请求开始观察消息后尝试发送。它说明观察到请求开始，不包含 token 用量。
+2. `usage_observed`：Observer 定稿时尝试发送，合并用量和网关可观察的终态。即使 token 未知或没有收到有效的网关 End，也可能发送这条事件。
+
+两条事件独立发送，可能只有一条到达；下游不能要求先看到 start 才处理 usage，也不能把 start 和 usage 算成两次模型调用。Kafka 重放可能带来物理重复。唯一请求标识是 `logical_request_id`，事件级标识是 `event_id`；`x_request_id` 仅供辅助排查。
+
+## 2. Kafka value 字段字典
+
+表中的“可空”指 JSON 值可以为 `null`；可空字段仍应出现在规范事件中。所有 `*_at_ms` 均为 Unix 毫秒，绝对时间按 UTC 理解。字符串 `"0"` 与数字 `0` 不等价，未知 token 用 `null` 表示。
+
+### 2.1 顶层字段
+
+| 字段 | JSON 类型 / 可空 | 含义与使用规则 |
+| --- | --- | --- |
+| `schema_version` | 整数 / 否 | 事件结构版本，当前为 `1`。不认识的版本应暂停该分区并报警，不能按旧字段默认值继续处理。 |
+| `event_id` | 字符串 / 否 | 事件级逻辑 ID；开始事件为 `<logical_request_id>:start`，结果事件为 `<logical_request_id>:usage`。用于去重并检测同 ID 不同内容的冲突。 |
+| `event_type` | 字符串 / 否 | 仅 `request_started` 或 `usage_observed`。 |
+| `logical_request_id` | 字符串 / 否 | 网关生成的请求级 ID，格式为 `<start_unix_ms>-<root_nonce_32hex>-<counter_16hex>`，同时也是 Kafka key 的文本值。 |
+| `x_request_id` | 字符串 / 是 | 网关当时可见的 `X-Request-Id`，可能缺失、复用或来自客户端；只用于辅助关联，不用于去重或授权。 |
+| `observation_id` | 字符串 / 否 | 一期与 `logical_request_id` 相同，表示本次观察。 |
+| `observation_scope` | 字符串 / 否 | 当前固定为 `gateway_response`，表示网关可见的一次逻辑响应，并非所有上游尝试。 |
+| `producer_id` | 字符串 / 否 | 生成事件的 Observer 实例标识。 |
+| `gateway_instance_id` | 字符串 / 否 | 观察该请求的网关实例标识。 |
+| `config_version` | 字符串 / 否 | 请求开始时固定的采集配置版本，用于解释当时的采集规则。 |
+| `adapter_id` | 字符串 / 否 | 解析上游协议的适配器 ID；当前接入范围固定为 `chat_completions_v1`。 |
+| `route_name` | 字符串 / 否 | 网关可信路由名称；事件不携带原始 URL 或 query。 |
+| `service_id` | 字符串 / 否 | 路由配置确定的目标业务服务标识，不从客户端请求猜测。 |
+| `api_key_id` | 字符串 / 是 | Auth 给出的稳定 API Key ID，不是密钥原文；身份信息缺失时为 `null`。 |
+| `customer_id` | 字符串 / 是 | 鉴权时的客户归属快照；用于租户范围过滤。 |
+| `application_id` | 字符串 / 是 | 鉴权时的应用归属快照。 |
+| `identity_status` | 字符串 / 否 | `known` 表示上述三个身份 ID 齐全，`invalid` 表示可信身份信息不完整；后者不进入有效用量统计。 |
+| `request_started_at_ms` | 整数 / 否 | 网关观察到请求头的开始时间，也是统计归属时间；必须与 `logical_request_id` 的时间前缀一致。 |
+| `observation_ended_at_ms` | 整数 / 是 | Observer 结束本次观察的时间；start 尚未结束时为 `null`。它不等于网关确认业务请求结束。 |
+| `request_finished_at_ms` | 整数 / 是 | 网关有效 End 中取得的请求结束时间；未收到有效 End 时为 `null`，不能补当前时间。 |
+| `event_created_at_ms` | 整数 / 否 | Observer 创建此 Kafka 事件的时间；通常晚于请求开始时间。 |
+| `request_model` | 字符串 / 是 | 请求体中的模型名称或 ID；未可靠取得或无效时为 `null`。 |
+| `response_model` | 字符串 / 是 | 响应上报的模型名称或 ID；可能与请求值不同，未可靠取得时为 `null`。 |
+| `http_status` | 整数 / 是 | 网关可见的 HTTP 响应状态码；不是用量是否为零的判断依据。 |
+| `upstream_attempt_count` | 整数 / 是 | 网关能可靠取得的上游尝试次数；未知为 `null`，不能据此推算隐藏重试的 token。 |
+| `response_flags` | 字符串 / 是 | 经采集规则限制的网关响应标志，供故障排查。 |
+| `response_code_details` | 字符串 / 是 | 经采集规则限制的网关响应诊断码；不保存任意上游错误文本。 |
+| `business_outcome` | 字符串 / 是 | `response_complete`、`stream_incomplete` 或 `unknown`；start 尚未确定时可为 `null`。它与 HTTP 状态、观察完整性分别判断。 |
+| `terminal_observed` | 布尔 / 否 | 是否收到有效网关 End；为 `false` 时 `request_finished_at_ms` 必须为 `null`。 |
+| `observation_status` | 字符串 / 是 | 结果事件为 `complete`（观察完整）、`partial`（缺片/截断等）或 `unknown`（只有有限元数据）；start 尚未定稿时为 `null`。 |
+| `usage_status` | 字符串 / 否 | start 为 `not_applicable`；结果事件为 `known`（输入输出都有效）、`partial`、`unknown` 或 `conflict`。 |
+| `usage_eligible` | 布尔 / 否 | 一期有效用量统计候选标志；需适配成功、观察完整、输入输出已知、身份有效且无冲突。不是收费资格；下游还需排除事件冲突。 |
+| `usage` | 对象 / 是 | start 固定为 `null`；结果事件为含六个 token 子字段的对象。即使用量未知，结果事件也保留各字段的 `value/source` 状态。 |
+| `raw_usage_json` | 字符串 / 否 | 白名单保留的上游 usage JSON 依据，最多 4 KiB；它是**JSON 字符串**，不是嵌套对象，也不是完整响应。无依据时为 `"{}"`。 |
+| `raw_usage_truncated` | 布尔 / 否 | usage 依据是否因过滤或大小限制丢弃内容；不表示模型回答被截断。 |
+| `anomaly_codes` | 字符串数组 / 否 | 固定异常码列表，无异常为 `[]`；已去重排序，不包含正文或错误堆栈。常见值包括 `missing_usage`、`missing_end`、`usage_conflict`、`protocol_incomplete`、`identity_invalid`。 |
+
+### 2.2 `usage` 对象中的每个字段
+
+每个子字段统一为 `{"value": 非负整数或 null, "source": "reported" 或 "unknown"}`。`reported` 表示有效的上游上报值；`unknown` 表示无法可靠取得，此时 `value=null`。上游明确上报的 `0` 必须保留为 `0/reported`，不能与未知混淆。当前采集子项不产生估算来源。
+
+| `usage` 子字段 | 上游 Chat Completions 路径 | 含义与包含关系 |
+| --- | --- | --- |
+| `input_tokens` | `usage.prompt_tokens` | 本次请求的输入 token 总量，含已命中的缓存输入及已写入缓存的输入部分。 |
+| `output_tokens` | `usage.completion_tokens` | 本次请求的输出 token 总量，包含可单独报告的推理 token。 |
+| `cached_read_tokens` | `usage.prompt_tokens_details.cached_tokens` | 本次输入中从提示词缓存复用的 token 数，已包含在 `input_tokens` 中。 |
+| `cached_write_tokens` | `usage.prompt_tokens_details.cache_write_tokens`（可选） | **本次请求的输入中，有多少 token 对应的可复用前缀被写入提示词缓存。**已包含在 `input_tokens` 中；字段缺失为 `null/unknown`，不从文本或其他总量推断。 |
+| `reasoning_tokens` | `usage.completion_tokens_details.reasoning_tokens` | 可报告的推理 token 数，已包含在 `output_tokens` 中。 |
+| `reported_total_tokens` | `usage.total_tokens` | 上游原样上报的总量；不使用输入加输出的推导值覆盖。 |
+
+`cached_read_tokens`、`cached_write_tokens` 和 `reasoning_tokens` 是细分量，不能再加到输入/输出总量上。两项缓存值都已知时，其和不得大于输入总量。兼容 OpenAI 的服务未必返回可选的 `cache_write_tokens`；接入时应核对实际响应。[OpenAI Chat Completions 用量定义](https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create)
+
+### 2.3 两种事件的字段差异
+
+| 字段组 | `request_started` | `usage_observed` |
+| --- | --- | --- |
+| `event_id` | `<logical_request_id>:start` | `<logical_request_id>:usage` |
+| `usage` | `null` | 六个 `{value,source}` 子字段 |
+| `usage_status` / `usage_eligible` | `not_applicable` / `false` | 按定稿结果填写；异常或未知时可以为 `false` |
+| `raw_usage_json` | `"{}"` | 白名单 usage 依据；没有则 `"{}"` |
+| `observation_ended_at_ms` / `request_finished_at_ms` | `null` / `null` | 能取得时填写；没有有效 End 时后者为 `null` |
+| `terminal_observed` / `observation_status` | `false` / `null` | 按网关 End 和实际采集完整性填写 |
+| 模型、HTTP、结果等后续字段 | 未取得时为 `null` | 已可靠取得时填写，否则仍为 `null` |
+
+两个事件都携带请求开始时间、服务、路由及身份快照，故只有结果事件到达时仍能归属。这里的“事件到达”仅表示应用从 Kafka 读到记录，不证明另一条事件必然存在。
+
+## 3. 完整的结果事件示例
+
+下例的输入总量为 1,000，其中缓存读取 200、缓存写入 300、其余输入 500；输出总量为 500，其中推理 100。缓存读写与推理均是总量中的细分量。
+
+```json
+{
+  "schema_version": 1,
+  "event_id": "1789862400000-00112233445566778899aabbccddeeff-0000000000000001:usage",
+  "event_type": "usage_observed",
+  "logical_request_id": "1789862400000-00112233445566778899aabbccddeeff-0000000000000001",
+  "x_request_id": "b3e1fba5-16a4-4dfb-aa84-50141e80d473",
+  "observation_id": "1789862400000-00112233445566778899aabbccddeeff-0000000000000001",
+  "observation_scope": "gateway_response",
+  "producer_id": "observer-pod-uid",
+  "gateway_instance_id": "gateway-pod-uid",
+  "config_version": "collection-v1",
+  "adapter_id": "chat_completions_v1",
+  "route_name": "llm-chat",
+  "service_id": "model-service-a",
+  "api_key_id": "key-42",
+  "customer_id": "customer-7",
+  "application_id": "app-3",
+  "identity_status": "known",
+  "request_started_at_ms": 1789862400000,
+  "observation_ended_at_ms": 1789862401200,
+  "request_finished_at_ms": 1789862401195,
+  "event_created_at_ms": 1789862401201,
+  "request_model": "model-a",
+  "response_model": "model-a-2026",
+  "http_status": 200,
+  "upstream_attempt_count": null,
+  "response_flags": null,
+  "response_code_details": null,
+  "business_outcome": "response_complete",
+  "terminal_observed": true,
+  "observation_status": "complete",
+  "usage_status": "known",
+  "usage_eligible": true,
+  "usage": {
+    "input_tokens": {"value": 1000, "source": "reported"},
+    "output_tokens": {"value": 500, "source": "reported"},
+    "cached_read_tokens": {"value": 200, "source": "reported"},
+    "cached_write_tokens": {"value": 300, "source": "reported"},
+    "reasoning_tokens": {"value": 100, "source": "reported"},
+    "reported_total_tokens": {"value": 1500, "source": "reported"}
+  },
+  "raw_usage_json": "{\"prompt_tokens\":1000,\"completion_tokens\":500,\"total_tokens\":1500,\"prompt_tokens_details\":{\"cached_tokens\":200,\"cache_write_tokens\":300},\"completion_tokens_details\":{\"reasoning_tokens\":100}}",
+  "raw_usage_truncated": false,
+  "anomaly_codes": []
+}
+```
+
+Kafka record 的 key 是上述 `logical_request_id`，不在 JSON 内另设 `kafka_key`。Kafka topic、partition、offset 和消费时间是传输/消费元数据，不属于事件 JSON；ClickHouse 的 `payload_hash`、`event_json`、`ingested_at` 等也是消费后产生的列，不要求上游事件携带。
+
+## 4. 消费处理顺序
+
+1. 用独立消费组订阅 Topic，关闭自动提交。新组从最早可用 offset 还是最新 offset 开始，须在接入时明确；示例从保留窗口内最早记录开始。
+2. 按 UTF-8 JSON 解析，校验最多 32 KiB、`schema_version`、Kafka key 与 `logical_request_id`、事件类型和 `event_id` 后缀。未知版本停止处理并报警，不能跳过后提交。
+3. 根据 `event_id` 做幂等处理；若同一 `event_id` 出现不同规范事件内容，隔离并报警，不能随意挑一条覆盖。用量只来自 `usage_observed`，而且是否进入正式统计还需检查 `usage_eligible` 和请求冲突。
+4. 业务处理或持久化成功后再提交对应分区的下一个 offset。处理成功但提交失败会重放，所以幂等是必要条件；永久非法记录应走有界诊断流程，不能静默跳过。
+5. 监控每个分区的消费延迟与 72 小时保留窗口。单个请求缺少 start 或 usage 时保留“缺失/未知”状态，不用零值补齐。
+
+下面的 Go 和 Java 示例只演示连接、读取、关键字段解析及手动提交。示例中的打印处理应替换为应用自己的持久化与冲突检测；生产环境还需加入实际 TLS/SASL、完整 schema 校验、异常隔离和监控。
+
+### 4.1 Go 示例
+
+依赖：`github.com/twmb/franz-go/pkg/kgo`（方案中使用 v1.18.1）。设置 `KAFKA_BROKERS` 后运行；`KAFKA_GROUP` 可选，默认 `my-app-metering-v1`。
+
+```go
+package main
+
+import (
+    "context"
+    "encoding/json"
+    "fmt"
+    "log"
+    "os"
+    "os/signal"
+    "strings"
+    "syscall"
+
+    "github.com/twmb/franz-go/pkg/kgo"
+)
+
+type TokenValue struct {
+    Value  *int64 `json:"value"`
+    Source string `json:"source"`
+}
+
+type Event struct {
+    SchemaVersion    int    `json:"schema_version"`
+    EventID          string `json:"event_id"`
+    EventType        string `json:"event_type"`
+    LogicalRequestID string `json:"logical_request_id"`
+    Usage            *struct {
+        CachedWriteTokens TokenValue `json:"cached_write_tokens"`
+    } `json:"usage"`
+}
+
+func handle(r *kgo.Record) error {
+    if len(r.Value) > 32*1024 {
+        return fmt.Errorf("event too large")
+    }
+    var e Event
+    if err := json.Unmarshal(r.Value, &e); err != nil {
+        return err
+    }
+    if e.SchemaVersion != 1 {
+        return fmt.Errorf("unsupported schema_version: %d", e.SchemaVersion)
+    }
+    if string(r.Key) != e.LogicalRequestID {
+        return fmt.Errorf("Kafka key and logical_request_id differ")
+    }
+    suffix := map[string]string{
+        "request_started": ":start",
+        "usage_observed":  ":usage",
+    }[e.EventType]
+    if suffix == "" || e.EventID != e.LogicalRequestID+suffix {
+        return fmt.Errorf("invalid event identity")
+    }
+    if e.EventType == "request_started" && e.Usage != nil {
+        return fmt.Errorf("start event must have usage=null")
+    }
+    if e.EventType == "usage_observed" && e.Usage == nil {
+        return fmt.Errorf("usage event must have a usage object")
+    }
+
+    var write any = "unknown"
+    if e.Usage != nil && e.Usage.CachedWriteTokens.Value != nil {
+        write = *e.Usage.CachedWriteTokens.Value // 0 仍是有效值
+    }
+    // 将这里替换为按 event_id 幂等写入；同 ID 不同内容应隔离。
+    fmt.Printf("%s %s cached_write_tokens=%v\n", e.EventID, e.EventType, write)
+    return nil
+}
+
+func main() {
+    brokers := os.Getenv("KAFKA_BROKERS")
+    if brokers == "" {
+        log.Fatal("KAFKA_BROKERS is required")
+    }
+    group := os.Getenv("KAFKA_GROUP")
+    if group == "" {
+        group = "my-app-metering-v1"
+    }
+    cl, err := kgo.NewClient(
+        kgo.SeedBrokers(strings.Split(brokers, ",")...),
+        kgo.ConsumerGroup(group),
+        kgo.ConsumeTopics("llm-metering-events"),
+        kgo.ConsumeResetOffset(kgo.NewOffset().AtStart()),
+        kgo.DisableAutoCommit(),
+    )
+    if err != nil {
+        log.Fatal(err)
+    }
+    defer cl.Close()
+
+    ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+    defer stop()
+    for ctx.Err() == nil {
+        fetches := cl.PollRecords(ctx, 100)
+        if ctx.Err() != nil {
+            break
+        }
+        var fetchErr error
+        fetches.EachError(func(topic string, partition int32, err error) {
+            fetchErr = fmt.Errorf("%s[%d]: %w", topic, partition, err)
+        })
+        if fetchErr != nil {
+            log.Print(fetchErr)
+            return
+        }
+        for _, r := range fetches.Records() {
+            if err := handle(r); err != nil {
+                log.Print(err) // 未提交；生产环境按版本/非法事件规则处理
+                return
+            }
+            if err := cl.CommitRecords(ctx, r); err != nil {
+                log.Print(err)
+                return
+            }
+        }
+    }
+}
+```
+
+### 4.2 Java 示例
+
+依赖：`org.apache.kafka:kafka-clients` 与 `com.fasterxml.jackson.core:jackson-databind`；示例使用 Java 17+。设置 `KAFKA_BROKERS` 后运行；`KAFKA_GROUP` 可选。
+
+```java
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import org.apache.kafka.clients.consumer.ConsumerRecord;
+import org.apache.kafka.clients.consumer.ConsumerRecords;
+import org.apache.kafka.clients.consumer.KafkaConsumer;
+import org.apache.kafka.clients.consumer.OffsetAndMetadata;
+import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.serialization.ByteArrayDeserializer;
+import org.apache.kafka.common.serialization.StringDeserializer;
+
+import java.time.Duration;
+import java.util.List;
+import java.util.Map;
+import java.util.Properties;
+
+public class MeteringConsumer {
+    private static final ObjectMapper JSON = new ObjectMapper();
+
+    private static void handle(ConsumerRecord<String, byte[]> record) throws Exception {
+        if (record.value() == null || record.value().length > 32 * 1024) {
+            throw new IllegalArgumentException("invalid event size");
+        }
+        JsonNode event = JSON.readTree(record.value());
+        if (event.path("schema_version").asInt(-1) != 1) {
+            throw new IllegalArgumentException("unsupported schema_version");
+        }
+        String requestId = event.path("logical_request_id").asText();
+        String type = event.path("event_type").asText();
+        String suffix = switch (type) {
+            case "request_started" -> ":start";
+            case "usage_observed" -> ":usage";
+            default -> throw new IllegalArgumentException("unknown event_type");
+        };
+        if (!requestId.equals(record.key())
+                || !event.path("event_id").asText().equals(requestId + suffix)) {
+            throw new IllegalArgumentException("invalid event identity");
+        }
+        JsonNode usage = event.path("usage");
+        if (type.equals("request_started") && !usage.isNull()
+                || type.equals("usage_observed") && !usage.isObject()) {
+            throw new IllegalArgumentException("invalid usage for event type");
+        }
+        JsonNode write = usage.path("cached_write_tokens").path("value");
+        String writeText = write.isNumber() ? write.asText() : "unknown";
+        // 将这里替换为按 event_id 幂等写入；同 ID 不同内容应隔离。
+        System.out.printf("%s %s cached_write_tokens=%s%n",
+                event.path("event_id").asText(), type, writeText);
+    }
+
+    public static void main(String[] args) throws Exception {
+        String brokers = System.getenv("KAFKA_BROKERS");
+        if (brokers == null || brokers.isBlank()) {
+            throw new IllegalArgumentException("KAFKA_BROKERS is required");
+        }
+        String group = System.getenv().getOrDefault("KAFKA_GROUP", "my-app-metering-v1");
+        Properties props = new Properties();
+        props.put("bootstrap.servers", brokers);
+        props.put("group.id", group);
+        props.put("enable.auto.commit", "false");
+        props.put("auto.offset.reset", "earliest");
+        props.put("key.deserializer", StringDeserializer.class.getName());
+        props.put("value.deserializer", ByteArrayDeserializer.class.getName());
+
+        try (KafkaConsumer<String, byte[]> consumer = new KafkaConsumer<>(props)) {
+            consumer.subscribe(List.of("llm-metering-events"));
+            while (true) {
+                ConsumerRecords<String, byte[]> records = consumer.poll(Duration.ofSeconds(1));
+                for (ConsumerRecord<String, byte[]> record : records) {
+                    handle(record); // 处理失败时抛错并停止，不提交该记录
+                    TopicPartition partition = new TopicPartition(record.topic(), record.partition());
+                    consumer.commitSync(Map.of(
+                            partition, new OffsetAndMetadata(record.offset() + 1)));
+                }
+            }
+        }
+    }
+}
+```
+
+两个示例均逐条提交，便于展示“处理成功后提交”。批量提交时只能提交**同一分区已连续处理成功**的下一 offset，不能跳过失败记录。[franz-go 消费与手动提交](https://pkg.go.dev/github.com/twmb/franz-go/pkg/kgo) · [Apache Kafka Java Consumer 手动提交说明](https://kafka.apache.org/34/javadoc/org/apache/kafka/clients/consumer/KafkaConsumer.html)

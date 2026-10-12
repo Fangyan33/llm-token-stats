@@ -429,13 +429,13 @@ SSE 完整协议要求 `[DONE]`；缺少它但收到传输 EOS/End 时标 `proto
 | input_tokens | usage.prompt_tokens | 输入总量 |
 | output_tokens | usage.completion_tokens | 输出总量 |
 | cached_read_tokens | usage.prompt_tokens_details.cached_tokens | 已包含于 input_tokens，不再相加 |
-| cached_write_tokens | 本适配器无标准来源 | null/unknown，不从文本推断 |
+| cached_write_tokens | usage.prompt_tokens_details.cache_write_tokens（可选） | 本次请求的输入中，有多少 token 对应的可复用前缀被写入提示词缓存；已包含于 input_tokens，不再相加；缺失为 null/unknown，不从文本推断 |
 | reasoning_tokens | usage.completion_tokens_details.reasoning_tokens | 已包含于 output_tokens |
 | reported_total_tokens | usage.total_tokens | 原服务上报总量，不用推导值覆盖 |
 
 每字段保存 `{value, source}`，一期采集子项 source 仅 `reported` 或 `unknown`。接受整数 JSON 数字，范围 `[0, 9223372036854775807]`；解析用 `json.Number`，拒绝字符串、布尔、负数、小数、溢出，不能先转 float64。缺失、非法值转换为 null，分别打原因码；有效 0 保留。
 
-校验 `cached_read <= input`、`reasoning <= output`，以及两项都已知时 `input + output == reported_total`；加法用溢出检查。冲突保留合法数值和来源以便解释，但 `usage_status=conflict`、`usage_eligible=false`。禁止据总量倒推缺失字段。
+校验 `cached_read <= input`、`cached_write <= input`、两者都已知时 `cached_read + cached_write <= input`、`reasoning <= output`，以及两项都已知时 `input + output == reported_total`；加法用溢出检查。冲突保留合法数值和来源以便解释，但 `usage_status=conflict`、`usage_eligible=false`。禁止据总量倒推缺失字段。OpenAI 官方 Chat Completions 把 `cache_write_tokens` 定义为可选字段，接入的兼容服务仍须以实际返回值为准；缺失不是零。[OpenAI Chat Completions 用量字段](https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create)
 
 `raw_usage_json` 不是任意 usage 对象的转存：只白名单复制上表数值字段及其 details 对象，最多 4 KiB，其余字段丢弃，设置 `raw_usage_truncated=true`。内容仅作为首次依据，不含正文、自由文本或服务原始错误。超限时保存 `{}` 并标记，不保存截断后的非法 JSON。
 
@@ -480,6 +480,8 @@ sequenceDiagram
 
 ### 6.1 事件格式
 
+下游应用接入步骤、全部事件字段说明及 Go/Java 消费示例见 [Kafka 计量事件应用接入指南](kafka-event-integration-guide.md)。
+
 Topic 固定 `llm-metering-events`，key 为 logical_request_id 的 UTF-8；初始 24 分区、3 副本、`min.insync.replicas=2`、保留 72 小时、`cleanup.policy=delete`。分区数属压测初值；同一部署周期不在线改分区数，变更需停采、排空在途后切换。Kafka 不接收正文片段。
 
 两类事件自带请求开始时间与身份快照，缺少 start 也能解释合并结果；缺少结果时，已入队的 start 只表示曾收到请求。模型等后续才知道的字段允许在不同事件类型之间不同，不属于同 ID 内容冲突。
@@ -522,11 +524,11 @@ Topic 固定 `llm-metering-events`，key 为 logical_request_id 的 UTF-8；初�
     "input_tokens": {"value": 1000, "source": "reported"},
     "output_tokens": {"value": 500, "source": "reported"},
     "cached_read_tokens": {"value": 200, "source": "reported"},
-    "cached_write_tokens": {"value": null, "source": "unknown"},
+    "cached_write_tokens": {"value": 300, "source": "reported"},
     "reasoning_tokens": {"value": 100, "source": "reported"},
     "reported_total_tokens": {"value": 1500, "source": "reported"}
   },
-  "raw_usage_json": "{\"prompt_tokens\":1000,\"completion_tokens\":500,\"total_tokens\":1500}",
+  "raw_usage_json": "{\"prompt_tokens\":1000,\"completion_tokens\":500,\"total_tokens\":1500,\"prompt_tokens_details\":{\"cached_tokens\":200,\"cache_write_tokens\":300},\"completion_tokens_details\":{\"reasoning_tokens\":100}}",
   "raw_usage_truncated": false,
   "anomaly_codes": []
 }
@@ -638,7 +640,7 @@ CREATE TABLE IF NOT EXISTS metering.events_raw
     output_tokens_source Nullable(String) COMMENT '对应 token 数值来源：reported 为有效上游上报，unknown 为未知；start 不携带 usage 时为 NULL',
     cached_read_tokens Nullable(Int64) COMMENT '缓存命中 token 数，来自 usage.prompt_tokens_details.cached_tokens，已包含于输入；未知为 NULL',
     cached_read_tokens_source Nullable(String) COMMENT '对应 token 数值来源：reported 为有效上游上报，unknown 为未知；start 不携带 usage 时为 NULL',
-    cached_write_tokens Nullable(Int64) COMMENT '缓存写入 token 数；当前适配器尚未映射该字段，保存 NULL，不以零代替未知',
+    cached_write_tokens Nullable(Int64) COMMENT '本次请求的输入中，有多少 token 对应的可复用前缀被写入提示词缓存；来自 usage.prompt_tokens_details.cache_write_tokens，已包含于输入；未知为 NULL',
     cached_write_tokens_source Nullable(String) COMMENT '对应 token 数值来源：reported 为有效上游上报，unknown 为未知；start 不携带 usage 时为 NULL',
     reasoning_tokens Nullable(Int64) COMMENT '推理 token 数，来自 usage.completion_tokens_details.reasoning_tokens，已包含于输出；未知为 NULL',
     reasoning_tokens_source Nullable(String) COMMENT '对应 token 数值来源：reported 为有效上游上报，unknown 为未知；start 不携带 usage 时为 NULL',

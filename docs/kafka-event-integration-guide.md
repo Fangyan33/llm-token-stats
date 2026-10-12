@@ -22,6 +22,14 @@
 
 两条事件独立发送，可能只有一条到达；下游不能要求先看到 start 才处理 usage，也不能把 start 和 usage 算成两次模型调用。Kafka 重放可能带来物理重复。唯一请求标识是 `logical_request_id`，事件级标识是 `event_id`；`x_request_id` 仅供辅助排查。
 
+### 1.1 `logical_request_id` 由 Observer 生成
+
+Observer 是唯一的请求 ID 生成方。网关 Wasm 只在请求头回调记录 `request_started_at_ms` 并随首帧 `Start` 发送；它不生成或提交 `logical_request_id`。Observer 收到并校验有效 Start 后，通过操作系统安全随机源生成 **UUIDv4**：读取 16 字节随机数，设置版本位为 4、变体位为 RFC 规定值，输出 36 字符小写规范形式 `xxxxxxxx-xxxx-4xxx-[89ab]xxx-xxxxxxxxxxxx`。例如 `7f6c2a90-4b13-4b68-9d21-67283e0c5f44`。随机源失败则拒绝该观察流并报警，不退化为时间戳、Pod UID 或客户端请求头。[RFC 9562 UUIDv4](https://www.rfc-editor.org/rfc/rfc9562.html#section-5.4)
+
+ID 与一个 gRPC 观察流绑定一次，Observer 在有效 Start ACK 中回传；后续 ACK、`request_started` 与 `usage_observed` 复用它。`observation_id` 一期等于该 UUID，Kafka key 是它的 UTF-8 字节，`event_id` 分别追加 `:start` 和 `:usage`。Kafka 发送失败、End 缺失或消息重放都不重新生成 ID；客户端重新发起请求得到新观察流和新 UUID。
+
+UUIDv4 不包含时间。`request_started_at_ms` 仍由网关观察并作为事件字段，Consumer 从该字段计算 UTC `request_date`；不得从 UUID 推导日期。相同 UUID 的开始和结果事件应携带相同开始时间；不一致时按请求冲突处理。响应头 `X-Metering-Request-Id` 仅在网关发出响应头前收到有效 Start ACK 时才能携带该 UUID，故可能缺失；有响应头也不保证 Kafka 已收到事件。下游按事件 ID 去重，不以 `x_request_id` 重新构造请求 ID。具体协议、跨日期冲突和查询方式见[采集开发方案](gateway-request-collection-implementation.md#22-请求标识及时间)。
+
 ## 2. Kafka value 字段字典
 
 表中的“可空”指 JSON 值可以为 `null`；可空字段仍应出现在规范事件中。所有 `*_at_ms` 均为 Unix 毫秒，绝对时间按 UTC 理解。字符串 `"0"` 与数字 `0` 不等价，未知 token 用 `null` 表示。
@@ -33,7 +41,7 @@
 | `schema_version` | 整数 / 否 | 事件结构版本，当前为 `1`。不认识的版本应暂停该分区并报警，不能按旧字段默认值继续处理。 |
 | `event_id` | 字符串 / 否 | 事件级逻辑 ID；开始事件为 `<logical_request_id>:start`，结果事件为 `<logical_request_id>:usage`。用于去重并检测同 ID 不同内容的冲突。 |
 | `event_type` | 字符串 / 否 | 仅 `request_started` 或 `usage_observed`。 |
-| `logical_request_id` | 字符串 / 否 | 网关生成的请求级 ID，格式为 `<start_unix_ms>-<root_nonce_32hex>-<counter_16hex>`，同时也是 Kafka key 的文本值。 |
+| `logical_request_id` | 字符串 / 否 | Observer 收到有效 Start 后生成的规范小写 UUIDv4，同时也是 Kafka key 的文本值；同一观察的两种事件共用，不编码请求时间。 |
 | `x_request_id` | 字符串 / 是 | 网关当时可见的 `X-Request-Id`，可能缺失、复用或来自客户端；只用于辅助关联，不用于去重或授权。 |
 | `observation_id` | 字符串 / 否 | 一期与 `logical_request_id` 相同，表示本次观察。 |
 | `observation_scope` | 字符串 / 否 | 当前固定为 `gateway_response`，表示网关可见的一次逻辑响应，并非所有上游尝试。 |
@@ -47,7 +55,7 @@
 | `customer_id` | 字符串 / 是 | 鉴权时的客户归属快照；用于租户范围过滤。 |
 | `application_id` | 字符串 / 是 | 鉴权时的应用归属快照。 |
 | `identity_status` | 字符串 / 否 | `known` 表示上述三个身份 ID 齐全，`invalid` 表示可信身份信息不完整；后者不进入有效用量统计。 |
-| `request_started_at_ms` | 整数 / 否 | 网关观察到请求头的开始时间，也是统计归属时间；必须与 `logical_request_id` 的时间前缀一致。 |
+| `request_started_at_ms` | 整数 / 否 | 网关观察到请求头的开始时间，也是统计归属和 UTC `request_date` 的来源；与 UUIDv4 独立，同一请求的两种事件必须一致。 |
 | `observation_ended_at_ms` | 整数 / 是 | Observer 结束本次观察的时间；start 尚未结束时为 `null`。它不等于网关确认业务请求结束。 |
 | `request_finished_at_ms` | 整数 / 是 | 网关有效 End 中取得的请求结束时间；未收到有效 End 时为 `null`，不能补当前时间。 |
 | `event_created_at_ms` | 整数 / 否 | Observer 创建此 Kafka 事件的时间；通常晚于请求开始时间。 |
@@ -103,11 +111,11 @@
 ```json
 {
   "schema_version": 1,
-  "event_id": "1789862400000-00112233445566778899aabbccddeeff-0000000000000001:usage",
+  "event_id": "7f6c2a90-4b13-4b68-9d21-67283e0c5f44:usage",
   "event_type": "usage_observed",
-  "logical_request_id": "1789862400000-00112233445566778899aabbccddeeff-0000000000000001",
+  "logical_request_id": "7f6c2a90-4b13-4b68-9d21-67283e0c5f44",
   "x_request_id": "b3e1fba5-16a4-4dfb-aa84-50141e80d473",
-  "observation_id": "1789862400000-00112233445566778899aabbccddeeff-0000000000000001",
+  "observation_id": "7f6c2a90-4b13-4b68-9d21-67283e0c5f44",
   "observation_scope": "gateway_response",
   "producer_id": "observer-pod-uid",
   "gateway_instance_id": "gateway-pod-uid",
@@ -153,7 +161,7 @@ Kafka record 的 key 是上述 `logical_request_id`，不在 JSON 内另设 `kaf
 ## 4. 消费处理顺序
 
 1. 用独立消费组订阅 Topic，关闭自动提交。新组从最早可用 offset 还是最新 offset 开始，须在接入时明确；示例从保留窗口内最早记录开始。
-2. 按 UTF-8 JSON 解析，校验最多 32 KiB、`schema_version`、Kafka key 与 `logical_request_id`、事件类型和 `event_id` 后缀。未知版本停止处理并报警，不能跳过后提交。
+2. 按 UTF-8 JSON 解析，校验最多 32 KiB、`schema_version`、`logical_request_id` 是规范小写 UUIDv4（`^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`）、Kafka key 与该 ID 一致、事件类型和 `event_id` 后缀。未知版本停止处理并报警，不能跳过后提交。
 3. 根据 `event_id` 做幂等处理；若同一 `event_id` 出现不同规范事件内容，隔离并报警，不能随意挑一条覆盖。用量只来自 `usage_observed`，而且是否进入正式统计还需检查 `usage_eligible` 和请求冲突。
 4. 业务处理或持久化成功后再提交对应分区的下一个 offset。处理成功但提交失败会重放，所以幂等是必要条件；永久非法记录应走有界诊断流程，不能静默跳过。
 5. 监控每个分区的消费延迟与 72 小时保留窗口。单个请求缺少 start 或 usage 时保留“缺失/未知”状态，不用零值补齐。

@@ -106,16 +106,16 @@ flowchart LR
 | 位置 | 职责 |
 | --- | --- |
 | ext_authz/Auth | 验证平台 API Key、状态、有效期和访问范围，返回客户/应用可信动态元数据 |
-| Wasm 请求头回调 | 先执行路由启用、方法和路径联合白名单；命中后从 ext_authz 元数据取得可信 API Key/客户/应用，生成 logical_request_id，准备请求改写和旁路观察流 |
+| Wasm 请求头回调 | 先执行路由启用、方法和路径联合白名单；命中后从 ext_authz 元数据取得可信 API Key/客户/应用，记录请求开始时间并准备请求改写和旁路观察流；logical_request_id 由 Observer 在有效 Start 后生成 UUIDv4 |
 | Wasm 请求正文回调 | 对目标流式 JSON 有界缓冲并设置 `stream_options.include_usage=true`，再观察最终转发正文 |
-| Wasm 响应头回调 | 向白名单请求返回 `X-Metering-Request-Id`，便于客户按计量请求 ID 查询；不以此承诺已采集成功 |
-| Wasm 响应正文回调 | 有界复制当前片段，附请求 ID、方向及序号，异步提交；立即返回 Continue |
+| Wasm 响应头回调 | 若响应头回调前已收到有效 Start ACK，向白名单请求返回含 Observer ID 的 `X-Metering-Request-Id`；不等待 ACK，也不以此承诺事件已入库 |
+| Wasm 响应正文回调 | 有界复制当前片段，附流内序号、方向及偏移，异步提交；立即返回 Continue |
 | Wasm 结束回调 | 报告可观察的终态与最后序号；不等待观察者响应，不延长业务流生命周期 |
-| Observer | 接收片段、解析 JSON/SSE、检查缺段、提取 usage、执行有界 token 估算 |
+| Observer | 收到有效 Start 后生成 UUIDv4 格式的 logical_request_id 并在 ACK 中回传；接收片段、解析 JSON/SSE、检查缺段、提取 usage、执行有界 token 估算 |
 | Observer 内 producer | 只把结构化计量事件写入 Kafka；不把正文片段写入 Kafka |
 | ClickHouse Consumer | 独立消费 Kafka，校验与规范化事件、计算内容摘要、写入 ClickHouse 并在确认后提交 offset；不负责归档或重新估算 |
 
-Wasm 不做重型 tokenizer 运算，不缓存完整长响应。除对目标流式请求设置 `stream_options.include_usage=true`、添加计量查询 ID 响应头外，不修改其他业务字段或响应正文，也不发送本地错误来代替业务响应。Observer 不承担转发业务、代替模型生成、管理重试或传播取消。
+Wasm 不做重型 tokenizer 运算，不缓存完整长响应。除对目标流式请求设置 `stream_options.include_usage=true`、在及时取得 Observer ID 时添加计量查询 ID 响应头外，不修改其他业务字段或响应正文，也不发送本地错误来代替业务响应。Observer 不承担转发业务、代替模型生成、管理重试或传播取消。
 
 请求头白名单排除 Authorization、Cookie 和密钥原文；`api_key_id/customer_id/application_id` 必须来自 `envoy.filters.http.ext_authz` 动态元数据。鉴权成功但元数据不全时标记身份无效并报警，不接受客户端伪造头。Auth、PostgreSQL、密钥生命周期和元数据契约见 [API Key Auth 服务开发实现方案](api-key-auth-service-implementation.md)。
 
@@ -141,7 +141,7 @@ Wasm 不做重型 tokenizer 运算，不缓存完整长响应。除对目标流�
 
 固定 Proxy-Wasm ABI 的 http_call、grpc_stream 和 grpc_send 会经 root_context() 调用，标准异步 hostcall 由 root 持有，不直接随单个业务请求 context 销毁。因此在请求结束时提交异步终态有底层依据，不需要等待统计确认来延长业务请求。[固定 ABI 实现][15]
 
-Root/VM 销毁仍会取消其调用；SDK 回调也不能访问已失效的业务请求对象。实现需按采集请求 ID 保存有界上报状态，验证 SDK 回调映射、请求结束、插件重载及 root 生命周期。异步提交不代表可靠送达，不能宣称在 onLog 调用发送后最终计量必达。[固定 Wasm 实现][13]
+Root/VM 销毁仍会取消其调用；SDK 回调也不能访问已失效的业务请求对象。实现需按本地流 token 保存有界上报状态，并关联 ACK 返回的计量请求 ID，验证 SDK 回调映射、请求结束、插件重载及 root 生命周期。异步提交不代表可靠送达，不能宣称在 onLog 调用发送后最终计量必达。[固定 Wasm 实现][13]
 
 这是上线前必须通过的 PoC 项，不是本文已完成的实现。结束消息丢失时，Observer 只能记录已观察的部分用量或缺失状态，不能制造正常完成状态。Observer 内可以有有限的活跃请求解析状态，但不能形成故障恢复队列。
 
@@ -189,10 +189,10 @@ ClickHouse Consumer 是与 Observer 分开部署的 Go Deployment，不在业务
 兼容 OpenAI Chat Completions 的请求设置 `stream_options.include_usage=true` 后，正常流式响应会在 `data: [DONE]` 前返回一个包含整次请求 usage 的最终数据块。Observer 先解析并暂存服务上报值，再等待网关观察到流结束。Wasm 在请求结束回调发送 End；Observer 收到有效 End 后，定稿并发送一条 `usage_observed`，同时写入 token 与网关可观察终态。**最终 usage 数据块不是请求结束信号**。OpenAI 说明，流中断时可能收不到最终 usage 块。[OpenAI 流式用量说明][17]
 
 ~~~text
-logical_request_id = R1
-1. 收到 Start → request_started (R1:start)
+logical_request_id = 7f6c2a90-4b13-4b68-9d21-67283e0c5f44
+1. 收到 Start → request_started (<logical_request_id>:start)
 2. 响应末尾解析最终 usage → 暂存 input=1000、output=500
-3. 收到有效 End → usage_observed (R1:usage,
+3. 收到有效 End → usage_observed (<logical_request_id>:usage,
    input_tokens=1000, output_tokens=500,
    terminal_observed=true, request_finished_at_ms=网关观察到的结束时间)
 ~~~
@@ -281,7 +281,7 @@ LiteLLM 的计数工具及部分流式聚合路径可作为分词兜底参考，
 | 归属准备 | 用户正常消耗、平台重试/故障消耗、待核对；一期不扣款 |
 | 扩展 | `measurement_unit`、多模态扩展项及平台元数据引用 |
 
-`X-Metering-Request-Id` 响应头承载 `logical_request_id`；可选的 `X-Request-Id` 只映射到 `x_request_id`，不能作为主键。`identity_status` 仅用 `known` 或 `invalid` 表示当前接入结果，元数据缺失时标 `invalid` 并报警；`usage_eligible` 只表示有效用量统计候选，不表示收费资格。完整字段定义和类型以[采集开发方案第 6、7 节](gateway-request-collection-implementation.md#6-kafka-事件与发送)为准。
+`X-Metering-Request-Id` 响应头在 Start ACK 及时到达时承载 Observer 生成的 UUIDv4 `logical_request_id`；该 ID 不编码时间，统计日期从 `request_started_at_ms` 计算；ACK 迟到时可缺失。可选的 `X-Request-Id` 只映射到 `x_request_id`，不能作为主键。`identity_status` 仅用 `known` 或 `invalid` 表示当前接入结果，元数据缺失时标 `invalid` 并报警；`usage_eligible` 只表示有效用量统计候选，不表示收费资格。完整字段定义和类型以[采集开发方案第 6、7 节](gateway-request-collection-implementation.md#6-kafka-事件与发送)为准。
 
 每个观察结果不可变，不设置业务用量修订号、历史结果替换接口或后续补查任务。`schema_version` 和一期后续估算器版本只解释原记录结构及算法。
 
@@ -291,7 +291,7 @@ LiteLLM 的计数工具及部分流式聚合路径可作为分词兜底参考，
 
 一期使用一个原始事件 topic `llm-metering-events`，按 `logical_request_id` 选择分区；当前仅 ClickHouse Consumer 消费并落库。归档属于一期后续设计，届时另行定义其消费、offset 与故障恢复契约。开始和结果事件分别按 event_id 去重，token 只累计去重后的结果事件。
 
-同一 ID、相同内容视为重复；同一 ID、不同内容为冲突，隔离报警，不覆盖或重复相加。归一化结果也应在重放时确定一致。
+同一 `event_id`、相同内容视为重复；同一 `event_id`、不同内容为事件冲突。同一 UUIDv4 的开始/结果时间或身份快照不一致属于请求冲突；两类冲突均跨日期隔离报警，不覆盖或重复相加。归一化结果也应在重放时确定一致。
 
 Kafka 事务或 producer 去重不自动保证外部 ClickHouse 写入恰好一次，落库与消费进度必须配合验证。[Kafka 投递语义][7]
 
@@ -320,7 +320,7 @@ Kafka 事务或 producer 去重不自动保证外部 ClickHouse 写入恰好一�
 提供：
 
 - 请求 ID 精确查询及对应服务 A 的观察结果。
-- 客户保留响应头 `X-Metering-Request-Id`，以插件生成的 `logical_request_id` 精确查询；可选保存网关可见的 `X-Request-Id` 作辅助关联。后者可能由客户端提供或跨请求复用，须限定客户与时间窗口，不作唯一键或授权凭据。
+- 客户若收到响应头 `X-Metering-Request-Id`，可以 Observer 生成的 UUIDv4 `logical_request_id` 精确查询；查询覆盖在线日期分区，不从 ID 推导日期；该头因 ACK 迟到可能缺失。客户可选保存网关可见的 `X-Request-Id` 作辅助关联。后者可能由客户端提供或跨请求复用，须限定客户与时间窗口，不作唯一键或授权凭据。
 - 按时间、API Key、服务、模型、结果和计量来源筛选分页。
 - 小时/日趋势与服务、API Key 排行。
 - 上报、估算、未知、事件缺失分别展示。

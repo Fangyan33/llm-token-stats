@@ -1,6 +1,6 @@
 # 网关请求采集开发实现方案
 
-版本：V1.5｜日期：2026-10-09｜状态：开发设计，尚未完成真实网关 PoC 和性能验收。
+版本：V1.7｜日期：2026-10-12｜状态：开发设计，尚未完成真实网关 PoC 和性能验收。
 
 依据：[原技术方案](token-metering-design.md)、[功能设计概览及开发周期](token-metering-functional-overview-and-schedule.md)、[API Key Auth 服务方案](api-key-auth-service-implementation.md)。本文细化一期中“鉴权后采集到 ClickHouse 明细入库”的采集子项；一期的估算、汇总、归档、客户查询与看板在后续子项完成，不能以本文验收代替一期整体验收。本文中的 SQL、协议和配置供后续实现使用；Go 代码标明为伪代码的部分不能直接编译。
 
@@ -81,19 +81,36 @@ SDK `GetProperty` 路径候选为 `metadata/filter_metadata/envoy.filters.http.e
 
 ### 2.2 请求标识及时间
 
-`logical_request_id = <start_unix_ms>-<root_nonce_32hex>-<counter_16hex>`。
+`logical_request_id` **只由 Observer 生成**，使用 RFC 9562 UUIDv4 的 36 字符小写规范形式（`xxxxxxxx-xxxx-4xxx-[89ab]xxx-xxxxxxxxxxxx`）。它是不含日期的请求主键；Wasm、客户端和 Consumer 不生成或根据 `X-Request-Id` 推导它。生成流程如下：
 
-- `start_unix_ms`：网关进入请求头回调的 UTC 毫秒时间；所有事件携带相同值。
-- `root_nonce`：Root 初始化时用经 PoC 验证的 WASI `random_get` 生成 128 位随机值；不可用则禁用本 Root 采集并报警，不能退化为单独时间戳。
-- `counter`：Root 内从 1 递增的 uint64；用完则停止新采集，不回绕。多 Worker、重启、热更新由不同 nonce 隔离。
+1. Wasm 在请求头回调记录 UTC 毫秒 `request_started_at_ms`，放入首帧 `Start`。Observer 先校验 Start：时间必须是正的可表示 Unix 毫秒值，且不得比 Observer 当前时间超前 5 分钟以上；无有效 Start 不分配 ID、不发事件。时间落后超过 5 分钟记 `clock_anomaly` 并告警。
+2. Observer 对每个有效 Start 从操作系统密码学安全随机源（Go `crypto/rand`）读取 16 字节，按 UUIDv4 设置版本位和变体位，再输出小写带连字符的规范文本。例如 `7f6c2a90-4b13-4b68-9d21-67283e0c5f44`。随机源失败时拒绝该观察流并报警；持续故障使 `/readyz` 不通过，不退化为时间戳、Pod UID 或客户端请求头。
+3. ID 只分配一次并绑定该 gRPC 流。Observer 在首个有效 `ObservationAck` 中返回它，后续 ACK、`request_started` 和 `usage_observed` 都复用它；`observation_id` 一期等于它，Kafka key 是其 UTF-8 字节，`event_id` 分别追加 `:start` 和 `:usage`。Kafka 发送失败、End 缺失及重放均不重新生成 ID；客户端重新发起请求会形成新流和新 ID。
+
+Go 实现的核心步骤如下；调用前须完成 Start 校验：
+
+```go
+func newLogicalRequestID() (string, error) {
+    var raw [16]byte
+    if _, err := rand.Read(raw[:]); err != nil { return "", err }
+    raw[6] = (raw[6] & 0x0f) | 0x40 // version 4
+    raw[8] = (raw[8] & 0x3f) | 0x80 // RFC 变体
+    h := hex.EncodeToString(raw[:])
+    return h[:8] + "-" + h[8:12] + "-" + h[12:16] + "-" +
+        h[16:20] + "-" + h[20:], nil
+}
+```
+
+`logical_request_id` 与 `request_started_at_ms` 相互独立。`request_date` 由 Consumer 将已校验的 `request_started_at_ms` 转为 UTC 日期，不从 UUID 解析。请求跨午夜结束时，两种事件仍使用同一个开始时间和日期；若同一 UUID 的事件给出不同开始时间或日期，按第 7 节跨日期冲突规则隔离。
+
 - `observation_id` 一期采集子项等于 `logical_request_id`，`observation_scope` 固定 `gateway_response`。
 - 两类 Kafka 事件的 `event_id` 分别为 `<logical_request_id>:start` 和 `<logical_request_id>:usage`，对应 `request_started` 和 `usage_observed`；`request_finished_at_ms` 只是结果事件字段，gRPC `End` 只是观察消息，不复用客户端 request ID。
 
-`logical_request_id` 是计量主键。匹配白名单后，插件在请求头回调生成并保存于 HTTP context；即使 Observer 无法接收，也应独立于旁路额度尝试在最终响应头写入 `X-Metering-Request-Id: <logical_request_id>`。该头由网关覆盖上游同名响应头，不改写 `X-Request-Id`。浏览器跨域调用如需读取此头，由网关 CORS 配置暴露；客户端应记录响应头以供一期查询接口使用。鉴权前拒绝、插件未执行或客户端未收到响应头时，不能保证取得计量 ID；返回了 ID 也只表示插件生成了标识，不保证事件成功入库。
+Wasm 用本地流 token 关联异步 ACK 与 HTTP 请求，不把 token 当计量 ID，也不在观察帧中提交 `logical_request_id`。收到有效 Start ACK 后，Root 状态保存 Observer 返回的 UUID；响应头回调若此时已可读取该 ID，写入 `X-Metering-Request-Id`。响应头不得等待 ACK：ACK 迟到、Observer 不可用或旁路提前放弃时，此头可缺失，即使事件后来入 Kafka 也可能没有响应头。白名单请求始终尝试清除上游同名头，防止伪造；不改写 `X-Request-Id`。浏览器跨域调用如需读取此头，由网关 CORS 配置暴露。返回 ID 只说明 Observer 已分配标识，不保证事件已入库；缺少响应头也不证明没有事件。
 
 可选 `x_request_id` 是插件在请求头回调读取的**网关当时可见**的 `x-request-id`，只接受 1–128 字节且符合 `[A-Za-z0-9._:-]+` 的值；缺失、过长或非法时为 null，并计数，不截断。插件只读取这个指定头，不枚举或上报其他请求头；重复头如何呈现依赖固定 Envoy 的处理，联调须覆盖，但无论如何该值都只是非唯一辅助关联。它随 `Start` 和两类事件保存，供访问日志/链路追踪辅助关联。Envoy 是否生成、替换或保留客户端 `X-Request-Id` 取决于实际 HTTP Connection Manager 配置；它可能来自客户端，也可能跨多跳复用，因此不作为计量主键、幂等键或授权依据。阶段 0 要在固定网关 `config_dump` 和实际请求中验证该行为及响应头可见性。[Envoy 1.21 HTTP Connection Manager](https://www.envoyproxy.io/docs/envoy/v1.21.0/api-v3/extensions/filters/network/http_connection_manager/v3/http_connection_manager.proto)
 
-Consumer 校验 ID 时间前缀与 `request_started_at_ms` 完全一致，以 ID 时间计算存储分区，不使用 Observer/入库时间分区。这样同一事件不能通过更改时间字段逃离冲突检查。请求持续跨午夜时全部事件仍进入开始日期分区。
+Consumer 校验 UUIDv4 格式和 Kafka key 后，以事件中的 `request_started_at_ms` 计算 UTC `request_date`；不使用 Observer/入库时间分区。相同 UUID 的开始、结果事件必须沿用同一个开始时间；跨日期不一致在请求级冲突视图中隔离。请求持续跨午夜时，正常事件仍进入开始日期分区。
 
 持续时间使用可用的单调时钟；绝对时间使用 UTC。检测时间倒退时记录 `clock_anomaly`，不生成负 duration。网关时钟偏差超 5 分钟触发接入告警；不偷偷改为入库时间。
 
@@ -104,7 +121,7 @@ Consumer 校验 ID 时间前缀与 `request_started_at_ms` 完全一致，以 ID
 1. **默认忽略**：全局 enabled 必须为 true，且可信 route_name 对应规则显式 enabled=true、方法和路径同时命中，才标记 selected。缺少规则、规则禁用、属性读取失败均不采集，不得回退为全量采集。route_name 必须从 Envoy 可信路由属性取得，不接受客户端 Header 控制开关、路由名、service_id 或 adapter_id。
 2. **一期采集子项只允许 Chat Completions**：adapter_id 固定为 chat_completions_v1，methods 固定为 ["POST"]，paths 为非空精确路径列表，默认 ["/v1/chat/completions"]。部署使用自定义前缀时必须逐条配置并验证；禁止通配符、前缀、包含或正则匹配。GET、HEAD、OPTIONS、指标、健康检查和模型列表接口不得进入采集；未来其他协议需独立适配器和评审。
 3. **路径口径固定**：使用 Wasm 请求头回调当时可见的 :path，去掉第一个 ? 及其后的查询串后逐字节匹配；插件不额外 URL 解码、大小写折叠、合并斜杠或去除尾斜杠。网关此前已做的规范化以实际可见结果为准。路径和 query 不上报、不入库、不记日志或指标标签。规则按该观察位置配置，不使用上游重写后的路径猜测；路径重写、路由属性及执行顺序须在固定镜像 PoC 验证，读取不到可信属性时禁止扩大匹配范围。
-4. **先过滤再分配**：HTTP context 初始 selected=false，只保存必要标志。未命中时不生成 logical_request_id、不读取身份或正文、不申请改写/观察额度、不建立观察 gRPC 流、不发送 Start/BodyChunk/End、不添加计量响应头，所有后续回调直接 Continue（结束回调直接返回）。不得为这类请求产生两类 Kafka 事件，包括 unknown 占位事件；只增加本地忽略计数。Envoy/SDK 基础 HTTP context 的创建不等于分配计量状态。
+4. **先过滤再分配**：HTTP context 初始 selected=false，只保存必要标志。未命中时不请求 Observer 分配 logical_request_id、不读取身份或正文、不申请改写/观察额度、不建立观察 gRPC 流、不发送 Start/BodyChunk/End、不添加计量响应头，所有后续回调直接 Continue（结束回调直接返回）。不得为这类请求产生两类 Kafka 事件，包括 unknown 占位事件；只增加本地忽略计数。Envoy/SDK 基础 HTTP context 的创建不等于分配计量状态。
 5. **请求内固定结果**：命中后固定规则、config_version 和 selected，后续配置更新、响应状态、usage 缺失不得改变本次选择。Content-Type、Content-Encoding、请求体中的 model/stream、是否携带 API Key 均不能替代入口白名单。内容类型/压缩不支持仅影响改写和解析；命中的失败响应、非法正文或断流仍按现有有界流程尝试产生可观察事件，未知用量不得补零，不承诺两事件必达。
 6. **鉴权独立**：不采集不代表免鉴权；普通查询按其自身鉴权策略处理。命中请求仍从 ext_authz 获取可信身份；鉴权前被拒绝的请求不在本观察位置的分母中。Observer/Consumer 的 schema、adapter_id/config_version 校验仅为防御性校验，不能替代入口过滤；现有事件不携带原始路径，不声称下游能重新验证全部匹配条件。
 
@@ -135,7 +152,7 @@ enum Direction {
 
 message ObservationFrame {
   uint32 schema_version = 1;       // 一期采集子项固定 1
-  string logical_request_id = 2;
+  reserved 2;                      // 不复用原草案中由网关填写的请求 ID 字段
   uint64 frame_seq = 3;            // 从 1 开始，整个流严格递增
   oneof payload {
     Start start = 10;
@@ -193,7 +210,7 @@ message End {
 }
 
 message ObservationAck {
-  string logical_request_id = 1;
+  string logical_request_id = 1;   // Observer 在有效 Start 后分配，后续 ACK 保持一致
   uint64 accepted_frame_seq = 2;   // 连续处理完成的最高 frame_seq
   bool close_stream = 3;
   string reason = 4;              // 固定原因码，禁止透传异常文本
@@ -204,13 +221,13 @@ message ObservationAck {
 
 ### 3.2 消息顺序、ACK 与缺片
 
-- `Start` 必须为 frame 1，且每流仅一次；无有效 Start 的流直接关闭，不制造请求事件。
+- `Start` 必须为 frame 1，且每流仅一次；Observer 校验后分配 `logical_request_id`，在立即发送的 Start ACK 中回传。无有效 Start 的流直接关闭，不分配 ID 或制造请求事件。
 - `ResponseHeaders` 发送最终业务响应头，忽略 1xx；请求和响应分片可交错，每方向独立累计偏移。
 - 无正文时头消息的 `end_stream=true`；trailers 回调只更新方向结束标志，不复制 trailers。`End` 仍是明确请求终态的唯一消息。
 - Observer 校验 frame 序号、方向 body_seq、offset 和 End 总量；序号跳跃、重复或不一致均判 `protocol_error` 并定稿 partial/unknown 后关闭。gRPC 本身有序，一期采集子项不尝试乱序缓存或正文重传。
 - ACK 在 Observer 已接纳并处理该消息、释放其临时缓冲后产生，不等待 Kafka。请求 JSON 的有界解析状态仍受 Observer 总额度约束。
 - ACK 累计确认，最多每 8 帧或 10 毫秒发送一次，Start 与 End 立即确认。只保留一个可覆盖的“最新 ACK”槽；写阻塞超时即关闭流，不积压 ACK 队列。
-- 插件按本地发送账本释放 `<= accepted_frame_seq` 的字节/消息额度；忽略重复 ACK。ID 不符、确认未发送序号或超大 ACK 视为协议错误并取消旁路。
+- 插件用 Root token 定位本地观察状态，按发送账本释放 `<= accepted_frame_seq` 的字节/消息额度。首个有效 ACK 必须确认 Start 且携带规范小写 UUIDv4 格式的 Observer ID；后续 ACK 的 ID 必须相同。忽略重复 ACK；ID 缺失/变化、确认未发送序号或超大 ACK 视为协议错误并取消旁路。ACK 回调不访问已删除的 HTTP context。
 - `End` 的 frame_seq 是最终序号。发送 End 使用 `end_of_stream=true` 半关闭发送方向，仍可接收最终 ACK；ACK 或超时后取消/清理剩余调用。
 
 本协议没有恢复 token、补传 cursor、历史补报方法或逐片持久化确认。
@@ -256,7 +273,7 @@ WASM 中不引入 gRPC-Go、网络 goroutine、完整 Envoy protobuf 类型或�
 | 层次 | 保存状态 |
 | --- | --- |
 | VM | 入口注册、构建版本 |
-| Root / PluginContext | 不可变配置、nonce/计数器、token→采集状态、在途额度、deadline 最小堆、指标 |
+| Root / PluginContext | 不可变配置、token→采集状态（可含 Observer ACK 返回的 ID）、在途额度、deadline 最小堆、指标 |
 | HTTP Context | selected（默认 false）、固定规则/config_version、采集状态 ID、方向累计字节/片序、EOS 标志、少量响应元数据、改写阶段及预算；正文只在有界改写期间临时持有 |
 | 采集状态 | ACTIVE / END_SENT / DROPPED / CLOSED、token、frame_seq、未 ACK 帧长度与发送时刻、结束 deadline |
 
@@ -288,11 +305,10 @@ func (h *HTTPContext) OnHttpRequestHeaders(_ int, eos bool) types.Action {
     }
     h.selected = true // 固定规则和 config_version，后续不重新匹配
     h.root.CountSelected()
-    h.logicalRequestID = h.root.NewLogicalRequestID(startMs)
     h.xRequestID = readOptionalGatewayRequestID() // 有界校验；不影响鉴权和业务
     action := h.requestRewrite.OnHeaders(rule, eos)
     if !h.root.TryReserveStream() { return action }
-    h.state = h.root.NewObservation(startMs, rule, readTrustedIdentity(), h.logicalRequestID, h.xRequestID, eos)
+    h.state = h.root.NewObservation(startMs, rule, readTrustedIdentity(), h.xRequestID, eos)
     if !h.root.TryOpenAndSendStart(h.state) { h.root.Drop(h.state, "open_failed") }
     return action
 }
@@ -331,8 +347,8 @@ func (h *HTTPContext) observeBody(dir Direction, n int, eos bool) {
 
 func (h *HTTPContext) OnHttpResponseHeaders(_ int, eos bool) types.Action {
     if !h.selected { return types.ActionContinue }
-    // 即使旁路流建立失败，也尝试向客户端返回本次计量查询 ID。
-    h.replaceMeteringRequestIDResponseHeader()
+    // 始终尝试清除上游伪造的同名头；仅在 Start ACK 已到达时写入 Observer ID。
+    h.replaceMeteringRequestIDResponseHeader(h.root.AckedLogicalRequestID(h.state))
     h.root.TrySendResponseHeaders(h.state, readAllowedResponseMetadata(), eos)
     return types.ActionContinue
 }
@@ -349,7 +365,7 @@ func (p *PluginContext) OnTick() {
 }
 ```
 
-`replaceMeteringRequestIDResponseHeader()` 只对已生成 ID 的白名单请求执行；先用 `RemoveHttpResponseHeader` 清除同名上游头的所有值，确认成功后再用 `AddHttpResponseHeader` 写入一个网关生成值。不能只调用 `ReplaceHttpResponseHeader`，固定 SDK 的该接口在重复头时只替换第一个值。删除/添加失败计数并继续业务；重复头及不存在头的实际 hostcall 行为需在 PoC 验证。[固定 SDK 响应头接口](https://github.com/tetratelabs/proxy-wasm-go-sdk/blob/v0.24.0/proxywasm/hostcall.go) `readOptionalGatewayRequestID()` 只读取、校验这一指定头；读取失败只丢弃辅助字段，不影响业务或主 ID，且不能从 `X-Metering-Request-Id` 请求头读值。请求和响应 trailers 回调也必须先检查 selected，未命中直接 Continue。实际 `OnHttpRequestTrailers` 对命中请求必须先结束或降级请求改写状态，再记录 EOS；`OnHttpResponseTrailers` 只记录 EOS，返回 Continue。`snapshotObservableEnd()` 的字段读取失败即留空；上游尝试数来自 Envoy 已验证属性，不读取客户端伪造的 attempt-count 头。response flags/code details 只允许已登记的有界诊断码，不持久化可能夹带上游错误文本的任意字符串。
+`replaceMeteringRequestIDResponseHeader(id)` 对所有白名单请求先用 `RemoveHttpResponseHeader` 清除同名上游头的所有值；只有 `id` 是已校验的 Observer Start ACK 返回的 UUIDv4 时，才用 `AddHttpResponseHeader` 写入一个值。清除失败时不添加 ID，记录故障并继续业务；不能保证上游伪造的头已消失。ACK 未到或旁路失败时保持该头缺失，不等待、不断言事件不存在。不能只调用 `ReplaceHttpResponseHeader`，固定 SDK 的该接口在重复头时只替换第一个值。删除/添加失败计数并继续业务；重复头及不存在头的实际 hostcall 行为需在 PoC 验证。[固定 SDK 响应头接口](https://github.com/tetratelabs/proxy-wasm-go-sdk/blob/v0.24.0/proxywasm/hostcall.go) `readOptionalGatewayRequestID()` 只读取、校验这一指定头；读取失败只丢弃辅助字段，不影响业务或主 ID，且不能从 `X-Metering-Request-Id` 请求头读值。请求和响应 trailers 回调也必须先检查 selected，未命中直接 Continue。实际 `OnHttpRequestTrailers` 对命中请求必须先结束或降级请求改写状态，再记录 EOS；`OnHttpResponseTrailers` 只记录 EOS，返回 Continue。`snapshotObservableEnd()` 的字段读取失败即留空；上游尝试数来自 Envoy 已验证属性，不读取客户端伪造的 attempt-count 头。response flags/code details 只允许已登记的有界诊断码，不持久化可能夹带上游错误文本的任意字符串。
 
 在实际 filter chain 中确认 bodySize 表示当前可见 buffer：请求改写期间使用累计 buffer；响应保持 Continue，但其他过滤器可能缓冲正文，导致单次回调很大。响应超过单回调额度直接放弃采集，不能先读取完整正文再检查大小；禁止跨回调保留 host buffer 引用。
 
@@ -394,7 +410,7 @@ WASM 线性内存高水位未必返还操作系统；验收检查长时间复用
 
 gRPC-Go 每流一个处理器，不为每片启动 goroutine。每个流在首次 Recv 前非阻塞申请活动流槽及一份 32 KiB 接收预留，再把消息转入另行记账的解析状态；不能接收完所有消息才检查内存。gRPC 内部帧/连接缓冲不包含在这份预留中，需同时约束连接数、HTTP/2 窗口及并发流。ACK 写协程每流最多一个；状态由单流串行处理，写侧只读最新 ACK 快照。接收消息上限 32 KiB，活动流上限 4096，解析状态总预算 256 MiB，进程 memory limit 初值 1 GiB；额外运行时/连接内存纳入压测。
 
-收到合法 Start 后尝试发送 `request_started`；Kafka 失败不重开观察流。请求 JSON 最多保存 256 KiB，以获得 model/stream；保存期间计入全局预算。响应普通 JSON 最多 1 MiB；SSE 只保存当前事件和 usage 候选，单事件最大 256 KiB。全流传入响应最多 8 MiB。限制 UTF-8、JSON 深度 64、JSON 元素数 100000；避免一次巨大对象耗尽 CPU。
+收到合法 Start 后先按第 2.2 节生成并固定 `logical_request_id`，立即回传带 ID 的 Start ACK，再尝试发送 `request_started`；ACK 和 Kafka 发送互不等待，Kafka 失败不重开观察流或重新分配 ID。请求 JSON 最多保存 256 KiB，以获得 model/stream；保存期间计入全局预算。响应普通 JSON 最多 1 MiB；SSE 只保存当前事件和 usage 候选，单事件最大 256 KiB。全流传入响应最多 8 MiB。限制 UTF-8、JSON 深度 64、JSON 元素数 100000；避免一次巨大对象耗尽 CPU。
 
 Observer 每处理至多 64 KiB 解析数据检查 deadline 和资源预算。单流累计解析 CPU 预算以处理耗时近似限额 100 ms 做测试初值；这是协作式检查，不宣称能中断 Go 标准库中任意解析操作。小块解析、大小/深度上限和进程隔离共同限制风险。
 
@@ -458,8 +474,9 @@ sequenceDiagram
     participant O as Observer
     participant K as Kafka
     participant D as Consumer/ClickHouse
-    W->>O: Start(seq=1)
-    O-->>W: ACK(1，不等待 Kafka)
+    W->>O: Start(seq=1, 无 logical_request_id)
+    Note over O: 校验 Start，生成并固定 logical_request_id
+    O-->>W: ACK(1, logical_request_id，不等待 Kafka)
     O->>K: request_started
     loop 请求/响应当前片段
         W->>O: BodyChunk(seq, direction, offset)
@@ -489,11 +506,11 @@ Topic 固定 `llm-metering-events`，key 为 logical_request_id 的 UTF-8；初�
 ```json
 {
   "schema_version": 1,
-  "event_id": "1789862400000-00112233445566778899aabbccddeeff-0000000000000001:usage",
+  "event_id": "7f6c2a90-4b13-4b68-9d21-67283e0c5f44:usage",
   "event_type": "usage_observed",
-  "logical_request_id": "1789862400000-00112233445566778899aabbccddeeff-0000000000000001",
+  "logical_request_id": "7f6c2a90-4b13-4b68-9d21-67283e0c5f44",
   "x_request_id": "b3e1fba5-16a4-4dfb-aa84-50141e80d473",
-  "observation_id": "1789862400000-00112233445566778899aabbccddeeff-0000000000000001",
+  "observation_id": "7f6c2a90-4b13-4b68-9d21-67283e0c5f44",
   "observation_scope": "gateway_response",
   "producer_id": "observer-pod-uid",
   "gateway_instance_id": "gateway-pod-uid",
@@ -574,12 +591,12 @@ ACK 与 Kafka 发送完全解耦；即便两条事件只有一条成功入 Kafka
 
 ### 7.1 存储选择与字段字典
 
-Consumer 在校验规范事件时一次解析字段，直接写入 `events_raw` 的类型化列；保留规范 `event_json` 仅供冲突核验，常规 SQL 不执行 JSONExtract。`event_id` 是事件级逻辑键，`logical_request_id` 是请求级逻辑键：一笔请求最多有 start 和合并后的 usage 两条事件。物理主键采用请求日期、请求 ID、事件 ID 的前缀，以支持请求精查；ClickHouse 主键不是唯一约束，排序键还必须包含 `payload_hash`，让同一 `event_id`、不同内容的变体都留下。相同事件重放由 `FINAL` 在查询时即时去重，不能只依赖后台 merge。[ReplacingMergeTree 机制](https://clickhouse.com/docs/engines/table-engines/mergetree-family/replacingmergetree)
+Consumer 在校验规范事件时一次解析字段，直接写入 `events_raw` 的类型化列；保留规范 `event_json` 仅供冲突核验，常规 SQL 不执行 JSONExtract。`event_id` 是事件级逻辑键，`logical_request_id` 是请求级逻辑键：一笔请求最多有 start 和合并后的 usage 两条事件。物理主键采用请求日期、请求 ID、事件 ID 的前缀；仅凭 UUID 精查需覆盖在线保留的日期分区并在每个分区按 ID 定位；ClickHouse 主键不是唯一约束，排序键还必须包含 `payload_hash`，让同一 `event_id`、不同内容的变体都留下。相同事件重放由 `FINAL` 在查询时即时去重，不能只依赖后台 merge。[ReplacingMergeTree 机制](https://clickhouse.com/docs/engines/table-engines/mergetree-family/replacingmergetree)
 
 | 字段组 | 存储/逻辑类型 | 来源与说明 |
 | --- | --- | --- |
-| request_date | Date | 从请求 ID 的开始时间计算；分区键 |
-| logical_request_id / event_id / event_type | String / String / LowCardinality(String) | 插件生成请求 ID / Observer 固定后缀 / 两种固定事件类型；Consumer 校验三者一致 |
+| request_date | Date | 从事件的 `request_started_at_ms` 计算 UTC 日期；分区键，不从 UUIDv4 推导 |
+| logical_request_id / event_id / event_type | String / String / LowCardinality(String) | Observer 生成请求 ID 和事件后缀 / 两种固定事件类型；Consumer 校验三者一致 |
 | x_request_id | Nullable(String) | 网关可见的 `X-Request-Id`，辅助关联；可能缺失或重复 |
 | payload_hash | FixedString(64) | Consumer 对规范事件计算 SHA-256 |
 | event_json | String | 规范化事件副本，仅供冲突证据和迁移核验，禁止正文；常规查询不读取 |
@@ -600,8 +617,8 @@ CREATE DATABASE IF NOT EXISTS metering;
 
 CREATE TABLE IF NOT EXISTS metering.events_raw
 (
-    request_date Date COMMENT '请求开始时间对应的 UTC 日期，从 logical_request_id 提取，用于分区和保留期',
-    logical_request_id String COMMENT 'Wasm 生成的请求级唯一标识，同一请求的两类事件共用',
+    request_date Date COMMENT '请求开始时间对应的 UTC 日期，从 request_started_at_ms 计算，用于分区和保留期',
+    logical_request_id String COMMENT 'Observer 生成的请求级唯一标识，同一请求的两类事件共用',
     event_id String COMMENT '事件级逻辑标识，由请求 ID 和 start/usage 后缀组成，不是数据库唯一约束',
     payload_hash FixedString(64) COMMENT 'Consumer 对规范事件计算的 SHA-256 十六进制摘要，区分重放与内容冲突',
     schema_version UInt32 COMMENT '规范事件结构版本，Consumer 据此校验和映射字段',
@@ -661,27 +678,41 @@ PRIMARY KEY (request_date, logical_request_id, event_id)
 ORDER BY (request_date, logical_request_id, event_id, payload_hash)
 TTL toDateTime(request_date, 'UTC') + INTERVAL 31 DAY DELETE;
 
--- 同 ID 同摘要的业务字段完全相同；FINAL 即时去除重放的物理行。
--- 不把 payload_hash 从 ORDER BY 中删除，否则同 ID 的冲突变体会被后台覆盖。
+-- 只存冲突 UUID；冲突证据先到期时仍阻止剩余变体恢复为有效用量。
+CREATE TABLE IF NOT EXISTS metering.request_conflict_ids
+(
+    logical_request_id String,
+    detected_at DateTime64(3, 'UTC'),
+    expires_at DateTime('UTC')
+)
+ENGINE = ReplacingMergeTree(detected_at)
+ORDER BY logical_request_id
+TTL expires_at DELETE;
+
+-- 同 UUID、同事件 ID、同摘要的重放在同一 request_date 分区内由 FINAL 去重。
+-- 不把 payload_hash 从 ORDER BY 中删除，否则同一事件的冲突变体会被后台覆盖。
 CREATE VIEW IF NOT EXISTS metering.event_variants AS
 SELECT * FROM metering.events_raw FINAL;
 
+-- 按 UUID 和事件 ID 跨所有在线日期判断；不能先用 request_date 排除另一变体。
 CREATE VIEW IF NOT EXISTS metering.event_conflicts AS
-SELECT request_date, logical_request_id, event_id,
+SELECT logical_request_id, event_id,
        count() AS variant_count,
        groupArray(payload_hash) AS payload_hashes
 FROM metering.event_variants
-GROUP BY request_date, logical_request_id, event_id
+GROUP BY logical_request_id, event_id
 HAVING count() > 1;
 
 CREATE VIEW IF NOT EXISTS metering.events_valid AS
 SELECT v.*
 FROM metering.event_variants AS v
 LEFT ANTI JOIN metering.event_conflicts AS c
-    ON v.request_date = c.request_date AND v.event_id = c.event_id;
+    ON v.logical_request_id = c.logical_request_id AND v.event_id = c.event_id;
 ```
 
-TTL 按天清理设 31 天，保证同一开始日期的全部变体同时到期，避免不同毫秒 TTL 先删一个变体后冲突“自动消失”。产品在线访问严格限制为 `request_started_at >= now()-30 DAY`；额外不足一天属于清理余量，不作为可查保留期。Consumer 拒绝已超过 30 天的历史事件重新进入在线表并记录原因，不用重放刷新 TTL。
+`request_date` 由各事件的 `request_started_at_ms` 计算，原始表仍按 UTC 开始日期分区、按日期加 31 天清理。正常请求的两种事件日期相同；若同一 UUID 出现不同开始时间或日期，冲突视图必须跨在线分区按 UUID 汇合，不能按 `(request_date, logical_request_id)` 分组后分别放行。产品查询仍按事件开始时间限制 30 天；Consumer 拒绝已超过 30 天的历史事件重新进入在线表。
+
+不同日期的冲突变体可能先后到期。为避免较早变体删除后较晚变体重新进入有效统计，冲突检测器对新消费的 UUID 跨所有在线分区检查事件变体、开始时间和身份快照，发现冲突即写 `request_conflict_ids`，`expires_at` 至少为检测时刻后 31 天；重复检测延长而不缩短期限。当前两变体共存时视图立即隔离，持久冲突标记覆盖原始证据到期后的剩余在线窗口。检测器必须监控滞后；未能在最早冲突证据到期前完成持久化时，暂停对外有效用量查询并报警，不能让冲突请求恢复有效。
 
 `payload_hash` 只标识内容变体，Consumer 必须重算并验证业务字段。类型化列必须直接来自同一个规范事件对象，不能从另一次解析或默认值推断；`usage=null` 时 token 和 source 列均为 SQL NULL，有效的 token 0 则保留为 0。上游输入若含非白名单字段、正文或不合法 schema，按第 8 节处理，不把原始 payload 无条件写入 `event_json`。同一键、同一摘要的重放可能保留任一 Kafka 坐标，因此它只供诊断，不表示首次接收位置。
 
@@ -717,7 +748,7 @@ FROM metering.events_valid;
 ```sql
 CREATE VIEW IF NOT EXISTS metering.requests AS
 SELECT
-    v.request_date, v.logical_request_id,
+    min(v.request_date) AS request_date, v.logical_request_id,
     countIf(v.event_type = 'request_started') AS start_variants,
     countIf(v.event_type = 'usage_observed') AS usage_variants,
     any(v.request_started_at_ms) AS request_started_at_ms,
@@ -750,6 +781,9 @@ SELECT
        CAST(NULL AS Nullable(String))) AS business_outcome,
     toUInt8(
       start_variants > 1 OR usage_variants > 1
+      OR uniqExact(v.request_started_at_ms) > 1
+      OR uniqExact(v.request_date) > 1
+      OR v.logical_request_id IN (SELECT logical_request_id FROM metering.request_conflict_ids WHERE expires_at > now())
       OR uniqExact(tuple(
         v.service_id, v.api_key_id, v.customer_id, v.application_id,
         v.identity_status, v.config_version, v.gateway_instance_id,
@@ -757,14 +791,13 @@ SELECT
       )) > 1
     ) AS has_conflict
 FROM metering.event_variants AS v
-GROUP BY v.request_date, v.logical_request_id;
+GROUP BY v.logical_request_id;
 
 CREATE VIEW IF NOT EXISTS metering.usage_effective AS
 SELECT d.*
 FROM metering.event_details AS d
 INNER JOIN metering.requests AS r
-    ON d.request_date = r.request_date
-   AND d.logical_request_id = r.logical_request_id
+    ON d.logical_request_id = r.logical_request_id
 WHERE d.event_type = 'usage_observed'
   AND r.has_conflict = 0
   AND d.usage_eligible = 1;
@@ -772,17 +805,16 @@ WHERE d.event_type = 'usage_observed'
 
 `requests` 中一行代表一个已记录请求，不能对 events 表 count 作为调用量。`usage_effective` 用于当前有效用量核验，不能把未满足条件的记录数当零用量请求；完整事件明细仍可查询 unknown/partial 等状态。冲突一旦到达即从有效视图排除，原记录不覆盖；一期采集子项不做物化累计，因此没有重复加法或冲突后减账问题。
 
-`event_conflicts` 是事件级隔离入口；跨事件身份冲突通过 `requests.has_conflict` 查询。每分钟按最近消费到的请求日期范围执行冲突检测并报警，日志只包含事件 ID/摘要，不输出 `event_json`。
+`event_conflicts` 是跨日期事件级隔离入口；开始/结果时间或身份快照不一致由 `requests.has_conflict` 隔离。检测器每分钟取最近消费的 UUID，在全部在线分区核对变体，并持久化冲突 ID；日志只包含事件 ID/摘要，不输出 `event_json`。
 
 ### 7.5 查询样例
 
-以下参数为 ClickHouse 客户端命名参数。业务查询必须带时间边界；事件级 view 的筛选要在去重/冲突判断之后应用，不能先按某个变体的客户或模型筛掉冲突证据。优化器执行计划在目标版本核验。
+以下参数为 ClickHouse 客户端命名参数。仅凭 UUID 精查覆盖在线保留的日期分区，客户查询再按 `request_started_at_ms` 限制 30 天；范围查询必须显式带时间边界。事件级 view 的筛选要在去重/冲突判断之后应用，不能先按某个变体的客户或模型筛掉冲突证据。优化器执行计划在目标版本核验。
 
 ```sql
--- 请求 ID 精查：request_date 从 ID 前缀推导。
+-- 只凭 UUIDv4 精查：不从 ID 推导日期，覆盖在线保留的日期分区。
 SELECT * FROM metering.requests
-WHERE request_date = {day:Date}
-  AND logical_request_id = {request_id:String};
+WHERE logical_request_id = {request_id:String};
 
 -- 客户查询用量：customer_id 由可信查询服务根据登录主体注入，不接受客户端指定。
 -- 只有 start 而无结果时仍返回请求，token 为 NULL，状态为 not_observed。
@@ -791,8 +823,8 @@ SELECT r.logical_request_id, r.x_request_id, r.request_started_at_ms,
        r.observation_status, r.input_tokens, r.output_tokens,
        r.terminal_observed, r.request_finished_at_ms, r.business_outcome
 FROM metering.requests AS r
-WHERE r.request_date = {day:Date}
-  AND r.logical_request_id = {request_id:String}
+WHERE r.logical_request_id = {request_id:String}
+  AND r.request_started_at_ms >= {online_from_ms:Int64}
   AND r.has_conflict = 0
   AND r.customer_id = {authenticated_customer_id:String};
 
@@ -810,8 +842,7 @@ ORDER BY r.request_started_at_ms, r.logical_request_id LIMIT 100;
 -- 同一事件的冲突证据（运维权限）。
 SELECT event_id, payload_hash, event_json
 FROM metering.event_variants
-WHERE request_date = {day:Date}
-  AND logical_request_id = {request_id:String}
+WHERE logical_request_id = {request_id:String}
 ORDER BY event_id, payload_hash;
 
 -- 有已记录开始但缺少结果；不据此断言业务仍在执行。
@@ -827,8 +858,7 @@ SELECT d.logical_request_id, d.request_started_at_ms, d.service_id,
        d.usage_status, d.anomaly_codes
 FROM metering.event_details AS d
 INNER JOIN metering.requests AS r
-    ON d.request_date = r.request_date
-   AND d.logical_request_id = r.logical_request_id
+    ON d.logical_request_id = r.logical_request_id
 WHERE d.request_date BETWEEN {from_day:Date} AND {to_day:Date}
   AND d.request_started_at_ms >= {from_ms:Int64}
   AND d.request_started_at_ms < {to_ms:Int64}
@@ -847,17 +877,17 @@ WHERE request_date = {day:Date}
   AND customer_id = {customer_id:String};
 ```
 
-一期客户查询接口按 `X-Metering-Request-Id` 提供的 `logical_request_id` 精查，先校验 ID 格式及 30 天在线窗口，再验证登录主体的客户身份并强制注入 `customer_id` 条件；对其他客户 ID 与不存在的 ID 给出相同未找到响应。按 `X-Request-Id` 查询是辅助入口，要求客户身份和有限时间窗口，允许零到多条结果，不据此跨客户查找或做结算幂等。接口展示 `usage_status`、各 token 的 null/有效值、完整性与数据水位：观察事件尚未入库时只能返回“暂未查到”，不能推断零消耗；旁路可丢采，超过水位仍无记录也不能保证原请求不存在。在线明细按 30 天窗口，过期按归档异步检索方案处理。按客户的正式对外查询必须排除 `requests.has_conflict=1` 的全部记录，并由可信服务注入客户条件；上面的明细 SQL 用于内部联调。数据库账号不直接发给客户。一期采集子项只有内部 SQL 验收，不声称已经实现租户隔离产品 API。
+一期客户查询接口在响应头含 `X-Metering-Request-Id` 时按其中的 UUIDv4 精查；未及时取得 Observer ACK 的请求可能没有此头，可按受限的 `X-Request-Id` 辅助检索。精查时先校验规范 UUIDv4 格式，覆盖在线保留的日期分区取得事件，再按 `request_started_at_ms` 校验 30 天在线窗口，并验证登录主体的客户身份、强制注入 `customer_id` 条件；对其他客户 ID 与不存在的 ID 给出相同未找到响应。按 `X-Request-Id` 查询是辅助入口，要求客户身份和有限时间窗口，允许零到多条结果，不据此跨客户查找或做结算幂等。接口展示 `usage_status`、各 token 的 null/有效值、完整性与数据水位：观察事件尚未入库时只能返回“暂未查到”，不能推断零消耗；旁路可丢采，超过水位仍无记录也不能保证原请求不存在。在线明细按 30 天窗口，过期按归档异步检索方案处理。按客户的正式对外查询必须排除 `requests.has_conflict=1` 的全部记录，并由可信服务注入客户条件；上面的明细 SQL 用于内部联调。数据库账号不直接发给客户。一期采集子项只有内部 SQL 验收，不声称已经实现租户隔离产品 API。
 
-日均约 1 亿事件意味着 30 天约 30 亿事件。类型化列将 JSON 解析成本移到写入阶段，也允许按列读取；但 `FINAL`、冲突检测、按请求关联及非排序键的客户筛选仍可能很贵。保留 `event_json` 会增加写入与存储成本，需与旧方案比较磁盘、写入 CPU 和查询延迟。一期采集子项验收先测请求 ID 精查、单客户 1 小时/24 小时分页，10 并发、返回 100 行，P95 目标 ≤3 秒。`X-Request-Id` 辅助查询的 SQL 先用于联调，一期客户接口上线前还须压测客户+时间+该字段的检索路径；如现有排序键不达标，建设以客户和时间为前缀的检索结构，候选结果仍回查 `requests.has_conflict`，不能用辅助索引绕过去重和租户隔离。若不达标，记录方案阻塞并单独设计物化检索明细或预聚合，不绕过去重来换性能。
+日均约 1 亿事件意味着 30 天约 30 亿事件。类型化列将 JSON 解析成本移到写入阶段，也允许按列读取；但 `FINAL`、冲突检测、按请求关联及非排序键的客户筛选仍可能很贵。保留 `event_json` 会增加写入与存储成本，需与旧方案比较磁盘、写入 CPU 和查询延迟。一期采集子项验收先测 UUIDv4 单 ID 跨在线日期分区精查、单客户 1 小时/24 小时分页，10 并发、返回 100 行，P95 目标 ≤3 秒。`X-Request-Id` 辅助查询的 SQL 先用于联调，一期客户接口上线前还须压测客户+时间+该字段的检索路径；如现有排序键不达标，建设以客户和时间为前缀的检索结构，候选结果仍回查 `requests.has_conflict`，不能用辅助索引绕过去重和租户隔离。若不达标，记录方案阻塞并单独设计物化检索明细或预聚合，不绕过去重来换性能。
 
 ## 8. Consumer 落库与异常事件
 
 ### 8.1 消费处理顺序
 
 1. 使用独立 group `llm-metering-clickhouse-v1`，禁用自动提交。每分区顺序处理，允许不同分区并行。遇到 Consumer 尚不支持的 Kafka 事件 `schema_version`，立即暂停该分区，保留当前未提交 offset，报警并等待 Consumer 升级；其他分区可继续处理。
-2. 对已支持版本校验大小、schema、白名单、ID/类型后缀、开始时间、身份类型、token 类型和来源组合；只接受 `request_started`（:start）和 `usage_observed`（:usage）。start 出现非 null usage 一律拒绝；结果事件必须带有用量状态和终态标识，即使 token 未知也不能省略状态。若 `terminal_observed=false`，`request_finished_at_ms` 必须为 null。开始时间超出消费者当前时间 5 分钟以上进入拒绝诊断，不让远期分区无限保留；所有拒绝都有原因计数。
-3. 规范化并计算摘要，按 ID 时间确定 `request_date`，从同一个已校验的事件对象展开类型化列并准备 `events_raw` 行。校验 `event_id` 与 `logical_request_id`/`event_type` 一致，所有可空字段按原事件 null 写 SQL NULL，token source 不从数值猜测；类型化列与保留的 `event_json` 必须表达同一事件。不在 Consumer 中重新提取服务 usage、补估算或改变定稿。
+2. 对已支持版本校验大小、schema、白名单、ID 为规范小写 UUIDv4（`^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`）、Kafka key 与 ID 一致、ID/类型后缀、`request_started_at_ms` 为合法 Unix 毫秒、身份类型、token 类型和来源组合；只接受 `request_started`（:start）和 `usage_observed`（:usage）。start 出现非 null usage 一律拒绝；结果事件必须带有用量状态和终态标识，即使 token 未知也不能省略状态。若 `terminal_observed=false`，`request_finished_at_ms` 必须为 null。开始时间超出消费者当前时间 5 分钟以上进入拒绝诊断，不让远期分区无限保留；所有拒绝都有原因计数。
+3. 规范化并计算摘要，按 `request_started_at_ms` 的 UTC 日期确定 `request_date`，从同一个已校验的事件对象展开类型化列并准备 `events_raw` 行。校验 `event_id` 与 `logical_request_id`/`event_type` 一致，所有可空字段按原事件 null 写 SQL NULL，token source 不从数值猜测；类型化列与保留的 `event_json` 必须表达同一事件。不在 Consumer 中重新提取服务 usage、补估算或改变定稿。
 4. 每批最多 5000 行/4 MiB，或等待 1 秒即写入；同步 INSERT 确认后，才提交该分区连续成功记录的下一 offset。
 5. INSERT 部分成功或确认丢失时不提交，原批重试允许重复插入；查询去重保持结果一致。若使用 ClickHouse async insert，必须等待持久化确认，不能默认接纳即提交。
 6. rebalance 停止已撤销分区的新处理；未确认批次留待新 owner 重放，不能提交越过失败记录的 offset。
@@ -965,7 +995,7 @@ consumer:
   clickhouse_database: metering
 ```
 
-Secret 只通过挂载/环境引用，不写入 ConfigMap 或文档样例。Observer 配置可接纳的 adapter_id/config_version 白名单与插件配置一起发布，避免未知适配器被静默当通用 JSON。健康检查分 `/livez`（进程可运行）和 `/readyz`（可接纳观察）；Kafka 故障触发发送熔断和指标，不通过 liveness 造成无限重启风暴，除非 watchdog 已确认客户端不能释放。
+Secret 只通过挂载/环境引用，不写入 ConfigMap 或文档样例。Observer 为每个有效 Start 从 `crypto/rand` 取得 UUIDv4 所需随机字节；随机源失败时拒绝该观察流并报警，持续失败使 `/readyz` 不通过。Observer 配置可接纳的 adapter_id/config_version 白名单与插件配置一起发布，避免未知适配器被静默当通用 JSON。健康检查分 `/livez`（进程可运行）和 `/readyz`（可接纳观察）；Kafka 故障触发发送熔断和指标，不通过 liveness 造成无限重启风暴，除非 watchdog 已确认客户端不能释放。
 
 ### 9.3 EnvoyFilter 和服务发现
 
@@ -1095,7 +1125,7 @@ WASM 预置到带版本文件名的网关镜像或只读挂载，不运行时远
 
 1. 先按 Auth 方案部署 PostgreSQL、Auth 和测试 Key，在独立测试网关验证 ext_authz、身份 metadata、401/403/503、上游凭证与过滤器顺序。
 2. 验证 SDK/ABI、身份与路由、旁路故障、初始化失败；所有阻断项通过后才能灰度。
-3. 先发布 ClickHouse 和 Consumer，再发布 Observer；以合成事件验证表和 offset，再启用带 `metering-canary=true` 的少量网关、单路由。
+3. 先发布 ClickHouse（含冲突 ID 标记表）和 Consumer，再发布 Observer；以合成事件验证表和 offset，再启用带 `metering-canary=true` 的少量网关、单路由。
 4. 采集开关默认关闭，通过发布配置打开。监控相同请求负载下业务 P99 首包差值、错误率、RSS/CPU、drop 比例；累计至少 24 小时长流测试。
 5. 额外 P99 首包 >10 ms、业务错误率相对基线持续上升、在途/内存不回落时立即关闭采集；阈值观测窗口初值 5 分钟。
 6. 正常回退发布 `enabled=false`，必要时移除对应 EnvoyFilter patch；保存上一版网关镜像、WASM 和配置。配置 NACK 时验证实际生效版本，不能把控制面已提交当回退完成。关闭采集不关闭鉴权，Auth 回退按独立方案执行。
@@ -1141,9 +1171,9 @@ data: [DONE]
 | 分块上传、HTTP/1.1 与 HTTP/2、Content-Length、trailers | 头与正文定界正确，无累计正文重复；暂停、恢复、EOS 一致 |
 | 改写超限/超时/非法 JSON/重复键/断开/Observer 不可用 | 改写预算有界且释放；失败计数；旁路故障不阻止正常参数补充 |
 | 模型名 128/129/1024/1025 字节、多字节 UTF-8、JSON 转义 | ≤1024 字节端到端完整保留；超限为 null/invalid_model，不截断；两模型最大长度事件可入库 |
-| 正常 JSON / SSE / 空响应 / trailers | 响应正文 Continue、字节不变；计量 ID 响应头可见；消息序号、EOS 和终态一致 |
+| 正常 JSON / SSE / 空响应 / trailers | 响应正文 Continue、字节不变；Start ACK 先于响应头回调时计量 ID 可见，迟到时可缺失；消息序号、EOS 和终态一致 |
 | 有/无/重复/伪造的 X-Request-Id、超长或非法值 | 仅保存校验通过的网关可见值；记录固定 Envoy 对重复头的呈现；无效写 null，任何值都不作为主键或授权条件 |
-| 响应头计量 ID、上游伪造同名头、Observer 故障 | 白名单请求的 `X-Metering-Request-Id` 等于事件主键并覆盖上游值；旁路失败时仍尝试返回；不承诺事件已入库 |
+| 响应头计量 ID、上游伪造同名头、Observer 故障及 Start ACK 迟到 | 白名单请求清除上游同名头；仅当响应头回调前已收到有效 Start ACK 才返回 Observer ID，且等于事件主键；无 ACK 可缺失，有头也不承诺事件已入库 |
 | UTF-8、CRLF、data 多行跨片 | 与完整输入解析结果一致；网络片数不影响 token |
 | 工具调用、多候选、usage 空 choices | 提取顶层终结 usage，不按 choices[0] 或片段累加 |
 | prompt_tokens=0、缺失、负数、浮点、超 Int64 | 0 合法，缺失/非法为 null；异常原因可区分 |
@@ -1154,24 +1184,25 @@ data: [DONE]
 | 请求体大于回调/累计上限 | 读取前判超限；业务字节不丢；采集有界放弃 |
 | 不支持压缩/协议 | 元数据可记录，usage 未知，不尝试业务改写 |
 | 重复帧/序号跳跃/End 总量错误 | 关闭观察，partial/unknown；不制造完整结果 |
-| HTTP context 删除后 ACK 到达 | 仅 Root 状态被访问；无 use-after-delete、重复释放 |
+| HTTP context 删除后 ACK 到达 | 仅 Root 状态被访问；无 use-after-delete、重复释放；迟到 ID 不修改已发响应头 |
 | 无 End、End 丢失、Observer 崩溃 | 已定稿结果标记 terminal_observed=false、结束时间为空；若结果未发出，已有 start 仍可查询 |
 | 有 End 且 usage 完整，或有 End 但 usage 缺失 | 均只发送一条 `usage_observed` 结果，分别标记用量已知或未知；两种情况都不发送独立 finish 事件 |
 | 客户端断开/网关隐藏重试 | 不猜取消责任；不宣称每次尝试的用量已覆盖 |
 | start 写 Kafka 失败但合并结果成功 | 结果自带快照可查请求，start_variants=0 |
 | 同 ID 同内容重复、INSERT 成功 commit 失败 | 事件/请求/有效 token 不增加，后台 merge 前也正确 |
-| 同 ID 不同内容，先后到达及后台 merge | 保留两个变体；有效视图排除；不能先筛客户藏掉冲突 |
+| 同 UUID 不同内容、跨 UTC 日期，先后到达及后台 merge | 按 UUID 跨日期保留并识别变体；有效视图排除；冲突标记持续到剩余在线窗口结束，不能先筛客户藏掉冲突 |
 | 两事件身份快照不同 | requests.has_conflict=1，不选任意客户归属 |
 | 两事件 X-Request-Id 不同、同 X-Request-Id 多次请求 | 前者隔离为冲突；后者保持不同 logical_request_id，辅助查询返回多个候选 |
 | 空 usage / SQL Nullable / 只有 start | SQL 不把 null 变零，不把两条事件计为两次请求 |
-| 跨 UTC 午夜、TTL 边界、超过 30 天重放 | 分区按开始日；无冲突因单变体早到期而复活 |
+| 跨 UTC 午夜、TTL 边界、超过 30 天重放 | 分区按 `request_started_at_ms` 的 UTC 开始日；跨日期同 UUID 冲突全局可见，冲突标记跨原始行到期仍保留至在线窗口结束 |
+| 多 Observer Pod、进程重启、并发 Start、随机源故障 | 每个有效 Start 从安全随机源生成独立 UUIDv4；故障拒绝该观察且不回退由网关生成 ID；同流两事件和所有 ACK 的 ID 一致 |
 | 已支持 schema 下的永久非法事件/正文混入事件 | 拒绝表只有坐标/摘要/原因，不保存原 payload；未知版本须暂停分区 |
 | Producer 黑洞/metadata 故障/确认丢失 | 有界执行槽；watchdog 可释放；uncertain 不重发 |
 | Consumer 遇到未知 Kafka `schema_version` | 暂停对应分区、不提交该 offset 并报警；升级后原位恢复，其他分区可继续 |
 | Consumer 遇到永久非法事件 | 有限诊断成功落库后才提交 offset，不保存原 payload |
 | 独立网关基数缺失 | 完整率未知，不用结果/开始比例替代 |
 
-SDK 单元测试验证 hostcall 签名和回调注册/清理；标准 Protobuf 与 WASM 编解码器做 golden 互操作测试；SQL 测试在目标 ClickHouse 版本执行全套 DDL、插入合成事件并在 merge 前后比较结果。数据库测试还须核对规范 JSON 与类型化列逐字段一致，覆盖合法 0、缺失/null、start 无 usage、同 ID 同摘要重放及同 ID 不同摘要冲突，并用 EXPLAIN 核查请求 ID 精查、客户分页与冲突隔离的实际扫描量。不能只用 SDK mock 代替真实 Envoy 测试。
+SDK 单元测试验证 hostcall 签名和回调注册/清理；标准 Protobuf 与 WASM 编解码器做 golden 互操作测试；SQL 测试在目标 ClickHouse 版本执行全套 DDL、插入合成事件并在 merge 前后比较结果。数据库测试还须核对规范 JSON 与类型化列逐字段一致，覆盖合法 0、缺失/null、start 无 usage、同 UUID 同摘要重放及同 UUID 跨日期不同摘要冲突、原始行先后到期后冲突标记持续有效，并用 EXPLAIN 核查请求 ID 精查、客户分页与冲突隔离的实际扫描量。不能只用 SDK mock 代替真实 Envoy 测试。
 
 ### 11.3 容量与性能验收
 

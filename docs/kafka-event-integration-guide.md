@@ -12,7 +12,7 @@
 | 事件类型 | `request_started` 与 `usage_observed`；不存在独立的 `request_finished` |
 | 事件大小 | JSON 序列化后最多 32 KiB |
 | 保留时间 | 设计初值 72 小时；应用应监控消费延迟，超出保留期无法靠 Kafka 补齐 |
-| 消费组 | 每个下游应用使用自己的 group ID；不要复用 ClickHouse Consumer 的 `llm-metering-clickhouse-v1` |
+| 消费组 | 每个下游应用使用自己的 group ID；不要复用 Doris Consumer 的 `llm-metering-doris-v1` |
 | 权限与连接 | 申请 Topic 读取、消费组权限，以及实际集群的 Broker 地址和 TLS/SASL 配置；密钥通过环境或 Secret 注入 |
 
 一次符合采集条件的逻辑请求最多形成两种事件：
@@ -156,7 +156,7 @@ UUIDv4 不包含时间。`request_started_at_ms` 仍由网关观察并作为事�
 }
 ```
 
-Kafka record 的 key 是上述 `logical_request_id`，不在 JSON 内另设 `kafka_key`。Kafka topic、partition、offset 和消费时间是传输/消费元数据，不属于事件 JSON；ClickHouse 的 `payload_hash`、`event_json`、`ingested_at` 等也是消费后产生的列，不要求上游事件携带。
+Kafka record 的 key 是上述 `logical_request_id`，不在 JSON 内另设 `kafka_key`。Kafka topic、partition、offset 和消费时间是传输/消费元数据，不属于事件 JSON；Doris 的 `payload_hash`、`identity_hash`、`event_json`、`ingested_at` 等也是消费后产生的列，不要求上游事件携带。
 
 ## 4. 消费处理顺序
 

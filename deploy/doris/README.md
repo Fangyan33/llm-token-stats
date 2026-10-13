@@ -1,0 +1,40 @@
+# Apache Doris 本地验证
+
+本目录使用 Apache Doris 4.1.3 官方 all-in-one 镜像，提供单 FE、单 BE 的开发/测试环境。生产环境应使用 Doris Operator 或独立 FE/BE 集群，按容量测试确定副本、分桶和资源配置。
+
+在仓库根目录启动：
+
+~~~sh
+docker compose -f deploy/doris/compose.yaml up -d --wait
+docker compose -f deploy/doris/compose.yaml exec doris mysql -uroot -h127.0.0.1 -P9030 -e "SHOW FRONTENDS; SHOW BACKENDS;"
+docker compose -f deploy/doris/compose.yaml exec -T doris mysql -uroot -h127.0.0.1 -P9030 < migrations/doris/metering/001_init.sql
+docker compose -f deploy/doris/compose.yaml exec doris mysql -uroot -h127.0.0.1 -P9030 -e "SHOW TABLES FROM metering;"
+~~~
+
+宿主机 SQL 连接：127.0.0.1:9030（MySQL 协议）；Stream Load：FE 8030，BE 8040。FE 会将 Stream Load 重定向至 BE；Docker Desktop 宿主机可能无法访问容器内部 BE 地址，联调时从 compose 网络内发起请求或使用可直达的 BE 地址。所有写入时间和 SQL 会话使用 UTC。
+
+Schema 采用 Unique Key (request_date, logical_request_id, event_id, payload_hash)：同内容重放覆盖同一键，不同摘要保留冲突证据。31 天和 30 天分区由 Doris 动态分区管理；部署后在 metering 数据库执行 SHOW DYNAMIC PARTITION TABLES，确认 State 为 NORMAL 且分区持续创建、过期删除。request_conflict_ids 长期保留 UUIDv4 冲突标记，避免较早证据过期后剩余变体重新变为有效用量。
+
+Consumer 仍需由后续工作包实现。写入建议采用 Stream Load：每批固定 label，Expect: 100-continue、format: json、read_json_by_line: true、max_filter_ratio: 0、timezone: +00:00，检查响应 Status、行数和可见性后再提交 Kafka offset。label 保留期有限，长期重放依赖 Unique Key；不同内容仍必须保留为独立变体。未知 schema 版本暂停对应 Kafka 分区。
+
+本示例不自动执行 migration；避免服务启动时以 root 反复改表。生产采用受控迁移与独立账号。
+
+参考：[Doris all-in-one 镜像](https://doris.apache.org/community/developer-guide/all-in-one-image/)、[Unique Key 模型](https://doris.apache.org/docs/4.x/table-design/data-model/unique/)、[动态分区](https://doris.apache.org/docs/4.x/table-design/data-partitioning/dynamic-partitioning/)、[Stream Load](https://doris.apache.org/docs/4.x/key-features/stream-load/)。
+
+## Kubernetes 开发环境
+
+单节点示例在 deploy/doris/doris.yaml，使用 StatefulSet 保存 FE 元数据和 BE 数据，服务名为 doris。集群需要默认 StorageClass。部署后先检查 BE Alive，再手动执行 migration；FE 的 HTTP 健康检查只能表明 FE 可用。
+
+~~~sh
+kubectl apply -f deploy/doris/doris.yaml
+kubectl rollout status statefulset/doris --timeout=5m
+kubectl exec doris-0 -- mysql -uroot -h127.0.0.1 -P9030 -e "SHOW FRONTENDS; SHOW BACKENDS;"
+kubectl exec -i doris-0 -- mysql -uroot -h127.0.0.1 -P9030 < migrations/doris/metering/001_init.sql
+kubectl exec doris-0 -- mysql -uroot -h127.0.0.1 -P9030 -e "USE metering; SHOW DYNAMIC PARTITION TABLES;"
+~~~
+
+集群内 SQL 地址为 doris:9030。这个无密码单节点示例仅用于隔离的开发命名空间；生产须使用 Doris Operator 或独立 FE/BE 集群、独立账户和 Secret 管理。
+
+## 从现有 ClickHouse 切换
+
+若已部署 ClickHouse，先保留旧库及 Kafka 消费进度快照。把仍在 Kafka 保留窗口内的事件按原内容重放到 Doris；更早的在线明细需从旧库按规范事件和类型化字段迁入，重算摘要与身份快照，并保持原请求日期。先迁移旧库的持久冲突 UUID 标记，再比较每日期事件键数、有效请求数、token 总量、冲突 UUID 和拒绝诊断数；确认 Doris 查询与水位后再切换读流量。旧库保留到在线窗口和回退期限结束，历史数据不能由空的新库自动恢复。

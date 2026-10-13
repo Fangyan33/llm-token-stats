@@ -87,13 +87,13 @@ flowchart LR
     G --> A[服务 A]
     W -. 异步 gRPC，失败丢弃 .-> O[独立观察者服务]
     O -->|Kafka producer| K[Kafka：72 小时]
-    K --> C[独立 ClickHouse Consumer]
-    C --> D[ClickHouse 明细与后续汇总]
+    K --> C[独立 Doris Consumer]
+    C --> D[Doris 明细与后续汇总]
 ~~~
 
 **业务：调用方 → ingressgateway ext_authz → 网关内 Wasm/router → A。**Auth 是新增同步鉴权调用，只接收请求头属性、不代理业务正文；Wasm 位于既有 Envoy 进程内，独立观察者服务不在业务路由中。
 
-**计量数据链路：Wasm 回调 → 异步 gRPC 观察流 → Observer 解析和估算 → Kafka producer → Kafka → 独立 ClickHouse Consumer → ClickHouse。**归档属于一期后续设计，不在当前 Consumer 的职责中。
+**计量数据链路：Wasm 回调 → 异步 gRPC 观察流 → Observer 解析和估算 → Kafka producer → Kafka → 独立 Doris Consumer → Doris。**归档属于一期后续设计，不在当前 Consumer 的职责中。
 
 不把 VirtualService 的业务目的地改为 Observer，不为统计修改上游重试、取消或超时策略，也不将镜像请求发送给模型再推理一次。鉴权结果决定请求是否进入业务路由；计量统计结果不参与鉴权、路由或响应生成。
 
@@ -113,7 +113,7 @@ flowchart LR
 | Wasm 结束回调 | 报告可观察的终态与最后序号；不等待观察者响应，不延长业务流生命周期 |
 | Observer | 收到有效 Start 后生成 UUIDv4 格式的 logical_request_id 并在 ACK 中回传；接收片段、解析 JSON/SSE、检查缺段、提取 usage、执行有界 token 估算 |
 | Observer 内 producer | 只把结构化计量事件写入 Kafka；不把正文片段写入 Kafka |
-| ClickHouse Consumer | 独立消费 Kafka，校验与规范化事件、计算内容摘要、写入 ClickHouse 并在确认后提交 offset；不负责归档或重新估算 |
+| Doris Consumer | 独立消费 Kafka，校验与规范化事件、计算内容摘要、写入 Doris 并在确认后提交 offset；不负责归档或重新估算 |
 
 Wasm 不做重型 tokenizer 运算，不缓存完整长响应。除对目标流式请求设置 `stream_options.include_usage=true`、在及时取得 Observer ID 时添加计量查询 ID 响应头外，不修改其他业务字段或响应正文，也不发送本地错误来代替业务响应。Observer 不承担转发业务、代替模型生成、管理重试或传播取消。
 
@@ -135,7 +135,7 @@ Wasm 不做重型 tokenizer 运算，不缓存完整长响应。除对目标流�
 - 不把 gRPC 底层缓冲当作无限队列；需验证取消后内存释放，以及慢接收端不会造成网关资源持续增长。
 - 不重传丢失的片段，不落盘，不在恢复后补发。片段缺失不能伪装成完整计量。
 
-正文只经过有限内存和旁路网络，Observer 完成定稿或放弃后释放；Kafka、ClickHouse 和归档只保存计量字段。
+正文只经过有限内存和旁路网络，Observer 完成定稿或放弃后释放；Kafka、Doris 和归档只保存计量字段。
 
 ### 3.4 请求结束后的上下文生命周期
 
@@ -169,9 +169,9 @@ Observer 以 Kubernetes 1.22 支持的普通 Deployment / Service 部署，用 K
 
 Observer/Kafka 不可用只丢计量，不改变业务流。业务没有新代理一跳，资源仍需为旁路正文吞吐、活跃解析状态和 tokenizer 计算单独测算。
 
-### 3.8 Kafka 到 ClickHouse
+### 3.8 Kafka 到 Doris
 
-ClickHouse Consumer 是与 Observer 分开部署的 Go Deployment，不在业务请求路径中。它使用独立消费组读取 `llm-metering-events`，校验 `schema_version` 与事件字段，规范化并计算 `payload_hash`，写入 ClickHouse；写入确认后才提交 Kafka offset。重放由事件 ID 与内容摘要识别重复或冲突。未知 schema 版本暂停对应分区、报警并等待 Consumer 升级，不能当永久非法事件跳过；永久非法事件按有限诊断规则处理。归档链路另行设计，不属于当前 Consumer。[采集开发方案第 8 节](gateway-request-collection-implementation.md#8-consumer-落库与异常事件)
+Doris Consumer 是与 Observer 分开部署的 Go Deployment，不在业务请求路径中。它使用独立消费组读取 `llm-metering-events`，校验 `schema_version` 与事件字段，规范化并计算 `payload_hash`，写入 Doris；写入确认后才提交 Kafka offset。重放由事件 ID 与内容摘要识别重复或冲突。未知 schema 版本暂停对应分区、报警并等待 Consumer 升级，不能当永久非法事件跳过；永久非法事件按有限诊断规则处理。归档链路另行设计，不属于当前 Consumer。[采集开发方案第 8 节](gateway-request-collection-implementation.md#8-consumer-落库与异常事件)
 
 ## 4. 一次请求最多产生两条记录
 
@@ -274,10 +274,10 @@ LiteLLM 的计数工具及部分流式聚合路径可作为分词兜底参考，
 | 事件身份 | `event_id`、`event_type`、`schema_version`、`producer_id`；`event_type` 仅为 `request_started` 或 `usage_observed` |
 | 请求/观察 | `logical_request_id`、`x_request_id`、`observation_id`、`observation_scope`、`service_id`、`api_key_id`、`customer_id`、`application_id`、`identity_status` |
 | 模型 | `request_model`、`response_model`；独立模型版本字段如计费需要，在一期后续明确并升级 schema |
-| 时间 | `request_started_at_ms`、`request_finished_at_ms`、`observation_ended_at_ms`、`event_created_at_ms`、`ingested_at`；前四项为 Unix 毫秒，最后一项为 ClickHouse 入库时间 |
+| 时间 | `request_started_at_ms`、`request_finished_at_ms`、`observation_ended_at_ms`、`event_created_at_ms`、`ingested_at`；前四项为 Unix 毫秒，最后一项为 Doris 入库时间 |
 | 结果 | `http_status`、`business_outcome`、`terminal_observed`、`observation_status`、`upstream_attempt_count`、`anomaly_codes` |
 | 用量 | `usage_status`、`usage_eligible`、`input_tokens`、`output_tokens`、`cached_read_tokens`、`cached_write_tokens`、`reasoning_tokens`、`reported_total_tokens`；仅 `usage_observed` 携带用量，可空 |
-| 依据 | Kafka `usage` 子对象中的 `{value, source}`，ClickHouse 中各 token 列及其 `_source` 列；`raw_usage_json`、`raw_usage_truncated`、`adapter_id`、`config_version`；tokenizer/模板/估算器版本为一期估算子项的待定扩展 |
+| 依据 | Kafka `usage` 子对象中的 `{value, source}`，Doris 中各 token 列及其 `_source` 列；`raw_usage_json`、`raw_usage_truncated`、`adapter_id`、`config_version`；tokenizer/模板/估算器版本为一期估算子项的待定扩展 |
 | 归属准备 | 用户正常消耗、平台重试/故障消耗、待核对；一期不扣款 |
 | 扩展 | `measurement_unit`、多模态扩展项及平台元数据引用 |
 
@@ -289,21 +289,21 @@ LiteLLM 的计数工具及部分流式聚合路径可作为分词兜底参考，
 
 消费者落库成功但提交消费位置失败后，可能重复读取事件。重放保持 event_id 和原内容不变，不能因为去掉事后变更功能就去掉幂等处理。
 
-一期使用一个原始事件 topic `llm-metering-events`，按 `logical_request_id` 选择分区；当前仅 ClickHouse Consumer 消费并落库。归档属于一期后续设计，届时另行定义其消费、offset 与故障恢复契约。开始和结果事件分别按 event_id 去重，token 只累计去重后的结果事件。
+一期使用一个原始事件 topic `llm-metering-events`，按 `logical_request_id` 选择分区；当前仅 Doris Consumer 消费并落库。归档属于一期后续设计，届时另行定义其消费、offset 与故障恢复契约。开始和结果事件分别按 event_id 去重，token 只累计去重后的结果事件。
 
 同一 `event_id`、相同内容视为重复；同一 `event_id`、不同内容为事件冲突。同一 UUIDv4 的开始/结果时间或身份快照不一致属于请求冲突；两类冲突均跨日期隔离报警，不覆盖或重复相加。归一化结果也应在重放时确定一致。
 
-Kafka 事务或 producer 去重不自动保证外部 ClickHouse 写入恰好一次，落库与消费进度必须配合验证。[Kafka 投递语义][7]
+Kafka 事务或 producer 去重不自动保证外部 Doris 写入恰好一次，落库与消费进度必须配合验证。[Kafka 投递语义][7]
 
-### 7.3 ClickHouse 与汇总
+### 7.3 Doris 与汇总
 
-在线以类型化列保存不可变事件，保留规范事件 JSON 供冲突核验；请求/观察视图基于类型化列关联，不在常规查询中反复解析 JSON，保留 30 天。物理写入可能重复，查询必须按事件 ID 与内容摘要去重，并隔离同一事件 ID 的不同内容，不能仅等待后台合并。
+在线以类型化列保存事件，保留规范事件 JSON 供冲突核验；请求/观察视图基于类型化列关联，不在常规查询中反复解析 JSON，产品在线窗口为 30 天。Doris Unique Key 包含请求日期、请求 ID、事件 ID 与内容摘要：同内容重放落在同一键，不同内容保留为冲突变体。
 
-如用 ReplacingMergeTree 消除相同事件重复，排序键需包含内容摘要以保留冲突变体，查询使用 FINAL 或等价去重；事件 ID 是逻辑键，不是 ClickHouse 的即时唯一约束。这里用于幂等，不承载多版本业务用量。分区、分片和排序键应保证同一事件的位置一致，类型化写入成本及查询性能都需要压测。[ClickHouse 去重机制][8]
+Doris Unique Key 的 Merge-on-Write 用于同内容重放幂等，不承载多版本业务用量；事件与请求冲突仍需跨在线分区按 UUID 检测，并长期保留冲突标记。分区、分桶和请求关联的查询性能须在目标集群压测。[Doris Unique Key][8]
 
 小时统计从去重后的结果事件生成，日统计由有效小时统计生成；周期刷新受新到达事件影响的桶，查询只读完整发布的汇总批次。逻辑请求按请求 ID 计一次，不能把两条事件计为两次调用。
 
-不将可能重复的原始插入直接接到求和物化视图；源表后台去重不会自动抵消已累加的重复值。一期按去重明细生成汇总，刷新周期以 60 秒可见目标为约束。[物化视图机制][9]
+不将重放事件直接接到求和物化视图；冲突到达后也必须能撤销或重算受影响汇总。一期后续汇总子项从已隔离冲突的有效明细构建可重算批次，刷新周期以 60 秒可见目标为约束。[Doris 异步物化视图][9]
 
 三个口径分开：
 
@@ -315,7 +315,7 @@ Kafka 事务或 producer 去重不自动保证外部 ClickHouse 写入恰好一�
 
 ## 8. 归档与查询
 
-一期后续归档能力计划将原始计量事件保存到对象存储 1 年；当前采集到 ClickHouse 的开发方案不包含归档 Consumer、归档写入或历史检索实现。归档事件没有正文，不能重新分词，也只能恢复已采集事件。
+一期后续归档能力计划将原始计量事件保存到对象存储 1 年；当前采集到 Doris 的开发方案不包含归档 Consumer、归档写入或历史检索实现。归档事件没有正文，不能重新分词，也只能恢复已采集事件。
 
 提供：
 
@@ -388,7 +388,7 @@ Kafka 事务或 producer 去重不自动保证外部 ClickHouse 写入恰好一�
            + 结果事件数 × 合并结果事件大小
 ~~~
 
-Kafka 按 72 小时保留并配足磁盘，避免更小的字节上限提前清理。队列副本、ClickHouse 副本/索引、归档压缩和汇总空间分开测算。
+Kafka 按 72 小时保留并配足磁盘，避免更小的字节上限提前清理。队列副本、Doris 副本/索引、归档压缩和汇总空间分开测算。
 
 ### 10.3 网关与 Observer 容量
 
@@ -409,7 +409,7 @@ Kafka 按 72 小时保留并配足磁盘，避免更小的字节上限提前清�
 
 两类事件均来自同一 Wasm → Observer 采集路径，不能用“已收到结果 / 已收到开始”证明没有漏采。独立基数不可靠时，真实完整率标记未知。
 
-展示网关同口径请求数、已记录逻辑请求数、观察结果覆盖情况、上报/估算/未知比例、发送失败/不确定计数和 ClickHouse 消费延迟；归档上线后另展示归档延迟。请求有记录不代表用量已知，计数差也不能还原漏掉的 token。
+展示网关同口径请求数、已记录逻辑请求数、观察结果覆盖情况、上报/估算/未知比例、发送失败/不确定计数和 Doris 消费延迟；归档上线后另展示归档延迟。请求有记录不代表用量已知，计数差也不能还原漏掉的 token。
 
 正常与故障时段分别展示并保留全日结果。日均 5,000 万的 0.01% 对应 5,000 次缺失预算，不等于允许重复累计。
 
@@ -462,7 +462,7 @@ Kafka 按 72 小时保留并配足磁盘，避免更小的字节上限提前清�
 - [固定 Wasm 回调与发送实现][13]、[Wasm 失败策略][14]、[Proxy-Wasm ABI][15]、[Istio WasmPlugin 转换][16]
 - [Kafka producer 配置][4]、[Kafka 投递语义][7]
 - [LiteLLM tokenizer 文档][5]、[流式聚合源码][6]
-- [ClickHouse 去重机制][8]、[物化视图机制][9]
+- [Doris Unique Key][8]、[Doris 异步物化视图][9]
 
 [1]: https://github.com/istio/istio/blob/1.13.5/pilot/pkg/networking/core/v1alpha3/accesslog.go
 [2]: https://github.com/istio/istio/blob/1.13.5/istio.deps
@@ -471,8 +471,8 @@ Kafka 按 72 小时保留并配足磁盘，避免更小的字节上限提前清�
 [5]: https://docs.litellm.ai/docs/completion/token_usage
 [6]: https://github.com/BerriAI/litellm/blob/main/litellm/litellm_core_utils/streaming_chunk_builder_utils.py
 [7]: https://kafka.apache.org/41/design/design/
-[8]: https://clickhouse.com/docs/concepts/features/operations/update/replacing-merge-tree
-[9]: https://clickhouse.com/docs/concepts/features/materialized-views/incremental-materialized-view
+[8]: https://doris.apache.org/docs/4.x/table-design/data-model/unique/
+[9]: https://doris.apache.org/docs/4.x/sql-manual/sql-statements/table-and-view/async-materialized-view/CREATE-ASYNC-MATERIALIZED-VIEW/
 [10]: https://github.com/istio/envoy/blob/e2e40d8d667e1b7c752d27980307f22d9f73e9ee/VERSION
 [11]: https://github.com/istio/proxy/blob/725ec273d665639aa9f6e0e9014af562a457c2f4/bazel/extension_config/extensions_build_config.bzl
 [12]: https://github.com/istio/envoy/blob/e2e40d8d667e1b7c752d27980307f22d9f73e9ee/api/envoy/extensions/filters/http/ext_proc/v3/ext_proc.proto

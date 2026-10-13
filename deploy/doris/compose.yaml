@@ -1,0 +1,13 @@
+services:
+  doris:
+    image: apache/doris:all-in-one-4.1.3
+    ports:
+      - "127.0.0.1:9030:9030"
+      - "127.0.0.1:8030:8030"
+      - "127.0.0.1:8040:8040"
+    volumes:
+      - doris-fe-meta:/opt/apache-doris/fe/doris-meta
+      - doris-be-storage:/opt/apache-doris/be/storage
+volumes:
+  doris-fe-meta:
+  doris-be-storage:

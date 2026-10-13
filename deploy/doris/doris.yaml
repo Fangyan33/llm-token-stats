@@ -1,0 +1,78 @@
+# Single-node development fixture. Use Doris Operator and multiple FE/BE nodes in production.
+apiVersion: v1
+kind: Service
+metadata:
+  name: doris
+spec:
+  clusterIP: None
+  selector:
+    app: doris
+  ports:
+    - name: mysql
+      port: 9030
+      targetPort: mysql
+    - name: fe-http
+      port: 8030
+      targetPort: fe-http
+    - name: be-http
+      port: 8040
+      targetPort: be-http
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: doris
+spec:
+  serviceName: doris
+  replicas: 1
+  selector:
+    matchLabels:
+      app: doris
+  template:
+    metadata:
+      labels:
+        app: doris
+    spec:
+      terminationGracePeriodSeconds: 120
+      containers:
+        - name: doris
+          image: apache/doris:all-in-one-4.1.3
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: mysql
+              containerPort: 9030
+            - name: fe-http
+              containerPort: 8030
+            - name: be-http
+              containerPort: 8040
+          startupProbe:
+            httpGet:
+              path: /api/health
+              port: fe-http
+            periodSeconds: 5
+            failureThreshold: 60
+          readinessProbe:
+            httpGet:
+              path: /api/health
+              port: fe-http
+            periodSeconds: 5
+          volumeMounts:
+            - name: fe-meta
+              mountPath: /opt/apache-doris/fe/doris-meta
+            - name: be-storage
+              mountPath: /opt/apache-doris/be/storage
+  volumeClaimTemplates:
+    - metadata:
+        name: fe-meta
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests:
+            storage: 10Gi
+    - metadata:
+        name: be-storage
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests:
+            storage: 20Gi

@@ -489,7 +489,7 @@ Auth 成功响应删除下游 Authorization。若模型服务需要独立凭证�
 | 3 | ext_authz 数据面 | Check API、状态和 scope 校验、固定响应、metadata 通过 |
 | 4 | 缓存与失效 | 有界缓存、NOTIFY/revision/TTL、吊销传播和 DB 故障验证通过 |
 | 5 | Istio 接入 | 固定版本字段、filter 顺序、mTLS、网络策略和全路径保护通过 |
-| 6 | 采集联调 | 身份快照进入 Kafka/ClickHouse，伪造头无效，拒绝请求不进入采集 |
+| 6 | 采集联调 | 身份快照进入 Kafka/Doris，伪造头无效，拒绝请求不进入采集 |
 | 7 | 压测与灰度 | 峰值两倍、故障注入、轮换、扩缩容、回退和安全检查归档 |
 
 ## 14. 待环境确认项

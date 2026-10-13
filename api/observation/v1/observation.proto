@@ -1,6 +1,6 @@
 syntax = "proto3";
 package metering.v1;
-option go_package = "example.com/llm-token-stats/gen/observation/v1;observationv1";
+option go_package = "github.com/Fangyan33/llm-token-stats/gen/observation/v1;observationv1";
 
 service ObservationService {
   rpc Observe(stream ObservationFrame) returns (stream ObservationAck);

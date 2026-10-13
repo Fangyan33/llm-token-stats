@@ -1,0 +1,48 @@
+# 网关数据采集组件实现计划
+
+确认日期：2026-10-13。依据 V1.9 采集方案及设计闭环清单。
+
+## 目标
+
+实现 Wasm → 双向 gRPC → Observer → Kafka → Consumer → Doris，交付可构建组件、部署模板和可复现本地联调。Auth 使用合成可信元数据；估算、汇总 Worker、查询 API、门户和计费属于后续工作。
+
+## 已确认决策
+
+- 真实旧版 Envoy PoC 后补充确认：请求头 Continue，正文有界 Pause/改写；允许头提前到上游，保持 usage 参数唯一改写及失败透传。
+- 旧版 Root 异步恢复后无法证明观察尾片完整，超时只恢复业务原文并取消观察，结果保留 partial/unknown。
+- 固定 franz-go 的 RecordRetries 使用 1 表示仅首次尝试，0 会阻止首次发送。
+
+- trailers 回调发送一次零字节 BodyChunk 标记对应方向 EOS，不上传 trailers 内容；End 保持严格一致性校验。
+- 新增 Doris 配套迁移，持久保存分区消费起点和保留期缺口。
+- 根模块 github.com/Fangyan33/llm-token-stats；插件独立模块，replace 引用固定 SDK v0.24.0 副本。
+- 仅 request_started、usage_observed 两类事件；未知用量为 null/unknown，不估算、不补零。
+
+## 实施顺序
+
+1. 共享事件类型、严格 JSON/wire 校验、规范编码和摘要；固定生成工具，更新 go_package，生成标准 Protobuf 代码并做 golden 对照。
+2. SDK gRPC hostcall/回调、Root token 注册和删除清理；有界插件编解码、入口过滤、独立请求改写、ACK/预算/deadline 状态机和响应计量头。
+3. Observer 有界 JSON/SSE 解析、一次 UUID 分配与定稿；ACK 独立于非阻塞 Kafka Producer，固定资源限额及 watchdog。
+4. Consumer 单分区顺序处理；冻结批次 → 原始/拒收表可见 → 跨在线分区冲突标记 → 日期通知可见 → 批次凭据可见 → 提交下一 offset。实现起点、缺口、rebalance 和分钟补偿巡检。
+5. 镜像、默认关闭部署模板、构建与 ABI 检查、CI、容器化真实网关/Kafka/Doris 联调及运行说明。
+
+## 接口与故障约束
+
+- 协议服务名、字段号和事件 schema v1 保持不变；可选事件字段显式输出 null，固定 struct 编码和 SHA-256 摘要。
+- Wasm 在可信路由/启用/POST/精确路径过滤后才读取身份正文、分配观察资源。改写只编辑 include_usage，超时/超限恢复透传；正文前缀只观察一次。
+- ACK 只确认已处理帧，不等待 Kafka；发送失败不补发，无正文持久化或恢复队列。
+- Consumer 未知 schema 暂停该分区；永久非法消息仅保存坐标/摘要/固定原因。事务未知须确认原 label，凭据只发送到允许的 FE/BE。
+- 新消费组先持久登记最早可用 offset；已有组缺少可信起点需显式接管配置。保留期缺口登记后暂停，显式恢复，不跳到最新。
+- 凭据、起点、缺口及通知本轮不清理；不把 MAX(offset) 当连续水位，不宣称缺口为零。
+- 服务提供 --config、健康检查和指标；凭据通过环境/挂载文件，日志不得含正文或密钥。
+
+## 验收
+
+- 原有 Python 契约检查及 20 项测试；新增 Go/Python 编码摘要 golden、标准/手工 Protobuf 互操作及畸形帧。
+- 插件过滤、改写差异、慢上传/边界/trailers、预算释放、超时和迟到回调；JSON/SSE 任意字节切片、工具/多候选、零值/unknown、模型长度和候选冲突。
+- Kafka 黑洞、Stream Load 确认丢失、逐屏障失败/崩溃、重放、rebalance、跨日期/身份冲突、未知版本和缺口恢复。
+- 三个组件产物构建成功；真实本地链路验证入库、去重、隔离、通知/凭据与 offset。mock 不代替网关测试。
+- 私有 Istio 1.13.5 兼容性、生产容量、24 小时压测与灰度按 G0–G5 单独验收。固定 SDK/运行时失败保留证据，不自动换架构。
+
+## 实施状态
+
+组件实现、构建与真实本地联调已完成，结果及限制记录在[组件运行说明](../../docs/collection-components.md)。生产 G0–G5 和运行说明列出的故障/容量验收仍待执行；本计划不代替生产发布批准。

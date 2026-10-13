@@ -1,6 +1,7 @@
+/dist/
 /bin/
 /.tmp/
 .env
-
 __pycache__/
 *.pyc
+/.private/

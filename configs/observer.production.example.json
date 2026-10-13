@@ -1,0 +1,20 @@
+{
+  "kafka": {
+    "bootstrap_servers": ["kafka.kafka.svc.cluster.local:9093"],
+    "topic": "llm-metering-events",
+    "ca_file": "/secrets/kafka/ca.crt",
+    "username_env": "KAFKA_USERNAME",
+    "password_env": "KAFKA_PASSWORD"
+  },
+  "observer": {
+    "listen": ":9090",
+    "health_listen": ":9091",
+    "max_connections": 128,
+    "max_active_streams": 4096,
+    "parser_budget_bytes": 268435456,
+    "max_observation_ms": 605000,
+    "accepted_config_versions": ["collection-v1"],
+    "accepted_adapter_ids": ["chat_completions_v1"],
+    "accepted_routes": [{"route_name": "llm-chat", "service_id": "model-service-a"}]
+  }
+}

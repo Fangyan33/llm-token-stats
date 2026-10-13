@@ -1,0 +1,28 @@
+{
+  "kafka": {
+    "bootstrap_servers": ["kafka.kafka.svc.cluster.local:9093"],
+    "topic": "llm-metering-events",
+    "ca_file": "/secrets/kafka/ca.crt",
+    "username_env": "KAFKA_USERNAME",
+    "password_env": "KAFKA_PASSWORD"
+  },
+  "consumer": {
+    "health_listen": ":9092",
+    "group_id": "llm-metering-doris-v1",
+    "max_batch_rows": 5000,
+    "max_batch_bytes": 4194304,
+    "flush_interval_ms": 1000,
+    "accepted_config_versions": ["collection-v1"],
+    "accepted_routes": [{"route_name": "llm-chat", "service_id": "model-service-a"}],
+    "initial_offsets": [],
+    "gap_resume_offsets": []
+  },
+  "doris": {
+    "fe_url": "http://doris-fe.doris.svc.cluster.local:8030",
+    "allowed_load_hosts": ["doris-fe.doris.svc.cluster.local:8030", "doris-be-0.doris-be.doris.svc.cluster.local:8040"],
+    "database": "metering",
+    "dsn_env": "DORIS_DSN",
+    "username_env": "DORIS_USER",
+    "password_env": "DORIS_PASSWORD"
+  }
+}

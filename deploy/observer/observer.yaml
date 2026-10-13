@@ -1,0 +1,38 @@
+# Render image/config/secret values before use. Kafka config references mounted CA.
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: metering-observer, namespace: metering}
+spec:
+  replicas: 2
+  selector: {matchLabels: {app: metering-observer}}
+  template:
+    metadata: {labels: {app: metering-observer}}
+    spec:
+      containers:
+        - name: observer
+          image: REPLACE_OBSERVER_IMAGE_DIGEST
+          args: [--config, /config/observer.json]
+          ports: [{name: grpc, containerPort: 9090}, {name: health, containerPort: 9091}]
+          env:
+            - name: POD_UID
+              valueFrom: {fieldRef: {fieldPath: metadata.uid}}
+            - name: KAFKA_USERNAME
+              valueFrom: {secretKeyRef: {name: metering-kafka-sasl, key: username}}
+            - name: KAFKA_PASSWORD
+              valueFrom: {secretKeyRef: {name: metering-kafka-sasl, key: password}}
+          resources: {requests: {cpu: '500m', memory: 256Mi}, limits: {cpu: '2', memory: 1Gi}}
+          readinessProbe: {httpGet: {path: /readyz, port: health}}
+          livenessProbe: {httpGet: {path: /livez, port: health}}
+          volumeMounts: [{name: config, mountPath: /config, readOnly: true}, {name: kafka-tls, mountPath: /secrets/kafka, readOnly: true}]
+      volumes:
+        - name: config
+          configMap: {name: metering-observer}
+        - name: kafka-tls
+          secret: {secretName: metering-kafka-tls}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: metering-observer, namespace: metering}
+spec:
+  selector: {app: metering-observer}
+  ports: [{name: grpc, port: 9090, targetPort: grpc}, {name: health, port: 9091, targetPort: health}]

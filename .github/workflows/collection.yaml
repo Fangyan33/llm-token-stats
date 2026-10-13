@@ -1,0 +1,19 @@
+name: collection
+on: [push, pull_request]
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: {go-version: '1.25.0'}
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.12'}
+      - run: make test build
+  wasm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: mkdir -p dist
+      - run: docker run --rm -v "$PWD:/src" -w /src/plugins/gateway-observer tinygo/tinygo:0.40.1 tinygo build -target=wasi -scheduler=none -o ../../dist/gateway-observer-v1.wasm .
+      - run: python3 scripts/check_wasm_abi.py dist/gateway-observer-v1.wasm

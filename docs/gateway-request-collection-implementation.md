@@ -1,6 +1,6 @@
 # 网关请求采集开发实现方案
 
-版本：V1.9｜日期：2026-10-13｜状态：设计契约与离线校验已闭环；组件尚待实现，真实网关 PoC 和性能验收未执行。
+版本：V1.9｜日期：2026-10-13｜状态：采集组件已实现，公开旧版 Envoy/Kafka/Doris 本地联调已通过；私有环境与性能验收待执行，详见[运行说明](collection-components.md)。
 
 依据：[原技术方案](token-metering-design.md)、[功能设计概览及开发周期](token-metering-functional-overview-and-schedule.md)、[API Key Auth 服务方案](api-key-auth-service-implementation.md)。本文细化一期中“鉴权后采集到 Doris 明细入库”的采集子项；一期的估算、日/月汇总、客户查询与看板在后续子项完成；归档为后续可选项，不能以本文验收代替一期整体验收。本文中的 SQL、协议和配置供后续实现使用；Go 代码标明为伪代码的部分不能直接编译。
 
@@ -58,7 +58,7 @@ flowchart LR
     D --> V[去重与请求视图]
 ```
 
-WASM 不解析业务 JSON、不运行 tokenizer、不使用 Go 网络库直连 Kafka。Observer 不承接业务路由；接收正文只为当前解析，完成或放弃后释放。任何组件的日志、错误、trace、死信记录都不得含正文或密钥。
+WASM 仅做有界 usage 参数编辑，不提取业务用量、不运行 tokenizer、不使用 Go 网络库直连 Kafka。Observer 不承接业务路由；接收正文只为当前解析，完成或放弃后释放。任何组件的日志、错误、trace、死信记录都不得含正文或密钥。
 
 ### 2.1 路由、身份与过滤器顺序
 
@@ -140,7 +140,7 @@ Consumer 校验 UUIDv4 格式和 Kafka key 后，以事件中的 `request_starte
 ```proto
 syntax = "proto3";
 package metering.v1;
-option go_package = "example.com/llm-token-stats/gen/observation/v1;observationv1";
+option go_package = "github.com/Fangyan33/llm-token-stats/gen/observation/v1;observationv1";
 
 service ObservationService {
   rpc Observe(stream ObservationFrame) returns (stream ObservationAck);
@@ -225,7 +225,7 @@ message ObservationAck {
 
 - `Start` 必须为 frame 1，且每流仅一次；Observer 校验后分配 `logical_request_id`，在立即发送的 Start ACK 中回传。无有效 Start 的流直接关闭，不分配 ID 或制造请求事件。
 - `ResponseHeaders` 发送最终业务响应头，忽略 1xx；请求和响应分片可交错，每方向独立累计偏移。
-- 无正文时头消息的 `end_stream=true`；trailers 回调只更新方向结束标志，不复制 trailers。`End` 仍是明确请求终态的唯一消息。
+- 无正文时头消息的 `end_stream=true`；trailers 回调在方向尚未结束时发送一次零字节 BodyChunk 标记 EOS，不复制 trailers。`End` 仍是明确请求终态的唯一消息。
 - Observer 校验 frame 序号、方向 body_seq、offset 和 End 总量；序号跳跃、重复或不一致均判 `protocol_error` 并定稿 partial/unknown 后关闭。gRPC 本身有序，一期采集子项不尝试乱序缓存或正文重传。
 - ACK 在 Observer 已接纳并处理该消息、释放其临时缓冲后产生，不等待 Kafka。请求 JSON 的有界解析状态仍受 Observer 总额度约束。
 - ACK 累计确认，最多每 8 帧或 10 毫秒发送一次，Start 与 End 立即确认。只保留一个可覆盖的“最新 ACK”槽；写阻塞超时即关闭流，不积压 ACK 队列。
@@ -285,11 +285,11 @@ WASM 中不引入 gRPC-Go、网络 goroutine、完整 Envoy protobuf 类型或�
 
 请求改写独立于 Observer 连接和采集额度：旁路不可用时，仍对符合条件的请求补充参数。插件启用后，`chat_completions_v1` 路由必须执行本规则；接入前验证上游支持该参数，不做自动重试或删除参数后重发。
 
-1. 先按第 2.3 节完成入口过滤；仅对 selected 请求判断 JSON Content-Type 和 identity Content-Encoding。请求头已带 EOS（无正文）时直接 Continue，不进入缓冲。符合条件时，先申请独立改写预算，并在头尚未转发时调用 `RemoveHttpRequestHeader("content-length")`；成功后返回 Pause，阻止请求头提前到达上游。HTTP/1.1 的消息定界交由 Envoy，插件不手写 Transfer-Encoding。非目标路由、非 JSON 或压缩请求直接透传并计数。
+1. 先按第 2.3 节完成入口过滤；仅对 selected 请求判断 JSON Content-Type 和 identity Content-Encoding。请求头已带 EOS（无正文）时直接 Continue，不进入缓冲。符合条件时，先申请独立改写预算，并在头尚未转发时调用 `RemoveHttpRequestHeader("content-length")`；成功后返回 Continue，允许请求头先到上游；正文回调再有界 Pause/改写。固定 Istio 1.13.5 的 ext_authz 恢复路径下暂停头会延迟已缓冲正文回调至超时，此调整已通过实施决策确认。HTTP/1.1 的消息定界交由 Envoy，插件不手写 Transfer-Encoding。非目标路由、非 JSON 或压缩请求直接透传并计数。
 2. 请求体以 Envoy 累积缓冲为准，未 EOS 返回 Pause，不将每次累计 buffer 重复追加。原始请求上限 256 KiB，改写结果也必须不超过 256 KiB；每个待改写请求预留 1 MiB，覆盖 host buffer、WASM 读取副本、输出和解析索引，Root 总预算 16 MiB、最多 16 个并发。超过预算直接原样放行并记 `rewrite_resource_limit`；不等待额度。host 超限回调的额外字节及 native buffer 另计入网关预算。
-3. 完整 JSON 有界校验后，仅对顶层布尔 `stream=true` 改写：没有 stream_options 或值为 null 时创建对象；已有对象时保留其他字段，把 include_usage 添加或替换为 true；原本为 true 时幂等。`stream=false` 或未设置 stream 的普通请求不添加该字段。stream_options 为其他类型、重复键、非法 JSON、深度超过 64 或元素超过 100000 时保持原文并记 `rewrite_invalid_json`。采用 token 位置编辑，避免重新编码 messages/tools、改变数值精度或其他业务字段。
+3. 完整 JSON 有界校验后，仅对顶层布尔 `stream=true` 改写：没有 stream_options 或值为 null 时创建对象；已有对象时保留其他字段，把 include_usage 添加或替换为 true；原本为 true 时幂等。`stream=false` 或未设置 stream 的普通请求不添加该字段。stream_options 为其他类型、重复键、非法 JSON、深度超过 64、元素超过 100000 或单对象键超过 8192 时保持原文并记 `rewrite_invalid_json`。采用 token 位置编辑，避免重新编码 messages/tools、改变数值精度或其他业务字段。
 4. 在最终 body 回调内调用 `ReplaceHttpRequestBody`，成功后返回 Continue。改写后的请求是唯一请求观察来源：从 offset=0 分片，只发送一次；按 16 KiB 拆片、在途不足时放弃旁路，不等待 ACK。这个有界完整请求路径不套用流式响应的 64 KiB/4 片回调限制。替换失败只在已验证 host 未修改原 buffer 时原文放行，不能转发部分改写内容。
-5. 改写在请求头回调后 2000 ms 判到期，实际恢复还受 tick/Worker 调度影响，必须实测到期恢复延迟。Root tick 在 HTTP context 仍存活时切换有效上下文，超时则 `ResumeHttpRequest` 原文放行并转入永久透传状态；后续片段不再次缓冲或改写。超限、客户端断开、context 删除和热更新都释放改写预算；降级时只观察已缓冲原文一次，再接续透传尾片，超出正文上限或无法取得一致缓冲时直接取消旁路，详见闭环清单第 4 节；暂停期间的 trailers 结束路径须在真实 Envoy 验证正文改写 hostcall 是否可用，若不可用则原文恢复并记 `rewrite_trailers_unsupported`，不能无限 Pause。任何旁路网络操作不得延长暂停期限。
+5. 改写在请求头回调后 2000 ms 判到期，实际恢复还受 tick/Worker 调度影响，必须实测到期恢复延迟。Root tick 在 HTTP context 仍存活时切换有效上下文，超时则 `ResumeHttpRequest` 原文放行并转入永久透传状态；后续片段不再次缓冲或改写。超限、客户端断开、context 删除和热更新都释放改写预算；降级时只观察已缓冲原文一次；只有可证明尾片缓冲边界时才接续观察，超出正文上限或无法取得一致缓冲时直接取消旁路。固定旧版 Envoy 的 Root 异步恢复 PoC 显示尾片可能不完整经过 Wasm，因此当前超时恢复原文后取消观察，结果为 partial/unknown，详见闭环清单第 4 节；暂停期间的 trailers 结束路径须在真实 Envoy 验证正文改写 hostcall 是否可用，若不可用则原文恢复并记 `rewrite_trailers_unsupported`，不能无限 Pause。任何旁路网络操作不得延长暂停期限。
 
 改写状态为 BYPASS / BUFFERING / REWRITTEN / PASSTHROUGH，与观察状态机独立。上述失败路径遵循业务 fail-open，但意味着 include_usage 未保证注入，必须单独统计 `rewrite_failed`（固定原因码），纳入采集完整率告警和灰度验收，不能静默宣称成功。压缩、非法 JSON、超限等不支持场景不承诺 usage 完整；正常支持范围内的缺字段/false 请求必须补充成功。
 
@@ -568,7 +568,7 @@ Observer 共享一个 producer，每事件先非阻塞申请执行槽，初值 2
 opts := []kgo.Opt{
     kgo.RequiredAcks(kgo.AllISRAcks()),
     kgo.DisableIdempotentWrite(),
-    kgo.RecordRetries(0),
+    kgo.RecordRetries(1),
     kgo.UnknownTopicRetries(0),
     kgo.ProducerLinger(0),
     kgo.MaxBufferedRecords(256),
@@ -581,7 +581,7 @@ opts := []kgo.Opt{
 // 获得槽后 TryProduce；在 promise 中释放槽。禁止失败后重新提交原事件。
 ```
 
-这里显式关闭 producer 幂等，是为了避免其序列号约束延后失败，业务幂等交给事件键。`RecordDeliveryTimeout` 是粗粒度期限，不是严格墙钟上限；必须测连接黑洞/元数据不可达。执行槽按 promise 完成释放，不能 context 超时就提前复用仍占客户端内存的槽。[固定配置源码](https://github.com/twmb/franz-go/blob/v1.18.1/pkg/kgo/config.go)
+固定 franz-go v1.18.1 的 RecordRetries 按总尝试次数比较，0 会阻止首次发送；实现使用 1，仅允许首次尝试、不重发事件。这里显式关闭 producer 幂等，是为了避免其序列号约束延后失败，业务幂等交给事件键。`RecordDeliveryTimeout` 是粗粒度期限，不是严格墙钟上限；必须测连接黑洞/元数据不可达。执行槽按 promise 完成释放，不能 context 超时就提前复用仍占客户端内存的槽。[固定配置源码](https://github.com/twmb/franz-go/blob/v1.18.1/pkg/kgo/config.go)
 
 增加 3 秒 watchdog：发现超龄发送则进入熔断，停止接纳新事件，对当前 producer 执行有界取消/关闭，丢弃在途集合；重建 producer 后仅接收新事件。取消/关闭若不能在额外 1 秒内释放，Observer 进程退出由 Deployment 重建，不能保留旧 producer 并无限新建。该行为也属于 PoC 故障验收项。
 
@@ -1023,7 +1023,7 @@ SDK 单元测试验证 hostcall 签名和回调注册/清理；标准 Protobuf �
 
 设计交付包括正式 Protobuf、事件与配置 Schema、六种合成事件、离线校验及边界测试，完整索引见[闭环与验收清单](gateway-collection-design-closure.md)。离线检查覆盖协议/文档一致性、20 项数值默认值、固定事件字段与 Doris 类型化列、严格 JSON、UTF-8 字节长度、来源/状态组合、Int64 算术冲突和资源关系。
 
-本次仍处于设计与工程初始化阶段：Consumer、Observer、插件和 SDK 扩展尚未实现，未连接实际 Istio/Kafka/Doris，未运行 protoc 或真实 DDL/业务性能验收。离线检查结果不能代替真实 Envoy、数据库和容量测试；G0–G5 各门槛与所需事实已列明，实施时逐项附证据。
+Consumer、Observer、插件和 SDK 扩展已实现，标准代码已由 protoc 生成，公开固定 Envoy/Kafka/Doris 本地链路与 DDL 已验证，证据见[本地验证记录](../spec/plan/gateway-collection-verification.md)。私有 Istio 环境与业务性能验收仍待执行；已通过的本地检查不能代替 G0–G5 完整门槛和生产容量测试。
 
 关键区别：Envoy host 有 gRPC 能力不等于 Go SDK 已有完整封装；发送成功不等于持久化成功；请求有记录不等于 usage 已知；Doris Unique Key 重放幂等不等于跨事件冲突隔离。
 

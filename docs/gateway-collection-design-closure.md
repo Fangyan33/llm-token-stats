@@ -1,6 +1,6 @@
 # 网关采集设计闭环与验收清单
 
-修订日期：2026-10-13。设计契约与离线校验已交付；插件、SDK 扩展、Observer、Consumer 尚未实现，真实环境验收未执行。本文与[开发实现方案](gateway-request-collection-implementation.md)共同构成采集子项的实施依据。
+修订日期：2026-10-13。插件、SDK 扩展、Observer、Consumer 已实现并完成公开旧版 Envoy/Kafka/Doris 本地联调；生产完整门槛未验收。实现结果与已确认的请求头 Continue 调整见[运行说明](collection-components.md)。本文与[开发实现方案](gateway-request-collection-implementation.md)共同构成采集子项的实施依据。
 
 ## 1. 交付物与变更规则
 
@@ -17,7 +17,7 @@ Schema 描述类型和固定字段集；UTF-8 字节上限、跨字段状态、K
 
 字段顺序以事件 Schema 的 properties 顺序为规范 Go struct 顺序；usage 顺序为 input、output、cached_read、cached_write、reasoning、reported_total，各子项按 value、source 排列。Consumer 重编码顺序固定，使用 Go encoding/json 默认转义；raw_usage_json 的字符串内容作为冻结依据原样保留，不按另一个 JSON 排序器改写。辅助校验器提供相同顺序和转义的摘要参考，正式 Go 实现仍须与它做 golden 对照。
 
-新增字段或改变含义须提升 Kafka schema_version，并先发布可读取新旧版本的 Consumer 与数据库，再发布 Producer；不得直接修改已上线 v1 struct 重算旧摘要。观察协议字段号独立演进，2 已 reserved。当前 go_package 为工程初始化占位，正式 Go module 定下后统一替换并记录生成工具版本。
+新增字段或改变含义须提升 Kafka schema_version，并先发布可读取新旧版本的 Consumer 与数据库，再发布 Producer；不得直接修改已上线 v1 struct 重算旧摘要。观察协议字段号独立演进，2 已 reserved。go_package 已固定为 github.com/Fangyan33/llm-token-stats/gen/observation/v1；生成工具版本见运行说明。
 
 配置发布先让 Observer 接受新版本及仍存活的旧 Root 版本，再更新网关；回退同样先核查接纳清单。Consumer 保留所有在线窗口内历史 config_version/route/service 登记，不能因为网关移除路由或旧版本而拒收合法重放。白名单限制新采集与历史事件校验分别管理。
 
@@ -61,7 +61,7 @@ ACK reason 封闭为 accepted、finalized、protocol_error、parse_limit、resou
 
 ## 4. 请求改写与观察衔接
 
-入口白名单先完成，改写与旁路资源分别申请。缓冲期间不发送请求 BodyChunk；改写完成只观察改写后的最终正文。超时/超限/非法 JSON/trailers 降级时，在恢复转发前或同一次回调中，按 offset=0 观察当时已缓冲的原文一次，再以新偏移处理透传尾片；不再次把累计 host buffer 当尾片发送。
+入口白名单先完成，改写与旁路资源分别申请。缓冲期间不发送请求 BodyChunk；改写完成只观察改写后的最终正文。超时/超限/非法 JSON/trailers 降级时，在恢复转发前或同一次回调中，按 offset=0 观察当时已缓冲的原文一次，只在可证明缓冲边界时再以新偏移处理透传尾片；不再次把累计 host buffer 当尾片发送。固定旧版 Envoy 的 Root 异步恢复可能漏掉尾片回调，因此当前超时路径观察有界前缀后取消旁路，恢复业务原文，结果保留 partial/unknown。
 
 完整缓冲观察先计算全部分片数和序列化上界，非阻塞预留全部额度后才复制。原缓冲超出 request_body_max_bytes、无法取得一致 buffer，或额度不足时直接取消观察，不先发送部分前缀再重新观察。只计已成功发送的正文长度与序号；取消后不发送 End。恢复 hostcall 成败、预算释放、重复 tick 和 context 删除均须幂等。
 
@@ -98,9 +98,9 @@ Doris 与 Kafka 不使用分布式事务，此处依靠固定事件、幂等表�
 | --- | --- | --- | --- |
 | D0 契约冻结 | 采集研发 | 正式文件、离线脚本及边界测试、评审 diff | 已完成离线校验 |
 | G0 环境与鉴权 | 网关/SRE、Auth 研发 | 固定镜像 digest/config_dump；Istio/Envoy/TinyGo/SDK 版本；ext_authz 身份读取、路由顺序、模型参数支持；真实 X-Request-Id/CORS 行为 | 待真实环境验收 |
-| G1 SDK/协议 PoC | 插件与 Observer 研发 | protoc 编译；标准代码与 WASM 编解码 golden；固定镜像加载、ACK、Root 删除/迟到回调、trap/初始化失败及 mTLS/HTTP2 限额 | 待实现与验收 |
-| G2 改写/解析 | 插件与 Observer 研发、测试 | HTTP1/2 慢上传和256 KiB边界、断开/trailers；正文差异仅允许 usage 参数；全字节切片 JSON/SSE、工具、多候选、EOS/End与资源释放 | 待实现与验收 |
-| G3 发送/入库/统计衔接 | Observer、Consumer、usage-worker 研发 | Kafka黑洞/watchdog；Stream Load确认丢失；逐步崩溃/rebalance；两事件重放、跨日期身份冲突、证据过期、Doris通知/凭据失败、未知schema暂停；查询版本变化、发布中断、月份触发恢复和发布者保护 | 待实现与验收 |
+| G1 SDK/协议 PoC | 插件与 Observer 研发 | protoc 编译；标准代码与 WASM 编解码 golden；固定镜像加载、ACK、Root 删除/迟到回调、trap/初始化失败及 mTLS/HTTP2 限额 | 实现及本地子项通过，完整门槛待验收 |
+| G2 改写/解析 | 插件与 Observer 研发、测试 | HTTP1/2 慢上传和256 KiB边界、断开/trailers；正文差异仅允许 usage 参数；全字节切片 JSON/SSE、工具、多候选、EOS/End与资源释放 | 实现及本地子项通过，完整门槛待验收 |
+| G3 发送/入库/统计衔接 | Observer、Consumer、usage-worker 研发 | Kafka黑洞/watchdog；Stream Load确认丢失；逐步崩溃/rebalance；两事件重放、跨日期身份冲突、证据过期、Doris通知/凭据失败、未知schema暂停；查询版本变化、发布中断、月份触发恢复和发布者保护 | 采集子项本地通过，完整统计衔接待实现与验收 |
 | G4 性能和数据质量 | 测试、SRE | 峰值两倍、24小时、10分钟SSE；额外首包P99≤10ms；明细≤60s；10并发查询P95≤3s；独立同口径分母与全日/故障窗口指标 | 待真实环境验收 |
 | G5 灰度与回退 | SRE、发布负责人 | 真实生效配置、canary流量与告警、disabled回退/必要移除patch、旧代限时释放、回退后Auth仍生效 | 待真实环境验收 |
 

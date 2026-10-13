@@ -1,0 +1,44 @@
+name: metering-collection-test
+services:
+  kafka:
+    image: apache/kafka:3.9.2
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,EXTERNAL://:29092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,EXTERNAL://127.0.0.1:29092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'false'
+    ports: ['127.0.0.1:29092:29092']
+  doris:
+    image: apache/doris:all-in-one-4.1.3
+    ports: ['127.0.0.1:19030:9030', '127.0.0.1:18030:8030', '127.0.0.1:18040:8040']
+  fixture:
+    image: alpine:latest
+    command: [/app/fixture]
+    volumes: ['../../dist:/app:ro']
+  observer:
+    image: alpine:latest
+    command: [/app/observer, --config, /config/observer.json]
+    volumes: ['../../dist:/app:ro', './observer.json:/config/observer.json:ro']
+    ports: ['127.0.0.1:19091:9091']
+  consumer:
+    image: alpine:latest
+    command: [/app/consumer, --config, /config/consumer.json]
+    environment:
+      DORIS_DSN: 'root@tcp(doris:9030)/metering?timeout=5s&readTimeout=30s&writeTimeout=10s&interpolateParams=true&time_zone=%27%2B00%3A00%27'
+      DORIS_USER: root
+      DORIS_PASSWORD: ''
+    volumes: ['../../dist:/app:ro', './consumer.json:/config/consumer.json:ro']
+    ports: ['127.0.0.1:19092:9092']
+  gateway:
+    image: istio/proxyv2:1.13.5
+    entrypoint: [/usr/local/bin/envoy]
+    command: [-c, /config/envoy.json, --concurrency, '2', --log-level, warning]
+    volumes: ['../../dist:/app:ro', './envoy.json:/config/envoy.json:ro']
+    ports: ['127.0.0.1:18080:8080', '127.0.0.1:19000:9901']

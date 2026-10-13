@@ -1,0 +1,33 @@
+# Template only: the JSON is default-disabled and must be rendered/validated.
+# Auth must already be installed before this filter; verify config_dump order.
+apiVersion: networking.istio.io/v1alpha3
+kind: EnvoyFilter
+metadata: {name: gateway-observer, namespace: istio-system}
+spec:
+  workloadSelector: {labels: {istio: ingressgateway, metering-canary: 'true'}}
+  configPatches:
+    - applyTo: HTTP_FILTER
+      match:
+        context: GATEWAY
+        listener:
+          filterChain:
+            filter:
+              name: envoy.filters.network.http_connection_manager
+              subFilter: {name: envoy.filters.http.router}
+      patch:
+        operation: INSERT_BEFORE
+        value:
+          name: envoy.filters.http.wasm
+          typed_config:
+            '@type': type.googleapis.com/envoy.extensions.filters.http.wasm.v3.Wasm
+            config:
+              name: gateway-observer
+              root_id: gateway-observer
+              fail_open: true
+              vm_config:
+                vm_id: gateway-observer-v1
+                runtime: envoy.wasm.runtime.v8
+                code: {local: {filename: /etc/istio/wasm/gateway-observer-v1.wasm}}
+              configuration:
+                '@type': type.googleapis.com/google.protobuf.StringValue
+                value: REPLACE_WITH_DEFAULT_DISABLED_RENDERED_CONFIG_JSON

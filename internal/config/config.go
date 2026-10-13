@@ -1,0 +1,211 @@
+package config
+
+import (
+	"crypto/tls"
+	"crypto/x509"
+	"fmt"
+	"github.com/Fangyan33/llm-token-stats/pkg/strictjson"
+	"os"
+	"time"
+	"unicode/utf8"
+)
+
+type Route struct {
+	RouteName string `json:"route_name"`
+	ServiceID string `json:"service_id"`
+}
+type Kafka struct {
+	Brokers     []string `json:"bootstrap_servers"`
+	Topic       string   `json:"topic"`
+	CAFile      string   `json:"ca_file"`
+	CertFile    string   `json:"cert_file"`
+	KeyFile     string   `json:"key_file"`
+	UsernameEnv string   `json:"username_env"`
+	PasswordEnv string   `json:"password_env"`
+}
+type Observer struct {
+	Listen           string   `json:"listen"`
+	Health           string   `json:"health_listen"`
+	ProducerID       string   `json:"producer_id"`
+	MaxActive        int      `json:"max_active_streams"`
+	ParserBudget     int64    `json:"parser_budget_bytes"`
+	MaxObservationMS int      `json:"max_observation_ms"`
+	AcceptedConfigs  []string `json:"accepted_config_versions"`
+	AcceptedAdapters []string `json:"accepted_adapter_ids"`
+	Routes           []Route  `json:"accepted_routes"`
+	Flags            []string `json:"response_flags_allowlist"`
+	Details          []string `json:"response_code_details_allowlist"`
+	MaxConnections   int      `json:"max_connections"`
+}
+type Doris struct {
+	FE           string   `json:"fe_url"`
+	AllowedHosts []string `json:"allowed_load_hosts"`
+	DSNEnv       string   `json:"dsn_env"`
+	UsernameEnv  string   `json:"username_env"`
+	PasswordEnv  string   `json:"password_env"`
+	Database     string   `json:"database"`
+}
+type Position struct {
+	Partition int32 `json:"partition"`
+	Offset    int64 `json:"offset"`
+}
+type Consumer struct {
+	Health          string     `json:"health_listen"`
+	Group           string     `json:"group_id"`
+	Rows            int        `json:"max_batch_rows"`
+	Bytes           int        `json:"max_batch_bytes"`
+	FlushMS         int        `json:"flush_interval_ms"`
+	Initial         []Position `json:"initial_offsets"`
+	Resume          []Position `json:"gap_resume_offsets"`
+	AcceptedConfigs []string   `json:"accepted_config_versions"`
+	Routes          []Route    `json:"accepted_routes"`
+	Flags           []string   `json:"response_flags_allowlist"`
+	Details         []string   `json:"response_code_details_allowlist"`
+}
+type Config struct {
+	Kafka    Kafka    `json:"kafka"`
+	Observer Observer `json:"observer"`
+	Consumer Consumer `json:"consumer"`
+	Doris    Doris    `json:"doris"`
+}
+
+func Read(path string) (Config, error) {
+	var c Config
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return c, fmt.Errorf("config_file")
+	}
+	if len(b) > 65536 || strictjson.Decode(b, &c) != nil {
+		return c, fmt.Errorf("config_invalid")
+	}
+	if c.Kafka.Topic != "llm-metering-events" || len(c.Kafka.Brokers) == 0 {
+		return c, fmt.Errorf("config_kafka")
+	}
+	return c, nil
+}
+func (c *Config) ObserverDefaults() error {
+	if c.Observer.Listen == "" {
+		c.Observer.Listen = ":9090"
+	}
+	if c.Observer.Health == "" {
+		c.Observer.Health = ":9091"
+	}
+	if c.Observer.MaxActive == 0 {
+		c.Observer.MaxActive = 4096
+	}
+	if c.Observer.ParserBudget == 0 {
+		c.Observer.ParserBudget = 256 << 20
+	}
+	if c.Observer.MaxObservationMS == 0 {
+		c.Observer.MaxObservationMS = 605000
+	}
+	if c.Observer.MaxConnections == 0 {
+		c.Observer.MaxConnections = 128
+	}
+	if c.Observer.ProducerID == "" {
+		c.Observer.ProducerID = os.Getenv("POD_UID")
+	}
+	if !text(c.Observer.ProducerID, 128) || c.Observer.MaxActive < 1 || c.Observer.MaxActive > 4096 || c.Observer.ParserBudget < 3*32768 || c.Observer.ParserBudget > 256<<20 || c.Observer.MaxObservationMS < 1 || c.Observer.MaxObservationMS > 605000 || c.Observer.MaxConnections < 1 || c.Observer.MaxConnections > 128 || !registration(c.Observer.AcceptedConfigs, c.Observer.Routes) || len(c.Observer.AcceptedAdapters) != 1 || c.Observer.AcceptedAdapters[0] != "chat_completions_v1" || !codes(c.Observer.Flags) || !codes(c.Observer.Details) {
+		return fmt.Errorf("config_observer")
+	}
+	return nil
+}
+func (c *Config) ConsumerDefaults() error {
+	if c.Consumer.Health == "" {
+		c.Consumer.Health = ":9092"
+	}
+	if c.Consumer.Group == "" {
+		c.Consumer.Group = "llm-metering-doris-v1"
+	}
+	if c.Consumer.Rows == 0 {
+		c.Consumer.Rows = 5000
+	}
+	if c.Consumer.Bytes == 0 {
+		c.Consumer.Bytes = 4 << 20
+	}
+	if c.Consumer.FlushMS == 0 {
+		c.Consumer.FlushMS = 1000
+	}
+	if c.Doris.Database == "" {
+		c.Doris.Database = "metering"
+	}
+	if !text(c.Consumer.Group, 128) || c.Consumer.Rows < 1 || c.Consumer.Rows > 5000 || c.Consumer.Bytes < 32768 || c.Consumer.Bytes > 4<<20 || c.Consumer.FlushMS < 1 || c.Consumer.FlushMS > 1000 || c.Doris.Database != "metering" || !registration(c.Consumer.AcceptedConfigs, c.Consumer.Routes) || len(c.Doris.AllowedHosts) == 0 || !codes(c.Consumer.Flags) || !codes(c.Consumer.Details) {
+		return fmt.Errorf("config_consumer")
+	}
+	for _, ps := range [][]Position{c.Consumer.Initial, c.Consumer.Resume} {
+		seen := map[int32]bool{}
+		for _, p := range ps {
+			if p.Partition < 0 || p.Offset < 0 || seen[p.Partition] {
+				return fmt.Errorf("config_offsets")
+			}
+			seen[p.Partition] = true
+		}
+	}
+	return nil
+}
+
+func text(s string, max int) bool { return len(s) > 0 && len(s) <= max && utf8.ValidString(s) }
+func codes(xs []string) bool {
+	if len(xs) > 128 {
+		return false
+	}
+	seen := map[string]bool{}
+	for _, s := range xs {
+		if !text(s, 128) || seen[s] {
+			return false
+		}
+		seen[s] = true
+	}
+	return true
+}
+func registration(configs []string, routes []Route) bool {
+	if len(configs) == 0 || len(configs) > 1024 || len(routes) == 0 || len(routes) > 1024 {
+		return false
+	}
+	if !codesConfig(configs) {
+		return false
+	}
+	seen := map[Route]bool{}
+	for _, r := range routes {
+		if !text(r.RouteName, 128) || !text(r.ServiceID, 128) || seen[r] {
+			return false
+		}
+		seen[r] = true
+	}
+	return true
+}
+func codesConfig(xs []string) bool {
+	seen := map[string]bool{}
+	for _, s := range xs {
+		if !text(s, 128) || seen[s] {
+			return false
+		}
+		seen[s] = true
+	}
+	return true
+}
+func (k Kafka) TLS() (*tls.Config, error) {
+	if k.CAFile == "" && k.CertFile == "" {
+		return nil, nil
+	}
+	t := &tls.Config{MinVersion: tls.VersionTLS12}
+	if k.CAFile != "" {
+		b, err := os.ReadFile(k.CAFile)
+		if err != nil {
+			return nil, fmt.Errorf("kafka_tls")
+		}
+		t.RootCAs = x509.NewCertPool()
+		if !t.RootCAs.AppendCertsFromPEM(b) {
+			return nil, fmt.Errorf("kafka_tls")
+		}
+	}
+	if k.CertFile != "" {
+		cert, err := tls.LoadX509KeyPair(k.CertFile, k.KeyFile)
+		if err != nil {
+			return nil, fmt.Errorf("kafka_tls")
+		}
+		t.Certificates = []tls.Certificate{cert}
+	}
+	return t, nil
+}
+func Duration(ms int) time.Duration { return time.Duration(ms) * time.Millisecond }

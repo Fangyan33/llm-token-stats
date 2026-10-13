@@ -1,0 +1,24 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: metering-consumer, namespace: metering}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: metering-consumer}}
+  template:
+    metadata: {labels: {app: metering-consumer}}
+    spec:
+      containers:
+        - name: consumer
+          image: REPLACE_CONSUMER_IMAGE_DIGEST
+          args: [--config, /config/consumer.json]
+          ports: [{name: health, containerPort: 9092}]
+          envFrom: [{secretRef: {name: metering-consumer-credentials}}]
+          resources: {requests: {cpu: '250m', memory: 128Mi}, limits: {cpu: '1', memory: 512Mi}}
+          readinessProbe: {httpGet: {path: /readyz, port: health}}
+          livenessProbe: {httpGet: {path: /livez, port: health}}
+          volumeMounts: [{name: config, mountPath: /config, readOnly: true}, {name: kafka-tls, mountPath: /secrets/kafka, readOnly: true}]
+      volumes:
+        - name: config
+          configMap: {name: metering-consumer}
+        - name: kafka-tls
+          secret: {secretName: metering-kafka-tls}

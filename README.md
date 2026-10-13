@@ -1,6 +1,6 @@
 # LLM Token Stats
 
-大模型请求鉴权、用量计量、统计、计费与对账平台。当前仓库包含设计文档、Doris 原始事件及日/月汇总 schema、汇总 SQL 模板；采集、统计刷新和平台接口仍处于设计及工程初始化阶段。
+大模型请求鉴权、用量计量、统计、计费与对账平台。当前已实现网关 Wasm、Observer、Consumer 采集链路，提供 Doris schema、构建/部署模板与真实本地联调；统计刷新、鉴权服务及平台接口属于后续工作。
 
 ## 目录约定
 
@@ -19,7 +19,7 @@
 | scripts/ | 生成、校验和发布辅助脚本 |
 | docs/ | 设计、接入和运维文档 |
 
-空目录由 .gitkeep 保留。其余组件的代码、协议、依赖文件和部署清单会在对应工作包实施时加入；目录存在不表示组件已实现。Doris 开发环境与 schema 见 [部署说明](deploy/doris/README.md) 和 [migration](migrations/doris/metering/001_init.sql)；Consumer 尚未实现。
+空目录由 .gitkeep 保留，目录存在不表示对应组件已实现。采集组件的构建、联调、恢复边界见[运行说明](docs/collection-components.md)；计划见[spec/plan](spec/plan/gateway-collection-implementation.md)。Doris 环境与 schema 见[部署说明](deploy/doris/README.md)和[migration](migrations/doris/metering/001_init.sql)。
 ## 一期数据与统计设计
 
 - 原始事件按 UTC 请求日期每日分区，在线保留一年：365 个日期，包含当天及前 364 天。
@@ -28,17 +28,18 @@
 - 采集与汇总无需额外 PostgreSQL：日期通知、消费凭据、水位和发布状态保存在 Doris；独立 Go usage-worker 默认由 K8s CronJob 每分钟调度，单个发布者串行执行。Auth 的 PostgreSQL 按原鉴权方案保留。
 - 归档只保留可选设计，后续另行建设，一期不部署归档任务或对象存储。
 
-详见[日/月汇总设计](docs/daily-monthly-summary-design.md)、[Doris 协调设计](docs/doris-summary-coordination.md)和[协调表迁移](migrations/doris/metering/004_summary_coordination.sql)、[可选归档设计](docs/archive-optional-design.md)。建表与 SQL 模板不包含任务调度实现；实际 Doris 联调和容量压测尚待执行。
+详见[日/月汇总设计](docs/daily-monthly-summary-design.md)、[Doris 协调设计](docs/doris-summary-coordination.md)和[协调表迁移](migrations/doris/metering/004_summary_coordination.sql)、[可选归档设计](docs/archive-optional-design.md)。Consumer 已登记通知和消费凭据；建表与汇总 SQL 模板尚不包含 Worker 调度实现，生产容量压测待执行。
 
 ## 网关采集设计闭环
 
-采集子项正式契约与验收门槛见[闭环清单](docs/gateway-collection-design-closure.md)和[主方案 V1.9](docs/gateway-request-collection-implementation.md)。已交付观察 Protobuf、事件/配置 Schema、默认关闭配置、六种合成事件与离线边界校验；采集组件与真实环境验收仍待实施。
+采集子项正式契约与验收门槛见[闭环清单](docs/gateway-collection-design-closure.md)和[主方案 V1.9](docs/gateway-request-collection-implementation.md)。已交付三个采集组件、SDK gRPC 扩展、标准 Protobuf 代码、默认关闭配置、005 恢复 migration、单元/竞态/真实集成测试；生产 G0–G5 验收仍待执行。
 
 在仓库根目录执行：
 
 ~~~sh
-python scripts/validate_collection_contracts.py
-python -m unittest discover -s tests -p "test_collection_contracts.py" -v
+make test build wasm
+make local-up
+make local-test
 ~~~
 
-脚本仅使用 Python 3.10+ 标准库，不接入网关、Kafka 或数据库；生产上线按闭环清单 G0–G5 收集真实证据。
+本地栈使用合成鉴权和模型 fixture，实际经过旧版 Envoy、Kafka、Doris；构建工具与端口见运行说明。生产上线按闭环清单 G0–G5 收集真实证据。

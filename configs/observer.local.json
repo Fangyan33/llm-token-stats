@@ -1,0 +1,25 @@
+{
+  "kafka": {
+    "bootstrap_servers": [
+      "kafka:9092"
+    ],
+    "topic": "llm-metering-events"
+  },
+  "observer": {
+    "listen": ":9090",
+    "health_listen": ":9091",
+    "producer_id": "observer-test",
+    "accepted_config_versions": [
+      "collection-v1"
+    ],
+    "accepted_adapter_ids": [
+      "chat_completions_v1"
+    ],
+    "accepted_routes": [
+      {
+        "route_name": "llm-chat",
+        "service_id": "model-service-a"
+      }
+    ]
+  }
+}

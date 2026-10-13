@@ -1,6 +1,6 @@
 # LLM Token Stats
 
-大模型请求鉴权、用量计量、统计、计费与对账平台。当前仓库处于设计及工程初始化阶段；现有方案见 docs/。
+大模型请求鉴权、用量计量、统计、计费与对账平台。当前仓库包含设计文档、Doris 原始事件及日/月汇总 schema、汇总 SQL 模板；采集、统计刷新和平台接口仍处于设计及工程初始化阶段。
 
 ## 目录约定
 
@@ -19,4 +19,12 @@
 | scripts/ | 生成、校验和发布辅助脚本 |
 | docs/ | 设计、接入和运维文档 |
 
-空目录由 .gitkeep 保留。代码、协议、依赖文件和部署清单会在对应工作包实施时加入；目录存在不表示组件已实现。Doris 开发环境与 schema 见 [部署说明](deploy/doris/README.md) 和 [migration](migrations/doris/metering/001_init.sql)；Consumer 尚未实现。
+空目录由 .gitkeep 保留。其余组件的代码、协议、依赖文件和部署清单会在对应工作包实施时加入；目录存在不表示组件已实现。Doris 开发环境与 schema 见 [部署说明](deploy/doris/README.md) 和 [migration](migrations/doris/metering/001_init.sql)；Consumer 尚未实现。
+## 一期数据与统计设计
+
+- 原始事件按 UTC 请求日期每日分区，在线保留一年：365 个日期，包含当天及前 364 天。
+- 一期包含日汇总和月汇总：分别独立保留 730 个日期及 24 个自然月；月汇总从已发布日汇总生成。
+- 重放、迟到事件和冲突触发对应日期与月份重算，使用临时分区校验后原子发布。
+- 归档只保留可选设计，后续另行建设，一期不部署归档任务或对象存储。
+
+详见[日/月汇总设计](docs/daily-monthly-summary-design.md)、[可选归档设计](docs/archive-optional-design.md)。建表与 SQL 模板不包含任务调度实现；实际 Doris 联调和容量压测尚待执行。

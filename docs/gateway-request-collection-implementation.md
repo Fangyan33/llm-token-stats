@@ -2,7 +2,7 @@
 
 版本：V1.7｜日期：2026-10-12｜状态：开发设计，尚未完成真实网关 PoC 和性能验收。
 
-依据：[原技术方案](token-metering-design.md)、[功能设计概览及开发周期](token-metering-functional-overview-and-schedule.md)、[API Key Auth 服务方案](api-key-auth-service-implementation.md)。本文细化一期中“鉴权后采集到 Doris 明细入库”的采集子项；一期的估算、汇总、归档、客户查询与看板在后续子项完成，不能以本文验收代替一期整体验收。本文中的 SQL、协议和配置供后续实现使用；Go 代码标明为伪代码的部分不能直接编译。
+依据：[原技术方案](token-metering-design.md)、[功能设计概览及开发周期](token-metering-functional-overview-and-schedule.md)、[API Key Auth 服务方案](api-key-auth-service-implementation.md)。本文细化一期中“鉴权后采集到 Doris 明细入库”的采集子项；一期的估算、日/月汇总、客户查询与看板在后续子项完成；归档为后续可选项，不能以本文验收代替一期整体验收。本文中的 SQL、协议和配置供后续实现使用；Go 代码标明为伪代码的部分不能直接编译。
 
 ## 1. 范围与技术决策
 
@@ -15,10 +15,10 @@
 | 协议 | 兼容 Chat Completions 的 JSON 和 SSE，包括工具调用、多候选 |
 | 用量 | 只提取有效服务 usage；缺失字段为 null/unknown；一期采集子项不估算，估算属于一期后续子项 |
 | 配置 | 采集参数使用版本化 JSON/YAML、ConfigMap；采集组件不建设管理 API，身份与 API Key 由独立 Auth + PostgreSQL 管理 |
-| 存储 | 类型化原始计量事件（保留规范 JSON 作冲突证据）、去重视图、请求关联视图，在线保留 30 天 |
+| 存储 | 类型化原始计量事件（保留规范 JSON 作冲突证据）、去重视图、请求关联视图，按 UTC 请求日期每日分区，在线保留一年（365 个日期） |
 | 故障策略 | 业务不等待采集，采集超限或失败放弃，无落盘、重传及恢复队列 |
-| 查询交付 | 一期采集子项提供计量查询 ID、事件字段、SQL 和联调查询样例；客户查询 HTTP API、门户和导出任务属于一期后续子项 |
-| 阶段衔接 | 一期后续子项：tokenizer 估算、小时/日汇总、对象存储归档（另行设计）、客户查询/导出和看板；二期：计费、账单发布与调整单；三期：对账和结算确认；A 侧逐尝试观察为可选扩展 |
+| 查询交付 | 一期采集子项提供计量查询 ID、事件字段、SQL 和联调查询样例；一年内在线事件 HTTP API、门户和大范围导出任务属于一期后续子项；外部归档历史检索为可选项 |
+| 阶段衔接 | 一期后续子项：tokenizer 估算、日汇总、月汇总、客户查询/导出和看板；对象存储归档为后续可选项；二期：计费、账单发布与调整单；三期：对账和结算确认；A 侧逐尝试观察为可选扩展 |
 
 只观察入口直接访问的服务 A 及其最终响应；不还原 A 内部 B/C 调用、网关隐藏重试或客户端未收到的后端消耗。客户端重新发起请求形成新的采集请求 ID。
 
@@ -606,7 +606,7 @@ ACK 与 Kafka 发送完全解耦；即便两条事件只有一条成功入 Kafka
 
 `identity_hash` 对下列固定顺序的字段构造 JSON 数组并计算 SHA-256：`service_id`、`api_key_id`、`customer_id`、`application_id`、`identity_status`、`config_version`、`gateway_instance_id`、`route_name`、`adapter_id`、`x_request_id`。使用规范事件序列化器编码 UTF-8、JSON null 和转义；不可用简单字符串拼接代替，以免空值与分隔符造成歧义。模型是观察结果，不纳入稳定身份摘要。`payload_hash` 和 `identity_hash` 均由 Consumer 对同一个已校验事件对象计算。
 
-事件表按 UTC 请求日期动态分区，保留约 31 天；拒绝诊断表按 Kafka 记录 UTC 日期保留约 30 天。创建历史分区后仍须检查 Doris 动态分区调度状态。产品在线查询按 `request_started_at_ms` 再限制 30 天；Consumer 不接收已超出在线窗口的历史事件。`request_conflict_ids` 长期保留冲突 UUIDv4，不随事件分区到期删除，避免较早冲突变体过期后较晚变体恢复有效。UUIDv4 不得重用。[动态分区](https://doris.apache.org/docs/4.x/table-design/data-partitioning/dynamic-partitioning/)
+事件表按 UTC 请求日期每日分区，拒绝诊断表按 Kafka 记录 UTC 日期每日分区，均在线保留一年：365 个 UTC 日期（当天及前 364 天）。Doris 动态分区创建与清理，time_unit=DAY、start=-364、end=2、time_zone=UTC；各 FE 须开启并持久化动态分区配置。Consumer 不接收超出在线窗口的历史事件，也不把过滤行视为成功。日/月汇总独立保留并由 usage-worker 刷新，见[一期日/月汇总设计](daily-monthly-summary-design.md)；归档为[后续可选设计](archive-optional-design.md)，一期不部署。`request_conflict_ids` 长期保留冲突 UUIDv4，不随事件分区到期删除，避免较早冲突变体过期后较晚变体恢复有效。UUIDv4 不得重用。[动态分区](https://doris.apache.org/docs/4.x/table-design/data-partitioning/dynamic-partitioning/)
 
 单 FE/BE 的 schema 仅供开发验证；生产需要确定副本数、BE 分桶数、分区数和容量。Doris 在分区和分桶间管理数据，跨日期或身份的冲突判断必须覆盖同一 `logical_request_id` 的全部在线变体。`requests` 是逻辑视图，并不预聚合；大规模查询的计划和延迟须在目标 Doris 集群验证。
 
@@ -626,7 +626,7 @@ Migration 创建 `event_variants`、`event_conflicts`、`events_valid`、`event_
 -- 按 UUIDv4 查询，覆盖全部在线分区。
 SELECT * FROM metering.requests WHERE logical_request_id = ?;
 
--- 客户精查。第二个参数为 30 天在线窗口的 Unix 毫秒下界。
+-- 客户精查。第二个参数为 365 日在线窗口的 Unix 毫秒下界。
 SELECT r.logical_request_id, r.x_request_id, r.request_started_at_ms,
        r.service_id, r.response_model, r.usage_status,
        r.observation_status, r.input_tokens, r.output_tokens,
@@ -661,7 +661,7 @@ WHERE request_date = ? AND customer_id = ?;
 
 仅凭 `X-Request-Id` 的辅助检索允许零到多条结果。客户接口先校验 UUIDv4 格式，再校验在线时间和认证主体；其他客户 ID 与不存在的 ID 返回相同未找到响应。查询结果应显示用量状态、token 的 NULL/有效值和数据水位；暂未查到不能推断为零消耗。数据库账号不直接交给客户。
 
-日均约 1 亿事件、30 天约 30 亿事件时，按请求聚合、跨分区冲突判断和客户筛选可能很贵。验收需测单 ID 精查和单客户 1 小时/24 小时分页，在 10 并发、100 行结果下 P95 ≤3 秒，并用 EXPLAIN 核对分区与扫描量。如不达标，增加经过冲突回查的检索结构或预聚合，并单独验收；不能跳过冲突隔离换性能。
+日均约 1 亿事件、一年约 365 亿事件时，按请求聚合、跨分区冲突判断和客户筛选可能很贵。验收需测单 ID 精查和单客户 1 小时/24 小时分页，在 10 并发、100 行结果下 P95 ≤3 秒，并用 EXPLAIN 核对分区与扫描量。如不达标，增加经过冲突回查的检索结构或预聚合，并单独验收；不能跳过冲突隔离换性能。
 
 ## 8. Consumer 落库与异常事件
 
@@ -672,7 +672,8 @@ WHERE request_date = ? AND customer_id = ?;
 3. 规范化并计算 `payload_hash` 与稳定身份 `identity_hash`，按 `request_started_at_ms` 的 UTC 日期确定 `request_date`，从同一个已校验的事件对象展开类型化列并准备 `events_raw` 行。校验 `event_id` 与 `logical_request_id`/`event_type` 一致，所有可空字段按原事件 null 写 SQL NULL，token source 不从数值猜测；类型化列与保留的 `event_json` 必须表达同一事件。不在 Consumer 中重新提取服务 usage、补估算或改变定稿。
 4. 每个 Kafka 分区每批最多 5000 行/4 MiB，或等待 1 秒即通过 Doris Stream Load 写入。固定 label 为表名及 topic、partition、首末 offset 的规范元组 SHA-256（表名前缀 + 64 位十六进制摘要，不超过 128 字符），重试沿用相同 label；设置 Expect: 100-continue、format=json、read_json_by_line=true、max_filter_ratio=0、timezone=+00:00，处理 FE 到 BE 的 307 重定向，并写入 UTC DATETIME(3) 字符串。响应成功、加载行数等于批次行数、过滤行数为 0 且事务可见后，才提交该分区连续成功记录的下一 offset。
 5. Stream Load 失败、Publish Timeout、行数不符或确认丢失时不提交 offset；查明事务状态后以原 label 和原内容重试。Label Already Exists 本身不等于成功，须核实原批已可见。label 有有限保留期，长期重放依赖事件表 Unique Key；同一事件的不同摘要不得合并。同一连续 offset 范围内若既有合法事件又有拒绝诊断，分别写入两表，两个事务均确认可见后才提交该范围的 offset。
-6. rebalance 停止已撤销分区的新处理；未确认批次留待新 owner 重放，不能提交越过失败记录的 offset。
+6. 一期统计衔接须在提交 offset 前确认 request_conflict_ids 已持久化，并登记所有受影响日期的汇总 dirty 状态；跨日期冲突需同时刷新旧日期。失败时保留 offset 重试，不能只在内存通知 usage-worker。采集子项联调可先核验原始数据，整体验收仍须完成该衔接。
+7. rebalance 停止已撤销分区的新处理；未确认批次留待新 owner 重放，不能提交越过失败记录的 offset。
 
 Consumer/Doris 故障可以依赖 Kafka 72 小时保留恢复，与禁止采集侧补传不冲突。数据库不可用时暂停分区获取、保持心跳与有界批次，不能无限增加消费内存。告警阈值初值 lag age >60 秒警告、>24 小时严重、>60 小时紧急；offset 已过期则显式报告数据缺口，不跳到最新并声称完整。
 
@@ -961,7 +962,7 @@ data: [DONE]
 | 两事件身份快照不同 | requests.has_conflict=1，不选任意客户归属 |
 | 两事件 X-Request-Id 不同、同 X-Request-Id 多次请求 | 前者隔离为冲突；后者保持不同 logical_request_id，辅助查询返回多个候选 |
 | 空 usage / SQL Nullable / 只有 start | SQL 不把 null 变零，不把两条事件计为两次请求 |
-| 跨 UTC 午夜、TTL 边界、超过 30 天重放 | 分区按 `request_started_at_ms` 的 UTC 开始日；跨日期同 UUID 冲突全局可见，冲突标记跨原始行到期仍保留至在线窗口结束 |
+| 跨 UTC 午夜、一年分区边界、超过 365 日重放 | 分区按 `request_started_at_ms` 的 UTC 开始日；跨日期同 UUID 冲突全局可见，冲突标记跨原始行到期仍保留至在线窗口结束 |
 | 多 Observer Pod、进程重启、并发 Start、随机源故障 | 每个有效 Start 从安全随机源生成独立 UUIDv4；故障拒绝该观察且不回退由网关生成 ID；同流两事件和所有 ACK 的 ID 一致 |
 | 已支持 schema 下的永久非法事件/正文混入事件 | 拒绝表只有坐标/摘要/原因，不保存原 payload；未知版本须暂停分区 |
 | Producer 黑洞/metadata 故障/确认丢失 | 有界执行槽；watchdog 可释放；uncertain 不重发 |
@@ -973,7 +974,7 @@ SDK 单元测试验证 hostcall 签名和回调注册/清理；标准 Protobuf �
 
 ### 11.3 容量与性能验收
 
-以下请求量仅指命中采集白名单的请求，不含普通 GET 等被过滤流量；网关总体负载另行压测。日均 5000 万请求约 579 RPS，正常两事件约 1157 events/s、1 亿 events/天。若暂按 1 KiB/事件举例，则约 100 GB/天、在线 30 天约 3 TB 未压缩且未计副本；合并后的结果事件可能更大，实际 JSON 大小需分别实测，不能用示例作为磁盘报价。
+以下请求量仅指命中采集白名单的请求，不含普通 GET 等被过滤流量；网关总体负载另行压测。日均 5000 万请求约 579 RPS，正常两事件约 1157 events/s、1 亿 events/天。若暂按 1 KiB/事件举例，则约 100 GB/天、在线 365 天约 36.5 TB 未压缩且未计副本；合并后的结果事件可能更大，实际 JSON 大小需分别实测，不能用示例作为磁盘报价。
 
 活跃观察流约 `峰值 RPS × 平均时长`。579 RPS、30 秒已约 17370 流，明显超过单 Root/单 Observer 初值，因此需要按网关 Worker 和 Observer 分片扩容；初值用于验证资源边界，不是全量接入配置。
 

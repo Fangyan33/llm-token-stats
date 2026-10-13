@@ -1,3 +1,5 @@
+-- Phase 1: 365 UTC request dates online (today + previous 364), partitioned by day.
+-- Doris dynamic partitions own creation and expiration; archive is an optional future design.
 -- Apache Doris 4.1.3 schema. Set the SQL session time zone to UTC.
 -- This single-BE example uses one replica. Size buckets and replicas for production.
 CREATE DATABASE IF NOT EXISTS metering;
@@ -68,12 +70,12 @@ PROPERTIES (
     "enable_unique_key_merge_on_write" = "true",
     "dynamic_partition.enable" = "true",
     "dynamic_partition.time_unit" = "DAY",
-    "dynamic_partition.time_zone" = "UTC",
-    "dynamic_partition.start" = "-31",
+    "dynamic_partition.start" = "-364",
     "dynamic_partition.end" = "2",
     "dynamic_partition.prefix" = "p",
     "dynamic_partition.buckets" = "16",
-    "dynamic_partition.create_history_partition" = "true"
+    "dynamic_partition.create_history_partition" = "true",
+    "dynamic_partition.time_zone" = "UTC"
 );
 
 -- Retain conflict markers: one variant may expire before another.
@@ -103,12 +105,12 @@ PROPERTIES (
     "enable_unique_key_merge_on_write" = "true",
     "dynamic_partition.enable" = "true",
     "dynamic_partition.time_unit" = "DAY",
-    "dynamic_partition.time_zone" = "UTC",
-    "dynamic_partition.start" = "-30",
+    "dynamic_partition.start" = "-364",
     "dynamic_partition.end" = "2",
     "dynamic_partition.prefix" = "p",
     "dynamic_partition.buckets" = "8",
-    "dynamic_partition.create_history_partition" = "true"
+    "dynamic_partition.create_history_partition" = "true",
+    "dynamic_partition.time_zone" = "UTC"
 );
 
 CREATE VIEW IF NOT EXISTS metering.event_variants AS

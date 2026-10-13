@@ -1,0 +1,509 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Metering Kafka event v1",
+  "description": "Property order is the canonical Go struct order. Byte limits and relational invariants also require validate_collection_contracts.py.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "event_id",
+    "event_type",
+    "logical_request_id",
+    "x_request_id",
+    "observation_id",
+    "observation_scope",
+    "producer_id",
+    "gateway_instance_id",
+    "config_version",
+    "adapter_id",
+    "route_name",
+    "service_id",
+    "api_key_id",
+    "customer_id",
+    "application_id",
+    "identity_status",
+    "request_started_at_ms",
+    "observation_ended_at_ms",
+    "request_finished_at_ms",
+    "event_created_at_ms",
+    "request_model",
+    "response_model",
+    "http_status",
+    "upstream_attempt_count",
+    "response_flags",
+    "response_code_details",
+    "business_outcome",
+    "terminal_observed",
+    "observation_status",
+    "usage_status",
+    "usage_eligible",
+    "usage",
+    "raw_usage_json",
+    "raw_usage_truncated",
+    "anomaly_codes"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "event_id": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}:(start|usage)$"
+    },
+    "event_type": {
+      "enum": [
+        "request_started",
+        "usage_observed"
+      ]
+    },
+    "logical_request_id": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "x_request_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9._:-]+$"
+    },
+    "observation_id": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "observation_scope": {
+      "const": "gateway_response"
+    },
+    "producer_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "gateway_instance_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "config_version": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "adapter_id": {
+      "const": "chat_completions_v1"
+    },
+    "route_name": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "service_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "api_key_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "customer_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "application_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "identity_status": {
+      "enum": [
+        "known",
+        "invalid"
+      ]
+    },
+    "request_started_at_ms": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 253402300799999
+    },
+    "observation_ended_at_ms": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 1,
+      "maximum": 253402300799999
+    },
+    "request_finished_at_ms": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 1,
+      "maximum": 253402300799999
+    },
+    "event_created_at_ms": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 253402300799999
+    },
+    "request_model": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "minLength": 1,
+      "maxLength": 1024
+    },
+    "response_model": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "minLength": 1,
+      "maxLength": 1024
+    },
+    "http_status": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 200,
+      "maximum": 599
+    },
+    "upstream_attempt_count": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 1,
+      "maximum": 2147483647
+    },
+    "response_flags": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "response_code_details": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "business_outcome": {
+      "enum": [
+        "response_complete",
+        "stream_incomplete",
+        "unknown",
+        null
+      ]
+    },
+    "terminal_observed": {
+      "type": "boolean"
+    },
+    "observation_status": {
+      "enum": [
+        "complete",
+        "partial",
+        "unknown",
+        null
+      ]
+    },
+    "usage_status": {
+      "enum": [
+        "not_applicable",
+        "known",
+        "partial",
+        "unknown",
+        "conflict"
+      ]
+    },
+    "usage_eligible": {
+      "type": "boolean"
+    },
+    "usage": {
+      "anyOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "input_tokens",
+            "output_tokens",
+            "cached_read_tokens",
+            "cached_write_tokens",
+            "reasoning_tokens",
+            "reported_total_tokens"
+          ],
+          "properties": {
+            "input_tokens": {
+              "$ref": "#/$defs/token"
+            },
+            "output_tokens": {
+              "$ref": "#/$defs/token"
+            },
+            "cached_read_tokens": {
+              "$ref": "#/$defs/token"
+            },
+            "cached_write_tokens": {
+              "$ref": "#/$defs/token"
+            },
+            "reasoning_tokens": {
+              "$ref": "#/$defs/token"
+            },
+            "reported_total_tokens": {
+              "$ref": "#/$defs/token"
+            }
+          }
+        }
+      ]
+    },
+    "raw_usage_json": {
+      "type": "string",
+      "maxLength": 4096
+    },
+    "raw_usage_truncated": {
+      "type": "boolean"
+    },
+    "anomaly_codes": {
+      "type": "array",
+      "maxItems": 32,
+      "uniqueItems": true,
+      "items": {
+        "enum": [
+          "invalid_model",
+          "identity_invalid",
+          "invalid_usage",
+          "usage_conflict",
+          "missing_usage",
+          "missing_end",
+          "protocol_error",
+          "protocol_incomplete",
+          "unsupported_encoding",
+          "unsupported_content_type",
+          "parse_limit",
+          "transport_lost",
+          "observation_timeout",
+          "clock_anomaly"
+        ]
+      }
+    }
+  },
+  "$defs": {
+    "token": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "value",
+        "source"
+      ],
+      "properties": {
+        "value": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0,
+          "maximum": 9223372036854775807
+        },
+        "source": {
+          "enum": [
+            "reported",
+            "unknown"
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "source": {
+                "const": "unknown"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "const": null
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "value": {
+                "type": "integer"
+              }
+            }
+          }
+        }
+      ]
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "event_type": {
+            "const": "request_started"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "observation_ended_at_ms": {
+            "const": null
+          },
+          "request_finished_at_ms": {
+            "const": null
+          },
+          "request_model": {
+            "const": null
+          },
+          "response_model": {
+            "const": null
+          },
+          "http_status": {
+            "const": null
+          },
+          "upstream_attempt_count": {
+            "const": null
+          },
+          "response_flags": {
+            "const": null
+          },
+          "response_code_details": {
+            "const": null
+          },
+          "business_outcome": {
+            "const": null
+          },
+          "observation_status": {
+            "const": null
+          },
+          "usage": {
+            "const": null
+          },
+          "usage_status": {
+            "const": "not_applicable"
+          },
+          "usage_eligible": {
+            "const": false
+          },
+          "terminal_observed": {
+            "const": false
+          },
+          "raw_usage_json": {
+            "const": "{}"
+          },
+          "raw_usage_truncated": {
+            "const": false
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "usage": {
+            "type": "object"
+          },
+          "observation_ended_at_ms": {
+            "type": "integer"
+          },
+          "observation_status": {
+            "enum": [
+              "complete",
+              "partial",
+              "unknown"
+            ]
+          },
+          "business_outcome": {
+            "enum": [
+              "response_complete",
+              "stream_incomplete",
+              "unknown"
+            ]
+          },
+          "usage_status": {
+            "enum": [
+              "known",
+              "partial",
+              "unknown",
+              "conflict"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "terminal_observed": {
+            "const": false
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "request_finished_at_ms": {
+            "const": null
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "request_finished_at_ms": {
+            "type": "integer"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "usage_eligible": {
+            "const": true
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "event_type": {
+            "const": "usage_observed"
+          },
+          "usage_status": {
+            "const": "known"
+          },
+          "observation_status": {
+            "const": "complete"
+          },
+          "identity_status": {
+            "const": "known"
+          },
+          "terminal_observed": {
+            "const": true
+          }
+        }
+      }
+    }
+  ]
+}

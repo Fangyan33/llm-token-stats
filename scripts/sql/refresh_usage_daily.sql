@@ -1,6 +1,7 @@
 -- Reference template only; the phase-1 usage-worker is a planned implementation.
 -- Render only validated ISO dates, partition names, UUID refresh IDs and hex SHA-256.
--- Preparation only: serialize jobs for this period, load and validate the temporary partition.
+-- Preparation only: one protected Go publisher serializes all periods.
+-- Persist captured inputs in Doris, then load and validate the temporary partition.
 -- Ordinary reads continue using the previous formal partition.
 -- Publish separately after validation; see docs/daily-monthly-summary-design.md.
 SET time_zone = '+00:00';

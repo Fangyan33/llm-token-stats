@@ -1,0 +1,63 @@
+{
+  "schema_version": 1,
+  "event_id": "7f6c2a90-4b13-4b68-9d21-67283e0c5f44:usage",
+  "event_type": "usage_observed",
+  "logical_request_id": "7f6c2a90-4b13-4b68-9d21-67283e0c5f44",
+  "x_request_id": "b3e1fba5-16a4-4dfb-aa84-50141e80d473",
+  "observation_id": "7f6c2a90-4b13-4b68-9d21-67283e0c5f44",
+  "observation_scope": "gateway_response",
+  "producer_id": "observer-pod-uid",
+  "gateway_instance_id": "gateway-pod-uid",
+  "config_version": "collection-v1",
+  "adapter_id": "chat_completions_v1",
+  "route_name": "llm-chat",
+  "service_id": "model-service-a",
+  "api_key_id": "key-42",
+  "customer_id": "customer-7",
+  "application_id": "app-3",
+  "identity_status": "known",
+  "request_started_at_ms": 1789862400000,
+  "observation_ended_at_ms": 1789862401200,
+  "request_finished_at_ms": 1789862401195,
+  "event_created_at_ms": 1789862401201,
+  "request_model": "model-a",
+  "response_model": "model-a-2026",
+  "http_status": 200,
+  "upstream_attempt_count": null,
+  "response_flags": null,
+  "response_code_details": null,
+  "business_outcome": "response_complete",
+  "terminal_observed": true,
+  "observation_status": "complete",
+  "usage_status": "known",
+  "usage_eligible": true,
+  "usage": {
+    "input_tokens": {
+      "value": 0,
+      "source": "reported"
+    },
+    "output_tokens": {
+      "value": 0,
+      "source": "reported"
+    },
+    "cached_read_tokens": {
+      "value": 0,
+      "source": "reported"
+    },
+    "cached_write_tokens": {
+      "value": 0,
+      "source": "reported"
+    },
+    "reasoning_tokens": {
+      "value": 0,
+      "source": "reported"
+    },
+    "reported_total_tokens": {
+      "value": 0,
+      "source": "reported"
+    }
+  },
+  "raw_usage_json": "{\"prompt_tokens\":0,\"completion_tokens\":0,\"total_tokens\":0,\"prompt_tokens_details\":{\"cached_tokens\":0,\"cache_write_tokens\":0},\"completion_tokens_details\":{\"reasoning_tokens\":0}}",
+  "raw_usage_truncated": false,
+  "anomaly_codes": []
+}

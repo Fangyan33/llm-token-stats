@@ -1,8 +1,10 @@
 # 网关请求采集开发实现方案
 
-版本：V1.7｜日期：2026-10-12｜状态：开发设计，尚未完成真实网关 PoC 和性能验收。
+版本：V1.9｜日期：2026-10-13｜状态：设计契约与离线校验已闭环；组件尚待实现，真实网关 PoC 和性能验收未执行。
 
 依据：[原技术方案](token-metering-design.md)、[功能设计概览及开发周期](token-metering-functional-overview-and-schedule.md)、[API Key Auth 服务方案](api-key-auth-service-implementation.md)。本文细化一期中“鉴权后采集到 Doris 明细入库”的采集子项；一期的估算、日/月汇总、客户查询与看板在后续子项完成；归档为后续可选项，不能以本文验收代替一期整体验收。本文中的 SQL、协议和配置供后续实现使用；Go 代码标明为伪代码的部分不能直接编译。
+
+设计闭环交付物、协议业务校验、请求改写衔接、Consumer 恢复屏障与 G0–G5 上线证据见[闭环与验收清单](gateway-collection-design-closure.md)。正式契约文件为实施依据，本文片段由离线脚本检查一致性。
 
 ## 1. 范围与技术决策
 
@@ -15,7 +17,7 @@
 | 协议 | 兼容 Chat Completions 的 JSON 和 SSE，包括工具调用、多候选 |
 | 用量 | 只提取有效服务 usage；缺失字段为 null/unknown；一期采集子项不估算，估算属于一期后续子项 |
 | 配置 | 采集参数使用版本化 JSON/YAML、ConfigMap；采集组件不建设管理 API，身份与 API Key 由独立 Auth + PostgreSQL 管理 |
-| 存储 | 类型化原始计量事件（保留规范 JSON 作冲突证据）、去重视图、请求关联视图，按 UTC 请求日期每日分区，在线保留一年（365 个日期） |
+| 存储 | Doris 保存类型化原始事件、冲突证据、去重/请求视图及汇总通知、消费凭据和发布状态；原始事件按 UTC 请求日期分区保留 365 个日期；采集与汇总无需额外 PostgreSQL |
 | 故障策略 | 业务不等待采集，采集超限或失败放弃，无落盘、重传及恢复队列 |
 | 查询交付 | 一期采集子项提供计量查询 ID、事件字段、SQL 和联调查询样例；一年内在线事件 HTTP API、门户和大范围导出任务属于一期后续子项；外部归档历史检索为可选项 |
 | 阶段衔接 | 一期后续子项：tokenizer 估算、日汇总、月汇总、客户查询/导出和看板；对象存储归档为后续可选项；二期：计费、账单发布与调整单；三期：对账和结算确认；A 侧逐尝试观察为可选扩展 |
@@ -133,7 +135,7 @@ Consumer 校验 UUIDv4 格式和 Kafka key 后，以事件中的 `request_starte
 
 ### 3.1 Protobuf 定义
 
-以下内容作为后续 `api/observation/v1/observation.proto` 的初始契约：
+正式观察契约见 [observation.proto](../api/observation/v1/observation.proto)，下列片段与该文件保持一致：
 
 ```proto
 syntax = "proto3";
@@ -287,7 +289,7 @@ WASM 中不引入 gRPC-Go、网络 goroutine、完整 Envoy protobuf 类型或�
 2. 请求体以 Envoy 累积缓冲为准，未 EOS 返回 Pause，不将每次累计 buffer 重复追加。原始请求上限 256 KiB，改写结果也必须不超过 256 KiB；每个待改写请求预留 1 MiB，覆盖 host buffer、WASM 读取副本、输出和解析索引，Root 总预算 16 MiB、最多 16 个并发。超过预算直接原样放行并记 `rewrite_resource_limit`；不等待额度。host 超限回调的额外字节及 native buffer 另计入网关预算。
 3. 完整 JSON 有界校验后，仅对顶层布尔 `stream=true` 改写：没有 stream_options 或值为 null 时创建对象；已有对象时保留其他字段，把 include_usage 添加或替换为 true；原本为 true 时幂等。`stream=false` 或未设置 stream 的普通请求不添加该字段。stream_options 为其他类型、重复键、非法 JSON、深度超过 64 或元素超过 100000 时保持原文并记 `rewrite_invalid_json`。采用 token 位置编辑，避免重新编码 messages/tools、改变数值精度或其他业务字段。
 4. 在最终 body 回调内调用 `ReplaceHttpRequestBody`，成功后返回 Continue。改写后的请求是唯一请求观察来源：从 offset=0 分片，只发送一次；按 16 KiB 拆片、在途不足时放弃旁路，不等待 ACK。这个有界完整请求路径不套用流式响应的 64 KiB/4 片回调限制。替换失败只在已验证 host 未修改原 buffer 时原文放行，不能转发部分改写内容。
-5. 改写等待最多 2000 ms（从请求头回调开始）。Root tick 在 HTTP context 仍存活时切换有效上下文，超时则 `ResumeHttpRequest` 原文放行并转入永久透传状态；后续片段不再次缓冲或改写。超限、客户端断开、context 删除和热更新都释放改写预算；暂停期间的 trailers 结束路径须在真实 Envoy 验证正文改写 hostcall 是否可用，若不可用则原文恢复并记 `rewrite_trailers_unsupported`，不能无限 Pause。任何旁路网络操作不得延长暂停期限。
+5. 改写在请求头回调后 2000 ms 判到期，实际恢复还受 tick/Worker 调度影响，必须实测到期恢复延迟。Root tick 在 HTTP context 仍存活时切换有效上下文，超时则 `ResumeHttpRequest` 原文放行并转入永久透传状态；后续片段不再次缓冲或改写。超限、客户端断开、context 删除和热更新都释放改写预算；降级时只观察已缓冲原文一次，再接续透传尾片，超出正文上限或无法取得一致缓冲时直接取消旁路，详见闭环清单第 4 节；暂停期间的 trailers 结束路径须在真实 Envoy 验证正文改写 hostcall 是否可用，若不可用则原文恢复并记 `rewrite_trailers_unsupported`，不能无限 Pause。任何旁路网络操作不得延长暂停期限。
 
 改写状态为 BYPASS / BUFFERING / REWRITTEN / PASSTHROUGH，与观察状态机独立。上述失败路径遵循业务 fail-open，但意味着 include_usage 未保证注入，必须单独统计 `rewrite_failed`（固定原因码），纳入采集完整率告警和灰度验收，不能静默宣称成功。压缩、非法 JSON、超限等不支持场景不承诺 usage 完整；正常支持范围内的缺字段/false 请求必须补充成功。
 
@@ -384,7 +386,7 @@ func (p *PluginContext) OnTick() {
 | root_rewrite_budget_bytes | uint64/字节 | 16777216 | 无额度原文透传并计数 |
 | root_max_rewrites | uint32/个 | 16 | 同上 |
 | response_body_max_bytes | uint64/字节 | 8388608 | 同上 |
-| stream_inflight_bytes | uint32/字节 | 131072 | 取消旁路，不等待额度 |
+| stream_inflight_bytes | uint32/字节 | 524288 | 取消旁路，不等待额度 |
 | stream_inflight_messages | uint32/条 | 32 | 同上 |
 | root_max_streams | uint32/流 | 512 | 新请求跳过采集 |
 | root_inflight_bytes | uint64/字节 | 16777216 | 取消触发超限的旁路 |
@@ -398,7 +400,7 @@ func (p *PluginContext) OnTick() {
 
 在途字节按“Protobuf 序列化长度 + 5 字节 gRPC 消息头”计算；账本只留序号、长度与时间，不留可重传正文。发送成功只表示 hostcall 接纳。失败后释放未提交预留，取消已提交旁路并一次性清理账本；迟到 ACK 不得再次释放。
 
-每流总额度内预留 4 条、8 KiB 给 Start/响应头/End，正文不能占用；仍需同时满足 Root 总额度。控制消息没有无限通道。如果已取消旁路，不再另开流补报 End；Observer 通过断开或期限定稿。
+每流总额度内预留 4 条、8 KiB 给 Start/响应头/End，正文不能占用；默认单流 512 KiB 可容纳最大 256 KiB 改写请求及分片开销，完整请求观察必须先预留全部额度再复制，不能等 ACK 补额度；仍需同时满足 Root 总额度。控制消息没有无限通道。如果已取消旁路，不再另开流补报 End；Observer 通过断开或期限定稿。
 
 每个 Worker/VM 有独立 Root，一期采集子项每 Worker 每代仅装一个插件实例。改写预留为独立预算，最多另加 `worker_count × root_rewrite_budget_bytes`，热更新同样按代数放大。稳态实例理论在途上界为 `worker_count × root_inflight_bytes`，还需加 VM heap、gRPC/HTTP2、Envoy native buffer 和元数据。热更新旧新代共存时还要乘以存活代数；发布节流保证最多两代采集状态，旧代退出前不连续发布。发布模板固定并核验 worker 数；初始灰度用 2 Worker，对应稳态 32 MiB 记账在途，不能声称整个网关只增加 32 MiB。
 
@@ -453,15 +455,15 @@ SSE 完整协议要求 `[DONE]`；缺少它但收到传输 EOS/End 时标 `proto
 
 校验 `cached_read <= input`、`cached_write <= input`、两者都已知时 `cached_read + cached_write <= input`、`reasoning <= output`，以及两项都已知时 `input + output == reported_total`；加法用溢出检查。冲突保留合法数值和来源以便解释，但 `usage_status=conflict`、`usage_eligible=false`。禁止据总量倒推缺失字段。OpenAI 官方 Chat Completions 把 `cache_write_tokens` 定义为可选字段，接入的兼容服务仍须以实际返回值为准；缺失不是零。[OpenAI Chat Completions 用量字段](https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create)
 
-`raw_usage_json` 不是任意 usage 对象的转存：只白名单复制上表数值字段及其 details 对象，最多 4 KiB，其余字段丢弃，设置 `raw_usage_truncated=true`。内容仅作为首次依据，不含正文、自由文本或服务原始错误。超限时保存 `{}` 并标记，不保存截断后的非法 JSON。
+`raw_usage_json` 不是任意 usage 对象的转存：只白名单复制上表有效非负 Int64 数值字段及其 details 对象，最多 4 KiB，其余字段及非法类型/数值丢弃，设置 `raw_usage_truncated=true`。内容仅作为首次依据，不含正文、自由文本或服务原始错误。超限时保存 `{}` 并标记，不保存截断后的非法 JSON。
 
 ### 5.4 完整性与终态
 
 来源、采集完整性、用量状态、业务结果分开建模：
 
 - `observation_status`：complete（两方向 EOS、序号/总量正确、有 End）、partial（有缺失/截断）、unknown（只获得有限元数据）。
-- `usage_status`：known（输入和输出均有效）、partial（只知道部分字段）、unknown、conflict。
-- `usage_eligible`：仅当服务适配成功、observation_status=complete、输入输出均已知、无用量/身份冲突且身份 known 时为 true；它只表示一期采集子项有效统计候选，不代表允许收费。
+- `usage_status`：known（输入和输出均有效）、partial（输入输出尚未全部有效，但六个字段中至少一个有效）、unknown（六字段全未知）、conflict（优先于其他状态）。
+- `usage_eligible`：仅当服务适配成功、observation_status=complete、输入输出均已知、无用量/身份冲突、无使结果失效的异常且身份 known 时为 true；它只表示一期采集子项有效统计候选，不代表允许收费。
 - `business_outcome`：response_complete、stream_incomplete、unknown；HTTP 成败由 http_status 另查。不能把所有断流归因为客户主动取消。
 
 普通 JSON 只有完整文档解析成功才能认定上报字段；已确认终结 SSE usage 即使后续流丢失也可以保留 reported 数值，但完整性标 partial，不进入有效统计候选。
@@ -497,7 +499,7 @@ sequenceDiagram
 
 ### 6.1 事件格式
 
-下游应用接入步骤、全部事件字段说明及 Go/Java 消费示例见 [Kafka 计量事件应用接入指南](kafka-event-integration-guide.md)。
+正式固定字段集见 [事件 Schema](../api/events/v1/metering-event.schema.json)，字节/状态/来源/关联校验由[离线校验器](../scripts/validate_collection_contracts.py)补充。下游应用接入步骤、全部事件字段说明及 Go/Java 消费示例见 [Kafka 计量事件应用接入指南](kafka-event-integration-guide.md)。
 
 Topic 固定 `llm-metering-events`，key 为 logical_request_id 的 UTF-8；初始 24 分区、3 副本、`min.insync.replicas=2`、保留 72 小时、`cleanup.policy=delete`。分区数属压测初值；同一部署周期不在线改分区数，变更需停采、排空在途后切换。Kafka 不接收正文片段。
 
@@ -555,7 +557,7 @@ Topic 固定 `llm-metering-events`，key 为 logical_request_id 的 UTF-8；初�
 
 字段值由 Go 固定 struct 编码，字段顺序固定、无缩进，所有可选字段显式输出 null，字符串采用 Go encoding/json 默认转义；不接受同名重复 JSON key、未知顶层字段或自由扩展 map。Consumer 解码后按同一 schema struct 重编码为 `event_json`，计算 SHA-256 小写十六进制 `payload_hash`。摘要不含 Kafka 坐标/入库时间，包含 producer_id、事件时间和全部业务字段。重放保留原事件，不重新生成时间或 producer_id。
 
-模型长度扩大后，两个模型字段在 JSON 转义情况下最多占约 12 KiB；单事件最大 **32 KiB**（按序列化后字节计），Observer 和 Consumer 使用同一上限，独立于 gRPC 单帧 32 KiB 限制；超限在发送前丢弃并计数。`anomaly_codes` 去重排序，最多 32 个固定枚举；不放异常堆栈、正文和密钥。首次版本至少包含 invalid_model、identity_invalid、invalid_usage、usage_conflict、missing_usage、missing_end、protocol_error、protocol_incomplete、unsupported_encoding、unsupported_content_type、parse_limit、transport_lost、observation_timeout、clock_anomaly。
+模型长度扩大后，两个模型字段在 JSON 转义情况下最多占约 12 KiB；单事件最大 **32 KiB**（按序列化后字节计），Observer 和 Consumer 使用同一上限，独立于 gRPC 单帧 32 KiB 限制；超限在发送前丢弃并计数。`anomaly_codes` 去重排序，最多 32 个固定枚举；不放异常堆栈、正文和密钥。v1 封闭枚举为 invalid_model、identity_invalid、invalid_usage、usage_conflict、missing_usage、missing_end、protocol_error、protocol_incomplete、unsupported_encoding、unsupported_content_type、parse_limit、transport_lost、observation_timeout、clock_anomaly。
 
 ### 6.2 Producer 策略
 
@@ -616,7 +618,7 @@ Migration 创建 `event_variants`、`event_conflicts`、`events_valid`、`event_
 
 `requests` 一行代表一个已记录请求，不能直接对事件表 `COUNT(*)` 当调用量。有开始事件而没有结果事件时，`usage_status=not_observed`，token 为 NULL，不意味着零用量。`usage_effective` 只用于当前有效用量核验；未知、部分、冲突与未观察到的状态仍需分别展示。
 
-冲突检测器每分钟取最近消费的 UUID，在全部在线分区核对事件变体、开始时间和身份摘要；发现冲突即写 `request_conflict_ids`。当前变体共存时视图立即隔离；标记保证其中一份过期后仍隔离。检测器若无法在最早证据过期前持久化标记，暂停对外有效用量查询并报警。日志仅输出事件 ID/摘要，不输出 `event_json`。
+Consumer 在提交 offset 前按本批 UUID 跨全部在线分区核对事件变体、开始时间和身份摘要，发现冲突即写 `request_conflict_ids` 并确认可见。每分钟补偿检测从持久消费水位及在线分区巡检恢复输入，不依赖内存中的最近 UUID；详见闭环清单第 5 节。当前变体共存时视图立即隔离；标记保证其中一份过期后仍隔离。检测器若无法在最早证据过期前持久化标记，暂停对外有效用量查询并报警。日志仅输出事件 ID/摘要，不输出 `event_json`。
 
 ### 7.3 查询样例
 
@@ -670,9 +672,9 @@ WHERE request_date = ? AND customer_id = ?;
 1. 使用独立 group `llm-metering-doris-v1`，禁用自动提交。每分区顺序处理，允许不同分区并行。遇到 Consumer 尚不支持的 Kafka 事件 `schema_version`，立即暂停该分区，保留当前未提交 offset，报警并等待 Consumer 升级；其他分区可继续处理。
 2. 对已支持版本校验大小、schema、白名单、ID 为规范小写 UUIDv4（`^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`）、Kafka key 与 ID 一致、ID/类型后缀、`request_started_at_ms` 为合法 Unix 毫秒、身份类型、token 类型和来源组合；只接受 `request_started`（:start）和 `usage_observed`（:usage）。start 出现非 null usage 一律拒绝；结果事件必须带有用量状态和终态标识，即使 token 未知也不能省略状态。若 `terminal_observed=false`，`request_finished_at_ms` 必须为 null。开始时间超出消费者当前时间 5 分钟以上进入拒绝诊断，不让远期分区无限保留；所有拒绝都有原因计数。
 3. 规范化并计算 `payload_hash` 与稳定身份 `identity_hash`，按 `request_started_at_ms` 的 UTC 日期确定 `request_date`，从同一个已校验的事件对象展开类型化列并准备 `events_raw` 行。校验 `event_id` 与 `logical_request_id`/`event_type` 一致，所有可空字段按原事件 null 写 SQL NULL，token source 不从数值猜测；类型化列与保留的 `event_json` 必须表达同一事件。不在 Consumer 中重新提取服务 usage、补估算或改变定稿。
-4. 每个 Kafka 分区每批最多 5000 行/4 MiB，或等待 1 秒即通过 Doris Stream Load 写入。固定 label 为表名及 topic、partition、首末 offset 的规范元组 SHA-256（表名前缀 + 64 位十六进制摘要，不超过 128 字符），重试沿用相同 label；设置 Expect: 100-continue、format=json、read_json_by_line=true、max_filter_ratio=0、timezone=+00:00，处理 FE 到 BE 的 307 重定向，并写入 UTC DATETIME(3) 字符串。响应成功、加载行数等于批次行数、过滤行数为 0 且事务可见后，才提交该分区连续成功记录的下一 offset。
-5. Stream Load 失败、Publish Timeout、行数不符或确认丢失时不提交 offset；查明事务状态后以原 label 和原内容重试。Label Already Exists 本身不等于成功，须核实原批已可见。label 有有限保留期，长期重放依赖事件表 Unique Key；同一事件的不同摘要不得合并。同一连续 offset 范围内若既有合法事件又有拒绝诊断，分别写入两表，两个事务均确认可见后才提交该范围的 offset。
-6. 一期统计衔接须在提交 offset 前确认 request_conflict_ids 已持久化，并登记所有受影响日期的汇总 dirty 状态；跨日期冲突需同时刷新旧日期。失败时保留 offset 重试，不能只在内存通知 usage-worker。采集子项联调可先核验原始数据，整体验收仍须完成该衔接。
+4. 每个 Kafka 分区每批最多 5000 行/4 MiB，或等待 1 秒即通过 Doris Stream Load 写入。固定 label 为表名前缀加冻结批次规范元组（topic、partition、首末 offset、Stream Load 正文字节 SHA-256）的 SHA-256（前缀 + 64 位十六进制摘要，不超过 128 字符），重试沿用相同 label；设置 Expect: 100-continue、format=json、read_json_by_line=true、max_filter_ratio=0、timezone=+00:00，处理 FE 到 BE 的 307 重定向，并写入 UTC DATETIME(3) 字符串。响应成功、加载行数等于批次行数、过滤行数为 0 且事务可见后，才提交该分区连续成功记录的下一 offset。
+5. Stream Load 失败、Publish Timeout、行数不符或确认丢失时不提交 offset；同一执行期查明事务状态后以原 label 和原内容重试；重启/新 owner 重新冻结的内容或范围变化时生成新 label，依赖 Unique Key 消除已成功写入的行。Label Already Exists 本身不等于成功，须核实原批已可见。label 有有限保留期，长期重放依赖事件表 Unique Key；同一事件的不同摘要不得合并。同一连续 offset 范围内若既有合法事件又有拒绝诊断，分别写入两表，两个事务均确认可见后才提交该范围的 offset。
+6. 在提交 offset 前完成本批 UUID 的跨在线分区冲突回查，确认 request_conflict_ids 可见；再在 Doris summary_dirty_notifications 登记所有受影响日期的幂等通知，确认后写 consumer_batch_receipts。Worker 尚未启用也登记，跨日期冲突覆盖旧日期。任一步失败保留 offset 重试，不能只在内存通知 usage-worker；采集/汇总组件不连接 PostgreSQL。冻结批次及恢复顺序见[闭环清单第 5 节](gateway-collection-design-closure.md#5-consumer-提交与恢复屏障)，通知 ID、连续分区水位及单个 Go Worker 调度见[Doris 协调设计](doris-summary-coordination.md)。
 7. rebalance 停止已撤销分区的新处理；未确认批次留待新 owner 重放，不能提交越过失败记录的 offset。
 
 Consumer/Doris 故障可以依赖 Kafka 72 小时保留恢复，与禁止采集侧补传不冲突。数据库不可用时暂停分区获取、保持心跳与有界批次，不能无限增加消费内存。告警阈值初值 lag age >60 秒警告、>24 小时严重、>60 小时紧急；offset 已过期则显式报告数据缺口，不跳到最新并声称完整。
@@ -689,7 +691,7 @@ Consumer/Doris 故障可以依赖 Kafka 72 小时保留恢复，与禁止采集�
 
 ### 9.1 插件配置
 
-JSON 是插件的唯一配置输入；ConfigMap/Helm 只负责渲染同一结构。配置不可在活动请求内热改；发布新版本后新请求使用新配置，旧 Root 有界结束。
+正式配置见 [Schema](../configs/gateway-observer.schema.json) 与[默认关闭样例](../configs/gateway-observer.example.json)。预发布执行校验器并核对跨字段额度。JSON 是插件的唯一配置输入；ConfigMap/Helm 只负责渲染同一结构。配置不可在活动请求内热改；发布新版本后新请求使用新配置，旧 Root 有界结束。
 
 ```json
 {
@@ -710,7 +712,7 @@ JSON 是插件的唯一配置输入；ConfigMap/Helm 只负责渲染同一结构
   "root_rewrite_budget_bytes": 16777216,
   "root_max_rewrites": 16,
   "response_body_max_bytes": 8388608,
-  "stream_inflight_bytes": 131072,
+  "stream_inflight_bytes": 524288,
   "stream_inflight_messages": 32,
   "root_max_streams": 512,
   "root_inflight_bytes": 16777216,
@@ -726,7 +728,7 @@ JSON 是插件的唯一配置输入；ConfigMap/Helm 只负责渲染同一结构
 
 `gateway_instance_id` 由插件读取已验证的 Envoy node metadata 中 Pod UID；配置示例的占位值用于联调替换，生产不得给多个 Pod 写同一个常量。若环境未暴露 Pod UID，通过网关启动配置注入 node metadata，插件读取后校验；不从 HTTP 请求头读。
 
-配置校验：路由 enabled 缺省为 false；空 routes 表示全部忽略。route_name 必须唯一；methods/paths 缺失、为空、重复、超限，路径不是以 / 开头、含查询串/片段标识或匹配模式，及非一期采集子项方法/适配器均为无效配置；不得把空列表解释为全匹配。遵循第 2.3 节的数量和长度上限。未知字段拒绝；ID、cluster、route 长度有界；每流额度必须小于等于 Root 额度；改写单次预留乘以并发上限不得大于 Root 改写预算；分片能装入 32 KiB gRPC 消息；控制预留不得大于总额度。预发布严格校验失败即阻止发布；运行时语义配置无效时进入 disabled 并返回初始化成功，暴露 config_invalid 指标。模块无法加载、ABI 不兼容等底层错误仍可能 NACK/启动失败，fail_open 无法兜底。
+配置校验：路由 enabled 缺省为 false；空 routes 表示全部忽略。route_name 必须唯一；methods/paths 缺失、为空、重复、超限，路径不是以 / 开头、含查询串/片段标识或匹配模式，及非一期采集子项方法/适配器均为无效配置；不得把空列表解释为全匹配。遵循第 2.3 节的数量和长度上限。未知字段拒绝；ID、cluster、route 长度有界；每流额度必须小于等于 Root 额度；改写单次预留乘以并发上限不得大于 Root 改写预算；分片连同保守 256 字节 Protobuf 开销能装入 32 KiB gRPC 消息；最大完整改写请求必须连同全部分片开销和控制预留装入单流额度；改写预留至少覆盖原始请求上限的 4 倍。控制预留必须小于总额度。预发布严格校验失败即阻止发布；运行时语义配置无效时进入 disabled 并返回初始化成功，暴露 config_invalid 指标。模块无法加载、ABI 不兼容等底层错误仍可能 NACK/启动失败，fail_open 无法兜底。
 
 ### 9.2 Observer 和 Consumer 配置契约
 
@@ -747,6 +749,12 @@ observer:
   ack_every_frames: 8
   ack_interval_ms: 10
   ack_write_timeout_ms: 2000
+  accepted_adapter_ids: [chat_completions_v1]
+  accepted_config_versions: [collection-v1]
+  accepted_routes:
+    - {route_name: llm-chat, service_id: model-service-a}
+  response_flags_allowlist: []
+  response_code_details_allowlist: []
   producer_slots: 256
   producer_watchdog_ms: 3000
   producer_close_timeout_ms: 1000
@@ -761,7 +769,11 @@ consumer:
   max_batch_bytes: 4194304
   flush_interval_ms: 1000
   doris_database: metering
+  summary_notifications_table: summary_dirty_notifications
+  batch_receipts_table: consumer_batch_receipts
 ```
+
+Consumer 使用同一 Doris 集群完成通知和批次凭据写入，不配置汇总 PostgreSQL DSN。usage-worker 与 Observer/Consumer 独立部署，默认每分钟 CronJob 的 --once 模式，单个发布者保护及状态表见[Doris 协调设计](doris-summary-coordination.md#4-单个-go-发布-worker-与调度)。
 
 Secret 只通过挂载/环境引用，不写入 ConfigMap 或文档样例。Observer 为每个有效 Start 从 `crypto/rand` 取得 UUIDv4 所需随机字节；随机源失败时拒绝该观察流并报警，持续失败使 `/readyz` 不通过。Observer 配置可接纳的 adapter_id/config_version 白名单与插件配置一起发布，避免未知适配器被静默当通用 JSON。健康检查分 `/livez`（进程可运行）和 `/readyz`（可接纳观察）；Kafka 故障触发发送熔断和指标，不通过 liveness 造成无限重启风暴，除非 watchdog 已确认客户端不能释放。
 
@@ -1009,9 +1021,9 @@ SDK 单元测试验证 hostcall 签名和回调注册/清理；标准 Protobuf �
 
 ## 12. 文档核查状态与参考
 
-本次交付仍处于设计与工程初始化阶段。已将数据库方案改为 Doris 并提供单节点开发 migration；未连接实际 Istio、Kafka 或 Doris 集群，Consumer 和 SDK 扩展尚未实现，也未执行真实 DDL/业务性能验收。SQL 的关联、跨分区冲突判断和写读性能须在目标 Doris 版本验证；请求有界 Pause/恢复、trailers 和改写行为仍需真实 Envoy 验证。
+设计交付包括正式 Protobuf、事件与配置 Schema、六种合成事件、离线校验及边界测试，完整索引见[闭环与验收清单](gateway-collection-design-closure.md)。离线检查覆盖协议/文档一致性、20 项数值默认值、固定事件字段与 Doris 类型化列、严格 JSON、UTF-8 字节长度、来源/状态组合、Int64 算术冲突和资源关系。
 
-文档静态检查已通过：3 个 JSON 示例、2 个 YAML 代码块（共 3 个 YAML 文档）可解析；20 项插件数值默认值与参数表一致；6 个 Protobuf message 的字段号无重复；8 个 SQL 表/视图的内部引用完整；Markdown 代码围栏与本地文档链接有效。这些检查不替代 protoc 编译、SQL 执行或 Envoy 配置验证。
+本次仍处于设计与工程初始化阶段：Consumer、Observer、插件和 SDK 扩展尚未实现，未连接实际 Istio/Kafka/Doris，未运行 protoc 或真实 DDL/业务性能验收。离线检查结果不能代替真实 Envoy、数据库和容量测试；G0–G5 各门槛与所需事实已列明，实施时逐项附证据。
 
 关键区别：Envoy host 有 gRPC 能力不等于 Go SDK 已有完整封装；发送成功不等于持久化成功；请求有记录不等于 usage 已知；Doris Unique Key 重放幂等不等于跨事件冲突隔离。
 

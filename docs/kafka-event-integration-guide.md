@@ -2,6 +2,10 @@
 
 本文面向订阅计量事件的应用开发者，依据 [网关请求采集开发实现方案](gateway-request-collection-implementation.md) 中的 **schema_version=1 设计契约**编写。该方案目前是开发设计，尚未完成真实 Kafka 集群联调；实际 Broker 地址、认证方式、访问权限和上线版本由部署环境提供。
 
+正式字段契约见 [事件 Schema](../api/events/v1/metering-event.schema.json)，合成事件见 [testdata/collection](../testdata/collection)。运行时还须执行 UTF-8 字节、状态关系、来源与 Kafka key 校验；[离线校验器](../scripts/validate_collection_contracts.py)提供可复现参考。Doris Consumer 的写入/冲突/dirty/提交恢复顺序见[闭环清单](gateway-collection-design-closure.md#5-consumer-提交与恢复屏障)。
+
+采集与汇总协调使用 Doris 保存日期通知、消费批次凭据和发布状态，无额外 PostgreSQL 依赖；Consumer 在这些记录确认可见后提交自己的 offset，参见[Doris 协调设计](doris-summary-coordination.md)。这些是平台内部处理元数据，不加入 schema_version=1 Kafka value，也不要求其他订阅应用建设同样的状态表；各应用仍按自己的幂等处理结果提交消费进度。
+
 ## 1. 接入信息
 
 | 项目 | 约定 |

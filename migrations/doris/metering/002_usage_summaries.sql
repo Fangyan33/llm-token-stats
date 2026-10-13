@@ -1,5 +1,6 @@
 -- Phase 1 summary schema for Apache Doris 4.1.3; this does not schedule refresh jobs.
--- Summary partition creation / expiration is owned by the planned usage-worker.
+-- Summary partition creation / expiration is owned by one protected Go usage-worker.
+-- Coordination tables are in 004_summary_coordination.sql; no PostgreSQL summary store.
 -- Daily: 730 UTC dates including today. Monthly: 24 UTC months including this month.
 -- Initial historical summary partitions are created by a controlled backfill job.
 -- One-replica / eight-bucket values are development examples.

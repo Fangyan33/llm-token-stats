@@ -1,13 +1,16 @@
 -- Reference template only; the phase-1 usage-worker is a planned implementation.
 -- Render only validated ISO dates, partition names, UUID refresh IDs and hex SHA-256.
--- Preparation only: serialize jobs for this period, load and validate the temporary partition.
+-- Preparation only: one protected Go publisher serializes all periods.
+-- Persist captured inputs in Doris, then load and validate the temporary partition.
 -- Ordinary reads continue using the previous formal partition.
 -- Publish separately after validation; see docs/daily-monthly-summary-design.md.
 SET time_zone = '+00:00';
 SET enable_insert_strict = true;
 
--- All dates from month_start through min(next_month, tomorrow) must have published state,
--- including zero-row days. Lock the month's daily inputs until monthly publication.
+-- Require confirmed daily coverage in [max(month_start, collection_start),
+-- min(next_month, tomorrow)), including zero-row days; never treat missing days as zero.
+-- Capture the daily publication-version vector in Doris and verify it before/after loading.
+-- The single publisher pauses daily publication until this month is published or aborted.
 ALTER TABLE metering.usage_monthly ADD PARTITION IF NOT EXISTS pm{{yyyymm}}
 VALUES [('{{month_start}}'), ('{{next_month}}'));
 ALTER TABLE metering.usage_monthly ADD TEMPORARY PARTITION tp{{refresh_token}}

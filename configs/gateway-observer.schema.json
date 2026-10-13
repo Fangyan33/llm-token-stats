@@ -1,0 +1,233 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Gateway observer config v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "enabled",
+    "config_version",
+    "gateway_instance_id",
+    "observer_cluster",
+    "identity_namespace",
+    "identity_fields",
+    "routes",
+    "chunk_bytes",
+    "callback_max_bytes",
+    "callback_max_chunks",
+    "request_body_max_bytes",
+    "rewrite_timeout_ms",
+    "rewrite_reservation_bytes",
+    "root_rewrite_budget_bytes",
+    "root_max_rewrites",
+    "response_body_max_bytes",
+    "stream_inflight_bytes",
+    "stream_inflight_messages",
+    "root_max_streams",
+    "root_inflight_bytes",
+    "root_inflight_messages",
+    "ack_timeout_ms",
+    "end_ack_timeout_ms",
+    "observation_max_ms",
+    "tick_ms",
+    "metadata_max_bytes",
+    "ack_max_bytes"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "enabled": {
+      "type": "boolean"
+    },
+    "config_version": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "gateway_instance_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "observer_cluster": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256
+    },
+    "identity_namespace": {
+      "const": "envoy.filters.http.ext_authz"
+    },
+    "identity_fields": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "api_key_id",
+        "customer_id",
+        "application_id"
+      ],
+      "properties": {
+        "api_key_id": {
+          "const": "api_key_id"
+        },
+        "customer_id": {
+          "const": "customer_id"
+        },
+        "application_id": {
+          "const": "application_id"
+        }
+      }
+    },
+    "routes": {
+      "type": "array",
+      "maxItems": 128,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "route_name",
+          "methods",
+          "paths",
+          "service_id",
+          "adapter_id"
+        ],
+        "properties": {
+          "route_name": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
+          },
+          "enabled": {
+            "type": "boolean",
+            "default": false
+          },
+          "methods": {
+            "const": [
+              "POST"
+            ]
+          },
+          "paths": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 16,
+            "uniqueItems": true,
+            "items": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 1024,
+              "pattern": "^/[^?#*\\[\\]{}()|^$\\\\]*$"
+            }
+          },
+          "service_id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
+          },
+          "adapter_id": {
+            "const": "chat_completions_v1"
+          }
+        }
+      }
+    },
+    "chunk_bytes": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 16384
+    },
+    "callback_max_bytes": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 4294967295
+    },
+    "callback_max_chunks": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 4294967295
+    },
+    "request_body_max_bytes": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 262144
+    },
+    "rewrite_timeout_ms": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 2000
+    },
+    "rewrite_reservation_bytes": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 4294967295
+    },
+    "root_rewrite_budget_bytes": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 9223372036854775807
+    },
+    "root_max_rewrites": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 4294967295
+    },
+    "response_body_max_bytes": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 8388608
+    },
+    "stream_inflight_bytes": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 4294967295
+    },
+    "stream_inflight_messages": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 4294967295
+    },
+    "root_max_streams": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 4294967295
+    },
+    "root_inflight_bytes": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 9223372036854775807
+    },
+    "root_inflight_messages": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 4294967295
+    },
+    "ack_timeout_ms": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 4294967295
+    },
+    "end_ack_timeout_ms": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 4294967295
+    },
+    "observation_max_ms": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 600000
+    },
+    "tick_ms": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 4294967295
+    },
+    "metadata_max_bytes": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 4096
+    },
+    "ack_max_bytes": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 1024
+    }
+  }
+}

@@ -1,6 +1,6 @@
 # 明细归档可选设计（不纳入一期）
 
-状态：后续可选方案，修订日期：2026-10-13。当前不交付 archive-worker、归档 PostgreSQL schema、S3/MinIO 部署或归档查询接口；一期仅依赖 Doris 一年明细及日/月汇总。
+状态：后续可选方案，修订日期：2026-10-13。当前不交付 archive-worker、归档状态 schema、S3/MinIO 部署或归档查询接口；一期仅依赖 Doris 一年明细、日/月汇总及[Doris 协调状态](doris-summary-coordination.md)，采集与汇总无需额外 PostgreSQL。
 
 ## 1. 何时采用
 

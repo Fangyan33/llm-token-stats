@@ -1,0 +1,79 @@
+syntax = "proto3";
+package metering.v1;
+option go_package = "example.com/llm-token-stats/gen/observation/v1;observationv1";
+
+service ObservationService {
+  rpc Observe(stream ObservationFrame) returns (stream ObservationAck);
+}
+
+enum Direction {
+  DIRECTION_UNSPECIFIED = 0;
+  REQUEST = 1;
+  RESPONSE = 2;
+}
+
+message ObservationFrame {
+  uint32 schema_version = 1;       // 一期采集子项固定 1
+  reserved 2;                      // 不复用原草案中由网关填写的请求 ID 字段
+  uint64 frame_seq = 3;            // 从 1 开始，整个流严格递增
+  oneof payload {
+    Start start = 10;
+    ResponseHeaders response_headers = 11;
+    BodyChunk body_chunk = 12;
+    End end = 13;
+  }
+}
+
+message Start {
+  int64 request_started_at_ms = 1;
+  string gateway_instance_id = 2;  // Pod UID，不是客户端输入
+  string config_version = 3;
+  string route_name = 4;
+  string service_id = 5;
+  string adapter_id = 6;
+  optional string api_key_id = 7;
+  optional string customer_id = 8;
+  optional string application_id = 9;
+  string identity_status = 10;
+  string method = 11;
+  string request_content_type = 12;
+  string request_content_encoding = 13;
+  bool request_end_stream = 14;
+  optional string x_request_id = 15; // 网关可见的 X-Request-Id，仅辅助关联
+}
+
+message ResponseHeaders {
+  uint32 http_status = 1;
+  string content_type = 2;
+  string content_encoding = 3;
+  bool end_stream = 4;
+}
+
+message BodyChunk {
+  Direction direction = 1;
+  uint64 body_seq = 2;             // 每方向从 1 开始
+  uint64 offset = 3;               // 每方向从 0 开始的正文绝对字节偏移
+  bytes data = 4;
+  bool end_stream = 5;             // 仅当前回调最后一个子片设置
+}
+
+message End {
+  int64 request_finished_at_ms = 1;
+  uint64 last_request_body_seq = 2;
+  uint64 last_response_body_seq = 3;
+  uint64 request_bytes_seen = 4;
+  uint64 response_bytes_seen = 5;
+  bool request_end_stream_seen = 6;
+  bool response_end_stream_seen = 7;
+  optional uint32 http_status = 8;
+  optional uint32 upstream_attempt_count = 9;
+  optional string response_flags = 10;
+  optional string response_code_details = 11;
+}
+
+message ObservationAck {
+  string logical_request_id = 1;   // Observer 在有效 Start 后分配，后续 ACK 保持一致
+  uint64 accepted_frame_seq = 2;   // 连续处理完成的最高 frame_seq
+  bool close_stream = 3;
+  string reason = 4;              // 固定原因码，禁止透传异常文本
+}

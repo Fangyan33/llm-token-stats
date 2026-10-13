@@ -93,7 +93,7 @@ flowchart LR
 
 **业务：调用方 → ingressgateway ext_authz → 网关内 Wasm/router → A。**Auth 是新增同步鉴权调用，只接收请求头属性、不代理业务正文；Wasm 位于既有 Envoy 进程内，独立观察者服务不在业务路由中。
 
-**计量数据链路：Wasm 回调 → 异步 gRPC 观察流 → Observer 解析和估算 → Kafka producer → Kafka → 独立 Doris Consumer → Doris。**一期由独立 usage-worker 生成日/月汇总，原始分区由 Doris 动态管理；归档是[后续可选设计](archive-optional-design.md)。
+**计量数据链路：Wasm 回调 → 异步 gRPC 观察流 → Observer 解析和估算 → Kafka producer → Kafka → 独立 Doris Consumer → Doris。**一期由独立 Go usage-worker 生成日/月汇总，默认 K8s CronJob 每分钟调度，单个发布者串行执行；通知、水位及任务状态全部保存在 Doris，采集与汇总无需额外 PostgreSQL。原始分区由 Doris 动态管理；归档是[后续可选设计](archive-optional-design.md)。
 
 不把 VirtualService 的业务目的地改为 Observer，不为统计修改上游重试、取消或超时策略，也不将镜像请求发送给模型再推理一次。鉴权结果决定请求是否进入业务路由；计量统计结果不参与鉴权、路由或响应生成。
 
@@ -171,7 +171,7 @@ Observer/Kafka 不可用只丢计量，不改变业务流。业务没有新代�
 
 ### 3.8 Kafka 到 Doris
 
-Doris Consumer 是与 Observer 分开部署的 Go Deployment，不在业务请求路径中。它使用独立消费组读取 `llm-metering-events`，校验 `schema_version` 与事件字段，规范化并计算 `payload_hash`，写入 Doris；写入确认后才提交 Kafka offset。重放由事件 ID 与内容摘要识别重复或冲突。未知 schema 版本暂停对应分区、报警并等待 Consumer 升级，不能当永久非法事件跳过；永久非法事件按有限诊断规则处理。一期日/月刷新由 usage-worker 负责；Consumer 在落库和冲突标记可见后登记 dirty 日期。归档为后续可选项。[采集开发方案第 8 节](gateway-request-collection-implementation.md#8-consumer-落库与异常事件)
+Doris Consumer 是与 Observer 分开部署的 Go Deployment，不在业务请求路径中。它使用独立消费组读取 `llm-metering-events`，校验 `schema_version` 与事件字段，规范化并计算 `payload_hash`，写入 Doris；写入确认后才提交 Kafka offset。重放由事件 ID 与内容摘要识别重复或冲突。未知 schema 版本暂停对应分区、报警并等待 Consumer 升级，不能当永久非法事件跳过；永久非法事件按有限诊断规则处理。一期日/月刷新由 usage-worker 负责；Consumer 在落库和冲突标记可见后，确认 Doris 日期通知及批次凭据再提交 Kafka offset，Worker 未启用也登记。Kafka committed offset 是恢复起点，Doris 水位按各分区连续确认范围推导，参见[Doris 协调设计](doris-summary-coordination.md)。归档为后续可选项。[采集开发方案第 8 节](gateway-request-collection-implementation.md#8-consumer-落库与异常事件)
 
 ## 4. 一次请求最多产生两条记录
 
@@ -303,7 +303,7 @@ Doris Unique Key 的 Merge-on-Write 用于同内容重放幂等，不承载多�
 
 一期增加独立 usage_daily 与 usage_monthly：日汇总从去重、隔离冲突后的请求投影重算，月汇总合并已发布日汇总；按客户、应用、API Key、服务、模型和用量来源统计。迟到事件和冲突标记触发受影响日/月重算，临时分区校验后原子替换，零行重算也清除旧分组。日保留 730 个日期、月保留 24 个月，不随原始分区到期删除。逻辑请求按请求 ID 计一次，不能把两条事件计为两次调用。
 
-不将重放事件直接接到求和物化视图；冲突到达后也必须能撤销或重算受影响汇总。一期汇总工作包使用独立刷新状态与完整批次发布，刷新周期以 60 秒可见目标为约束；规模压测不达标时引入小时中间结果优化扫描。表结构、字段、NULL/零值、迟到处理、发布状态与验收见[日/月汇总设计](daily-monthly-summary-design.md)。
+不将重放事件直接接到求和物化视图；冲突到达后也必须能撤销或重算受影响汇总。一期汇总工作包在 Doris 保存独立通知、刷新状态与输入版本，使用临时分区完整批次发布；日发布版本变化触发月重算，查询按前后状态版本校验。每分钟调度并不保证端到端 60 秒可见，刷新性能仍以可见目标验收；规模压测不达标时引入小时中间结果优化扫描。表结构、字段、NULL/零值、迟到处理、发布状态与验收见[日/月汇总设计](daily-monthly-summary-design.md)。
 
 三个口径分开：
 

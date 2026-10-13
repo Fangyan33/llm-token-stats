@@ -1,6 +1,6 @@
 # API Key Auth 服务开发实现方案
 
-版本：V1.1｜日期：2026-10-09｜状态：开发设计，尚未完成真实网关联调与性能验收。
+版本：V1.2｜日期：2026-10-13｜状态：开发设计，尚未完成真实网关联调与性能验收。
 
 依据：[功能设计概览及开发周期](token-metering-functional-overview-and-schedule.md)、[网关请求采集实现方案](gateway-request-collection-implementation.md)。本文设计新增的 API Key 鉴权与客户归属能力，解决当前网关没有鉴权、采集插件无法获得可信 `api_key_id` 和 `customer_id` 的问题。
 
@@ -18,6 +18,8 @@
 | 采集关系 | ext_authz 在计量 WASM 前；只有鉴权成功请求进入采集和模型路由 |
 | 扩容方式 | Auth 服务无本地持久状态、可横向扩容；PostgreSQL 是事实源，本地仅有界缓存 |
 | 一期边界 | 支持 API Key 创建、查询、轮换、吊销、客户/应用归属和路由范围；不包含 OAuth、用户登录、余额或实时额度 |
+
+本文 PostgreSQL 仅用于 Auth 身份、密钥和鉴权审计；采集与日/月汇总的通知、水位及发布状态使用 Doris，见[Doris 协调设计](doris-summary-coordination.md)，不为汇总新增 PostgreSQL schema 或连接。
 
 Auth 与 Observer 必须独立部署。Auth 位于业务同步链路，决定请求是否能继续；Observer 是旁路采集，故障不能阻断业务。两者不得共用进程、健康状态或故障策略。
 

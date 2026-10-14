@@ -15,7 +15,7 @@ docker compose -f deploy/doris/compose.yaml exec -T doris mysql -uroot -h127.0.0
 docker compose -f deploy/doris/compose.yaml exec doris mysql -uroot -h127.0.0.1 -P9030 -e "SHOW TABLES FROM metering;"
 ~~~
 
-宿主机 SQL 连接：127.0.0.1:9030（MySQL 协议）；Stream Load：FE 8030，BE 8040。FE 会将 Stream Load 重定向至 BE；Docker Desktop 宿主机可能无法访问容器内部 BE 地址，联调时从 compose 网络内发起请求或使用可直达的 BE 地址。所有写入时间和 SQL 会话使用 UTC。
+此独立 Compose 环境的 SQL、FE HTTP、BE HTTP 端口分别为 9030、8030、8040，统一绑定 `0.0.0.0`。远端 DBeaver 使用 MySQL 驱动连接 `服务器IP:9030`，用户 `root`、密码为空。`make local-up` 启动的采集联调栈使用独立端口 19030、18030、18040，详见[组件运行说明](../../docs/collection-components.md)。FE 会将 Stream Load 重定向至 BE；Docker Desktop 宿主机可能无法访问容器内部 BE 地址，联调时从 compose 网络内发起请求或使用可直达的 BE 地址。所有写入时间和 SQL 会话使用 UTC。
 
 Schema 采用 Unique Key (request_date, logical_request_id, event_id, payload_hash)：同内容重放覆盖同一键，不同摘要保留冲突证据。两张明细表按 UTC 日期每日分区，在线保留一年：365 个日期（当天及前 364 天），dynamic_partition.start=-364、end=2；Doris 自动创建并周期清理。各 FE 的 dynamic_partition_enable=true 还须写入持久 fe.conf，ADMIN 修改仅更新运行配置；重启后重新核验。首次写入前确认日期分区实际已创建。已有部署先停归档任务，再应用 003_raw_retention_one_year.sql；扩大窗口不会恢复已删数据。日/月汇总采用独立普通 RANGE 表，由待实现的 usage-worker 管理分区并原子发布；详见[汇总设计](../../docs/daily-monthly-summary-design.md)。归档为[可选设计](../../docs/archive-optional-design.md)，一期无 S3/MinIO 依赖。request_conflict_ids 长期保留 UUIDv4 冲突标记，避免较早证据过期后剩余变体重新变为有效用量。
 

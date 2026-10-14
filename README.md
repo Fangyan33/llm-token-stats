@@ -43,3 +43,15 @@ make local-test
 ~~~
 
 本地栈使用合成鉴权和模型 fixture，实际经过旧版 Envoy、Kafka、Doris；构建工具与端口见运行说明。生产上线按闭环清单 G0–G5 收集真实证据。
+
+本地开发组件的发布端口绑定 `0.0.0.0`，DBeaver 可直接连接 `服务器IP:19030`。Kafka 默认公布识别出的服务器 IPv4 地址；多网卡或 NAT 环境用 `KAFKA_EXTERNAL_HOST=客户端可达地址 make local-up` 指定。Kafka 与 Doris 使用持久卷，启动脚本会先备份并迁移旧容器的数据。
+
+
+|组件|端口|
+|--|--|
+|网关 / Envoy admin| 18080 / 19000|
+|Kafka| 29092|
+|Doris SQL / FE HTTP / BE HTTP| 19030 / 18030 / 18040|
+|Observer gRPC / 健康检| 19090 / 19091|
+|Consumer 健康检查| 19092|
+|模型 fixture / 模拟鉴权         | 18081 / 19002|

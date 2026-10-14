@@ -6,8 +6,8 @@
     "topic": "llm-metering-events"
   },
   "observer": {
-    "listen": ":9090",
-    "health_listen": ":9091",
+    "listen": "0.0.0.0:9090",
+    "health_listen": "0.0.0.0:9091",
     "producer_id": "observer-test",
     "accepted_config_versions": [
       "collection-v1"

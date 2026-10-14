@@ -19,7 +19,27 @@ python3 scripts/local_collection.py stop
 
 产物在 `dist/`：`observer`、`consumer`、`fixture`、`gateway-observer-v1.wasm` 和摘要清单。CI 运行契约检查、Go 竞态测试、服务构建及固定 TinyGo 镜像构建/ABI 检查；真实集成测试需单独启动 Docker 栈。
 
-本地栈只绑定 127.0.0.1：网关 18080、Envoy admin 19000、Kafka 29092、Doris SQL 19030/FE HTTP 18030/BE HTTP 18040、Observer 健康端口 19091、Consumer 健康端口 19092。`make local-up` 只初始化该 Compose 栈，应用 001/002/004/005 migration，并创建 24 分区、72 小时保留、delete 策略的测试 topic。副本数 1 与 Doris root 空密码仅用于合成联调；生产按原方案配置副本、min ISR 和最小权限账号。
+本地栈的已发布端口统一绑定 `0.0.0.0`，可使用服务器 IP 从远端访问：
+
+| 组件 | 宿主机端口 |
+| --- | --- |
+| 网关 / Envoy admin | 18080 / 19000 |
+| Kafka 客户端 | 29092 |
+| Doris SQL（MySQL 协议）/ FE HTTP / BE HTTP | 19030 / 18030 / 18040 |
+| Observer gRPC / 健康、指标 | 19090 / 19091 |
+| Consumer 健康、指标 | 19092 |
+| 模型 fixture HTTP / 合成 ext_authz gRPC | 18081 / 19002 |
+
+DBeaver 使用 MySQL 驱动连接 `服务器IP:19030`，数据库 `metering`、用户 `root`、密码为空。Kafka 的监听地址为 `0.0.0.0`，但 `advertised.listeners` 必须公布客户端可达的实际 IP 或域名；`make local-up` 默认识别服务器 IPv4 地址并保存到已忽略的 `deploy/local/.env`，也可先设置 `KAFKA_EXTERNAL_HOST`。多网卡或 NAT 环境使用客户端实际可达地址：
+
+```sh
+KAFKA_EXTERNAL_HOST=192.168.227.128 make local-up
+# 持久设置时，在 deploy/local/.env 中配置 KAFKA_EXTERNAL_HOST=服务器IP或域名。
+```
+
+Kafka 容器内客户端仍使用 `kafka:9092`。重建容器时 Kafka 日志及 Doris FE/BE 数据由命名卷保留；首次从旧版无持久卷配置启动时，脚本先停栈，将原数据备份到 `.tmp/local-storage-*` 并迁移到卷，再重建容器。已有不匹配的目标卷会使迁移停止，避免覆盖或合并历史。不要使用 `docker compose down -v` 删除数据卷。
+
+`make local-up` 只初始化该 Compose 栈，应用 001/002/004/005 migration，并创建 24 分区、72 小时保留、delete 策略的测试 topic。明文 Kafka、合成鉴权、副本数 1 与 Doris root 空密码仅用于开发联调；生产按原方案配置认证、副本、min ISR 和最小权限账号。
 
 普通 JSON / SSE 合成请求：
 
@@ -95,7 +115,9 @@ Consumer 按 Kafka 分区跨多次拉取攒批：达到 `max_batch_rows`（默�
 
 本地使用公开 `istio/proxyv2:1.13.5` 中的 Envoy，静态配置运行，过滤器顺序为 ext_authz → Wasm → router；Kafka 3.9.2、Doris 4.1.3。这验证固定 Envoy hostcall 和数据链路，尚未验证用户私有镜像、完整 Istio 控制面、Kubernetes 1.22 的真实发布。
 
-已通过契约/文档/表字段一致性检查、20 项 Python 测试、Go 单元和竞态测试、SDK internal/proxytest 测试、TinyGo 编译与 ABI 检查。事件规范编码与摘要同六份 Python golden 对照；标准/手工 Protobuf 互操作、非法帧、逐字节 JSON/SSE 分片、usage 候选冲突、提交屏障故障及撤销 owner 由自动测试覆盖。
+2026-10-14 已将所有本地发布端口切换到 `0.0.0.0`，通过服务器 IPv4 地址验证全部 11 个 TCP 端口、健康检查、Doris SQL 和 Kafka 元数据连接。切换前的 108 条原始事件、129 条消费凭据及 24 个 Kafka 分区的消费位置、日志末尾位置均保持一致；数据备份保留在 `.tmp/local-storage-*`。重新执行 `make test build wasm` 与禁用缓存的 `make local-test` 均通过，集成测试实际写入和查询 Doris；再次调用存储迁移检查不会重建已有挂载卷的容器。
+
+已通过契约/文档/表字段一致性检查、25 项 Python 测试（含本地地址配置、迁移覆盖保护和备份失败恢复）、Go 单元和竞态测试、SDK internal/proxytest 测试、TinyGo 编译与 ABI 检查。事件规范编码与摘要同六份 Python golden 对照；标准/手工 Protobuf 互操作、非法帧、逐字节 JSON/SSE 分片、usage 候选冲突、提交屏障故障及撤销 owner 由自动测试覆盖。
 
 真实本地集成覆盖普通 JSON、SSE/响应 trailers、Start ACK 关联、unknown 保留 NULL、非白名单请求、相同事件重放去重、不同变体冲突隔离、日期通知/凭据、未知版本暂停；HTTP1 chunked 中途停顿超过 2 秒、256 KiB 边界/边界加一/1 MiB 请求的上游正文摘要保持原样，超时观察降为 partial/unknown，正常延迟响应中的计量 ID 与事件一致；真实 BE 写入后断开 HTTP 确认，仍确认原 label 与行键；独立 TCP Kafka 黑洞验证发送不阻塞及有界超时/watchdog。测试及失败诊断由 `make local-test` 重现。
 

@@ -15,7 +15,7 @@ wasm:
 	python3 scripts/check_wasm_abi.py dist/gateway-observer-v1.wasm
 test:
 	python3 scripts/validate_collection_contracts.py
-	python3 -m unittest discover -s tests -p 'test_collection_contracts.py'
+	python3 -m unittest discover -s tests -p 'test_*.py'
 	go test -race ./...
 	cd plugins/gateway-observer && go test -race ./...
 generate:

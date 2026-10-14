@@ -6,7 +6,7 @@
     "topic": "llm-metering-events"
   },
   "consumer": {
-    "health_listen": ":9092",
+    "health_listen": "0.0.0.0:9092",
     "group_id": "llm-metering-doris-v1",
     "accepted_config_versions": [
       "collection-v1"

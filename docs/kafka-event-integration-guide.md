@@ -69,15 +69,17 @@ UUIDv4 不包含时间。`request_started_at_ms` 仍由网关观察并作为事�
 | `upstream_attempt_count` | 整数 / 是 | 网关能可靠取得的上游尝试次数；未知为 `null`，不能据此推算隐藏重试的 token。 |
 | `response_flags` | 字符串 / 是 | 经采集规则限制的网关响应标志，供故障排查。 |
 | `response_code_details` | 字符串 / 是 | 经采集规则限制的网关响应诊断码；不保存任意上游错误文本。 |
-| `business_outcome` | 字符串 / 是 | `response_complete`、`stream_incomplete` 或 `unknown`；start 尚未确定时可为 `null`。它与 HTTP 状态、观察完整性分别判断。 |
+| `business_outcome` | 字符串 / 是 | 有没有观察到响应完整结束？`response_complete` 表示观察到完整结束；`stream_incomplete` 表示已有部分请求或响应信息，但未观察到完整结束；`unknown` 表示信息不足，无法判断。start 为 `null`。不表示 HTTP 成功，也不保证采集完整。 |
 | `terminal_observed` | 布尔 / 否 | 是否收到有效网关 End；为 `false` 时 `request_finished_at_ms` 必须为 `null`。 |
 | `observation_status` | 字符串 / 是 | 结果事件为 `complete`（观察完整）、`partial`（缺片/截断等）或 `unknown`（只有有限元数据）；start 尚未定稿时为 `null`。 |
-| `usage_status` | 字符串 / 否 | start 为 `not_applicable`；结果事件为 `known`（输入输出都有效）、`partial`、`unknown` 或 `conflict`。 |
-| `usage_eligible` | 布尔 / 否 | 一期有效用量统计候选标志；需适配成功、观察完整、输入输出已知、身份有效且无冲突。不是收费资格；下游还需排除事件冲突。 |
+| `usage_status` | 字符串 / 否 | token 数字有没有拿到，是否齐全、是否矛盾？start 为 `not_applicable`；结果事件中，`known` 表示输入、输出总量都有效；`partial` 表示输入输出尚未全部有效，但六个用量字段中至少一个有效；`unknown` 表示六字段全未知；`conflict` 表示用量存在矛盾，优先于其他状态。 |
+| `usage_eligible` | 布尔 / 否 | 这条用量是否符合有效统计条件，可以作为统计候选？一期仅在适配成功、`observation_status=complete`、`usage_status=known`、`identity_status=known`，且无用量/身份冲突及使结果失效的异常时为 `true`；否则为 `false`，start 固定为 `false`。不表示收费资格；下游仍须去重并排除事件或请求冲突。 |
 | `usage` | 对象 / 是 | start 固定为 `null`；结果事件为含六个 token 子字段的对象。即使用量未知，结果事件也保留各字段的 `value/source` 状态。 |
 | `raw_usage_json` | 字符串 / 否 | 白名单保留的上游 usage JSON 依据，最多 4 KiB；它是**JSON 字符串**，不是嵌套对象，也不是完整响应。无依据时为 `"{}"`。 |
 | `raw_usage_truncated` | 布尔 / 否 | usage 依据是否因过滤或大小限制丢弃内容；不表示模型回答被截断。 |
 | `anomaly_codes` | 字符串数组 / 否 | 固定异常码列表，无异常为 `[]`；已去重排序，不包含正文或错误堆栈。常见值包括 `missing_usage`、`missing_end`、`usage_conflict`、`protocol_incomplete`、`identity_invalid`。 |
+
+`business_outcome`、`usage_status`、`usage_eligible` 分别描述响应结束情况、用量数据状态和统计候选资格，不能互相替代；判定规则与场景示例见[第 5 节常见问答](#5-常见问答)。
 
 ### 2.2 `usage` 对象中的每个字段
 
@@ -100,7 +102,7 @@ UUIDv4 不包含时间。`request_started_at_ms` 仍由网关观察并作为事�
 | --- | --- | --- |
 | `event_id` | `<logical_request_id>:start` | `<logical_request_id>:usage` |
 | `usage` | `null` | 六个 `{value,source}` 子字段 |
-| `usage_status` / `usage_eligible` | `not_applicable` / `false` | 按定稿结果填写；异常或未知时可以为 `false` |
+| `usage_status` / `usage_eligible` | `not_applicable` / `false` | 按定稿结果填写；仅满足有效用量统计候选条件时，`usage_eligible` 才为 `true` |
 | `raw_usage_json` | `"{}"` | 白名单 usage 依据；没有则 `"{}"` |
 | `observation_ended_at_ms` / `request_finished_at_ms` | `null` / `null` | 能取得时填写；没有有效 End 时后者为 `null` |
 | `terminal_observed` / `observation_status` | `false` / `null` | 按网关 End 和实际采集完整性填写 |
@@ -379,3 +381,51 @@ public class MeteringConsumer {
 ```
 
 两个示例均逐条提交，便于展示“处理成功后提交”。批量提交时只能提交**同一分区已连续处理成功**的下一 offset，不能跳过失败记录。[franz-go 消费与手动提交](https://pkg.go.dev/github.com/twmb/franz-go/pkg/kgo) · [Apache Kafka Java Consumer 手动提交说明](https://kafka.apache.org/34/javadoc/org/apache/kafka/clients/consumer/KafkaConsumer.html)
+
+## 5. 常见问答
+
+### Q1：`business_outcome` 表示调用成功或失败吗？
+
+**A：它描述观察到的结束情况，HTTP 成败另看 `http_status`。**
+
+- `response_complete`：观察到完整结束。即使 HTTP 500，错误响应也可能完整结束。
+- `stream_incomplete`：已有部分请求或响应信息，但没有观察到完整结束。可能是业务连接中断，也可能是采集链路丢失或超时，不能直接认定客户主动取消。
+- `unknown`：信息不足，无法判断结束情况。
+- `null`：用于 `request_started`，此时尚未确定结果。
+
+它也不等于 `observation_status`。例如流式响应传输已结束且收到有效网关 End，但缺少协议要求的 `[DONE]` 标记，`business_outcome` 仍可能是 `response_complete`，而采集完整性为 `observation_status=partial`。
+
+### Q2：`usage_status` 的几个值怎么理解？
+
+**A：看用量字段是否已知，以及它们之间是否有冲突。**
+
+| 值 | 含义与示例 |
+| --- | --- |
+| `not_applicable` | 开始事件不承载用量，此时 `usage=null`。 |
+| `known` | 输入、输出总量都有有效值，且无用量冲突，例如输入 1,000、输出 500。 |
+| `partial` | 输入输出尚未全部有效，但至少一个用量字段有效，例如输入已知、输出未知；只有上报总量已知也属于此状态。 |
+| `unknown` | 六个用量字段全部未知，例如响应未上报任何用量。 |
+| `conflict` | 数字或多次上报互相矛盾，例如输入 1,000、输出 500，但上报总量是 1,200。此状态优先于其他状态。 |
+
+`known` 不要求缓存、推理等细分字段全部已知；`partial` 指用量字段不齐全，不表示回答只生成了一半。未知值用 `null`，不能当作 `0`；只有上游明确上报的有效零值才记为零。
+
+### Q3：什么情况下 `usage_eligible=true`？可以直接累加或收费吗？
+
+**A：只有数字可靠、采集完整、身份有效，并通过相关检查，才是有效统计候选。**
+
+条件包括适配成功、`observation_status=complete`、`usage_status=known`、`identity_status=known`，以及没有用量/身份冲突和使结果失效的异常。身份有效指 API Key ID、客户 ID、应用 ID 齐全。
+
+`true` 不代表收费资格；下游仍需按 `event_id` 去重，并排除事件或请求冲突。`false` 不代表没有消耗 token，也不代表调用失败，记录仍可用于异常排查和采集质量分析。开始事件固定为 `false`。
+
+### Q4：为什么响应完整、用量已知，也可能不能进入有效统计？
+
+**A：三个字段检查的内容不同，任一统计条件不满足都会使 `usage_eligible=false`。** 以下均为结果事件；标为 `true` 的场景假设其他检查也全部通过。
+
+| 场景 | `business_outcome` | `usage_status` | `usage_eligible` |
+| --- | --- | --- | --- |
+| 响应完整结束，用量齐全，采集和身份正常 | `response_complete` | `known` | `true` |
+| 响应完整结束，但六个用量字段全部未知 | `response_complete` | `unknown` | `false` |
+| 响应完整结束，只取得输入量 | `response_complete` | `partial` | `false` |
+| 已解析到流式终结 usage，之后观察中断，缺少完整结束信息 | `stream_incomplete` | `known` | `false` |
+| 响应和用量完整，但客户身份缺失 | `response_complete` | `known` | `false` |
+| 响应完整结束，但输入、输出与上报总量对不上 | `response_complete` | `conflict` | `false` |

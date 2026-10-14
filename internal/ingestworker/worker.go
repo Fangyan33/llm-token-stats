@@ -19,22 +19,23 @@ import (
 )
 
 type Worker struct {
-	Cfg     config.Config
-	Store   *doris.Store
-	Health  *health.State
-	Client  *kgo.Client
-	mu      sync.Mutex
-	owned   map[int32]bool
-	ready   map[int32]bool
-	pending map[int32]*consumer.Batch
-	blocked map[int32]bool
-	retryAt map[int32]time.Time
-	auditOK bool
+	Cfg      config.Config
+	Store    *doris.Store
+	Health   *health.State
+	Client   *kgo.Client
+	mu       sync.Mutex
+	owned    map[int32]bool
+	ready    map[int32]bool
+	pending  map[int32]*consumer.Batch
+	buffered map[int32]*recordBuffer
+	blocked  map[int32]bool
+	retryAt  map[int32]time.Time
+	auditOK  bool
 }
 
 func (w *Worker) owns(p int32) bool { w.mu.Lock(); defer w.mu.Unlock(); return w.owned[p] }
 func New(c config.Config, s *doris.Store, h *health.State) (*Worker, error) {
-	w := &Worker{Cfg: c, Store: s, Health: h, owned: map[int32]bool{}, ready: map[int32]bool{}, pending: map[int32]*consumer.Batch{}, blocked: map[int32]bool{}, retryAt: map[int32]time.Time{}}
+	w := &Worker{Cfg: c, Store: s, Health: h, owned: map[int32]bool{}, ready: map[int32]bool{}, pending: map[int32]*consumer.Batch{}, buffered: map[int32]*recordBuffer{}, blocked: map[int32]bool{}, retryAt: map[int32]time.Time{}}
 	o, err := producer.Options(c.Kafka)
 	if err != nil {
 		return nil, err
@@ -60,6 +61,7 @@ func (w *Worker) revoke(ps map[string][]int32) {
 		delete(w.owned, p)
 		delete(w.ready, p)
 		delete(w.pending, p)
+		delete(w.buffered, p)
 		delete(w.blocked, p)
 		delete(w.retryAt, p)
 	}
@@ -187,9 +189,10 @@ func (w *Worker) setup(ctx context.Context, p int32) (int64, error) {
 	return next, nil
 }
 func (w *Worker) Run(ctx context.Context) error {
-	defer w.Client.Close()
+	defer w.Client.CloseAllowingRebalance()
 	auditTick := time.NewTicker(time.Minute)
 	defer auditTick.Stop()
+	var releaseAt time.Time
 	for ctx.Err() == nil {
 		w.mu.Lock()
 		parts := []int32{}
@@ -228,8 +231,8 @@ func (w *Worker) Run(ctx context.Context) error {
 			w.mu.Unlock()
 			w.Client.ResumeFetchPartitions(map[string][]int32{w.Cfg.Kafka.Topic: {p}})
 		}
-		pollCtx, pollCancel := context.WithTimeout(ctx, 500*time.Millisecond)
-		fetch := w.Client.PollRecords(pollCtx, min(w.Cfg.Consumer.Rows, 128))
+		pollCtx, pollCancel := context.WithTimeout(ctx, w.pollWait(time.Now(), releaseAt))
+		fetch := w.Client.PollRecords(pollCtx, w.Cfg.Consumer.Rows)
 		pollCancel()
 		if ctx.Err() != nil {
 			w.Client.AllowRebalance()
@@ -242,128 +245,70 @@ func (w *Worker) Run(ctx context.Context) error {
 			w.Health.Count("fetch_failure")
 			w.mu.Lock()
 			w.ready[e.Partition] = false
+			delete(w.buffered, e.Partition)
 			w.mu.Unlock()
 			w.Client.PauseFetchPartitions(map[string][]int32{e.Topic: {e.Partition}})
 		}
-		var wg sync.WaitGroup
-		sem := make(chan struct{}, 4)
+		receivedAt := time.Now()
+		partitions := map[int32]kgo.FetchTopicPartition{}
 		fetch.EachPartition(func(fp kgo.FetchTopicPartition) {
 			if len(fp.Records) == 0 {
 				return
 			}
-			w.mu.Lock()
-			ready := w.ready[fp.Partition]
-			w.mu.Unlock()
-			if !ready {
-				return
+			if prev, ok := partitions[fp.Partition]; ok {
+				fp.Records = append(prev.Records, fp.Records...)
 			}
+			partitions[fp.Partition] = fp
+		})
+		w.mu.Lock()
+		force := !releaseAt.IsZero() && !receivedAt.Before(releaseAt)
+		for p, b := range w.buffered {
+			if _, ok := partitions[p]; !ok {
+				partitions[p] = kgo.FetchTopicPartition{Topic: w.Cfg.Kafka.Topic, FetchPartition: kgo.FetchPartition{Partition: p}}
+			}
+			force = force || !receivedAt.Before(b.started.Add(config.Duration(w.Cfg.Consumer.FlushMS)))
+		}
+		w.mu.Unlock()
+		var wg sync.WaitGroup
+		sem := make(chan struct{}, 4)
+		for _, fp := range partitions {
 			wg.Add(1)
 			sem <- struct{}{}
 			go func() {
 				defer wg.Done()
 				defer func() { <-sem }()
-				rs := fp.Records
-				for len(rs) > 0 {
-					n, total := 0, 0
-					for n < len(rs) && n < w.Cfg.Consumer.Rows && total+len(rs[n].Value)+len(rs[n].Key) <= w.Cfg.Consumer.Bytes {
-						total += len(rs[n].Value) + len(rs[n].Key)
-						n++
-					}
-					if n == 0 {
-						w.mu.Lock()
-						w.blocked[fp.Partition] = true
-						w.mu.Unlock()
-						w.Client.PauseFetchPartitions(map[string][]int32{fp.Topic: {fp.Partition}})
-						w.Health.Count("partition_paused")
-						return
-					}
-					w.mu.Lock()
-					b := w.pending[fp.Partition]
-					w.mu.Unlock()
-					var err error
-					if b == nil {
-						b, err = consumer.Freeze(rs[:n], w.Cfg.Consumer, time.Now())
-						if err == nil {
-							w.mu.Lock()
-							w.pending[fp.Partition] = b
-							w.mu.Unlock()
-						}
-					} else {
-						n = 0
-						for n < len(rs) && rs[n].Offset <= b.Last {
-							n++
-						}
-						if n == 0 || rs[0].Offset != b.First {
-							err = consumer.ErrPause
-						}
-					}
-
-					if err == nil {
-						c, cancel := context.WithTimeout(ctx, 30*time.Second)
-						p := consumer.Processor{Store: w.Store, Owns: func() bool { return w.owns(fp.Partition) }}
-						err = p.Process(c, b)
-						if err == nil && w.owns(fp.Partition) {
-							offsets := map[string]map[int32]kgo.EpochOffset{fp.Topic: {fp.Partition: {Epoch: b.Records[len(b.Records)-1].LeaderEpoch, Offset: b.Last + 1}}}
-							w.Client.CommitOffsetsSync(c, offsets, func(_ *kgo.Client, _ *kmsg.OffsetCommitRequest, r *kmsg.OffsetCommitResponse, e error) {
-								err = e
-								if r != nil {
-									for _, t := range r.Topics {
-										for _, p := range t.Partitions {
-											if p.ErrorCode != 0 {
-												err = errors.New("commit_failure")
-											}
-										}
-									}
-								}
-							})
-						}
-						cancel()
-					}
-					if err != nil {
-						w.Health.Count("batch_failure")
-						if !w.owns(fp.Partition) {
-							return
-						}
-						w.Client.SetOffsets(map[string]map[int32]kgo.EpochOffset{fp.Topic: {fp.Partition: {Epoch: -1, Offset: rs[0].Offset}}})
-						w.mu.Lock()
-						w.blocked[fp.Partition] = true
-						if err != consumer.ErrPause {
-							w.retryAt[fp.Partition] = time.Now().Add(time.Second)
-						}
-						w.mu.Unlock()
-						w.Client.PauseFetchPartitions(map[string][]int32{fp.Topic: {fp.Partition}})
-						return
-					}
-					if !w.owns(fp.Partition) {
-						return
-					}
-					w.mu.Lock()
-					delete(w.pending, fp.Partition)
-					delete(w.blocked, fp.Partition)
-					w.mu.Unlock()
-					w.Health.Count("batch_committed")
-					if rs[n-1].Offset < b.Last {
-						w.Client.SetOffsets(map[string]map[int32]kgo.EpochOffset{fp.Topic: {fp.Partition: {Epoch: -1, Offset: b.Last + 1}}})
-						return
-					}
-					rs = rs[n:]
-				}
+				w.processPartition(ctx, fp, receivedAt, force, w.Store, w.Client)
 			}()
-		})
+		}
 		wg.Wait()
-		w.Client.AllowRebalance()
-		select {
-		case <-auditTick.C:
-			w.audit(ctx)
-		default:
-			w.mu.Lock()
-			needAudit := !w.auditOK && len(w.owned) > 0 && len(w.blocked) == 0
-			for p := range w.owned {
-				needAudit = needAudit && w.ready[p]
-			}
-			w.mu.Unlock()
-			if needAudit {
+		// Keep the poll's rebalance protection while accumulating records. At the
+		// accumulation window's deadline, flush all partial buffers before
+		// releasing it, so a busy partition cannot postpone rebalance indefinitely.
+		w.mu.Lock()
+		empty := len(w.buffered) == 0
+		w.mu.Unlock()
+		if empty {
+			w.Client.AllowRebalance()
+			releaseAt = time.Time{}
+		} else if releaseAt.IsZero() {
+			releaseAt = receivedAt.Add(config.Duration(w.Cfg.Consumer.FlushMS))
+		}
+		// Do not hold a partial batch's rebalance protection through a database
+		// audit; finish the bounded accumulation window first.
+		if empty {
+			select {
+			case <-auditTick.C:
 				w.audit(ctx)
+			default:
+				w.mu.Lock()
+				needAudit := !w.auditOK && len(w.owned) > 0 && len(w.blocked) == 0
+				for p := range w.owned {
+					needAudit = needAudit && w.ready[p]
+				}
+				w.mu.Unlock()
+				if needAudit {
+					w.audit(ctx)
+				}
 			}
 		}
 		w.mu.Lock()

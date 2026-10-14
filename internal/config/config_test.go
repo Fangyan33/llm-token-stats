@@ -1,0 +1,36 @@
+package config
+
+import "testing"
+
+func TestConsumerFlushConfiguration(t *testing.T) {
+	for _, tc := range []struct {
+		name, path string
+		override   int
+		want       int
+		wantErr    bool
+	}{
+		{name: "local_default", path: "../../configs/consumer.local.json", want: 15000},
+		{name: "deployment_default", path: "../../deploy/local/consumer.json", want: 15000},
+		{name: "production_example", path: "../../configs/consumer.production.example.json", want: 15000},
+		{name: "explicit_shorter_interval", path: "../../configs/consumer.local.json", override: 1000, want: 1000},
+		{name: "minimum_interval", path: "../../configs/consumer.local.json", override: 1, want: 1},
+		{name: "above_maximum", path: "../../configs/consumer.local.json", override: 15001, wantErr: true},
+		{name: "negative_interval", path: "../../configs/consumer.local.json", override: -1, wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c, err := Read(tc.path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tc.override != 0 {
+				c.Consumer.FlushMS = tc.override
+			}
+			if err = c.ConsumerDefaults(); (err != nil) != tc.wantErr {
+				t.Fatalf("ConsumerDefaults() error = %v, wantErr = %v", err, tc.wantErr)
+			}
+			if !tc.wantErr && c.Consumer.FlushMS != tc.want {
+				t.Fatalf("flush interval = %d, want %d", c.Consumer.FlushMS, tc.want)
+			}
+		})
+	}
+}

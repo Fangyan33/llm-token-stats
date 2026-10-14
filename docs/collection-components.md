@@ -1,6 +1,6 @@
 # 网关采集组件运行说明
 
-更新日期：2026-10-13。[实现计划](../spec/plan/gateway-collection-implementation.md)已落地到三个可构建组件。业务仍直接经过网关到模型服务；Wasm 旁路发送有界片段，Observer 解析后使用原生 Producer 写 Kafka，Consumer 确认 Doris 可见性后提交 offset。仅产生 `request_started`、`usage_observed`，未知值保留 null/unknown。
+更新日期：2026-10-14。[实现计划](../spec/plan/gateway-collection-implementation.md)已落地到三个可构建组件。业务仍直接经过网关到模型服务；Wasm 旁路发送有界片段，Observer 解析后使用原生 Producer 写 Kafka，Consumer 确认 Doris 可见性后提交 offset。仅产生 `request_started`、`usage_observed`，未知值保留 null/unknown。
 
 本轮命令、故障处理及资源归零证据见[本地验证记录](../spec/plan/gateway-collection-verification.md)，实际镜像 digest 见[镜像记录](../deploy/local/images.lock.json)。
 
@@ -78,6 +78,10 @@ Doris Stream Load 只向 `allowed_load_hosts` 发送凭据，拒绝未登记跳�
 ## Consumer 恢复与统计边界
 
 每分区顺序执行：冻结记录 → events_raw / ingest_rejections 可见 → 跨在线分区冲突标记可见 → 全部日期通知可见 → 批次凭据可见 → 提交下一 offset。数据库故障暂停对应分区，保留一份冻结批次并有界重试；撤销 owner 后停止新写入/提交，新 owner 从已提交位置重放。相同事件与摘要由 Unique Key 去重；不同变体保留并永久登记冲突。
+
+Consumer 按 Kafka 分区跨多次拉取攒批：达到 `max_batch_rows`（默认 5000）、`max_batch_bytes`（默认 4 MiB），或最早一条记录等待 `flush_interval_ms`（默认 15000 ms，即 15 秒；可配置范围 1–15000 ms）后写入；下一条放不进字节预算时先写已有前缀。字节预算按 Kafka key/value 计量，不是展开后的 Stream Load 正文或进程 RSS 上限。每次拉取最多配置的行数，没有额外的 128 条写入限制；数据库回查仍按 128 条拆分查询。每个已分配分区最多保留一份未满批次或一份失败后的冻结批次，写库并发最多 4 个分区；总内存还包含本次拉取、冻结编码与 Kafka 客户端缓冲，需要按分区数和实际事件大小验收。
+
+即使没有后续消息，未满批次到期也会写入。攒批期间保留 Kafka poll 的 rebalance 保护；一个攒批窗口到期时也会写入其他分区的未满批次，然后允许分区移交，避免持续流量无限推迟 rebalance。写库或巡检耗时可能延长实际可见延迟，15000 ms 是默认攒批等待预算。失败时回退到冻结批次的首 offset、沿用原内容及 label；分区撤销清除未提交缓冲，后续 owner 从 Kafka 已提交位置重放。
 
 新增 [005 migration](../migrations/doris/metering/005_consumer_recovery.sql) 保存消费起点和保留期缺口；这些表及凭据/通知本轮不自动清理。新组持久登记 Kafka earliest；已有组缺少起点时通过 `initial_offsets` 明确接管。多份不兼容起点阻塞分区。已保存的恢复位置落后于 earliest 时登记缺口并暂停；经人工处置后，`gap_resume_offsets` 必须填写该分区当时的 earliest，不能填 latest。恢复新流量不会抹掉缺口或把历史覆盖改为可信。
 

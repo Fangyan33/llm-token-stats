@@ -124,12 +124,12 @@ func (c *Config) ConsumerDefaults() error {
 		c.Consumer.Bytes = 4 << 20
 	}
 	if c.Consumer.FlushMS == 0 {
-		c.Consumer.FlushMS = 1000
+		c.Consumer.FlushMS = 15000
 	}
 	if c.Doris.Database == "" {
 		c.Doris.Database = "metering"
 	}
-	if !text(c.Consumer.Group, 128) || c.Consumer.Rows < 1 || c.Consumer.Rows > 5000 || c.Consumer.Bytes < 32768 || c.Consumer.Bytes > 4<<20 || c.Consumer.FlushMS < 1 || c.Consumer.FlushMS > 1000 || c.Doris.Database != "metering" || !registration(c.Consumer.AcceptedConfigs, c.Consumer.Routes) || len(c.Doris.AllowedHosts) == 0 || !codes(c.Consumer.Flags) || !codes(c.Consumer.Details) {
+	if !text(c.Consumer.Group, 128) || c.Consumer.Rows < 1 || c.Consumer.Rows > 5000 || c.Consumer.Bytes < 32768 || c.Consumer.Bytes > 4<<20 || c.Consumer.FlushMS < 1 || c.Consumer.FlushMS > 15000 || c.Doris.Database != "metering" || !registration(c.Consumer.AcceptedConfigs, c.Consumer.Routes) || len(c.Doris.AllowedHosts) == 0 || !codes(c.Consumer.Flags) || !codes(c.Consumer.Details) {
 		return fmt.Errorf("config_consumer")
 	}
 	for _, ps := range [][]Position{c.Consumer.Initial, c.Consumer.Resume} {

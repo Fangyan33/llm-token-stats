@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -127,6 +128,10 @@ func TestCollectionEndToEnd(t *testing.T) {
 			eventually(t, func() bool {
 				return db.QueryRow("SELECT logical_request_id,event_json,kafka_partition,usage_status,observation_status,usage_eligible,input_tokens,output_tokens FROM metering.events_raw WHERE x_request_id=? AND event_type='usage_observed'", xid).Scan(&id, &raw, &part, &status, &observation, &eligible, &input, &output) == nil
 			})
+			var event events.Event
+			if err = json.Unmarshal([]byte(raw), &event); err != nil || event.RouteName != "unknown" {
+				t.Fatal("unnamed Envoy route must be recorded as unknown")
+			}
 			if observation != "complete" {
 				t.Fatalf("observation=%s", observation)
 			}
@@ -169,20 +174,66 @@ func TestCollectionEndToEnd(t *testing.T) {
 			}
 		})
 	}
-	var before, after int
-	if err := db.QueryRow("SELECT COUNT(*) FROM metering.events_raw").Scan(&before); err != nil {
-		t.Fatal(err)
-	}
-	res, err := http.Get("http://127.0.0.1:18080/healthz")
+	t.Run("ignored_methods_and_paths", func(t *testing.T) {
+		before := gatewaySelectedRequests(t)
+		ids := []string{}
+		for _, tc := range []struct{ method, path string }{
+			{"GET", "/v1/chat/completions"}, {"HEAD", "/v1/chat/completions"},
+			{"OPTIONS", "/v1/chat/completions"}, {"PUT", "/v1/chat/completions"},
+			{"POST", "/v1/embeddings"}, {"POST", "/v1/chat/completions/"},
+			{"POST", "/v1/chat/completions/extra"}, {"GET", "/healthz"},
+		} {
+			id := uuid(t)
+			ids = append(ids, id)
+			req, _ := http.NewRequest(tc.method, "http://127.0.0.1:18080"+tc.path, strings.NewReader(`{"model":"fixture","stream":false}`))
+			req.Header.Set("content-type", "application/json")
+			req.Header.Set("x-request-id", id)
+			res, err := (&http.Client{Timeout: 5 * time.Second}).Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			io.Copy(io.Discard, res.Body)
+			res.Body.Close()
+		}
+		if after := gatewaySelectedRequests(t); after != before {
+			t.Fatalf("ignored request selected: before=%d after=%d", before, after)
+		}
+		var count int
+		where := "'" + strings.Join(ids, "','") + "'"
+		if err := db.QueryRow("SELECT COUNT(*) FROM metering.events_raw WHERE x_request_id IN (" + where + ")").Scan(&count); err != nil || count != 0 {
+			t.Fatal("non-whitelisted request generated events")
+		}
+	})
+}
+
+func gatewaySelectedRequests(t *testing.T) uint64 {
+	t.Helper()
+	res, err := (&http.Client{Timeout: 5 * time.Second}).Get("http://127.0.0.1:19000/stats?filter=metering_requests_selected_total")
 	if err != nil {
 		t.Fatal(err)
 	}
-	io.Copy(io.Discard, res.Body)
-	res.Body.Close()
-	time.Sleep(300 * time.Millisecond)
-	if err = db.QueryRow("SELECT COUNT(*) FROM metering.events_raw").Scan(&after); err != nil || before != after {
-		t.Fatal("non-whitelisted request generated events")
+	defer res.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(res.Body, 65536))
+	if err != nil || res.StatusCode != 200 {
+		t.Fatal("cannot read gateway selected counter")
 	}
+	var total uint64
+	found := false
+	for _, line := range strings.Split(string(body), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) == 2 && strings.HasSuffix(fields[0], "metering_requests_selected_total:") {
+			n, err := strconv.ParseUint(fields[1], 10, 64)
+			if err != nil {
+				t.Fatal(err)
+			}
+			total += n
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("gateway selected counter missing")
+	}
+	return total
 }
 func eventsUUID(s string) bool { return observationwire.UUID(s) }
 

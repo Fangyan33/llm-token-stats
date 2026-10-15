@@ -108,7 +108,7 @@ def infra_up():
    if 'Alive' in columns and any(row.split('\t')[columns.index('Alive')]=='true' for row in rows[1:]):break
   time.sleep(2)
  else:raise RuntimeError('Doris readiness timeout')
- for name in ['001_init.sql','002_usage_summaries.sql','004_summary_coordination.sql','005_consumer_recovery.sql']:
+ for name in ['001_init.sql','002_usage_summaries.sql','004_summary_coordination.sql','005_consumer_recovery.sql','006_optional_route_identity.sql']:
   run('exec','-T','doris','mysql','-uroot','-h127.0.0.1','-P9030',input=(ROOT/'migrations/doris/metering'/name).read_text())
  for _ in range(45):
   result=subprocess.run([*BASE,'exec','-T','kafka','/opt/kafka/bin/kafka-topics.sh','--bootstrap-server','kafka:9092','--create','--if-not-exists','--topic','llm-metering-events','--partitions','24','--replication-factor','1','--config','retention.ms=259200000','--config','cleanup.policy=delete'],capture_output=True)

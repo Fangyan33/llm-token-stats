@@ -53,7 +53,7 @@ UUIDv4 不包含时间。`request_started_at_ms` 仍由网关观察并作为事�
 | `gateway_instance_id` | 字符串 / 否 | 观察该请求的网关实例标识。 |
 | `config_version` | 字符串 / 否 | 请求开始时固定的采集配置版本，用于解释当时的采集规则。固定为 `collection-v1` |
 | `adapter_id` | 字符串 / 否 | 解析上游协议的适配器 ID；当前接入范围固定为 `chat_completions_v1`。 |
-| `route_name` | 字符串 / 否 | 网关可信路由名称；事件不携带原始 URL 或 query。 |
+| `route_name` | 字符串 / 否 | 真实 Envoy HTTP 路由名；不可读时为 `unknown`。仅用于诊断、审计，不参与身份一致性、准入或价格选择；不是 VirtualService 名称或后端 ID。字段保留非空字符串，业务上可缺失；历史 `*` 原文保留。事件不携带原始 URL 或 query。 |
 | `service_id` | 字符串 / 否 | 路由配置确定的目标业务服务标识，不从客户端请求猜测。 |
 | `api_key_id` | 字符串 / 是 | Auth 给出的稳定 API Key ID，不是密钥原文；身份信息缺失时为 `null`。 |
 | `customer_id` | 字符串 / 是 | 鉴权时的客户归属快照；用于租户范围过滤。 |

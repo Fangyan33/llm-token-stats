@@ -85,3 +85,47 @@ func TestConsumerFlushConfiguration(t *testing.T) {
 		})
 	}
 }
+
+func TestServiceAdmissionAndLegacyConfiguration(t *testing.T) {
+	for _, component := range []string{"observer", "consumer"} {
+		for _, mode := range []string{"services", "legacy_routes", "legacy_without_route", "missing", "duplicate", "mixed"} {
+			t.Run(component+"/"+mode, func(t *testing.T) {
+				t.Setenv("POD_UID", "observer-test")
+				c, err := Read("../../configs/" + component + ".local.json")
+				if err != nil {
+					t.Fatal(err)
+				}
+				services := []string{"model-service-a"}
+				var routes []Route
+				switch mode {
+				case "legacy_routes":
+					services = nil
+					routes = []Route{{RouteName: "old-route", ServiceID: "model-service-a"}, {RouteName: "*", ServiceID: "model-service-a"}}
+				case "legacy_without_route":
+					services = nil
+					routes = []Route{{ServiceID: "model-service-a"}}
+				case "missing":
+					services = nil
+				case "duplicate":
+					services = append(services, services[0])
+				case "mixed":
+					routes = []Route{{ServiceID: "other"}}
+				}
+				if component == "observer" {
+					c.Observer.AcceptedServices, c.Observer.Routes = services, routes
+					err = c.ObserverDefaults()
+				} else {
+					c.Consumer.AcceptedServices, c.Consumer.Routes = services, routes
+					err = c.ConsumerDefaults()
+				}
+				valid := mode == "services" || mode == "legacy_routes" || mode == "legacy_without_route"
+				if (err == nil) != valid {
+					t.Fatalf("configuration error: %v", err)
+				}
+				if valid && (!AcceptsService(services, routes, "model-service-a") || AcceptsService(services, routes, "unregistered")) {
+					t.Fatal("service allowlist bypassed")
+				}
+			})
+		}
+	}
+}

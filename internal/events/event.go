@@ -25,7 +25,7 @@ func Canonical(e *Event) ([]byte, error) {
 	return b, nil
 }
 func IdentityHash(e *Event) string {
-	return Tuple([]any{e.ServiceID, e.ApiKeyID, e.CustomerID, e.ApplicationID, e.IdentityStatus, e.ConfigVersion, e.GatewayInstanceID, e.RouteName, e.AdapterID, e.XRequestID})
+	return Tuple([]any{e.ServiceID, e.ApiKeyID, e.CustomerID, e.ApplicationID, e.IdentityStatus, e.ConfigVersion, e.GatewayInstanceID, e.AdapterID, e.XRequestID})
 }
 func Decode(b, key []byte, now time.Time) (*Event, error) {
 	if len(b) > MaxBytes {

@@ -205,7 +205,7 @@ type Start struct {
 	RequestStartedAtMs     int64                  `protobuf:"varint,1,opt,name=request_started_at_ms,json=requestStartedAtMs,proto3" json:"request_started_at_ms,omitempty"`
 	GatewayInstanceId      string                 `protobuf:"bytes,2,opt,name=gateway_instance_id,json=gatewayInstanceId,proto3" json:"gateway_instance_id,omitempty"` // Pod UID，不是客户端输入
 	ConfigVersion          string                 `protobuf:"bytes,3,opt,name=config_version,json=configVersion,proto3" json:"config_version,omitempty"`
-	RouteName              string                 `protobuf:"bytes,4,opt,name=route_name,json=routeName,proto3" json:"route_name,omitempty"`
+	RouteName              string                 `protobuf:"bytes,4,opt,name=route_name,json=routeName,proto3" json:"route_name,omitempty"` // 真实 Envoy 路由名，仅诊断；不可读为 unknown，不作为接纳条件
 	ServiceId              string                 `protobuf:"bytes,5,opt,name=service_id,json=serviceId,proto3" json:"service_id,omitempty"`
 	AdapterId              string                 `protobuf:"bytes,6,opt,name=adapter_id,json=adapterId,proto3" json:"adapter_id,omitempty"`
 	ApiKeyId               *string                `protobuf:"bytes,7,opt,name=api_key_id,json=apiKeyId,proto3,oneof" json:"api_key_id,omitempty"`

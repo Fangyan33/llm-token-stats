@@ -63,7 +63,7 @@ WASM 仅做有界 usage 参数编辑，不提取业务用量、不运行 tokeniz
 ### 2.1 路由、身份与过滤器顺序
 
 1. 在 ingressgateway HTTP filter chain 中，把插件放在 `envoy.filters.http.ext_authz` 之后、router 之前；顺序以真实 `config_dump` 确认。Auth 及 PostgreSQL 设计见独立文档。
-2. 必须在请求头阶段按第 2.3 节执行“可信路由显式启用 + 方法 + 路径”联合白名单，仅匹配 route_name 不足以启用采集。服务 ID 来自配置，不从客户端路径推断；Observer 服务路由永远排除。
+2. 必须在请求头阶段按第 2.3 节执行“规则显式启用 + 方法 + 路径”联合白名单。当前 `route_name: "*"` 忽略路由名，所有到达该观察位置的 `POST /v1/chat/completions` 均进入采集流程；精确路由筛选保留兼容。服务 ID 来自配置，不从客户端路径推断；Observer 的 gRPC 接口路径不在白名单中。
 3. 一期采集子项统计基数为到达该观察位置且命中完整白名单的请求，不包含同路由上的普通查询。鉴权前被拒绝的请求可能不经过插件，单列网关指标，不混入完整率分母。
 4. 可信身份来自 Auth 的 `CheckResponse.dynamic_metadata`，由 Envoy 写入 `filter_metadata.envoy.filters.http.ext_authz` namespace。
 5. 不信任客户端传入的 API Key ID、客户 ID、应用 ID；一期采集子项不支持把任意请求头配置为身份来源。
@@ -120,14 +120,14 @@ Consumer 校验 UUIDv4 格式和 Kafka key 后，以事件中的 `request_starte
 
 本节为实现和上线验收的强制约束；“白名单请求”均指命中以下完整条件的请求。
 
-1. **默认忽略**：全局 enabled 必须为 true，且可信 route_name 对应规则显式 enabled=true、方法和路径同时命中，才标记 selected。缺少规则、规则禁用、属性读取失败均不采集，不得回退为全量采集。route_name 必须从 Envoy 可信路由属性取得，不接受客户端 Header 控制开关、路由名、service_id 或 adapter_id。
-2. **一期采集子项只允许 Chat Completions**：adapter_id 固定为 chat_completions_v1，methods 固定为 ["POST"]，paths 为非空精确路径列表，默认 ["/v1/chat/completions"]。部署使用自定义前缀时必须逐条配置并验证；禁止通配符、前缀、包含或正则匹配。GET、HEAD、OPTIONS、指标、健康检查和模型列表接口不得进入采集；未来其他协议需独立适配器和评审。
-3. **路径口径固定**：使用 Wasm 请求头回调当时可见的 :path，去掉第一个 ? 及其后的查询串后逐字节匹配；插件不额外 URL 解码、大小写折叠、合并斜杠或去除尾斜杠。网关此前已做的规范化以实际可见结果为准。路径和 query 不上报、不入库、不记日志或指标标签。规则按该观察位置配置，不使用上游重写后的路径猜测；路径重写、路由属性及执行顺序须在固定镜像 PoC 验证，读取不到可信属性时禁止扩大匹配范围。
+1. **默认忽略**：全局 enabled 必须为 true，命中规则显式 enabled=true、方法和路径同时命中，才标记 selected。当前单条规则使用 `route_name: "*"`，忽略实际路由名，路由属性或 metadata 不可读时仍按 method/path 匹配；缺少规则或规则禁用时不采集。只有整个值 `*` 具有通配含义，不支持 `llm-*` 等部分模式。精确路由模式仍从 Envoy 可信路由属性取得名称，读取不到时不命中该精确规则；不接受客户端 Header 控制开关、路由名、service_id 或 adapter_id。事件的 service_id/adapter_id 固定为命中规则的配置值；route_name 单独读取真实 Envoy 属性，缺失、超过 128 UTF-8 字节、无效或通配值时写 `unknown`，不使用兼容计量 metadata 冒充真实路由。该诊断快照在请求内不变，不参与服务准入、身份一致性或价格选择。
+2. **一期采集子项只允许 Chat Completions**：adapter_id 固定为 chat_completions_v1，methods 固定为 ["POST"]，paths 为非空精确路径列表，默认 ["/v1/chat/completions"]。部署使用自定义路径时必须逐条配置并验证；路径禁止通配符、前缀、包含或正则匹配。GET、HEAD、OPTIONS、指标、健康检查和模型列表接口不得进入采集；未来其他协议需独立适配器和评审。
+3. **路径口径固定**：使用 Wasm 请求头回调当时可见的 :path，去掉第一个 ? 及其后的查询串后逐字节匹配；插件不额外 URL 解码、大小写折叠、合并斜杠或去除尾斜杠。网关此前已做的规范化以实际可见结果为准。路径和 query 不上报、不入库、不记日志或指标标签。规则按该观察位置配置，不使用上游重写后的路径猜测；路径重写及执行顺序须在固定镜像 PoC 验证。
 4. **先过滤再分配**：HTTP context 初始 selected=false，只保存必要标志。未命中时不请求 Observer 分配 logical_request_id、不读取身份或正文、不申请改写/观察额度、不建立观察 gRPC 流、不发送 Start/BodyChunk/End、不添加计量响应头，所有后续回调直接 Continue（结束回调直接返回）。不得为这类请求产生两类 Kafka 事件，包括 unknown 占位事件；只增加本地忽略计数。Envoy/SDK 基础 HTTP context 的创建不等于分配计量状态。
 5. **请求内固定结果**：命中后固定规则、config_version 和 selected，后续配置更新、响应状态、usage 缺失不得改变本次选择。Content-Type、Content-Encoding、请求体中的 model/stream、是否携带 API Key 均不能替代入口白名单。内容类型/压缩不支持仅影响改写和解析；命中的失败响应、非法正文或断流仍按现有有界流程尝试产生可观察事件，未知用量不得补零，不承诺两事件必达。
 6. **鉴权独立**：不采集不代表免鉴权；普通查询按其自身鉴权策略处理。命中请求仍从 ext_authz 获取可信身份；鉴权前被拒绝的请求不在本观察位置的分母中。Observer/Consumer 的 schema、adapter_id/config_version 校验仅为防御性校验，不能替代入口过滤；现有事件不携带原始路径，不声称下游能重新验证全部匹配条件。
 
-规则匹配按全局禁用、路由缺失/不匹配、规则禁用、方法不匹配、路径不匹配的顺序判定；属性读取异常记 attribute_unavailable，其他首次失败原因分别为 disabled、route_not_allowed、route_disabled、method_not_allowed、path_not_allowed，每请求只计一次。路由规则上限 128 条，每路由最多 16 个路径，每路径最多 1024 UTF-8 字节；请求头读取上限同时由网关配置约束，禁止无界复制。
+规则匹配先检查全局开关及 POST 方法，再按配置顺序选择首先命中路由名（精确名或 `*`）的规则，检查该规则开关及精确路径；先命中的规则禁用或路径不匹配时不会继续回退到后续规则。忽略原因分别为 disabled、method、route_disabled、path、route，指标为 `metering_requests_ignored_<原因>_total`，每请求只计一次；`*` 规则不会因缺少路由名而忽略。规则上限 128 条，每规则最多 16 个路径，每路径最多 1024 UTF-8 字节；请求头读取上限同时由网关配置约束，禁止无界复制。
 
 ## 3. WASM → Observer 协议
 
@@ -168,7 +168,7 @@ message Start {
   int64 request_started_at_ms = 1;
   string gateway_instance_id = 2;  // Pod UID，不是客户端输入
   string config_version = 3;
-  string route_name = 4;
+  string route_name = 4;           // 真实 Envoy 路由名，仅诊断；不可读为 unknown，不作为接纳条件
   string service_id = 5;
   string adapter_id = 6;
   optional string api_key_id = 7;
@@ -518,7 +518,7 @@ sequenceDiagram
   "gateway_instance_id": "gateway-pod-uid",
   "config_version": "collection-v1",
   "adapter_id": "chat_completions_v1",
-  "route_name": "llm-chat",
+  "route_name": "unknown",
   "service_id": "model-service-a",
   "api_key_id": "key-42",
   "customer_id": "customer-7",
@@ -606,7 +606,9 @@ ACK 与 Kafka 发送完全解耦；即便两条事件只有一条成功入 Kafka
 | 状态 | TINYINT、VARCHAR | 0 与 NULL 含义不同；布尔值在 SQL 列中用 0/1 |
 | Kafka 坐标 | VARCHAR、INT、BIGINT | 重放后同一键可能保留任一次写入的坐标 |
 
-`identity_hash` 对下列固定顺序的字段构造 JSON 数组并计算 SHA-256：`service_id`、`api_key_id`、`customer_id`、`application_id`、`identity_status`、`config_version`、`gateway_instance_id`、`route_name`、`adapter_id`、`x_request_id`。使用规范事件序列化器编码 UTF-8、JSON null 和转义；不可用简单字符串拼接代替，以免空值与分隔符造成歧义。模型是观察结果，不纳入稳定身份摘要。`payload_hash` 和 `identity_hash` 均由 Consumer 对同一个已校验事件对象计算。
+`identity_hash` 对下列固定顺序的字段构造 JSON 数组并计算 SHA-256：`service_id`、`api_key_id`、`customer_id`、`application_id`、`identity_status`、`config_version`、`gateway_instance_id`、`adapter_id`、`x_request_id`。`route_name` 为可缺失的诊断维度（以 `unknown` 占位），不进入身份摘要。使用规范事件序列化器编码 UTF-8、JSON null 和转义；不可用简单字符串拼接代替，以免空值与分隔符造成歧义。模型是观察结果，不纳入稳定身份摘要。`payload_hash` 和 `identity_hash` 均由 Consumer 对同一个已校验事件对象计算。
+
+[006 migration](../migrations/doris/metering/006_optional_route_identity.sql) 更新 requests / request_statistics：对全部新旧记录，以相同九个类型化身份字段构造 JSON 数组比较；Consumer 的跨日期冲突查询采用同样字段。旧 identity_hash 含 route_name，不能直接与新版摘要比较，也不要求回填。历史 event_json、payload_hash、路由原值保持不变；同一 event_id 即使只改路由名也属于不同内容，仍保留冲突。既有 request_conflict_ids 不自动删除。部署顺序为暂停旧 Consumer → 执行 006 → 升级 Consumer / Observer 和白名单 → 发布新 Wasm。
 
 事件表按 UTC 请求日期每日分区，拒绝诊断表按 Kafka 记录 UTC 日期每日分区，均在线保留一年：365 个 UTC 日期（当天及前 364 天）。Doris 动态分区创建与清理，time_unit=DAY、start=-364、end=2、time_zone=UTC；各 FE 须开启并持久化动态分区配置。Consumer 不接收超出在线窗口的历史事件，也不把过滤行视为成功。日/月汇总独立保留并由 usage-worker 刷新，见[一期日/月汇总设计](daily-monthly-summary-design.md)；归档为[后续可选设计](archive-optional-design.md)，一期不部署。`request_conflict_ids` 长期保留冲突 UUIDv4，不随事件分区到期删除，避免较早冲突变体过期后较晚变体恢复有效。UUIDv4 不得重用。[动态分区](https://doris.apache.org/docs/4.x/table-design/data-partitioning/dynamic-partitioning/)
 
@@ -702,7 +704,7 @@ Consumer/Doris 故障可以依赖 Kafka 72 小时保留恢复，与禁止采集�
   "observer_cluster": "outbound|9090||metering-observer.metering.svc.cluster.local",
   "identity_namespace": "envoy.filters.http.ext_authz",
   "identity_fields": {"api_key_id": "api_key_id", "customer_id": "customer_id", "application_id": "application_id"},
-  "routes": [{"route_name": "llm-chat", "enabled": true, "methods": ["POST"], "paths": ["/v1/chat/completions"], "service_id": "model-service-a", "adapter_id": "chat_completions_v1"}],
+  "routes": [{"route_name": "*", "enabled": true, "methods": ["POST"], "paths": ["/v1/chat/completions"], "service_id": "model-service-a", "adapter_id": "chat_completions_v1"}],
   "chunk_bytes": 16384,
   "callback_max_bytes": 65536,
   "callback_max_chunks": 4,
@@ -728,7 +730,7 @@ Consumer/Doris 故障可以依赖 Kafka 72 小时保留恢复，与禁止采集�
 
 `gateway_instance_id` 由发布渲染器从目标 Kubernetes Pod 的实际 UID 注入插件配置，生产不得给多个 Pod 写同一个常量。EnvoyFilter 使用代理启动元数据 `NAME/NAMESPACE` 精确匹配目标 Pod，不依赖启动后补加的 UID 标签；Pod 重建后获取新名称、UID 重新渲染。UID 不从 HTTP 请求头读取。
 
-配置校验：路由 enabled 缺省为 false；空 routes 表示全部忽略。route_name 必须唯一；methods/paths 缺失、为空、重复、超限，路径不是以 / 开头、含查询串/片段标识或匹配模式，及非一期采集子项方法/适配器均为无效配置；不得把空列表解释为全匹配。遵循第 2.3 节的数量和长度上限。未知字段拒绝；ID、cluster、route 长度有界；每流额度必须小于等于 Root 额度；改写单次预留乘以并发上限不得大于 Root 改写预算；分片连同保守 256 字节 Protobuf 开销能装入 32 KiB gRPC 消息；最大完整改写请求必须连同全部分片开销和控制预留装入单流额度；改写预留至少覆盖原始请求上限的 4 倍。控制预留必须小于总额度。预发布严格校验失败即阻止发布；运行时语义配置无效时进入 disabled 并返回初始化成功，暴露 config_invalid 指标。模块无法加载、ABI 不兼容等底层错误仍可能 NACK/启动失败，fail_open 无法兜底。
+配置校验：规则 enabled 缺省为 false；空 routes 表示全部忽略。route_name 必须唯一，可使用完整值 `*` 忽略路由名；methods/paths 缺失、为空、重复、超限，路径不是以 / 开头、含查询串/片段标识或匹配模式，及非一期采集子项方法/适配器均为无效配置；不得把空列表解释为全匹配。遵循第 2.3 节的数量和长度上限。未知字段拒绝；ID、cluster、route 长度有界；每流额度必须小于等于 Root 额度；改写单次预留乘以并发上限不得大于 Root 改写预算；分片连同保守 256 字节 Protobuf 开销能装入 32 KiB gRPC 消息；最大完整改写请求必须连同全部分片开销和控制预留装入单流额度；改写预留至少覆盖原始请求上限的 4 倍。控制预留必须小于总额度。预发布严格校验失败即阻止发布；运行时语义配置无效时进入 disabled 并返回初始化成功，暴露 config_invalid 指标。模块无法加载、ABI 不兼容等底层错误仍可能 NACK/启动失败，fail_open 无法兜底。
 
 ### 9.2 Observer 和 Consumer 配置契约
 
@@ -751,8 +753,7 @@ observer:
   ack_write_timeout_ms: 2000
   accepted_adapter_ids: [chat_completions_v1]
   accepted_config_versions: [collection-v1]
-  accepted_routes:
-    - {route_name: llm-chat, service_id: model-service-a}
+  accepted_service_ids: [model-service-a]
   response_flags_allowlist: []
   response_code_details_allowlist: []
   producer_slots: 256
@@ -765,6 +766,7 @@ kafka:
   sasl_secret: metering-kafka-sasl
 consumer:
   group_id: llm-metering-doris-v1
+  accepted_service_ids: [model-service-a]
   max_batch_rows: 5000
   max_batch_bytes: 4194304
   flush_interval_ms: 15000
@@ -1023,7 +1025,7 @@ SDK 单元测试验证 hostcall 签名和回调注册/清理；标准 Protobuf �
 
 设计交付包括正式 Protobuf、事件与配置 Schema、六种合成事件、离线校验及边界测试，完整索引见[闭环与验收清单](gateway-collection-design-closure.md)。离线检查覆盖协议/文档一致性、20 项数值默认值、固定事件字段与 Doris 类型化列、严格 JSON、UTF-8 字节长度、来源/状态组合、Int64 算术冲突和资源关系。
 
-Consumer、Observer、插件和 SDK 扩展已实现，标准代码已由 protoc 生成，公开固定 Envoy/Kafka/Doris 本地链路与 DDL 已验证，证据见[本地验证记录](../spec/plan/gateway-collection-verification.md)。私有 Istio 环境与业务性能验收仍待执行；已通过的本地检查不能代替 G0–G5 完整门槛和生产容量测试。
+Consumer、Observer、插件和 SDK 扩展已实现，标准代码已由 protoc 生成，公开固定 Envoy/Kafka/Doris 本地链路与 DDL 已验证，证据见[本地验证记录](spec/plan/gateway-collection-verification.md)。私有 Istio 环境与业务性能验收仍待执行；已通过的本地检查不能代替 G0–G5 完整门槛和生产容量测试。
 
 关键区别：Envoy host 有 gRPC 能力不等于 Go SDK 已有完整封装；发送成功不等于持久化成功；请求有记录不等于 usage 已知；Doris Unique Key 重放幂等不等于跨事件冲突隔离。
 

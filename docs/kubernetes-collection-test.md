@@ -69,12 +69,16 @@ curl --noproxy '*' -N -H 'Host: wasm-verify.local' -H 'Content-Type: application
 | 网格 | Observer 入站 STRICT mTLS 下，9093 下载、9090 gRPC 及实际采集入库成功 |
 | 配置收敛 | 已激活监听器内 `code.remote` 摘要及 enabled 状态正确，等待 XDS 收敛后才发验收请求 |
 | Pod 匹配 | 错误 NAME 不安装采集过滤器，业务健康请求仍为 200；恢复实际 Pod NAME / NAMESPACE 后重新加载 |
+| 请求过滤 | 使用 `route_name: "*"`；真实 HTTP 路由命名为 `synthetic-model-route`，不注入计量 route metadata，仍采集 POST 精确路径；JSON 场景附查询串也命中 |
+| 忽略请求 | GET / HEAD / OPTIONS / PUT，及 POST 的其它路径、尾斜杠、子路径共 8 个反例均不增加网关 selected 计数，Doris 事件为 0 |
 | 普通 JSON | HTTP 200，Doris 中恰有两条对应事件；用量 known、输入 10、输出 4、complete、usage_eligible=1 |
 | SSE | HTTP 200，返回 `[DONE]`，Doris 事件与正常 JSON 用量一致；fixture 要求 include_usage，间接验证网关改写 |
 | SSE 缺 usage | HTTP 200，事件 unknown，输入 / 输出 NULL，complete、usage_eligible=0 |
-| 数据来源 | 三个请求的 gateway_instance_id 为实际网关 Pod UID，producer_id 属于 Kubernetes Observer，kafka_topic 为本次独立 topic |
+| 数据来源 | 三个请求的 gateway_instance_id 为实际网关 Pod UID，producer_id 属于 Kubernetes Observer，kafka_topic 为本次独立 topic，事件 route_name 为真实 HTTP 路由名 `synthetic-model-route`；若该版本属性不可读则为 `unknown`，两事件保持一致，不允许写 `*` |
 | 独立 Consumer | 3 个分区无积压，已有记录的分区提交位点合计为 6（空分区允许尚无提交）；Doris 有对应分区起点及可见批次回执；缩容 Kubernetes Consumer 至 0 后该组为 Empty / 0 成员，恢复至 1 后为 Stable / 1 成员且原消费位点保持 |
 | 原网关隔离 | 测试前后 `istio-system` 原网关 Pod 名称、UID 和容器重启次数一致 |
+
+2026-10-15 本次验证中，请求头阶段未读到真实路由属性，三种场景的事件均记录 `route_name: "unknown"`；不会用配置通配符或 VirtualService 名称填充。单元测试另覆盖实际路由名可读时原样保存。
 
 kind 到 Compose 的连接经过 SNAT，broker 记录的 HOST 可能是 Docker 网桥地址。用例通过 Kubernetes Consumer 实际停止 / 恢复与消费组成员数的对应变化核验归属，不用 broker 所见地址推断 Pod IP。
 

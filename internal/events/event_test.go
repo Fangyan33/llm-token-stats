@@ -52,3 +52,33 @@ func TestRawUsageRejectsNull(t *testing.T) {
 		}
 	}
 }
+
+func TestDiagnosticRouteExcludedFromIdentity(t *testing.T) {
+	e := &Event{ServiceID: "s", ApiKeyID: Ptr("key"), CustomerID: Ptr("customer"), ApplicationID: Ptr("app"), IdentityStatus: "known", ConfigVersion: "v1", GatewayInstanceID: "gateway", AdapterID: "chat_completions_v1", XRequestID: Ptr("x"), RouteName: "old-route"}
+	identity := IdentityHash(e)
+	before, _ := Canonical(e)
+	for _, route := range []string{"unknown", "new.actual-route", "*"} {
+		e.RouteName = route
+		after, _ := Canonical(e)
+		if IdentityHash(e) != identity || Hash(before) == Hash(after) {
+			t.Fatal("route must affect payload evidence only")
+		}
+	}
+	for _, change := range []func(*Event){
+		func(e *Event) { e.ServiceID = "other" },
+		func(e *Event) { e.ApiKeyID = Ptr("other") },
+		func(e *Event) { e.CustomerID = Ptr("other") },
+		func(e *Event) { e.ApplicationID = Ptr("other") },
+		func(e *Event) { e.IdentityStatus = "invalid" },
+		func(e *Event) { e.ConfigVersion = "v2" },
+		func(e *Event) { e.GatewayInstanceID = "other" },
+		func(e *Event) { e.AdapterID = "other" },
+		func(e *Event) { e.XRequestID = nil },
+	} {
+		copy := *e
+		change(&copy)
+		if IdentityHash(&copy) == identity {
+			t.Fatal("stable identity field ignored")
+		}
+	}
+}

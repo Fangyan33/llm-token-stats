@@ -14,6 +14,10 @@ import (
 )
 
 func testHost(t *testing.T) proxytest.HostEmulator {
+	return testHostWithRoute(t, "llm-chat")
+}
+
+func testHostWithRoute(t *testing.T, route string) proxytest.HostEmulator {
 	t.Helper()
 	proxytest.ResetGrpc()
 	b, err := os.ReadFile("../../configs/gateway-observer.example.json")
@@ -25,12 +29,42 @@ func testHost(t *testing.T) proxytest.HostEmulator {
 	c["enabled"] = true
 	c["gateway_instance_id"] = "test-gateway"
 	b, _ = json.Marshal(c)
-	host, reset := proxytest.NewHostEmulator(proxytest.NewEmulatorOption().WithVMContext(&vm{}).WithPluginConfiguration(b).WithProperty([]string{"route_name"}, []byte("llm-chat")))
+	option := proxytest.NewEmulatorOption().WithVMContext(&vm{}).WithPluginConfiguration(b)
+	if route != "" {
+		option = option.WithProperty([]string{"route_name"}, []byte(route))
+	}
+	host, reset := proxytest.NewHostEmulator(option)
 	t.Cleanup(reset)
 	if host.StartVM() != types.OnVMStartStatusOK || host.StartPlugin() != types.OnPluginStartStatusOK {
 		t.Fatal("start")
 	}
 	return host
+}
+
+func TestWildcardSelectsWithoutRouteMetadata(t *testing.T) {
+	for _, route := range []string{"", "other.named-match", "llm-chat", "*", strings.Repeat("r", 129), string([]byte{0xff})} {
+		t.Run(route, func(t *testing.T) {
+			h := testHostWithRoute(t, route)
+			id := h.InitializeHttpContext()
+			h.CallOnRequestHeaders(id, [][2]string{{":method", "POST"}, {":path", "/v1/chat/completions?x=y"}, {"content-type", "application/json"}}, false)
+			calls := proxytest.GrpcCalls()
+			if len(calls) != 1 || len(calls[0].Messages) != 1 {
+				t.Fatal("matching method/path did not send Start")
+			}
+			var frame pb.ObservationFrame
+			if err := proto.Unmarshal(calls[0].Messages[0], &frame); err != nil {
+				t.Fatal(err)
+			}
+			start := frame.GetStart()
+			want := route
+			if route == "" || route == "*" || len(route) > 128 || route == string([]byte{0xff}) {
+				want = "unknown"
+			}
+			if start == nil || start.RouteName != want || start.ServiceId != "model-service-a" {
+				t.Fatalf("Start must report actual route or unknown: %+v", start)
+			}
+		})
+	}
 }
 
 func TestGrpcUpstreamAuthority(t *testing.T) {
@@ -122,12 +156,27 @@ func TestFullRequestBoundaryAndControlReserve(t *testing.T) {
 	}
 }
 func TestIgnoreBeforeAllocation(t *testing.T) {
-	h := testHost(t)
-	id := h.InitializeHttpContext()
-	h.CallOnRequestHeaders(id, [][2]string{{":method", "GET"}, {":path", "/v1/chat/completions"}, {"content-type", "application/json"}}, false)
-	h.CallOnRequestBody(id, []byte("invalid"), true)
-	if len(proxytest.GrpcCalls()) != 0 {
-		t.Fatal("ignored opened grpc")
+	for _, tc := range []struct{ method, path string }{
+		{"GET", "/v1/chat/completions"}, {"HEAD", "/v1/chat/completions"},
+		{"OPTIONS", "/v1/chat/completions"}, {"PUT", "/v1/chat/completions"},
+		{"POST", "/v1/embeddings"}, {"POST", "/healthz"},
+		{"POST", "/v1/chat/completions/"}, {"POST", "/v1/chat/completions/extra"},
+	} {
+		t.Run(tc.method+tc.path, func(t *testing.T) {
+			h := testHostWithRoute(t, "")
+			id := h.InitializeHttpContext()
+			h.CallOnRequestHeaders(id, [][2]string{{":method", tc.method}, {":path", tc.path}, {"content-type", "application/json"}}, false)
+			h.CallOnRequestBody(id, []byte("invalid"), true)
+			h.CallOnResponseHeaders(id, [][2]string{{":status", "200"}}, false)
+			h.CallOnResponseBody(id, []byte("ignored"), true)
+			if len(proxytest.GrpcCalls()) != 0 || string(h.GetCurrentRequestBody(id)) != "invalid" {
+				t.Fatal("ignored request opened grpc or changed business body")
+			}
+			h.CompleteHttpContext(id)
+			if len(proxytest.GrpcCalls()) != 0 {
+				t.Fatal("ignored request completion sent event")
+			}
+		})
 	}
 }
 func TestRewriteEOSAndLateACK(t *testing.T) {

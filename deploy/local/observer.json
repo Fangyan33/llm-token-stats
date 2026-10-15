@@ -16,11 +16,6 @@
     "accepted_adapter_ids": [
       "chat_completions_v1"
     ],
-    "accepted_routes": [
-      {
-        "route_name": "llm-chat",
-        "service_id": "model-service-a"
-      }
-    ]
+    "accepted_service_ids": ["model-service-a"]
   }
 }

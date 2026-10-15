@@ -37,20 +37,12 @@
                         ],
                         "routes": [
                           {
-                            "name": "llm-chat",
                             "match": {
                               "prefix": "/"
                             },
                             "route": {
                               "cluster": "fixture",
                               "timeout": "0s"
-                            },
-                            "metadata": {
-                              "filter_metadata": {
-                                "metering": {
-                                  "route_name": "llm-chat"
-                                }
-                              }
                             }
                           }
                         ]
@@ -97,7 +89,7 @@
                           },
                           "configuration": {
                             "@type": "type.googleapis.com/google.protobuf.StringValue",
-                            "value": "{\"schema_version\": 1, \"enabled\": true, \"config_version\": \"collection-v1\", \"gateway_instance_id\": \"gateway-test\", \"observer_cluster\": \"observer\", \"identity_namespace\": \"envoy.filters.http.ext_authz\", \"identity_fields\": {\"api_key_id\": \"api_key_id\", \"customer_id\": \"customer_id\", \"application_id\": \"application_id\"}, \"routes\": [{\"route_name\": \"llm-chat\", \"enabled\": true, \"methods\": [\"POST\"], \"paths\": [\"/v1/chat/completions\"], \"service_id\": \"model-service-a\", \"adapter_id\": \"chat_completions_v1\"}], \"chunk_bytes\": 16384, \"callback_max_bytes\": 65536, \"callback_max_chunks\": 4, \"request_body_max_bytes\": 262144, \"rewrite_timeout_ms\": 2000, \"rewrite_reservation_bytes\": 1048576, \"root_rewrite_budget_bytes\": 16777216, \"root_max_rewrites\": 16, \"response_body_max_bytes\": 8388608, \"stream_inflight_bytes\": 524288, \"stream_inflight_messages\": 32, \"root_max_streams\": 512, \"root_inflight_bytes\": 16777216, \"root_inflight_messages\": 8192, \"ack_timeout_ms\": 2000, \"end_ack_timeout_ms\": 2000, \"observation_max_ms\": 600000, \"tick_ms\": 100, \"metadata_max_bytes\": 4096, \"ack_max_bytes\": 1024}"
+                            "value": "{\"schema_version\": 1, \"enabled\": true, \"config_version\": \"collection-v1\", \"gateway_instance_id\": \"gateway-test\", \"observer_cluster\": \"observer\", \"identity_namespace\": \"envoy.filters.http.ext_authz\", \"identity_fields\": {\"api_key_id\": \"api_key_id\", \"customer_id\": \"customer_id\", \"application_id\": \"application_id\"}, \"routes\": [{\"route_name\": \"*\", \"enabled\": true, \"methods\": [\"POST\"], \"paths\": [\"/v1/chat/completions\"], \"service_id\": \"model-service-a\", \"adapter_id\": \"chat_completions_v1\"}], \"chunk_bytes\": 16384, \"callback_max_bytes\": 65536, \"callback_max_chunks\": 4, \"request_body_max_bytes\": 262144, \"rewrite_timeout_ms\": 2000, \"rewrite_reservation_bytes\": 1048576, \"root_rewrite_budget_bytes\": 16777216, \"root_max_rewrites\": 16, \"response_body_max_bytes\": 8388608, \"stream_inflight_bytes\": 524288, \"stream_inflight_messages\": 32, \"root_max_streams\": 512, \"root_inflight_bytes\": 16777216, \"root_inflight_messages\": 8192, \"ack_timeout_ms\": 2000, \"end_ack_timeout_ms\": 2000, \"observation_max_ms\": 600000, \"tick_ms\": 100, \"metadata_max_bytes\": 4096, \"ack_max_bytes\": 1024}"
                           },
                           "fail_open": true
                         }

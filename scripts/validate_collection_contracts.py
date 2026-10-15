@@ -18,7 +18,7 @@ MAX_EVENT_BYTES = 32768
 INT64_MAX = 9223372036854775807
 IDENTITY_FIELDS = (
     "service_id", "api_key_id", "customer_id", "application_id", "identity_status",
-    "config_version", "gateway_instance_id", "route_name", "adapter_id", "x_request_id",
+    "config_version", "gateway_instance_id", "adapter_id", "x_request_id",
 )
 TOKEN_NAMES = (
     "input_tokens", "output_tokens", "cached_read_tokens", "cached_write_tokens",
@@ -320,6 +320,14 @@ def validate_repository():
     fields = load(ROOT / "api/events/v1/metering-event.schema.json")["properties"]
     require(set(fields) - {"usage"} <= columns, "event_doris_column_drift")
     require(all(n in columns and n + "_source" in columns for n in TOKEN_NAMES), "token_doris_column_drift")
+    # Identity comparison must agree across new hashes, legacy reads and both
+    # database projections; route diagnostics must never re-enter this key.
+    identity_sql = "CAST(JSON_ARRAY(" + ", ".join(IDENTITY_FIELDS) + ") AS STRING)"
+    store = (ROOT / "internal/doris/store.go").read_text(encoding="utf-8")
+    migration = (ROOT / "migrations/doris/metering/006_optional_route_identity.sql").read_text(encoding="utf-8")
+    require(identity_sql in store and migration.count("COUNT(DISTINCT " + identity_sql + ")") == 2,
+            "identity_comparison_field_drift")
+    require("COUNT(DISTINCT identity_hash)" not in migration, "legacy_identity_hash_comparison")
     print(f"PASS: protocol/document parity, config/table parity, Doris fields, {len(fixtures)} event fixtures.")
 
 def main():

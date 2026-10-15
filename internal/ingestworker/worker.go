@@ -332,7 +332,7 @@ func (w *Worker) audit(ctx context.Context) {
 
 	c, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
-	rows, err := w.Store.DB.QueryContext(c, "SELECT DISTINCT logical_request_id FROM metering.events_raw GROUP BY logical_request_id HAVING COUNT(DISTINCT request_started_at_ms)>1 OR COUNT(DISTINCT request_date)>1 OR COUNT(DISTINCT identity_hash)>1 OR SUM(CASE WHEN event_type='request_started' THEN 1 ELSE 0 END)>1 OR SUM(CASE WHEN event_type='usage_observed' THEN 1 ELSE 0 END)>1")
+	rows, err := w.Store.DB.QueryContext(c, "SELECT DISTINCT logical_request_id FROM metering.events_raw GROUP BY logical_request_id HAVING COUNT(DISTINCT request_started_at_ms)>1 OR COUNT(DISTINCT request_date)>1 OR COUNT(DISTINCT "+doris.IdentityKeySQL+")>1 OR SUM(CASE WHEN event_type='request_started' THEN 1 ELSE 0 END)>1 OR SUM(CASE WHEN event_type='usage_observed' THEN 1 ELSE 0 END)>1")
 	if err != nil {
 		w.Health.Count("audit_failure")
 		return

@@ -68,7 +68,7 @@ spec:
   hosts: [wasm-verify.local]
   gateways: [wasm-gateway]
   http:
-    - name: llm-chat
+    - name: synthetic-model-route
       match: [{uri: {prefix: /}}]
       route:
         - destination:
@@ -110,11 +110,3 @@ spec:
                 cluster_name: outbound|9002||collection-fixture.TEST_NAMESPACE.svc.cluster.local
                 authority: collection-fixture.TEST_NAMESPACE.svc.cluster.local
               timeout: 1s
-    - applyTo: HTTP_ROUTE
-      match: {context: GATEWAY}
-      patch:
-        operation: MERGE
-        value:
-          metadata:
-            filter_metadata:
-              metering: {route_name: llm-chat}

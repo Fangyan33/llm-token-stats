@@ -43,7 +43,7 @@ KAFKA_EXTERNAL_HOST=192.168.227.128 make local-up
 
 Kafka 容器内客户端仍使用 `kafka:9092`。重建容器时 Kafka 日志及 Doris FE/BE 数据由命名卷保留；首次从旧版无持久卷配置启动时，脚本先停栈，将原数据备份到 `.tmp/local-storage-*` 并迁移到卷，再重建容器。已有不匹配的目标卷会使迁移停止，避免覆盖或合并历史。不要使用 `docker compose down -v` 删除数据卷。
 
-`make local-up` 在 `dist/envoy.remote.json` 渲染实际 Wasm 摘要，重启 Fixture/Observer/Consumer，核对下载内容后重建网关。网关只挂载配置，插件来自 Observer HTTP 下载。更新本地产物后运行 `make build wasm local-up`，再运行 `GOFLAGS='-count=1' make local-test`，不能仅重启旧网关而沿用旧摘要。脚本只初始化该 Compose 栈，应用 001/002/004/005 migration，并创建 24 分区、72 小时保留、delete 策略的测试 topic。明文 Kafka、合成鉴权、副本数 1 与 Doris root 空密码仅用于开发联调；生产按原方案配置认证、副本、min ISR 和最小权限账号。
+`make local-up` 在 `dist/envoy.remote.json` 渲染实际 Wasm 摘要，重启 Fixture/Observer/Consumer，核对下载内容后重建网关。网关只挂载配置，插件来自 Observer HTTP 下载。更新本地产物后运行 `make build wasm local-up`，再运行 `GOFLAGS='-count=1' make local-test`，不能仅重启旧网关而沿用旧摘要。脚本只初始化该 Compose 栈，应用 001/002/004/005/006 migration，并创建 24 分区、72 小时保留、delete 策略的测试 topic。明文 Kafka、合成鉴权、副本数 1 与 Doris root 空密码仅用于开发联调；生产按原方案配置认证、副本、min ISR 和最小权限账号。
 
 普通 JSON / SSE 合成请求：
 
@@ -75,7 +75,8 @@ make generate
 - 请求头 Continue；符合条件的正文在非 EOS 回调 Pause，EOS 时只修改 `stream_options.include_usage`。请求头可先到上游。这是用户在真实旧版 ext_authz PoC 后确认的调整：暂停头会延迟已缓冲正文回调直到改写超时。
 - 改写预算与观察预算独立；Observer 不可用仍可补充参数。超限、超时或 JSON 无效时恢复原文，响应正文一直 Continue。旧版真实慢上传 PoC 中，Root 异步 Resume 后尾片可能不再完整经过 Wasm 回调，因此超时恢复会在有界前缀后取消观察，结果保留 partial/unknown，不宣称完整用量。JSON 校验限制深度 64、元素 100000、单对象键 8192；超限取消解析/原文放行。这些额外保护可能使复杂合法 JSON 降级，不能宣称所有请求均能改写。
 - 当前 Wasm 配置资源整数还限制在有符号 32 位正值范围，防止 TinyGo wasm32 的长度转换溢出；给出的初值全部满足。预发布仍必须运行 Schema 与关系校验。
-- `route_name` 在 router 前可能不可见。插件首先读取该可信属性，缺失时读取 `route_metadata.filter_metadata.metering.route_name`；必须在实际选中 Route 的 metadata 显式登记与配置一致的名称。两者都缺失时不采集，不读取客户端提供的路由或身份头。
+- 当前默认规则为 `route_name: "*"`，忽略路由名，只采集 `POST /v1/chat/completions`；路由属性或 metadata 缺失也可命中。路径去掉查询串后精确匹配，其它方法、尾斜杠、子路径和不同路径均忽略。精确路由规则仍支持：先读取可信 `route_name`，缺失时读取 `route_metadata.filter_metadata.metering.route_name`，都不可读时该精确规则不命中。规则按配置顺序选择，不读取客户端提供的路由或身份头。
+- 事件 `route_name` 使用真实 Envoy `route_name` 属性；不可读、无效或超长时为 `unknown`，计量 metadata 仅兼容精确规则匹配，不充当真实路由名。它是辅助诊断字段，不参与身份一致性、服务准入或价格选择；`service_id` / `adapter_id` 仍为配置值。Observer / Consumer 使用 `accepted_service_ids`；旧 `accepted_routes` 兼容读取且只取 service_id，新旧清单不能同时配置。历史事件（含 `*`）原文重放。升级先暂停旧 Consumer、应用 [006 migration](../migrations/doris/metering/006_optional_route_identity.sql)，更新下游和白名单，再发布 Wasm。新旧身份一致性均按排除路由的字段比较；不改写历史事件或删除旧冲突标记，同事件内容不同仍判为冲突。
 - trailers 只产生零字节 EOS BodyChunk，不上传其内容。End 校验两个方向的片序、偏移、字节总数及 EOS；HTTP context 删除后只由 Root+token 处理迟到 ACK，不能延长业务生命周期。
 - 上游重复伪造的计量响应头先全部移除；Start ACK 已到才加入一个 Observer UUID。快响应允许头缺失；有头也不保证事件已入 Kafka/Doris。
 - 固定 franz-go 的 `RecordRetries(0)` 阻止首次发送，实际使用 1 表示仅一次尝试。发送超时/重试次数耗尽保守计为 uncertain，不补发。3 秒 watchdog 关闭超龄 Producer，额外 1 秒内不能释放则退出进程。

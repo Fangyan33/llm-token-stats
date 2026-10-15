@@ -132,3 +132,46 @@ Wasm SHA-256 为 `a15b181ff3e59385e64aa2ba0e3d3df72be0d84e21a4b12137d37dcc24f731
 | 缺 usage | `acc9bef3-084c-43d7-a1d6-d5d906dd0139` | unknown，NULL / NULL |
 
 Wasm 摘要仍为 `c67679d6d16ca029a70fd42d6565b67530295131a2ea9925e4e7dd9fe46e34e2`。本用例使用合成鉴权 / 模型、明文外部 Kafka 和本地 Doris root 空密码；真实认证、生产网络和容量、完整 G0–G5 仍需单独验收。
+
+## 2026-10-15 入口仅按 POST 与精确路径过滤
+
+新增 `route_name: "*"`：全局及规则启用时，任意路由名或路由属性缺失的 `POST /v1/chat/completions` 均进入有界采集流程，其它方法与路径忽略。路径去掉查询串后精确比较，尾斜杠、子路径和不同路径不命中。事件沿用配置规则名 `*`；service_id / adapter_id 仍取自配置。Observer / Consumer 精确接纳 `*` 与服务组合，同时保留旧 `llm-chat` 登记，事件结构及数据库迁移不变。
+
+| 检查 | 实际结果 |
+| --- | --- |
+| `make test build wasm` | 46 项 Python 测试、主模块 / 插件 Go 竞态测试、构建及 TinyGo ABI 检查通过；新增规则匹配、无路由属性时发送 Start、忽略请求无 gRPC 调用及正文不变测试 |
+| 规则兼容 | 精确路由名仍按原方式匹配；全局 / 规则关闭仍忽略，前序禁用规则不会被后续通配规则绕过 |
+| Compose 真实入口 | 移除实际 Envoy Route 的 name 和计量 metadata，JSON / SSE / unknown 仍各产生两条事件并进入 Doris，事件 route_name 为 `*` |
+| `GOFLAGS='-count=1' make local-test` | 全部通过，278.517 秒；8 类方法 / 路径反例不增加 selected 计数、不产生事件，其余正文边界、Consumer 恢复及四类 Wasm 下载故障 / 恢复回归通过 |
+| `make k8s-test` | 完整通过，5 个 Pod Ready、无重启；实际路由名为 `synthetic-model-route`，未注入计量路由 metadata，三个正例成功入库；JSON 正例附查询串 |
+| Kubernetes 忽略验证 | GET / HEAD / OPTIONS / PUT 访问目标路径、POST 访问 embeddings / 尾斜杠 / 子路径、GET 健康检查共 8 个请求，selected 计数 `3 → 3`，Doris 事件为 0 |
+| 独立 Consumer | Kubernetes Consumer 消费组提交 6 条事件；缩容至 0 时 Empty / 0 成员，恢复至 1 时 Stable / 1 成员且位点保持，未复用 Compose Consumer |
+| 原网关 | `istio-system` 原网关 Pod 名称、UID 和重启次数保持不变 |
+
+Kubernetes 运行 ID 为 `b67af2b4169c`；正例、反例、已激活配置、消费位点与镜像版本保存在 `.tmp/k8s-collection/kind-kind/metering-wasm-verify/b67af2b4169c/`。镜像版本按当前 Git commit 解析为 `84028685dbf8`；Wasm SHA-256 为 `e82dba1f86e859e6af8a68430d738be5468ec8e6cbde088ec51c5a63ad86404e`，`make manifest` 已更新本地产物清单。
+
+| 场景 | logical_request_id | 用量 |
+| --- | --- | --- |
+| JSON（附查询串） | `9aca5517-f94b-440a-bc48-352f33ea1782` | known，10 / 4 |
+| SSE | `7e7ba43d-957f-47fc-b5d6-b51347e0516b` | known，10 / 4 |
+| 缺 usage | `139969e0-1c18-4868-bf9a-5bc1819bfa75` | unknown，NULL / NULL |
+
+本次测试资源保持运行，清理仍使用 `make k8s-clean`。上述仅为本地合成验证，不代替生产 G0–G5 验收。
+
+## 2026-10-15 route_name 作为辅助诊断字段
+
+本节为当前实现与验收结果；上一节记录通配入口的最初版本。入口继续仅按 `POST` 与去掉查询串后的精确路径 `/v1/chat/completions` 筛选，配置 `route_name: "*"` 仅控制选择。事件记录请求头阶段实际可读的 Envoy 路由名，缺失、无效或超长时用 `unknown`；计量 metadata 不冒充实际路由。路由快照在请求内不变，不参与客户归属、服务接纳、稳定身份比较或价格选择。
+
+Observer / Consumer 改用 `accepted_service_ids`，兼容旧 `accepted_routes` 中的 service_id，新旧清单不能同时配置。新身份摘要排除 route_name；006 migration、Consumer 跨日期冲突查询和启动 / 周期审计统一从九个类型化身份字段比较新旧记录，不直接比较不同版本的旧摘要，不回填原始事件或自动清除持久冲突标记。同一 event_id 的不同内容仍保留冲突。已有部署先暂停旧 Consumer、执行 006，再升级 Consumer / Observer 和 Wasm；本地共享 Doris 已应用 006。
+
+| 检查 | 实际结果 |
+| --- | --- |
+| 契约 / 单元 / 竞态 | `make test` 通过，47 项 Python 测试；新增诊断路由、服务准入及历史通配值接纳测试。后续契约校验也核对 Go / SQL 的身份字段顺序，Python 全量复验通过 |
+| 构建与 ABI | Observer / Consumer / fixture 构建通过，`make wasm` 的 ABI 检查通过；Proto 使用原固定工具重新生成，wire 字段不变，`make manifest` 已刷新 |
+| Compose 真实链路 | `GOFLAGS='-count=1' make local-test` 通过，耗时 293.156s；含三个采集场景、八个忽略反例、重放 / 冲突、Consumer 攒批 / 再均衡 / 退出恢复、黑洞、请求改写边界与四种下载失败恢复 |
+| 新旧身份兼容 | 真实 Doris 中混合旧路由或历史 `*` 的旧摘要与新 unknown 路由事件，两个请求视图均无身份冲突；重放不增行。专项复验在混合记录写入后启动真实 Consumer，其启动审计不产生错误持久冲突；客户变化及同事件路由内容变化仍冲突 |
+| Kubernetes 实际部署 | `make k8s-test` 通过，Kubernetes 1.22.17 / Istio 1.13.5，原始 Istio 网关镜像从 Observer 下载 Wasm；两个 Observer、独立 Consumer 和 fixture 在 Kubernetes，Kafka / Doris 复用 Compose |
+| Kubernetes 数据 | JSON / SSE 均 known，输入 10、输出 4；缺 usage 保持 unknown、NULL / NULL。三个请求各两条事件；当前请求头阶段路由属性未读到，均记录 unknown。八个忽略请求 selected 计数不变、Doris 事件为 0 |
+| Kubernetes Consumer 归属 | 独立 topic/group `llm-metering-k8s-03888bc89ca7`，提交事件合计 6；缩容后 Empty / 0 成员，恢复后 Stable / 1 成员。最终 5 个 Pod 全就绪、0 次重启；原 istio-system 网关未改变 |
+
+本次测试镜像版本为 `84028685dbf8`；Wasm SHA-256 为 `c63cf60efb6bd07c29a4e45676acac1f913179fb872a9d49fa19a75e75434636`。Kubernetes 证据保存在 `.tmp/k8s-collection/kind-kind/metering-wasm-verify/03888bc89ca7/result.json`，资源保留供检查，清理使用 `make k8s-clean`。本节证明本地合成链路，生产 G0–G5 仍须独立验收。

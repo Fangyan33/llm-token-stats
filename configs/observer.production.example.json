@@ -16,6 +16,6 @@
     "max_observation_ms": 605000,
     "accepted_config_versions": ["collection-v1"],
     "accepted_adapter_ids": ["chat_completions_v1"],
-    "accepted_routes": [{"route_name": "llm-chat", "service_id": "model-service-a"}]
+    "accepted_service_ids": ["model-service-a"]
   }
 }

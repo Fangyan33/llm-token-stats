@@ -22,7 +22,7 @@ flowchart LR
 | 组件 | 职责 | 运行方式与实现情况 |
 | --- | --- | --- |
 | Istio / Envoy 网关 | 执行鉴权、路由和业务转发，向 Wasm 提供可信路由及身份元数据 | 复用现有入口网关；本地使用 `istio/proxyv2:1.13.5` 中的 Envoy |
-| Gateway Observer Wasm | 按路由、方法和路径白名单选择请求；有界观察正文，必要时补充 `stream_options.include_usage`，旁路发送观察消息 | 已实现；加载在网关内，不是独立服务，也不直接连接 Kafka |
+| Gateway Observer Wasm | 当前按 POST 与精确路径白名单选择请求，`route_name: "*"` 忽略路由名；有界观察正文，必要时补充 `stream_options.include_usage`，旁路发送观察消息 | 已实现；加载在网关内，不是独立服务，也不直接连接 Kafka |
 | Observer | 接收观察流，分配请求 ID，解析 JSON / SSE usage，生成 `request_started`、`usage_observed` 事件，通过原生 Producer 发送 Kafka | 已实现；入口为 `cmd/observer/`，提供 gRPC、健康检查、指标及独立 HTTP Wasm 下载端口 |
 | Kafka | 缓冲结构化事件，按分区保存消费位置，为 Consumer 重放提供数据 | 外部基础设施；本地由 Compose 启动 |
 | Consumer | 校验事件与摘要、去重并保留冲突证据；写入 Doris 明细、拒绝诊断、日期通知和批次凭据；全部可见后提交 offset | 已实现；入口为 `cmd/consumer/`，多个副本使用同一 consumer group 分摊分区 |
@@ -108,7 +108,7 @@ Kafka、Doris 使用基础设施镜像；Fixture 由本地 Compose 挂载编译�
 make test build wasm local-up local-test
 ```
 
-该命令依次完成检查、编译和 Wasm ABI 验证，启动 Kafka、Doris、Fixture、Observer、Consumer、Envoy，然后执行真实链路集成测试。`make local-up` 会等待基础设施就绪，应用 `001/002/004/005` Doris 迁移，并创建 24 分区、72 小时保留的测试 topic。它本身不编译代码，会重新渲染下载摘要，重启使用挂载产物的 Fixture、Observer、Consumer，校验下载文件后重建网关。网关只挂载生成的配置，不挂载 Wasm。配置与编排位于 [deploy/local/](deploy/local/compose.yaml)。
+该命令依次完成检查、编译和 Wasm ABI 验证，启动 Kafka、Doris、Fixture、Observer、Consumer、Envoy，然后执行真实链路集成测试。`make local-up` 会等待基础设施就绪，应用 `001/002/004/005/006` Doris 迁移，并创建 24 分区、72 小时保留的测试 topic。它本身不编译代码，会重新渲染下载摘要，重启使用挂载产物的 Fixture、Observer、Consumer，校验下载文件后重建网关。网关只挂载生成的配置，不挂载 Wasm。配置与编排位于 [deploy/local/](deploy/local/compose.yaml)。
 
 `make test` 不启动容器、不写 Doris；`make local-test` 验证实际 Envoy → Observer → Kafka → Consumer → Doris 链路，包括 JSON / SSE、未知用量、重放去重、冲突、未知 schema 暂停、写入确认丢失和超时边界。测试使用合成数据，也会留下诊断记录。
 
@@ -198,7 +198,7 @@ kafka-topics.sh --bootstrap-server "$KAFKA_BOOTSTRAP" \
 
 上述副本配置需要至少 3 个可用 Broker；24 分区是容量验收初值。同一采集部署周期不在线调整分区数。为 Observer 配置 topic 生产权限，为 Consumer 配置 topic 消费和 group 权限；现有 topic 的参数要另行核对，`--if-not-exists` 不会更新已有配置。
 
-Doris 新库按 `001 → 002 → 004 → 005` 顺序执行迁移。仓库 SQL 的副本数为开发值 1，需先生成经过审查的生产副本；以下示例改为 3，要求实际 BE 数量和存储资源满足条件：
+Doris 新库按 `001 → 002 → 004 → 005 → 006` 顺序执行迁移。仓库 SQL 的副本数为开发值 1，需先生成经过审查的生产副本；以下示例改为 3，要求实际 BE 数量和存储资源满足条件：
 
 ```sh
 export DEPLOY_DIR="$PWD/.private/deploy"
@@ -210,14 +210,15 @@ from pathlib import Path
 
 target = Path(os.environ['DEPLOY_DIR']) / 'doris'
 for name in ('001_init.sql', '002_usage_summaries.sql',
-             '004_summary_coordination.sql', '005_consumer_recovery.sql'):
+             '004_summary_coordination.sql', '005_consumer_recovery.sql',
+             '006_optional_route_identity.sql'):
     sql = (Path('migrations/doris/metering') / name).read_text()
     sql = re.sub(r'("replication_num"\s*=\s*)"1"', r'\g<1>"3"', sql)
     (target / name).write_text(sql)
 PY
 
 # 在能够连接 FE SQL 的管理环境执行；认证配置由 Secret 安全提供。
-for migration in 001_init.sql 002_usage_summaries.sql 004_summary_coordination.sql 005_consumer_recovery.sql; do
+for migration in 001_init.sql 002_usage_summaries.sql 004_summary_coordination.sql 005_consumer_recovery.sql 006_optional_route_identity.sql; do
   mysql --defaults-extra-file=/run/secrets/doris/admin.cnf \
     --init-command="SET time_zone = '+00:00'" < "$DEPLOY_DIR/doris/$migration" || exit 1
 done
@@ -242,9 +243,9 @@ cp configs/gateway-observer.example.json "$DEPLOY_DIR/gateway-observer.json"
 
 | 配置 | 必须确认的内容 |
 | --- | --- |
-| Observer | Kafka Broker、CA 和认证环境变量名；`accepted_config_versions`、`accepted_adapter_ids`、`accepted_routes`；资源预算；`wasm_download` 的镜像内路径与下载端口 |
-| Consumer | 同一 Kafka topic、稳定的 `group_id`、历史版本及路由注册；Doris `fe_url`、`allowed_load_hosts`；攒批大小与时间 |
-| Wasm | 实际可信路由、方法、路径、`service_id`、`adapter_id`、`config_version`、Observer cluster；保持默认关闭，通过渲染器显式启用 |
+| Observer | Kafka Broker、CA 和认证环境变量名；`accepted_config_versions`、`accepted_adapter_ids`、`accepted_service_ids`；资源预算；`wasm_download` 的镜像内路径与下载端口 |
+| Consumer | 同一 Kafka topic、稳定的 `group_id`、历史配置版本及服务白名单；Doris `fe_url`、`allowed_load_hosts`；攒批大小与时间 |
+| Wasm | 规则 `route_name`（当前为 `*`，忽略路由名）、方法、精确路径、`service_id`、`adapter_id`、`config_version`、Observer cluster；保持默认关闭，通过渲染器显式启用 |
 
 `allowed_load_hosts` 必须覆盖实际 FE 和所有可能接收重定向的 BE 地址及端口，且 Consumer 可达这些地址。配置只向登记地址发送 Stream Load 凭据，并拒绝 HTTPS 降级。首次使用新 consumer group 会登记 Kafka earliest；接管缺少起点记录的旧组需要明确 `initial_offsets`，不能随意更换 group 或跳到 latest。
 
@@ -349,16 +350,23 @@ kubectl apply -f "$DEPLOY_DIR/envoyfilter.$GATEWAY_POD_UID.disabled.yaml"
 
 渲染器会验证 Wasm 配置及产物文件头、计算文件 SHA-256、写入实际 Pod UID、生成唯一 EnvoyFilter 名称，通过代理启动时的 `metadata.NAME/NAMESPACE` 精确匹配该 Pod；`--gateway-pod-name` 必填，`--gateway-namespace` 默认为 `istio-system`。不要直接 apply [EnvoyFilter 模板](deploy/gateway/envoyfilter.yaml)，也不要给整个 Deployment 共用一个实例 ID。Istio 1.13 的代理标签取自启动快照，Pod 启动后补加 UID 标签不能可靠匹配 EnvoyFilter，因此无需再给 Pod 添加 `metering-instance` 标签。
 
-在实际路由配置中登记可信名称。若网关在 Wasm 执行位置无法读取 `route_name`，需保证最终选中的 Envoy Route 带有以下 metadata；由现有网关路由配置或专用路由补丁管理，不是单独可 apply 的 Kubernetes 对象：
+当前仅采集 `POST /v1/chat/completions`，不限制 VirtualService、HTTP 路由名或域名。入口使用以下规则，`route_name: "*"` 接受任意路由名及路由名不可读的情况，无需配置路由 metadata：
 
-```yaml
-metadata:
-  filter_metadata:
-    metering:
-      route_name: llm-chat
+```json
+{
+  "routes": [{"route_name": "*", "enabled": true, "methods": ["POST"], "paths": ["/v1/chat/completions"], "service_id": "model-service-a", "adapter_id": "chat_completions_v1"}]
+}
 ```
 
-路由名称必须与三份配置中的注册一致。鉴权身份来自 `envoy.filters.http.ext_authz` 的 dynamic metadata，不接受客户端请求头代替。检查实际代理配置：
+方法必须为 `POST`；路径去掉查询串后精确匹配，不做额外 URL 解码或大小写转换。其它方法、路径、尾斜杠和子路径全部忽略，不读取正文、不建立观察流、不发送事件。`*` 只支持作为完整 `route_name`，不表示路径或其它字段支持通配。全局和规则开关仍必须开启。
+
+配置中的 `route_name: "*"` 仅控制筛选。事件的 `route_name` 单独记录请求头阶段可读的真实 Envoy HTTP 路由名；缺失、超过 128 UTF-8 字节或无效时记录 `unknown`，不使用通配值或计量 metadata 冒充真实路由。它仅用于诊断、审计，不作为客户归属、服务接纳、身份一致性或价格依据，也不代表 VirtualService 名称或实际后端。`service_id` 和 `adapter_id` 仍取自命中规则，当前目标请求统一归入 `model-service-a`。精确路由名筛选仍兼容，规则按配置顺序选择首先命中路由名的规则。
+
+Observer / Consumer 使用 `"accepted_service_ids": ["model-service-a"]`，路由名缺失或变化不会导致拒收；配置版本、适配器和可信身份校验继续保留。旧 `accepted_routes` 仍可读取，但只提取其中的 `service_id`，不再按路由名准入；新旧两种清单不能同时配置。Kafka 历史事件中的 `*` 保留原文，可以正常重放，不会改写为真实路由名。
+
+升级先暂停旧 Consumer，执行 [006 路由身份兼容迁移](migrations/doris/metering/006_optional_route_identity.sql)，更新 Consumer / Observer 及服务白名单，再发布 Wasm。新 `identity_hash` 排除 `route_name`，数据库视图和 Consumer 对所有新旧记录按相同身份字段比较，无需回填原始事件或旧摘要。同一 `event_id` 的不同内容仍保留冲突；既有持久冲突标记也不会自动撤销。
+
+鉴权身份继续来自 `envoy.filters.http.ext_authz` 的 dynamic metadata，不接受客户端请求头代替。检查实际代理配置：
 
 ```sh
 istioctl proxy-config all "$GATEWAY_POD" -n istio-system -o json \

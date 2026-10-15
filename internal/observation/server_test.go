@@ -10,6 +10,7 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/test/bufconn"
 	"net"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -27,7 +28,7 @@ func (s *sink) Emit(e *events.Event) {
 	s.es = append(s.es, &copy)
 }
 func TestObserveEOSAndOnceFinalization(t *testing.T) {
-	for _, mode := range []string{"trailers_eos", "bad_end", "resource_limit"} {
+	for _, mode := range []string{"trailers_eos", "bad_end", "resource_limit", "missing_route", "other_route", "legacy_wildcard", "overlong_route"} {
 		t.Run(mode, func(t *testing.T) {
 			badEnd, limited := mode == "bad_end", mode == "resource_limit"
 			l := bufconn.Listen(1 << 20)
@@ -53,6 +54,17 @@ func TestObserveEOSAndOnceFinalization(t *testing.T) {
 				t.Fatal(err)
 			}
 			st := &pb.Start{RequestStartedAtMs: time.Now().UnixMilli(), GatewayInstanceId: "gateway", ConfigVersion: "v1", RouteName: "chat", ServiceId: "a", AdapterId: "chat_completions_v1", IdentityStatus: "known", ApiKeyId: events.Ptr("k"), CustomerId: events.Ptr("c"), ApplicationId: events.Ptr("a"), Method: "POST", RequestContentType: "application/json"}
+			wantRoute := "chat"
+			switch mode {
+			case "missing_route":
+				st.RouteName, wantRoute = "", "unknown"
+			case "other_route":
+				st.RouteName, wantRoute = "different.actual-route", "different.actual-route"
+			case "legacy_wildcard":
+				st.RouteName, wantRoute = "*", "unknown"
+			case "overlong_route":
+				st.RouteName, wantRoute = strings.Repeat("r", 129), "unknown"
+			}
 			if err = stream.Send(&pb.ObservationFrame{SchemaVersion: 1, FrameSeq: 1, Payload: &pb.ObservationFrame_Start{Start: st}}); err != nil {
 				t.Fatal(err)
 			}
@@ -86,6 +98,9 @@ func TestObserveEOSAndOnceFinalization(t *testing.T) {
 				t.Fatal("not exactly two", len(k.es))
 			}
 			e := k.es[1]
+			if k.es[0].RouteName != wantRoute || e.RouteName != wantRoute {
+				t.Fatalf("diagnostic route must be fixed across events: %q / %q", k.es[0].RouteName, e.RouteName)
+			}
 			b, _ := events.Canonical(e)
 			if _, err = events.Decode(b, []byte(e.LogicalRequestID), time.Now()); err != nil {
 				t.Fatal(err)

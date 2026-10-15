@@ -191,7 +191,10 @@ func (s *Store) Evidence(ctx context.Context, ids []string) ([]consumer.Evidence
 		for _, id := range ids[start:end] {
 			qs = append(qs, quote(id))
 		}
-		r, err := s.DB.QueryContext(ctx, "SELECT CAST(request_date AS STRING),logical_request_id,payload_hash,identity_hash,request_started_at_ms,event_id FROM metering.events_raw WHERE logical_request_id IN ("+strings.Join(qs, ",")+")")
+		// Derive the comparison key from typed columns for both old and new rows.
+		// Stored legacy identity_hash includes route_name; comparing hash versions
+		// directly would turn a harmless diagnostics change into a tenant conflict.
+		r, err := s.DB.QueryContext(ctx, "SELECT CAST(request_date AS STRING),logical_request_id,payload_hash,"+IdentityKeySQL+",request_started_at_ms,event_id FROM metering.events_raw WHERE logical_request_id IN ("+strings.Join(qs, ",")+")")
 		if err != nil {
 			return nil, errors.New("doris_evidence")
 		}
@@ -215,3 +218,7 @@ func (s *Store) Evidence(ctx context.Context, ids []string) ([]consumer.Evidence
 	}
 	return out, nil
 }
+
+// IdentityKeySQL keeps the field order aligned with events.IdentityHash and migration 006.
+// This JSON tuple is used only for equality within Doris, not as a payload hash.
+const IdentityKeySQL = "CAST(JSON_ARRAY(service_id, api_key_id, customer_id, application_id, identity_status, config_version, gateway_instance_id, adapter_id, x_request_id) AS STRING)"

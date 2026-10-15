@@ -94,11 +94,15 @@ class KubernetesCollectionTests(unittest.TestCase):
     def test_acceptance_rejects_compose_producer_wrong_topic_and_unknown_zero(self):
         results = [{'scenario': 'unknown', 'x_request_id': 'request'}]
         rows = [['request', 'request_started', 'logical', 'unknown', 'NULL', 'NULL',
-                 'complete', '0', 'gateway-uid', 'observer-pod-uid', 'test-topic'],
+                 'complete', '0', 'gateway-uid', 'observer-pod-uid', 'test-topic', 'synthetic-model-route'],
                 ['request', 'usage_observed', 'logical', 'unknown', 'NULL', 'NULL',
-                 'complete', '0', 'gateway-uid', 'observer-pod-uid', 'test-topic']]
+                 'complete', '0', 'gateway-uid', 'observer-pod-uid', 'test-topic', 'synthetic-model-route']]
         k8s.validate_events(copy.deepcopy(results), rows, 'gateway-uid', {'observer-pod-uid'}, 'test-topic')
-        for column, value in ((9, 'compose-observer'), (10, 'llm-metering-events'), (4, '0')):
+        missing = copy.deepcopy(rows)
+        for row in missing:
+            row[11] = 'unknown'
+        k8s.validate_events(copy.deepcopy(results), missing, 'gateway-uid', {'observer-pod-uid'}, 'test-topic')
+        for column, value in ((9, 'compose-observer'), (10, 'llm-metering-events'), (4, '0'), (11, '*'), (11, 'llm-chat')):
             invalid = copy.deepcopy(rows)
             invalid[1][column] = value
             with self.assertRaises(RuntimeError):

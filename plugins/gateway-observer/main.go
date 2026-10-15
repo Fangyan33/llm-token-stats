@@ -4,6 +4,7 @@ import (
 	"container/heap"
 	"github.com/Fangyan33/llm-token-stats/pkg/gatewayconfig"
 	w "github.com/Fangyan33/llm-token-stats/pkg/observationwire"
+	"github.com/Fangyan33/llm-token-stats/pkg/routeinfo"
 	"github.com/Fangyan33/llm-token-stats/pkg/strictjson"
 	"github.com/tetratelabs/proxy-wasm-go-sdk/proxywasm"
 	"github.com/tetratelabs/proxy-wasm-go-sdk/proxywasm/types"
@@ -284,7 +285,8 @@ func idValid(s string) bool { return len(s) > 0 && len(s) <= 128 && utf8.ValidSt
 func (h *httpContext) OnHttpRequestHeaders(_ int, eos bool) types.Action {
 	now := time.Now()
 	r := h.root
-	route := property("route_name")
+	actualRoute := property("route_name")
+	route := actualRoute
 	if route == "" {
 		route = property("route_metadata", "filter_metadata", "metering", "route_name")
 	}
@@ -335,7 +337,7 @@ func (h *httpContext) OnHttpRequestHeaders(_ int, eos bool) types.Action {
 	b := w.UInt(nil, 1, uint64(now.UnixMilli()))
 	b = w.String(b, 2, h.cfg.GatewayInstanceID)
 	b = w.String(b, 3, h.cfg.ConfigVersion)
-	b = w.String(b, 4, rule.RouteName)
+	b = w.String(b, 4, routeinfo.Name(actualRoute))
 	b = w.String(b, 5, rule.ServiceID)
 	b = w.String(b, 6, rule.AdapterID)
 	ids := []string{property("metadata", "filter_metadata", h.cfg.IdentityNamespace, "api_key_id"), property("metadata", "filter_metadata", h.cfg.IdentityNamespace, "customer_id"), property("metadata", "filter_metadata", h.cfg.IdentityNamespace, "application_id")}

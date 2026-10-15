@@ -28,7 +28,7 @@
 ## 接口与故障约束
 
 - 协议服务名、字段号和事件 schema v1 保持不变；可选事件字段显式输出 null，固定 struct 编码和 SHA-256 摘要。
-- Wasm 在可信路由/启用/POST/精确路径过滤后才读取身份正文、分配观察资源。改写只编辑 include_usage，超时/超限恢复透传；正文前缀只观察一次。
+- Wasm 在规则启用/POST/精确路径过滤后才读取身份正文、分配观察资源。当前 `route_name: "*"` 忽略实际路由名及其 metadata；精确路由规则仍兼容。事件记录真实 Envoy 路由名或 unknown，仅供诊断；Observer / Consumer 按 accepted_service_ids 接纳，旧 accepted_routes 只提取服务 ID。身份一致性排除路由，通过 006 migration 兼容旧摘要；历史事件原文重放，同事件不同内容仍冲突。改写只编辑 include_usage，超时/超限恢复透传；正文前缀只观察一次。
 - ACK 只确认已处理帧，不等待 Kafka；发送失败不补发，无正文持久化或恢复队列。
 - Consumer 未知 schema 暂停该分区；永久非法消息仅保存坐标/摘要/固定原因。事务未知须确认原 label，凭据只发送到允许的 FE/BE。
 - 新消费组先持久登记最早可用 offset；已有组缺少可信起点需显式接管配置。保留期缺口登记后暂停，显式恢复，不跳到最新。

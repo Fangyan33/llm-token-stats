@@ -169,6 +169,32 @@ class CollectionContractsTest(unittest.TestCase):
         config["routes"] = []
         contracts.validate_config(config)
 
+    def test_method_path_only_wildcard_and_downstream_registration(self):
+        config = copy.deepcopy(self.config)
+        self.assertEqual(config['routes'][0]['route_name'], '*')
+        self.assertEqual(config['routes'][0]['methods'], ['POST'])
+        self.assertEqual(config['routes'][0]['paths'], ['/v1/chat/completions'])
+        contracts.validate_config(config)
+        for filename, component in [('configs/observer.local.json', 'observer'),
+                                    ('deploy/local/observer.json', 'observer'),
+                                    ('configs/observer.production.example.json', 'observer'),
+                                    ('configs/consumer.local.json', 'consumer'),
+                                    ('deploy/local/consumer.json', 'consumer'),
+                                    ('configs/consumer.production.example.json', 'consumer')]:
+            settings = contracts.load(ROOT / filename)[component]
+            self.assertEqual(settings['accepted_service_ids'], ['model-service-a'])
+            self.assertNotIn('accepted_routes', settings)
+
+    def test_diagnostic_route_only_changes_payload_hash(self):
+        payload, identity = contracts.event_hashes(self.event)
+        for route in ('unknown', 'other.actual-route', '*'):
+            changed = copy.deepcopy(self.event)
+            changed['route_name'] = route
+            contracts.validate_event(changed)
+            other_payload, other_identity = contracts.event_hashes(changed)
+            self.assertNotEqual(payload, other_payload)
+            self.assertEqual(identity, other_identity)
+
     def test_config_resource_relationships(self):
         changes = [
             ("stream_inflight_bytes", 131072),

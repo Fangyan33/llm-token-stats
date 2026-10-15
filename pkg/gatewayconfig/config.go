@@ -64,7 +64,7 @@ func (c Config) Match(route, method, path string) (Route, string, bool) {
 		path = path[:i]
 	}
 	for _, r := range c.Routes {
-		if r.RouteName == route {
+		if r.RouteName == "*" || r.RouteName == route {
 			if !r.Enabled {
 				return Route{}, "route_disabled", false
 			}

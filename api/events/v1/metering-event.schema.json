@@ -97,7 +97,8 @@
     "route_name": {
       "type": "string",
       "minLength": 1,
-      "maxLength": 128
+      "maxLength": 128,
+      "description": "Envoy 实际 HTTP 路由名，仅用于诊断；不可读时为 unknown，不参与身份一致性或服务接纳。历史事件中的 * 保留原值。"
     },
     "service_id": {
       "type": "string",

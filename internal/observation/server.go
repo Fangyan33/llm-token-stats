@@ -12,6 +12,7 @@ import (
 	"github.com/Fangyan33/llm-token-stats/internal/health"
 	"github.com/Fangyan33/llm-token-stats/internal/producer"
 	"github.com/Fangyan33/llm-token-stats/pkg/observationwire"
+	"github.com/Fangyan33/llm-token-stats/pkg/routeinfo"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
@@ -285,6 +286,7 @@ func (s *Server) Observe(stream pb.ObservationService_ObserveServer) error {
 					return status.Error(codes.Unavailable, "random_source")
 				}
 				start = st
+				st.RouteName = routeinfo.Name(st.RouteName)
 				known := validIdentity(st.ApiKeyId) && validIdentity(st.CustomerId) && validIdentity(st.ApplicationId) && st.IdentityStatus == "known"
 				if !known {
 					st.ApiKeyId = nil
@@ -404,7 +406,7 @@ func (s *Server) Observe(stream pb.ObservationService_ObserveServer) error {
 func validIdentity(s *string) bool     { return s != nil && validString(*s, 128) }
 func validString(s string, n int) bool { return len(s) > 0 && len(s) <= n && utf8.ValidString(s) }
 func (s *Server) validStart(st *pb.Start) bool {
-	if st.RequestStartedAtMs < 1 || st.RequestStartedAtMs > 253402300799999 || st.RequestStartedAtMs > time.Now().UnixMilli()+300000 || st.Method != "POST" || !validString(st.GatewayInstanceId, 128) || !validString(st.ConfigVersion, 128) || !validString(st.RouteName, 128) || !validString(st.ServiceId, 128) || st.AdapterId != "chat_completions_v1" || !events.Has(s.Cfg.AcceptedConfigs, st.ConfigVersion) || !events.Has(s.Cfg.AcceptedAdapters, st.AdapterId) || len(st.RequestContentType) > 128 || len(st.RequestContentEncoding) > 128 {
+	if st.RequestStartedAtMs < 1 || st.RequestStartedAtMs > 253402300799999 || st.RequestStartedAtMs > time.Now().UnixMilli()+300000 || st.Method != "POST" || !validString(st.GatewayInstanceId, 128) || !validString(st.ConfigVersion, 128) || !validString(st.ServiceId, 128) || st.AdapterId != "chat_completions_v1" || !events.Has(s.Cfg.AcceptedConfigs, st.ConfigVersion) || !events.Has(s.Cfg.AcceptedAdapters, st.AdapterId) || len(st.RequestContentType) > 128 || len(st.RequestContentEncoding) > 128 {
 		return false
 	}
 	if st.IdentityStatus != "known" && st.IdentityStatus != "invalid" {
@@ -420,10 +422,5 @@ func (s *Server) validStart(st *pb.Start) bool {
 			}
 		}
 	}
-	for _, r := range s.Cfg.Routes {
-		if r.RouteName == st.RouteName && r.ServiceID == st.ServiceId {
-			return true
-		}
-	}
-	return false
+	return config.AcceptsService(s.Cfg.AcceptedServices, s.Cfg.Routes, st.ServiceId)
 }

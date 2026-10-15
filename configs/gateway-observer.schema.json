@@ -93,6 +93,7 @@
         ],
         "properties": {
           "route_name": {
+            "description": "精确路由名；单独的 * 表示忽略路由名，仅按 method/path 筛选，包括路由名不可读的请求。事件单独记录实际 Envoy 路由名，不可读时为 unknown。规则按配置顺序选择，先命中的路由规则决定启用与路径匹配。",
             "type": "string",
             "minLength": 1,
             "maxLength": 128

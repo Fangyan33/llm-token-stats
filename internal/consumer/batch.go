@@ -49,7 +49,7 @@ func Freeze(rs []*kgo.Record, c config.Consumer, now time.Time) (*Batch, error) 
 			if reason == "unknown_schema" {
 				return nil, ErrPause
 			}
-		} else if !events.Has(c.AcceptedConfigs, e.ConfigVersion) || !route(c.Routes, e.RouteName, e.ServiceID) || e.ResponseFlags != nil && !events.Has(c.Flags, *e.ResponseFlags) || e.ResponseCodeDetails != nil && !events.Has(c.Details, *e.ResponseCodeDetails) {
+		} else if !events.Has(c.AcceptedConfigs, e.ConfigVersion) || !config.AcceptsService(c.AcceptedServices, c.Routes, e.ServiceID) || e.ResponseFlags != nil && !events.Has(c.Flags, *e.ResponseFlags) || e.ResponseCodeDetails != nil && !events.Has(c.Details, *e.ResponseCodeDetails) {
 			reason = "event_registration"
 			err = errors.New(reason)
 		}
@@ -109,14 +109,6 @@ func Freeze(rs []*kgo.Record, c config.Consumer, now time.Time) (*Batch, error) 
 
 var tokenNames = []string{"input_tokens", "output_tokens", "cached_read_tokens", "cached_write_tokens", "reasoning_tokens", "reported_total_tokens"}
 
-func route(rs []config.Route, r, s string) bool {
-	for _, x := range rs {
-		if x.RouteName == r && x.ServiceID == s {
-			return true
-		}
-	}
-	return false
-}
 func EncodeRows(rs []map[string]any) []byte {
 	var b []byte
 	for _, r := range rs {

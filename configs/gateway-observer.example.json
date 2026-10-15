@@ -12,7 +12,7 @@
   },
   "routes": [
     {
-      "route_name": "llm-chat",
+      "route_name": "*",
       "enabled": true,
       "methods": [
         "POST"

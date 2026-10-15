@@ -11,6 +11,7 @@ import (
 	"unicode/utf8"
 )
 
+// Route is the legacy service registration format; route_name is ignored for admission.
 type Route struct {
 	RouteName string `json:"route_name"`
 	ServiceID string `json:"service_id"`
@@ -34,6 +35,7 @@ type Observer struct {
 	MaxObservationMS int           `json:"max_observation_ms"`
 	AcceptedConfigs  []string      `json:"accepted_config_versions"`
 	AcceptedAdapters []string      `json:"accepted_adapter_ids"`
+	AcceptedServices []string      `json:"accepted_service_ids"`
 	Routes           []Route       `json:"accepted_routes"`
 	Flags            []string      `json:"response_flags_allowlist"`
 	Details          []string      `json:"response_code_details_allowlist"`
@@ -56,17 +58,18 @@ type Position struct {
 	Offset    int64 `json:"offset"`
 }
 type Consumer struct {
-	Health          string     `json:"health_listen"`
-	Group           string     `json:"group_id"`
-	Rows            int        `json:"max_batch_rows"`
-	Bytes           int        `json:"max_batch_bytes"`
-	FlushMS         int        `json:"flush_interval_ms"`
-	Initial         []Position `json:"initial_offsets"`
-	Resume          []Position `json:"gap_resume_offsets"`
-	AcceptedConfigs []string   `json:"accepted_config_versions"`
-	Routes          []Route    `json:"accepted_routes"`
-	Flags           []string   `json:"response_flags_allowlist"`
-	Details         []string   `json:"response_code_details_allowlist"`
+	Health           string     `json:"health_listen"`
+	Group            string     `json:"group_id"`
+	Rows             int        `json:"max_batch_rows"`
+	Bytes            int        `json:"max_batch_bytes"`
+	FlushMS          int        `json:"flush_interval_ms"`
+	Initial          []Position `json:"initial_offsets"`
+	Resume           []Position `json:"gap_resume_offsets"`
+	AcceptedConfigs  []string   `json:"accepted_config_versions"`
+	AcceptedServices []string   `json:"accepted_service_ids"`
+	Routes           []Route    `json:"accepted_routes"`
+	Flags            []string   `json:"response_flags_allowlist"`
+	Details          []string   `json:"response_code_details_allowlist"`
 }
 type Config struct {
 	Kafka    Kafka    `json:"kafka"`
@@ -123,7 +126,7 @@ func (c *Config) ObserverDefaults() error {
 	if c.Observer.ProducerID == "" {
 		c.Observer.ProducerID = os.Getenv("POD_UID")
 	}
-	if !text(c.Observer.ProducerID, 128) || c.Observer.MaxActive < 1 || c.Observer.MaxActive > 4096 || c.Observer.ParserBudget < 3*32768 || c.Observer.ParserBudget > 256<<20 || c.Observer.MaxObservationMS < 1 || c.Observer.MaxObservationMS > 605000 || c.Observer.MaxConnections < 1 || c.Observer.MaxConnections > 128 || !registration(c.Observer.AcceptedConfigs, c.Observer.Routes) || len(c.Observer.AcceptedAdapters) != 1 || c.Observer.AcceptedAdapters[0] != "chat_completions_v1" || !codes(c.Observer.Flags) || !codes(c.Observer.Details) {
+	if !text(c.Observer.ProducerID, 128) || c.Observer.MaxActive < 1 || c.Observer.MaxActive > 4096 || c.Observer.ParserBudget < 3*32768 || c.Observer.ParserBudget > 256<<20 || c.Observer.MaxObservationMS < 1 || c.Observer.MaxObservationMS > 605000 || c.Observer.MaxConnections < 1 || c.Observer.MaxConnections > 128 || !registration(c.Observer.AcceptedConfigs, c.Observer.AcceptedServices, c.Observer.Routes) || len(c.Observer.AcceptedAdapters) != 1 || c.Observer.AcceptedAdapters[0] != "chat_completions_v1" || !codes(c.Observer.Flags) || !codes(c.Observer.Details) {
 		return fmt.Errorf("config_observer")
 	}
 	return nil
@@ -147,7 +150,7 @@ func (c *Config) ConsumerDefaults() error {
 	if c.Doris.Database == "" {
 		c.Doris.Database = "metering"
 	}
-	if !text(c.Consumer.Group, 128) || c.Consumer.Rows < 1 || c.Consumer.Rows > 5000 || c.Consumer.Bytes < 32768 || c.Consumer.Bytes > 4<<20 || c.Consumer.FlushMS < 1 || c.Consumer.FlushMS > 15000 || c.Doris.Database != "metering" || !registration(c.Consumer.AcceptedConfigs, c.Consumer.Routes) || len(c.Doris.AllowedHosts) == 0 || !codes(c.Consumer.Flags) || !codes(c.Consumer.Details) {
+	if !text(c.Consumer.Group, 128) || c.Consumer.Rows < 1 || c.Consumer.Rows > 5000 || c.Consumer.Bytes < 32768 || c.Consumer.Bytes > 4<<20 || c.Consumer.FlushMS < 1 || c.Consumer.FlushMS > 15000 || c.Doris.Database != "metering" || !registration(c.Consumer.AcceptedConfigs, c.Consumer.AcceptedServices, c.Consumer.Routes) || len(c.Doris.AllowedHosts) == 0 || !codes(c.Consumer.Flags) || !codes(c.Consumer.Details) {
 		return fmt.Errorf("config_consumer")
 	}
 	for _, ps := range [][]Position{c.Consumer.Initial, c.Consumer.Resume} {
@@ -176,21 +179,39 @@ func codes(xs []string) bool {
 	}
 	return true
 }
-func registration(configs []string, routes []Route) bool {
-	if len(configs) == 0 || len(configs) > 1024 || len(routes) == 0 || len(routes) > 1024 {
+func registration(configs, services []string, routes []Route) bool {
+	if len(configs) == 0 || len(configs) > 1024 || len(services)+len(routes) == 0 || len(services)+len(routes) > 1024 || len(services) > 0 && len(routes) > 0 {
 		return false
 	}
-	if !codesConfig(configs) {
+	if !codesConfig(configs) || !codesConfig(services) {
 		return false
 	}
 	seen := map[Route]bool{}
 	for _, r := range routes {
-		if !text(r.RouteName, 128) || !text(r.ServiceID, 128) || seen[r] {
+		if !text(r.ServiceID, 128) || seen[r] {
 			return false
 		}
 		seen[r] = true
 	}
 	return true
+}
+
+// AcceptsService also reads legacy accepted_routes without using its route names.
+// Defaults reject simultaneous new and legacy lists to avoid ambiguous admission.
+func AcceptsService(services []string, routes []Route, service string) bool {
+	for _, s := range services {
+		if s == service {
+			return true
+		}
+	}
+	if len(services) == 0 {
+		for _, r := range routes {
+			if r.ServiceID == service {
+				return true
+			}
+		}
+	}
+	return false
 }
 func codesConfig(xs []string) bool {
 	seen := map[string]bool{}

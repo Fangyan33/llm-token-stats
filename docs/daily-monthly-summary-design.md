@@ -114,6 +114,7 @@ CronJob 的 Forbid 仅防同一调度对象并发，程序仍须统一发布者�
 - [002 汇总表与请求投影](../migrations/doris/metering/002_usage_summaries.sql)：日/月表与 request_statistics。
 - [003 一年保留迁移](../migrations/doris/metering/003_raw_retention_one_year.sql)：已有表属性迁移；CREATE IF NOT EXISTS 不会更新旧表。
 - [004 Doris 协调表](../migrations/doris/metering/004_summary_coordination.sql)：日期通知、批次凭据、任务输入/审计和发布状态；旧 PostgreSQL usage 迁移已退役。
+- [006 路由身份兼容迁移](../migrations/doris/metering/006_optional_route_identity.sql)：更新 requests / request_statistics，统一按排除诊断 route_name 的身份字段比较新旧记录；不回填事件或自动撤销历史冲突。
 - [日准备](../scripts/sql/refresh_usage_daily.sql)、[日发布](../scripts/sql/publish_usage_daily.sql)、[月准备](../scripts/sql/refresh_usage_monthly.sql)、[月发布](../scripts/sql/publish_usage_monthly.sql)：分阶段执行的参考模板，必须由未来 Worker 校验和协调。
 
 迁移与旧 PostgreSQL 试验状态的受控切换见[协调设计第 7 节](doris-summary-coordination.md#7-迁移与验收)。迁移前停止旧汇总/归档 Worker、CronJob 和其他分区清理器。开启各 FE dynamic_partition_enable 并持久化配置；确认分区范围与调度状态后开放 Consumer 写入。扩大期限不能恢复此前已删除的数据。SQL 模板参数只能由 Worker 生成，并验证 ISO 日期、允许的表名、分区名、UUID 与 64 位十六进制水位，不把客户输入直接拼进 SQL。

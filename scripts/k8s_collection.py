@@ -113,6 +113,9 @@ def validate_events(results, rows, gateway_uid, producer_ids, topic):
                 '每个请求必须恰有 request_started 和 usage_observed 两条事件')
         require(all(row[8] == gateway_uid and row[9] in producer_ids and row[10] == topic for row in matches),
                 '事件必须来自本次 Kubernetes 网关、Observer 和独立 topic')
+        require(len({row[11] for row in matches}) == 1
+                and matches[0][11] in ('synthetic-model-route', 'unknown'),
+                '事件必须记录真实 HTTP 路由名或 unknown，且请求内保持不变')
         usage = next(row for row in matches if row[1] == 'usage_observed')
         require(usage[6] == 'complete', '观察结果不完整')
         expected = ['unknown', 'NULL', 'NULL'] if result['scenario'] == 'unknown' else ['known', '10', '4']
@@ -122,7 +125,7 @@ def validate_events(results, rows, gateway_uid, producer_ids, topic):
                       input_tokens=None if usage[4] == 'NULL' else int(usage[4]),
                       output_tokens=None if usage[5] == 'NULL' else int(usage[5]),
                       gateway_instance_id=usage[8], observer_producer_id=usage[9],
-                      kafka_topic=usage[10], event_count=len(matches))
+                      kafka_topic=usage[10], route_name=usage[11], event_count=len(matches))
 
 
 def offsets_caught_up(raw, topic):
@@ -345,12 +348,13 @@ class Harness:
                         process.kill()
                         process.wait(timeout=5)
 
-    def request(self, path, body=None, request_id=None):
+    def request(self, path, body=None, request_id=None, method=None):
         headers = {'Host': 'wasm-verify.local', 'Content-Type': 'application/json'}
         if request_id:
             headers['x-request-id'] = request_id
         request = urllib.request.Request(self.url + path, headers=headers,
-                                         data=json.dumps(body).encode() if body is not None else None)
+                                         data=json.dumps(body).encode() if body is not None else None,
+                                         method=method)
         with self.http.open(request, timeout=15) as response:
             return response.status, response.read(), response.headers
 
@@ -373,7 +377,8 @@ class Harness:
             if scenario == 'unknown':
                 body['test_case'] = 'missing_usage'
             request_id = str(uuid.uuid4())
-            status, payload, headers = self.request('/v1/chat/completions', body, request_id)
+            path = '/v1/chat/completions?source=wildcard-test' if scenario == 'json' else '/v1/chat/completions'
+            status, payload, headers = self.request(path, body, request_id)
             require(status == 200, '模型请求失败')
             if scenario != 'json':
                 require(b'data: [DONE]' in payload, 'SSE 响应不完整')
@@ -381,7 +386,7 @@ class Harness:
                             'content_type': headers.get('Content-Type')})
         ids = ','.join("'" + r['x_request_id'] + "'" for r in results)
         sql = ('SELECT x_request_id,event_type,logical_request_id,usage_status,input_tokens,output_tokens,'
-               'observation_status,usage_eligible,gateway_instance_id,producer_id,kafka_topic '
+               'observation_status,usage_eligible,gateway_instance_id,producer_id,kafka_topic,route_name '
                'FROM metering.events_raw WHERE x_request_id IN (' + ids + ') ORDER BY x_request_id,event_type;')
 
         def events():
@@ -392,6 +397,36 @@ class Harness:
         validate_events(results, rows, self.gateway_uid, producers, self.topic)
         write_json(self.output / 'requests.result.json', results)
         return results
+
+    def ignored_requests(self):
+        def selected():
+            raw = self.kubectl('-n', self.namespace, 'exec', self.gateway['metadata']['name'],
+                               '-c', 'istio-proxy', '--', 'pilot-agent', 'request', 'GET',
+                               'stats?filter=metering_requests_selected_total')
+            values = re.findall(r'metering_requests_selected_total:\s+(\d+)', raw)
+            require(bool(values), '网关 selected 计数不可读')
+            return sum(int(value) for value in values)
+        before = selected()
+        results = []
+        for method, path in [('GET', '/v1/chat/completions'), ('HEAD', '/v1/chat/completions'),
+                             ('OPTIONS', '/v1/chat/completions'), ('PUT', '/v1/chat/completions'),
+                             ('POST', '/v1/embeddings'), ('POST', '/v1/chat/completions/'),
+                             ('POST', '/v1/chat/completions/extra'), ('GET', '/healthz')]:
+            request_id = str(uuid.uuid4())
+            try:
+                status, _, _ = self.request(path, {'model': 'fixture', 'stream': False}, request_id, method)
+            except urllib.error.HTTPError as error:
+                status = error.code
+                error.close()
+            results.append({'method': method, 'path': path, 'http_status': status, 'x_request_id': request_id})
+        after = selected()
+        require(after == before, '非白名单请求触发了采集')
+        ids = ','.join("'" + result['x_request_id'] + "'" for result in results)
+        count = self.sql('SELECT COUNT(*) FROM metering.events_raw WHERE x_request_id IN (' + ids + ');').strip()
+        require(count == '0', '非白名单请求产生了事件')
+        report = {'requests': results, 'selected_before': before, 'selected_after': after, 'event_count': 0}
+        write_json(self.output / 'ignored-requests.result.json', report)
+        return report
 
     def check_consumer(self):
         consumer = self.pods('metering-consumer')
@@ -503,6 +538,7 @@ class Harness:
             with self.forwarding():
                 self.check_match(resource)
                 results = self.requests()
+                ignored = self.ignored_requests()
             consumer = self.check_consumer()
             self.verify_pods()
             after = self.gateway_snapshot()
@@ -511,7 +547,7 @@ class Harness:
             summary = {'status': 'passed', 'context': self.args.context, 'namespace': self.namespace,
                        'image_tag': self.image_tag, 'images': self.images,
                        'wasm_sha256': self.sha, 'kafka_topic': self.topic, 'consumer': consumer,
-                       'requests': results, 'existing_gateway_unchanged': True}
+                       'requests': results, 'ignored_requests': ignored, 'existing_gateway_unchanged': True}
             write_json(self.output / 'result.json', summary)
             print(json.dumps(summary, ensure_ascii=False, indent=2), flush=True)
             print('PASS：Kubernetes 网关 → Observer → Compose Kafka → Kubernetes Consumer → Compose Doris', flush=True)

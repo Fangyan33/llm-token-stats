@@ -85,7 +85,7 @@ Doris 显式事务不能包含 DDL；REPLACE PARTITION 与发布状态写入分�
 
 ## 7. 迁移与验收
 
-新环境执行 Doris 001、002、004；已有 Doris 环境按需执行 003 保留期迁移，再执行 004，并核对实际 schema。旧 [PostgreSQL usage 迁移](../migrations/postgres/usage/001_summary_refresh_state.sql)已退役为空操作说明，不执行建库或建表；Auth PostgreSQL migration 不受影响。
+新环境执行 Doris 001、002、004、005、006；已有 Doris 环境按需执行 003 保留期迁移，再执行缺失的后续迁移，并核对实际 schema。006 更新请求视图，诊断 route_name 不参与新旧记录的身份比较；升级前暂停旧 Consumer，再更新 Consumer / Observer 和 Wasm。旧 [PostgreSQL usage 迁移](../migrations/postgres/usage/001_summary_refresh_state.sql)已退役为空操作说明，不执行建库或建表；Auth PostgreSQL migration 不受影响。
 
 若某个环境曾试验旧状态表，先停止所有旧 Worker，保存 Kafka 进度、成功 refresh_id、覆盖范围和未完成任务；将已发布分区核验后迁入 Doris 状态，未确认日期重新生成初始化/修复通知，再从 Kafka committed offset 恢复 Consumer。纯 Doris 切换验证完成前保留旧状态备份；本次文档/DDL 更新不自动删除已部署数据库。仅建新表不能证明历史覆盖。
 

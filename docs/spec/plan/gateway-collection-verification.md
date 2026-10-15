@@ -36,7 +36,7 @@
 
 ## 剩余验收
 
-私有镜像、真实 Auth 与网格 mTLS/HTTP2、完整 Istio/K8s 发布、HTTP2 慢上传、断开与热更新交叉、真实进程崩溃/rebalance/保留期丢失恢复、峰值两倍与 24 小时压测、10 分钟 SSE、延迟目标、灰度回退仍待 G0–G5 执行。汇总 Worker/平台 API 属于后续子项。
+私有镜像、真实 Auth、生产 Istio/K8s 发布与网格验证、HTTP2 慢上传、断开与热更新交叉、真实进程崩溃/rebalance/保留期丢失恢复、峰值两倍与 24 小时压测、10 分钟 SSE、延迟目标、灰度回退仍待 G0–G5 执行。汇总 Worker/平台 API 属于后续子项。
 
 
 ## 2026-10-15 Observer Wasm 下载验证
@@ -63,4 +63,72 @@ docker build --network=host \
   -f deploy/observer/Dockerfile -t metering-observer:wasm-download-test .
 ```
 
-Wasm SHA-256 为 `a15b181ff3e59385e64aa2ba0e3d3df72be0d84e21a4b12137d37dcc24f7316b`；工具版本与构建文件摘要由本次 `make manifest` 更新至 `dist/collection-manifest.json`。单版本服务不承诺旧网关重启仍取得旧文件，也不承诺下载失败后自动恢复采集。上述结果仍是公开 Envoy 的本地验证；完整 Istio 控制面、私有镜像、网格 mTLS、热更新、生产容量及 G0–G5 尚未完成。
+Wasm SHA-256 为 `a15b181ff3e59385e64aa2ba0e3d3df72be0d84e21a4b12137d37dcc24f7316b`；工具版本与构建文件摘要由本次 `make manifest` 更新至 `dist/collection-manifest.json`。单版本服务不承诺旧网关重启仍取得旧文件，也不承诺下载失败后自动恢复采集。本节是当时公开 Envoy 的静态配置验证；本地真实 Istio 控制面与网格 mTLS 的后续结果见下一节，私有镜像、热更新、生产容量及完整 G0–G5 仍未完成。
+
+
+## 2026-10-15 本地 Kubernetes / Istio 首次手工验证（历史记录）
+
+环境为 `kind-kind`，单节点 Kubernetes **1.22.17**，Istio 控制面和测试网关均为 **1.13.5**。独立命名空间为 `metering-wasm-verify`，不更新原 `istio-system` 网关 Deployment 或业务 EnvoyFilter。Observer、测试网关、合成鉴权/模型 fixture 在 Kubernetes 中运行；Kafka、Consumer、Doris 复用既有本地 Compose 实例，因此本次不宣称这些基础设施已迁入 Kubernetes，也不代表真实 Auth 或生产容量验收。
+
+### 发现并修复的部署问题
+
+1. 原流程启动后给 Pod 添加 `metering-instance=UID` 标签，但 Istio 1.13 的代理启动标签快照没有该字段，过滤器未命中。移除临时标签后，以 `match.proxy.metadata.NAME/NAMESPACE` 精确匹配实际 Pod，成功下发并加载插件；错误 Pod 名称不插入该过滤器，业务仍返回 200，恢复正确匹配后插件重新出现。渲染器新增必填 `--gateway-pod-name` 与可选 `--gateway-namespace`（默认 `istio-system`）；UID 仍使用 Kubernetes 实际值。
+2. 默认 gRPC authority 取集群名，Istio `outbound|...` 名称含竖线，合成鉴权出现 403、Observer 流断开。合成 ext_authz 显式指定有效服务 DNS；插件在保持原集群名的同时，将 Istio 集群的 authority 设置为 `服务DNS:端口`。原生本地集群名保持原值，TLS/SNI 不变。字段行为依据[固定 Envoy gRPC 定义](https://github.com/envoyproxy/envoy/blob/e2e40d8d667e1b7c752d27980307f22d9f73e9ee/api/envoy/config/core/v3/grpc_service.proto)。
+
+下发配置后先确认实际代理已经收敛到目标 Wasm 摘要和 enabled 状态，再发送验收请求；`kubectl apply` 返回成功本身不能代替 XDS 收敛检查。
+
+### 实际结果
+
+| 项目 | 结果 |
+| --- | --- |
+| 服务部署 | Observer 2/2、fixture 1/1、测试网关 1/1 可用；四个 Pod 全部 Ready，容器重启次数均为 0 |
+| 网关镜像 | 原始 `docker.io/istio/proxyv2:1.13.5`，未加入 Wasm 文件或文件挂载 |
+| 下载与多副本 | 两个 Observer 镜像内 Wasm 摘要一致；从带 sidecar 的 fixture 下载所得摘要相同，网关原生远程下载成功，无 fetch failure |
+| 网格传输 | Observer 入站 PeerAuthentication 为 STRICT；9093 HTTP 下载和 9090 gRPC 都可用，gRPC 集群使用 HTTP/2，连接由 Istio mTLS 传输 |
+| 实际过滤器 | config_dump 中顺序为 ext_authz → gateway-observer Wasm → router，code.remote 的 URL、HTTP 集群和 SHA-256 与发布产物一致 |
+| 请求与入库 | JSON、SSE、SSE 缺 usage 均 HTTP 200，每请求两条事件实际进入 Doris；complete，正常输入 10/输出 4，unknown 输入/输出为 NULL、usage_eligible=0 |
+| 实例身份 | gateway_instance_id 为测试网关实际 Pod UID；三个用例的 producer_id 分别落在两个 Kubernetes Observer Pod UID 上，未使用 Compose Observer |
+| 匹配隔离 | 去除后加标签仍正常匹配；错误 NAME 不安装过滤器，恢复正确 NAME 后重新加载 |
+| 原网关 | 原 Pod `istio-ingressgateway-656ccc4f69-ggq9j` UID 始终为 `59100d69-0dec-4629-b44d-31a8f9579344`，重启次数前后均为 13 |
+| 本地回归 | `make test build wasm` 通过：29 项 Python 测试、主模块/插件竞态测试、新增 gRPC authority 协议测试、构建及 ABI 检查；`GOFLAGS='-count=1' make local-test` 再次通过，273.412 秒，含四类下载故障与恢复 |
+
+| 用例 | logical_request_id | 用量状态 |
+| --- | --- | --- |
+| json | `194de6ad-d43d-4616-b899-2fc9940312c4` | known |
+| sse | `3f4f9bae-f63b-44c0-9873-9785cd304851` | known |
+| unknown | `3d51d592-d5f8-42b5-a097-e8ce2931b42d` | unknown |
+
+本次 Wasm SHA-256 为 `c67679d6d16ca029a70fd42d6565b67530295131a2ea9925e4e7dd9fe46e34e2`。Observer 本地验证镜像为 `metering-observer:wasm-k8s-verify`，镜像 ID 为 `sha256:503fa9db35238385240266fb4581e37c1c38136b78a45b6279c008d80a43fbea`（本地镜像 ID，不是已推送的仓库 digest）。服务镜像通过 `kind load docker-image` 导入节点，没有推送到外部仓库。
+
+首次手工验证的清单、config_dump、匹配检查和请求结果保存在已忽略的 `.tmp/k8s-wasm-verify/`。该批临时资源由后续自动用例替换，新的执行及清理方式见[测试用例](../../kubernetes-collection-test.md)。`istioctl analyze` 没有 Warning/Error，仅健康端口命名的 IST0118 Info；这些探针与服务访问均正常。合成鉴权和模型不能代替真实 Auth/模型验证，生产网络与安全策略、性能/容量、崩溃恢复、热更新和完整 G0–G5 仍需另验。
+
+## 2026-10-15 自动用例 K8S-WASM-001：独立 Kubernetes Consumer
+
+将上述实际部署整理为[可重复测试用例](../../kubernetes-collection-test.md)，提供 `make k8s-test`、`make k8s-clean` 和独立清理脚本。Kubernetes 运行 Observer 两副本、Consumer、fixture 和原始 Istio 测试网关；只有 Kafka、Doris 复用本地 Compose。每次创建独立的 `llm-metering-k8s-<run-id>` topic / 消费组，3 分区、24 小时保留期，Compose Consumer 不参与消费。
+
+服务入口原先拒绝所有非默认 topic，现改为校验合法 Kafka 名称；生产样例仍使用 `llm-metering-events`，Observer / Consumer 配置必须一致。没有事件协议或数据库迁移变更。kind 出口经过 SNAT，不能用 broker 所见 HOST 识别 Pod；通过实际停止 / 恢复 Kubernetes Consumer 核验消费组归属。空分区允许没有 committed offset，不将其误判为消费失败。
+
+| 检查 | 实际结果 |
+| --- | --- |
+| `make local-infra-up` | 仅启动共享 Kafka / Doris 并应用既有本地迁移；无需启动 Compose Consumer 等应用服务 |
+| 自动部署 | 5 个 Pod 全部 Ready、容器重启为 0；网关仍使用 `docker.io/istio/proxyv2:1.13.5`，无 Wasm 挂载 |
+| 远程 Wasm / mTLS | 两个 Observer 镜像内文件与 fixture 通过 STRICT mTLS 下载的摘要一致；网关已激活配置收敛后再发请求 |
+| JSON / SSE / unknown | 三个请求均 200，Doris 各有两条事件；正常用量 10 / 4，缺 usage 为 unknown / NULL，身份及 Kafka topic 均归属于本次 Kubernetes 测试 |
+| Consumer 消费提交 | 对应独立消费组提交 6 条记录，三个分区无积压，Doris 分区起点和批次回执可见 |
+| Consumer 归属与恢复 | Kubernetes Consumer 缩容至 0 时消费组为 Empty / 0 成员；恢复至 1 时为 Stable / 1 成员，原消费位点保持，Consumer Ready |
+| 清理及幂等 | `make k8s-clean` 实际删除测试 namespace / topic / group；第二次执行成功。共享 Kafka / Doris 容器及数据卷、默认 topic / group、原网关保持，6 条 Doris 验证事件仍可查询 |
+| `make test` | 38 项 Python 测试、契约校验、主模块及独立插件 Go 竞态测试通过；覆盖清理保护、重入清理、数据来源、unknown 与空分区边界 |
+| `make build wasm` | Observer / Consumer / fixture、TinyGo Wasm 及 ABI 检查通过 |
+| `GOFLAGS='-count=1' make local-test` | 全部通过，279.547 秒，包含四类原生 Wasm 下载故障与恢复 |
+
+首次完整自动运行 ID 为 `4ba5854f8b82`；结果在 `.tmp/k8s-collection/kind-kind/metering-wasm-verify/4ba5854f8b82/result.json`。清理前后核对保存在 `.tmp/k8s-cleanup-check.json`，本次清理没有删除共享数据库内的测试历史。
+
+清理后 `make k8s-test` 再次完整通过，运行 ID 为 `5e2726078a5b`，结果保存在对应目录。该次资源保留在 `metering-wasm-verify`；当前 Consumer Pod 为 `metering-consumer-f5c49bc7d-zc44s`，UID 为 `f6f69c36-143d-441f-b5b6-4be478fe35d0`。5 个 Pod 均 Ready、重启为 0；原网关 UID / 重启次数保持不变。
+
+| 场景 | logical_request_id | 用量 |
+| --- | --- | --- |
+| JSON | `02a9e4e6-99d3-4689-b37f-3931744d5beb` | known，10 / 4 |
+| SSE | `95ffb9ea-f143-4468-8cfc-99b77a309992` | known，10 / 4 |
+| 缺 usage | `acc9bef3-084c-43d7-a1d6-d5d906dd0139` | unknown，NULL / NULL |
+
+Wasm 摘要仍为 `c67679d6d16ca029a70fd42d6565b67530295131a2ea9925e4e7dd9fe46e34e2`。本用例使用合成鉴权 / 模型、明文外部 Kafka 和本地 Doris root 空密码；真实认证、生产网络和容量、完整 G0–G5 仍需单独验收。

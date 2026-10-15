@@ -30,6 +30,15 @@ def env_path(temp):
 
 
 class LocalCollectionTests(unittest.TestCase):
+    def test_infra_up_starts_only_shared_kafka_and_doris(self):
+        readiness = result('BackendId\tAlive\n1\ttrue\n')
+        with patch.object(local, 'external_host'), patch.object(local, 'migrate_storage'), \
+                patch.object(local, 'run', return_value=result()) as compose, \
+                patch.object(local.subprocess, 'run', return_value=readiness):
+            local.infra_up()
+        starts = [call.args for call in compose.call_args_list if call.args[0] == 'up']
+        self.assertEqual(starts, [('up', '-d', 'kafka', 'doris')])
+
     def test_gateway_render_replaces_local_source_and_refreshes_checksum(self):
         with tempfile.TemporaryDirectory() as temp, patch.object(local, 'ROOT', Path(temp)):
             source = Path(temp) / 'deploy/local/envoy.json'

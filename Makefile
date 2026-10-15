@@ -3,7 +3,7 @@ GOMODCACHE ?= /tmp/metering-mod
 GOPATH ?= /tmp/metering-go
 export GOCACHE GOMODCACHE GOPATH
 PROTOC ?= protoc
-.PHONY: build wasm test generate local-up local-test manifest
+.PHONY: build wasm test generate local-infra-up local-up local-test k8s-test k8s-clean manifest
 build:
 	mkdir -p dist
 	CGO_ENABLED=0 go build -trimpath -o dist/observer ./cmd/observer
@@ -22,7 +22,13 @@ generate:
 	$(PROTOC) --go_out=. --go_opt=module=github.com/Fangyan33/llm-token-stats --go-grpc_out=. --go-grpc_opt=module=github.com/Fangyan33/llm-token-stats api/observation/v1/observation.proto
 local-up:
 	python3 scripts/local_collection.py up
+local-infra-up:
+	python3 scripts/local_collection.py infra-up
 local-test:
 	go test -tags=integration -v ./tests/integration
+k8s-test: build wasm
+	python3 scripts/k8s_collection.py test $(K8S_TEST_ARGS)
+k8s-clean:
+	python3 scripts/cleanup_k8s_collection.py $(K8S_TEST_ARGS)
 manifest:
 	python3 scripts/collection_manifest.py

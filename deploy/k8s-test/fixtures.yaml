@@ -1,0 +1,120 @@
+# Synthetic authentication/model and an isolated gateway. Render via k8s_collection.py.
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: collection-fixture, namespace: TEST_NAMESPACE}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: collection-fixture}}
+  template:
+    metadata:
+      labels: {app: collection-fixture}
+      annotations: {proxy.istio.io/config: '{"concurrency":2}'}
+    spec:
+      containers:
+        - name: fixture
+          image: TEST_FIXTURE_IMAGE
+          imagePullPolicy: IfNotPresent
+          ports: [{name: http-model, containerPort: 8081}, {name: grpc-auth, containerPort: 9002}]
+          readinessProbe: {httpGet: {path: /healthz, port: http-model}}
+          resources: {requests: {cpu: 50m, memory: 32Mi}, limits: {cpu: 500m, memory: 128Mi}}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: collection-fixture, namespace: TEST_NAMESPACE}
+spec:
+  selector: {app: collection-fixture}
+  ports: [{name: http-model, port: 8081, targetPort: http-model}, {name: grpc-auth, port: 9002, targetPort: grpc-auth}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: wasm-gateway, namespace: TEST_NAMESPACE}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: metering-wasm-gateway, istio: TEST_NAMESPACE}}
+  template:
+    metadata:
+      labels: {app: metering-wasm-gateway, istio: TEST_NAMESPACE}
+      annotations:
+        inject.istio.io/templates: gateway
+        proxy.istio.io/config: '{"concurrency":2}'
+    spec:
+      containers:
+        - name: istio-proxy
+          image: auto
+          imagePullPolicy: IfNotPresent
+          ports: [{name: http, containerPort: 8080}, {name: status, containerPort: 15021}]
+          resources: {requests: {cpu: 100m, memory: 128Mi}, limits: {cpu: '2', memory: 1Gi}}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: wasm-gateway, namespace: TEST_NAMESPACE}
+spec:
+  selector: {app: metering-wasm-gateway, istio: TEST_NAMESPACE}
+  ports: [{name: http, port: 8080, targetPort: http}, {name: status, port: 15021, targetPort: status}]
+---
+apiVersion: networking.istio.io/v1alpha3
+kind: Gateway
+metadata: {name: wasm-gateway, namespace: TEST_NAMESPACE}
+spec:
+  selector: {istio: TEST_NAMESPACE}
+  servers:
+    - port: {number: 8080, name: http, protocol: HTTP}
+      hosts: [wasm-verify.local]
+---
+apiVersion: networking.istio.io/v1alpha3
+kind: VirtualService
+metadata: {name: wasm-model, namespace: TEST_NAMESPACE}
+spec:
+  hosts: [wasm-verify.local]
+  gateways: [wasm-gateway]
+  http:
+    - name: llm-chat
+      match: [{uri: {prefix: /}}]
+      route:
+        - destination:
+            host: collection-fixture.TEST_NAMESPACE.svc.cluster.local
+            port: {number: 8081}
+---
+apiVersion: security.istio.io/v1beta1
+kind: PeerAuthentication
+metadata: {name: observer-strict, namespace: TEST_NAMESPACE}
+spec:
+  selector: {matchLabels: {app: metering-observer}}
+  mtls: {mode: STRICT}
+---
+apiVersion: networking.istio.io/v1alpha3
+kind: EnvoyFilter
+metadata: {name: wasm-verify-auth-route, namespace: TEST_NAMESPACE}
+spec:
+  priority: -20
+  workloadSelector: {labels: {istio: TEST_NAMESPACE}}
+  configPatches:
+    - applyTo: HTTP_FILTER
+      match:
+        context: GATEWAY
+        listener:
+          filterChain:
+            filter:
+              name: envoy.filters.network.http_connection_manager
+              subFilter: {name: envoy.filters.http.router}
+      patch:
+        operation: INSERT_BEFORE
+        value:
+          name: envoy.filters.http.ext_authz
+          typed_config:
+            '@type': type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthz
+            transport_api_version: V3
+            failure_mode_allow: false
+            grpc_service:
+              envoy_grpc:
+                cluster_name: outbound|9002||collection-fixture.TEST_NAMESPACE.svc.cluster.local
+                authority: collection-fixture.TEST_NAMESPACE.svc.cluster.local
+              timeout: 1s
+    - applyTo: HTTP_ROUTE
+      match: {context: GATEWAY}
+      patch:
+        operation: MERGE
+        value:
+          metadata:
+            filter_metadata:
+              metering: {route_name: llm-chat}

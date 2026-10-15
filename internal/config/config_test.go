@@ -1,6 +1,30 @@
 package config
 
-import "testing"
+import (
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"testing"
+)
+
+func TestReadKafkaTopicIsolationAndInvalidNames(t *testing.T) {
+	for _, topic := range []string{"llm-metering-events", "llm-metering-k8s-0123456789ab", "", ".", "..", "bad/topic", "bad topic", "bad\nname", strings.Repeat("a", 250)} {
+		t.Run(topic, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.json")
+			// Escape untrusted topic strings as JSON, including control characters.
+			data := []byte(`{"kafka":{"bootstrap_servers":["kafka:9092"],"topic":` + strconv.Quote(topic) + `}}`)
+			if err := os.WriteFile(path, data, 0600); err != nil {
+				t.Fatal(err)
+			}
+			_, err := Read(path)
+			valid := topic == "llm-metering-events" || topic == "llm-metering-k8s-0123456789ab"
+			if (err == nil) != valid {
+				t.Fatalf("Read topic %q error = %v", topic, err)
+			}
+		})
+	}
+}
 
 func TestObserverWasmDownloadConfiguration(t *testing.T) {
 	for _, path := range []string{"../../configs/observer.local.json", "../../deploy/local/observer.json", "../../configs/observer.production.example.json"} {

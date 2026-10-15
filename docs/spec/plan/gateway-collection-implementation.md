@@ -50,4 +50,9 @@
 
 ## 2026-10-15 Wasm 下载增量
 
-Observer 新增可选固定文件下载服务，Wasm 随 Observer 镜像发布；网关使用原生 HTTP 下载和 SHA-256 校验，保持 `fail_open`。本地网关不再挂载 Wasm，由启动脚本渲染摘要、核对下载后启动。README、运行说明、总体设计及采集实现方案同步这一发布方式。单版本允许下载失败期间缺少采集，恢复与版本回退需显式重载；验证证据追加到[本地验证记录](gateway-collection-verification.md)，完整 Istio 与生产验收仍独立执行。
+Observer 新增可选固定文件下载服务，Wasm 随 Observer 镜像发布；网关使用原生 HTTP 下载和 SHA-256 校验，保持 `fail_open`。本地网关不再挂载 Wasm，由启动脚本渲染摘要、核对下载后启动。README、运行说明、总体设计及采集实现方案同步这一发布方式。单版本允许下载失败期间缺少采集，恢复与版本回退需显式重载；验证证据追加到[本地验证记录](gateway-collection-verification.md)，本地真实 Istio 部署验证已在同日后续完成，生产验收仍独立执行。
+
+
+## 2026-10-15 本地 Istio 部署修正
+
+真实 kind 集群验证发现启动后追加 UID 标签不能命中旧版代理标签快照；渲染器改为必填 Pod 名称，按启动元数据 NAME/NAMESPACE 匹配，UID 继续作为采集实例 ID。Istio 的 outbound 集群名包含竖线，插件显式生成服务 DNS/端口形式的 gRPC authority，保留集群路由和 TLS/SNI。独立测试命名空间已部署并完成 JSON/SSE/unknown 入库，具体环境与边界见验证记录。

@@ -501,7 +501,7 @@ sequenceDiagram
 
 正式固定字段集见 [事件 Schema](../api/events/v1/metering-event.schema.json)，字节/状态/来源/关联校验由[离线校验器](../scripts/validate_collection_contracts.py)补充。下游应用接入步骤、全部事件字段说明及 Go/Java 消费示例见 [Kafka 计量事件应用接入指南](kafka-event-integration-guide.md)。
 
-Topic 固定 `llm-metering-events`，key 为 logical_request_id 的 UTF-8；初始 24 分区、3 副本、`min.insync.replicas=2`、保留 72 小时、`cleanup.policy=delete`。分区数属压测初值；同一部署周期不在线改分区数，变更需停采、排空在途后切换。Kafka 不接收正文片段。
+生产 Topic 约定为 `llm-metering-events`，key 为 logical_request_id 的 UTF-8；初始 24 分区、3 副本、`min.insync.replicas=2`、保留 72 小时、`cleanup.policy=delete`。`kafka.topic` 接受合法 Kafka 名称（1–249 个 ASCII 字母、数字、点、下划线或短横线，排除 `.` / `..`），Observer 与 Consumer 必须配置一致；本地 Kubernetes 用例使用独立测试 topic，不与 Compose Consumer 共享数据。分区数属压测初值；同一部署周期不在线改分区数，变更需停采、排空在途后切换。Kafka 不接收正文片段。
 
 两类事件自带请求开始时间与身份快照，缺少 start 也能解释合并结果；缺少结果时，已入队的 start 只表示曾收到请求。模型等后续才知道的字段允许在不同事件类型之间不同，不属于同 ID 内容冲突。
 
@@ -726,7 +726,7 @@ Consumer/Doris 故障可以依赖 Kafka 72 小时保留恢复，与禁止采集�
 }
 ```
 
-`gateway_instance_id` 由插件读取已验证的 Envoy node metadata 中 Pod UID；配置示例的占位值用于联调替换，生产不得给多个 Pod 写同一个常量。若环境未暴露 Pod UID，通过网关启动配置注入 node metadata，插件读取后校验；不从 HTTP 请求头读。
+`gateway_instance_id` 由发布渲染器从目标 Kubernetes Pod 的实际 UID 注入插件配置，生产不得给多个 Pod 写同一个常量。EnvoyFilter 使用代理启动元数据 `NAME/NAMESPACE` 精确匹配目标 Pod，不依赖启动后补加的 UID 标签；Pod 重建后获取新名称、UID 重新渲染。UID 不从 HTTP 请求头读取。
 
 配置校验：路由 enabled 缺省为 false；空 routes 表示全部忽略。route_name 必须唯一；methods/paths 缺失、为空、重复、超限，路径不是以 / 开头、含查询串/片段标识或匹配模式，及非一期采集子项方法/适配器均为无效配置；不得把空列表解释为全匹配。遵循第 2.3 节的数量和长度上限。未知字段拒绝；ID、cluster、route 长度有界；每流额度必须小于等于 Root 额度；改写单次预留乘以并发上限不得大于 Root 改写预算；分片连同保守 256 字节 Protobuf 开销能装入 32 KiB gRPC 消息；最大完整改写请求必须连同全部分片开销和控制预留装入单流额度；改写预留至少覆盖原始请求上限的 4 倍。控制预留必须小于总额度。预发布严格校验失败即阻止发布；运行时语义配置无效时进入 disabled 并返回初始化成功，暴露 config_invalid 指标。模块无法加载、ABI 不兼容等底层错误仍可能 NACK/启动失败，fail_open 无法兜底。
 

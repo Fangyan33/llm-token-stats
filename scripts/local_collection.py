@@ -96,10 +96,7 @@ def migrate_storage():
   if running:subprocess.run(['docker','start',*running],check=False,stdout=subprocess.DEVNULL)
   raise
  print('Storage copied to persistent volumes; backup retained at '+str(backup),flush=True)
-def up():
- for name in ['observer','consumer','fixture','gateway-observer-v1.wasm']:
-  if not (ROOT/'dist'/name).is_file():raise RuntimeError('Run make build wasm first')
- expected=render_gateway()
+def infra_up():
  external_host()
  migrate_storage()
  run('up','-d','kafka','doris')
@@ -118,12 +115,18 @@ def up():
   if result.returncode==0:break
   time.sleep(2)
  else:raise RuntimeError('Kafka readiness timeout')
+def up():
+ for name in ['observer','consumer','fixture','gateway-observer-v1.wasm']:
+  if not (ROOT/'dist'/name).is_file():raise RuntimeError('Run make build wasm first')
+ expected=render_gateway()
+ infra_up()
  run('up','-d','fixture','observer','consumer')
  # Mounted executables/artifacts may change without a Compose configuration change.
  run('restart','fixture','observer','consumer')
  wait_download(expected)
  run('up','-d','--force-recreate','gateway')
 if __name__=='__main__':
- p=argparse.ArgumentParser();p.add_argument('action',choices=['up','stop']);args=p.parse_args()
+ p=argparse.ArgumentParser();p.add_argument('action',choices=['up','infra-up','stop']);args=p.parse_args()
  if args.action=='up':up()
+ elif args.action=='infra-up':infra_up()
  else:run('stop')

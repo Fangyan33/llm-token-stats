@@ -12,7 +12,7 @@ from wasm_artifact import remote_source
 
 
 class WasmDistributionTests(unittest.TestCase):
-    def test_rendered_filter_uses_exact_artifact_and_keeps_pod_selector(self):
+    def test_rendered_filter_uses_exact_artifact_and_matches_pod_metadata(self):
         with tempfile.TemporaryDirectory() as directory:
             artifact = Path(directory) / 'plugin.wasm'
             data = b'\x00asm\x01\x00\x00\x00synthetic'
@@ -20,15 +20,21 @@ class WasmDistributionTests(unittest.TestCase):
             output = Path(directory) / 'filter.yaml'
             uid = '7f6c2a90-4b13-4b68-9d21-67283e0c5f44'
             url = 'http://observer.example:9093/wasm/gateway-observer-v1.wasm'
+            pod = 'istio-ingressgateway-12345-abcde'
+            namespace = 'gateway-test'
             command = [sys.executable, str(ROOT / 'scripts/render_gateway_filter.py'),
-                       '--gateway-pod-uid', uid, '--wasm-file', str(artifact),
+                       '--gateway-pod-uid', uid, '--gateway-pod-name', pod,
+                       '--gateway-namespace', namespace, '--wasm-file', str(artifact),
                        '--wasm-url', url, '--wasm-cluster', 'download-http', '--output', str(output)]
             subprocess.run(command, cwd=ROOT, check=True, capture_output=True)
             text = output.read_text()
             self.assertIn('sha256: "' + hashlib.sha256(data).hexdigest() + '"', text)
             self.assertIn('uri: ' + json.dumps(url), text)
             self.assertIn('cluster: "download-http"', text)
-            self.assertIn('metering-instance: ' + json.dumps(uid), text)
+            self.assertIn('NAME: ' + json.dumps(pod), text)
+            self.assertIn('NAMESPACE: ' + json.dumps(namespace), text)
+            self.assertIn('namespace: ' + json.dumps(namespace), text)
+            self.assertNotIn('metering-instance', text)
             self.assertIn('gateway-observer-' + uid, text)
             self.assertNotIn('filename:', text)
             self.assertNotIn('REPLACE_', text)
@@ -39,6 +45,19 @@ class WasmDistributionTests(unittest.TestCase):
             result = subprocess.run(command, cwd=ROOT, capture_output=True)
             self.assertNotEqual(result.returncode, 0)
             self.assertFalse(output.exists())
+
+    def test_renderer_rejects_invalid_or_missing_pod_identity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            artifact = Path(directory) / 'plugin.wasm'
+            artifact.write_bytes(b'\x00asm\x01\x00\x00\x00')
+            command = [sys.executable, str(ROOT / 'scripts/render_gateway_filter.py'),
+                       '--gateway-pod-uid', '7f6c2a90-4b13-4b68-9d21-67283e0c5f44',
+                       '--wasm-file', str(artifact), '--output', str(Path(directory) / 'filter.yaml')]
+            for args in [[], ['--gateway-pod-name', 'bad/name'],
+                         ['--gateway-pod-name', 'gateway', '--gateway-namespace', 'a.b']]:
+                result = subprocess.run([*command, *args], cwd=ROOT, capture_output=True)
+                self.assertNotEqual(result.returncode, 0)
+            self.assertFalse((Path(directory) / 'filter.yaml').exists())
 
     def test_unsafe_urls_and_invalid_artifacts_are_rejected(self):
         with tempfile.TemporaryDirectory() as directory:

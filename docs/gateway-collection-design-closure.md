@@ -122,4 +122,4 @@ python scripts/validate_collection_contracts.py --config configs/gateway-observe
 
 部署渲染后加 --release 校验占位值；它不自动核查 Pod UID 来源或网关生效配置。单个 Kafka 事件使用 --event FILE --key UUID，消费入口再提供 --now-ms UTC_UNIX_MS 检查365日保留和未来时间。合成历史样例不传当前时间，避免将静态协议样例误当当前可消费数据。
 
-本地未安装 protoc，未连接实际 Istio/Kafka/Doris；离线脚本只做 proto 字段号及文档一致性检查，不宣称已编译或执行数据库。上述真实验收按 G0–G5 执行。
+离线脚本本身只做 proto 字段号及文档一致性检查，不代替编译或数据库验证。现已完成真实本地 Envoy/Kafka/Doris 联调，并于 2026-10-15 补充本地 Kubernetes 1.22.17 / Istio 1.13.5 的双副本 Observer、远程 Wasm、强制 mTLS、过滤器顺序及合成请求入库验证，详见[验证记录](spec/plan/gateway-collection-verification.md)。这不代表生产完整 G0–G5 已通过。

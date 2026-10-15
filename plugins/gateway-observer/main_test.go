@@ -33,6 +33,23 @@ func testHost(t *testing.T) proxytest.HostEmulator {
 	return host
 }
 
+func TestGrpcUpstreamAuthority(t *testing.T) {
+	for _, tc := range []struct{ cluster, authority string }{
+		{"observer", "observer"},
+		{"outbound|9090||metering-observer.metering.svc.cluster.local", "metering-observer.metering.svc.cluster.local:9090"},
+		{"outbound|9090|canary|metering-observer.metering.svc.cluster.local", "metering-observer.metering.svc.cluster.local:9090"},
+	} {
+		service, err := w.Read(grpcUpstream(tc.cluster))
+		if err != nil || len(service) != 1 || service[0].N != 1 {
+			t.Fatal("invalid GrpcService EnvoyGrpc")
+		}
+		fields, err := w.Read(service[0].B)
+		if err != nil || len(fields) != 2 || fields[0].N != 1 || string(fields[0].B) != tc.cluster || fields[1].N != 2 || string(fields[1].B) != tc.authority {
+			t.Fatalf("routing cluster or HTTP/2 authority mismatch: %q", tc.cluster)
+		}
+	}
+}
+
 func TestRewriteTimeoutResumesAndStopsAmbiguousObservation(t *testing.T) {
 	h := testHost(t)
 	id := h.InitializeHttpContext()

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"github.com/Fangyan33/llm-token-stats/pkg/strictjson"
 	"os"
+	"regexp"
 	"time"
 	"unicode/utf8"
 )
@@ -83,11 +84,15 @@ func Read(path string) (Config, error) {
 	if len(b) > 65536 || strictjson.Decode(b, &c) != nil {
 		return c, fmt.Errorf("config_invalid")
 	}
-	if c.Kafka.Topic != "llm-metering-events" || len(c.Kafka.Brokers) == 0 {
+	if !kafkaTopicName.MatchString(c.Kafka.Topic) || c.Kafka.Topic == "." || c.Kafka.Topic == ".." || len(c.Kafka.Brokers) == 0 {
 		return c, fmt.Errorf("config_kafka")
 	}
 	return c, nil
 }
+
+// Kafka topic names are configurable so isolated deployments do not share data.
+var kafkaTopicName = regexp.MustCompile(`^[A-Za-z0-9._-]{1,249}$`)
+
 func (c *Config) ObserverDefaults() error {
 	if w := c.Observer.WasmDownload; w != nil {
 		if w.Listen == "" {

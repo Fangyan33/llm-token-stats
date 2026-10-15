@@ -448,7 +448,7 @@ Kafka 按 72 小时保留并配足磁盘，避免更小的字节上限提前清�
 5. 接入 tokenizer、资源限制、消费者幂等、日/月汇总及独立网关/鉴权指标对照。
 6. 按少量网关和业务路由灰度，测鉴权、CPU/内存、首包与流式延迟后扩展。
 
-未连接实际集群。私有镜像差异、Wasm SDK、ext_authz 元数据路径、过滤器顺序、PostgreSQL/Auth 可用性、实际流控、Kafka 网络和负载仍需验证。不得直接复制未经实际版本验证的新版本 Istio/Envoy 字段。
+已于 2026-10-15 在本地 kind Kubernetes 1.22.17 / Istio 1.13.5 验证 Observer 两副本、原始网关镜像的 HTTP Wasm 下载、真实 XDS 过滤器顺序、强制 mTLS 下的 gRPC 及合成 JSON/SSE 入库，证据见[验证记录](spec/plan/gateway-collection-verification.md)。私有镜像差异、真实 PostgreSQL/Auth、生产网络/负载、长期流控及完整 G0–G5 仍需验证。不得直接复制未经实际版本验证的新版本 Istio/Envoy 字段。
 
 网关单点观察不能完整测量隐藏重试；如业务仍要求 A 的逐尝试用量，需另确认 A 侧已有 Envoy 的观察位置及关联信息，不擅自改变业务链路实现该目标。
 

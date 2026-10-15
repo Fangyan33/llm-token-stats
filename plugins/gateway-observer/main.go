@@ -321,7 +321,7 @@ func (h *httpContext) OnHttpRequestHeaders(_ int, eos bool) types.Action {
 	if int64(len(r.states)) >= h.cfg.RootMaxStreams {
 		return action
 	}
-	upstream := w.Bytes(nil, 1, w.String(nil, 1, h.cfg.ObserverCluster))
+	upstream := grpcUpstream(h.cfg.ObserverCluster)
 	token, err := proxywasm.OpenGrpcStream(r.id, upstream, "metering.v1.ObservationService", "Observe", r)
 	if err != nil {
 		r.count("dropped_open_failed")
@@ -367,6 +367,18 @@ func (h *httpContext) OnHttpRequestHeaders(_ int, eos bool) types.Action {
 	}
 	r.send(s, 10, b, false)
 	return action
+}
+
+// Istio cluster names contain '|', which is not a valid HTTP/2 authority for Go gRPC.
+// Preserve the routing cluster and use its service DNS/port as :authority; SNI stays on the cluster.
+func grpcUpstream(cluster string) []byte {
+	authority := cluster
+	parts := strings.Split(cluster, "|")
+	if len(parts) == 4 && parts[0] == "outbound" && parts[1] != "" && parts[3] != "" {
+		authority = parts[3] + ":" + parts[1]
+	}
+	envoy := w.String(nil, 1, cluster)
+	return w.Bytes(nil, 1, w.String(envoy, 2, authority))
 }
 func (h *httpContext) releaseRewrite() {
 	if !h.rewrite {

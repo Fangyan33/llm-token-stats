@@ -334,20 +334,20 @@ kubectl -n istio-system get pods -l istio=ingressgateway -o wide
 # 从上述 Deployment 选取一个实际 Pod，替换名称。
 export GATEWAY_POD=替换为灰度网关Pod名
 export GATEWAY_POD_UID="$(kubectl -n istio-system get pod "$GATEWAY_POD" -o jsonpath='{.metadata.uid}')"
-kubectl -n istio-system label pod "$GATEWAY_POD" \
-  metering-instance="$GATEWAY_POD_UID" --overwrite
 
 python3 scripts/render_gateway_filter.py \
   --config "$DEPLOY_DIR/gateway-observer.json" \
   --wasm-file dist/gateway-observer-v1.wasm \
   --wasm-url http://metering-observer.metering.svc.cluster.local:9093/wasm/gateway-observer-v1.wasm \
   --wasm-cluster 'outbound|9093||metering-observer.metering.svc.cluster.local' \
+  --gateway-pod-name "$GATEWAY_POD" \
+  --gateway-namespace istio-system \
   --gateway-pod-uid "$GATEWAY_POD_UID" \
   --output "$DEPLOY_DIR/envoyfilter.$GATEWAY_POD_UID.disabled.yaml"
 kubectl apply -f "$DEPLOY_DIR/envoyfilter.$GATEWAY_POD_UID.disabled.yaml"
 ```
 
-渲染器会验证 Wasm 配置及产物文件头、计算文件 SHA-256、写入实际 Pod UID、生成唯一 EnvoyFilter 名称，并将选择器限定到该 Pod。不要直接 apply [EnvoyFilter 模板](deploy/gateway/envoyfilter.yaml)，也不要把一个 Pod UID 写入整个 Deployment 的模板标签。
+渲染器会验证 Wasm 配置及产物文件头、计算文件 SHA-256、写入实际 Pod UID、生成唯一 EnvoyFilter 名称，通过代理启动时的 `metadata.NAME/NAMESPACE` 精确匹配该 Pod；`--gateway-pod-name` 必填，`--gateway-namespace` 默认为 `istio-system`。不要直接 apply [EnvoyFilter 模板](deploy/gateway/envoyfilter.yaml)，也不要给整个 Deployment 共用一个实例 ID。Istio 1.13 的代理标签取自启动快照，Pod 启动后补加 UID 标签不能可靠匹配 EnvoyFilter，因此无需再给 Pod 添加 `metering-instance` 标签。
 
 在实际路由配置中登记可信名称。若网关在 Wasm 执行位置无法读取 `route_name`，需保证最终选中的 Envoy Route 带有以下 metadata；由现有网关路由配置或专用路由补丁管理，不是单独可 apply 的 Kubernetes 对象：
 
@@ -367,6 +367,8 @@ istioctl proxy-config all "$GATEWAY_POD" -n istio-system -o json \
 
 确认过滤器顺序为 **ext_authz → Wasm → router**，远程 Wasm 加载成功，HTTP 下载集群 `outbound|9093||metering-observer.metering.svc.cluster.local` 与 HTTP/2 采集集群 `outbound|9090||metering-observer.metering.svc.cluster.local` 均存在，网格 mTLS、网络策略与授权允许访问相应端口。集群名称依赖实际服务发现；Service 已创建或健康探针成功本身不足以证明下载和采集链路就绪。
 
+使用 Istio `outbound|端口||服务DNS` 集群时，插件自动将 gRPC authority 设置为 `服务DNS:端口`，保留路由集群与 mTLS/SNI。自定义 ext_authz 配置也应显式设置 `grpc_service.envoy_grpc.authority` 为有效服务 DNS，不能让带 `|` 的集群名作为 HTTP/2 authority。
+
 ### 6. 启用、验证与回退
 
 完成[验收清单](docs/gateway-collection-design-closure.md)中 G0 / G1 的环境、鉴权与协议验证后，显式启用该 Pod：
@@ -377,6 +379,8 @@ python3 scripts/render_gateway_filter.py \
   --wasm-file dist/gateway-observer-v1.wasm \
   --wasm-url http://metering-observer.metering.svc.cluster.local:9093/wasm/gateway-observer-v1.wasm \
   --wasm-cluster 'outbound|9093||metering-observer.metering.svc.cluster.local' \
+  --gateway-pod-name "$GATEWAY_POD" \
+  --gateway-namespace istio-system \
   --gateway-pod-uid "$GATEWAY_POD_UID" --enable \
   --output "$DEPLOY_DIR/envoyfilter.$GATEWAY_POD_UID.enabled.yaml"
 kubectl apply -f "$DEPLOY_DIR/envoyfilter.$GATEWAY_POD_UID.enabled.yaml"
@@ -396,9 +400,43 @@ kubectl apply -f "$DEPLOY_DIR/envoyfilter.$GATEWAY_POD_UID.disabled.yaml"
 kubectl -n istio-system delete envoyfilter "gateway-observer-$GATEWAY_POD_UID"
 ```
 
-**每个网关 Pod 都需要独立渲染；Pod 重建、扩容后要获取新 UID、重新打标签并发布对应过滤器，同时清理旧 UID 的资源。** 当前仓库未提供自动执行此流程的控制器，需要纳入实际发布流程。关闭配置用于停止采集，`fail_open` 不能保证底层模块加载失败时网关一定成功启动。
+**每个网关 Pod 都需要独立渲染；Pod 重建、扩容后要获取实际 Pod 名称及 UID，重新渲染并发布对应过滤器，同时清理旧 UID 的资源。** 当前仓库未提供自动执行此流程的控制器，需要纳入实际发布流程。关闭配置用于停止采集，`fail_open` 不能保证底层模块加载失败时网关一定成功启动。
 
 本地集成通过不代表生产发布验收完成。扩大灰度前执行真实环境的改写、解析与故障恢复验证，生产验收还需完成性能、数据质量和回退检查；完整 G0–G5 要求见[闭环与验收清单](docs/gateway-collection-design-closure.md)，已有本地证据见[验证记录](docs/spec/plan/gateway-collection-verification.md)。
+
+## 本地 Kubernetes / Istio 部署验证
+
+已将 **Kubernetes 1.22.17 + Istio 1.13.5** 实际部署验证固化为用例 **K8S-WASM-001**。Observer 两副本、Consumer、独立测试网关和合成鉴权/模型 fixture 均部署到 Kubernetes；Kafka、Doris 复用本地 Compose。每次使用独立 Kafka topic 和消费组，不依赖 Compose Consumer。原 `istio-system` 网关不参与发布。
+
+```sh
+# 仅启动 Kafka / Doris 并初始化本地迁移；已就绪可跳过。
+make local-infra-up
+# 构建并实际部署，验证 JSON、SSE、unknown、mTLS 下载及独立 Consumer 入库。
+make k8s-test
+```
+
+默认 context 为 `kind-kind`，测试命名空间为 `metering-wasm-verify`。测试会保留资源与 `.tmp/k8s-collection/` 下的结果，重复执行会清理归属于本测试的旧环境。网关仍使用原始 `istio/proxyv2:1.13.5`，没有挂载或打包 Wasm。完整前置条件、断言与自定义参数见[测试用例](docs/kubernetes-collection-test.md)，实际结果见[验证记录](docs/spec/plan/gateway-collection-verification.md)。
+
+```sh
+kubectl --context kind-kind -n metering-wasm-verify get deployment,pod,svc
+kubectl --context kind-kind -n metering-wasm-verify port-forward service/wasm-gateway 28080:8080
+```
+
+保持端口转发，在另一个终端发送合成 SSE 请求：
+
+```sh
+curl --noproxy '*' -N -H 'Host: wasm-verify.local' -H 'Content-Type: application/json' \
+  --data '{"model":"fixture","stream":true,"messages":[{"role":"user","content":"synthetic Kubernetes verification"}]}' \
+  http://127.0.0.1:28080/v1/chat/completions
+```
+
+该入口只用于合成验证，不提供真实 API Key 鉴权或模型调用。清理脚本删除本次测试命名空间及独立 Kafka topic / 消费组，保留共享 Compose 数据卷、Doris 历史测试记录和原网关：
+
+```sh
+make k8s-clean
+# 或直接运行独立脚本；重复执行安全。
+python3 scripts/cleanup_k8s_collection.py
+```
 
 ## 目录与文档
 

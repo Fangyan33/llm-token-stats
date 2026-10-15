@@ -8,6 +8,8 @@
 
 需要 Go 1.25.0、TinyGo 0.40.1、Python 3.10+、Docker Compose。插件使用独立模块及仓库内 SDK v0.24.0 扩展副本，依赖由 go.mod/go.sum 锁定。
 
+已安装 Kubernetes 1.22.17 / Istio 1.13.5 的 kind 环境可执行 `make local-infra-up k8s-test`：仅复用 Compose Kafka / Doris，Observer、Consumer、fixture 和测试网关均在 Kubernetes 中运行，使用独立 topic / 消费组验证 JSON、SSE、unknown 和真实消费提交。`make k8s-clean` 或 `python3 scripts/cleanup_k8s_collection.py` 清理测试命名空间及本次 topic / 消费组，保留共享基础设施和 Doris 历史测试记录。前置条件、断言和参数见[本地 Kubernetes 测试用例](kubernetes-collection-test.md)。
+
 ```sh
 make test build wasm
 make local-up
@@ -80,13 +82,17 @@ make generate
 
 入口为 `observer --config PATH`、`consumer --config PATH`。服务配置严格拒绝未知字段；Observer/Consumer 分别读取自己接受的 config_version 和 route/service 注册。网关升级前先让 Observer 接受新旧配置，Consumer 保留在线窗口内的历史注册，避免合法重放被误拒收。
 
-部署模板在 [Observer](../deploy/observer/observer.yaml)、[Consumer](../deploy/consumer/consumer.yaml)、[EnvoyFilter](../deploy/gateway/envoyfilter.yaml)。先 `make wasm`，再构建 Observer/Consumer Dockerfile 镜像，替换 image digest，建立 metering namespace、对应 ConfigMap/Secret，再使用模板。生产配置示例在 `configs/*.production.example.json`，其中地址是待核对的样例，不代表已部署。Kafka 支持挂载 CA/客户端证书与 SASL PLAIN 环境变量；Doris DSN、HTTP 用户及密码从 Secret 环境变量读取。DSN 必须显式配置连接、读写超时、UTC 会话；禁止将密码写入配置或提交仓库。需要受控网络与网格 mTLS，模板没有代替真实认证、网络策略或 G0 验收。
+部署模板在 [Observer](../deploy/observer/observer.yaml)、[Consumer](../deploy/consumer/consumer.yaml)、[EnvoyFilter](../deploy/gateway/envoyfilter.yaml)。先 `make wasm`，再构建 Observer/Consumer Dockerfile 镜像，替换 image digest，建立 metering namespace、对应 ConfigMap/Secret，再使用模板。生产配置示例在 `configs/*.production.example.json`，其中地址是待核对的样例，不代表已部署。Kafka 支持挂载 CA/客户端证书与 SASL PLAIN 环境变量；`kafka.topic` 支持合法 Kafka 名称，Observer 与 Consumer 必须配置一致，生产约定使用 `llm-metering-events`，隔离测试使用专属 topic。Doris DSN、HTTP 用户及密码从 Secret 环境变量读取。DSN 必须显式配置连接、读写超时、UTC 会话；禁止将密码写入配置或提交仓库。需要受控网络与网格 mTLS，模板没有代替真实认证、网络策略或 G0 验收。
 
-EnvoyFilter 模板不可原样 apply；必须校验渲染后的 JSON。按一个实际网关 Pod UID 渲染，默认关闭：
+EnvoyFilter 模板不可原样 apply；必须校验渲染后的 JSON。按一个实际网关 Pod 名称和 UID 渲染，默认关闭：
 
 ```sh
+export GATEWAY_POD=替换为实际网关Pod名称
+export GATEWAY_POD_UID="$(kubectl -n istio-system get pod "$GATEWAY_POD" -o jsonpath='{.metadata.uid}')"
 python3 scripts/render_gateway_filter.py \
-  --gateway-pod-uid 7f6c2a90-4b13-4b68-9d21-67283e0c5f44 \
+  --gateway-pod-name "$GATEWAY_POD" \
+  --gateway-namespace istio-system \
+  --gateway-pod-uid "$GATEWAY_POD_UID" \
   --wasm-file dist/gateway-observer-v1.wasm \
   --wasm-url http://metering-observer.metering.svc.cluster.local:9093/wasm/gateway-observer-v1.wasm \
   --wasm-cluster 'outbound|9093||metering-observer.metering.svc.cluster.local' \
@@ -94,7 +100,9 @@ python3 scripts/render_gateway_filter.py \
 # G0/G1 通过后，为该 Pod 使用显式 --enable。
 ```
 
-将目标网关 Pod 的 `metering-instance` 标签设置为其实际 UID，确保每份渲染只选中那个 Pod；每次 Pod 重建重新渲染，不能把同一个实例 ID 共享给整个 Deployment。Wasm 使用远程 URL、HTTP 集群和实际文件 SHA-256 加载，不要求网关镜像预置文件；模板插在 router 前，要求 ext_authz 已在它之前，以真实 config_dump 核验。每 Worker 一份 Root，初始 2 Worker；热更新存活代数、Pod 选择及回退需另做灰度验收。路由可信 metadata 由网关路由配置提供，不由这个过滤器自动创建。
+渲染器通过代理启动元数据 `NAME/NAMESPACE` 匹配目标 Pod，实际 Pod UID 只作为该 Pod 的 `gateway_instance_id` 和资源名称后缀；每次 Pod 重建都要获取新名称、UID 并重新渲染，不能共享一个实例 ID。Istio 1.13 启动后补加的 Pod 标签未进入代理标签快照，不能依靠补 UID 标签实现匹配。`--gateway-pod-name` 必填，`--gateway-namespace` 默认 `istio-system`。可通过 config_dump 检查启动元数据和实际过滤器，字段机制见 [Istio 1.13 ProxyMatch](https://istio.io/v1.13/docs/reference/config/networking/envoy-filter/#EnvoyFilter-ProxyMatch)。Wasm 使用远程 URL、HTTP 集群和实际文件 SHA-256 加载，不要求网关镜像预置文件；模板插在 router 前，要求 ext_authz 已在它之前，以真实 config_dump 核验。每 Worker 一份 Root，初始 2 Worker；热更新存活代数、Pod 选择及回退需另做灰度验收。路由可信 metadata 由网关路由配置提供，不由这个过滤器自动创建。
+
+Istio 的 `outbound|端口|子集|服务DNS` 是路由集群名，不能原样作为 Go gRPC 服务的 HTTP/2 `:authority`。插件保持 `cluster_name` 不变，自动将这类集群的 authority 设置为 `服务DNS:端口`；普通本地集群名保持原值，不改变集群 TLS/SNI。自定义 ext_authz 若同样使用 Istio 集群名，必须在其 `grpc_service.envoy_grpc.authority` 显式填写有效服务 DNS。
 
 Doris Stream Load 只向 `allowed_load_hosts` 发送凭据，拒绝未登记跳转及 HTTPS 降级到 HTTP。每个 label 的冻结内容摘要参与命名；超时或确认丢失后先查询原事务为 VISIBLE，再核对全部行键。`Label Already Exists` 不是成功判据。
 
@@ -140,7 +148,7 @@ Consumer 按 Kafka 分区跨多次拉取攒批：达到 `max_batch_rows`（默�
 
 ## 验证记录与未完成门槛
 
-本地使用公开 `istio/proxyv2:1.13.5` 中的 Envoy，静态配置运行并通过 Observer 下载 Wasm，过滤器顺序为 ext_authz → Wasm → router；Kafka 3.9.2、Doris 4.1.3。这验证固定 Envoy hostcall 和数据链路，尚未验证用户私有镜像、完整 Istio 控制面、Kubernetes 1.22 的真实发布。
+本地使用公开 `istio/proxyv2:1.13.5` 中的 Envoy，静态配置运行并通过 Observer 下载 Wasm，过滤器顺序为 ext_authz → Wasm → router；Kafka 3.9.2、Doris 4.1.3。这验证固定 Envoy hostcall 和数据链路。2026-10-15 另已在本地 kind Kubernetes 1.22.17 / Istio 1.13.5 控制面完成独立命名空间部署、XDS 匹配、强制 mTLS 下载及 gRPC 采集入库验证，见[验证记录](spec/plan/gateway-collection-verification.md)和 README 的本地 Kubernetes 操作说明；私有镜像、真实 Auth、生产容量和完整 G0–G5 仍未验收。
 
 2026-10-14 已将所有本地发布端口切换到 `0.0.0.0`，通过服务器 IPv4 地址验证全部 11 个 TCP 端口、健康检查、Doris SQL 和 Kafka 元数据连接。切换前的 108 条原始事件、129 条消费凭据及 24 个 Kafka 分区的消费位置、日志末尾位置均保持一致；数据备份保留在 `.tmp/local-storage-*`。重新执行 `make test build wasm` 与禁用缓存的 `make local-test` 均通过，集成测试实际写入和查询 Doris；再次调用存储迁移检查不会重建已有挂载卷的容器。
 

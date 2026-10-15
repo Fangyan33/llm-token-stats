@@ -12,6 +12,23 @@ import k8s_collection as k8s
 
 
 class KubernetesCollectionTests(unittest.TestCase):
+    def test_builds_and_kind_import_use_git_version_for_all_images(self):
+        for version in ('v1.2.3', '0123456789ab'):
+            with self.subTest(version=version), tempfile.TemporaryDirectory() as directory:
+                harness = self.harness(directory)
+                harness.run_id = 'unrelated-random-run-id'
+                with patch.object(k8s, 'resolve_image_tag', return_value=version), \
+                        patch.object(k8s, 'run') as run:
+                    harness.build_images()
+                expected = ['metering-' + name + ':' + version for name in ('observer', 'consumer', 'fixture')]
+                builds = [call.args[0] for call in run.call_args_list if call.args[0][:2] == ['docker', 'build']]
+                self.assertEqual([cmd[cmd.index('-t') + 1] for cmd in builds], expected)
+                self.assertEqual(run.call_args_list[-1].args[0], ['kind', 'load', 'docker-image',
+                                                                 *expected, '--name', 'kind'])
+                saved = json.loads((Path(directory) / 'images.json').read_text())
+                self.assertEqual(saved['image_tag'], version)
+                self.assertEqual(list(saved['images'].values()), expected)
+
     def test_namespace_guard_excludes_existing_system_and_business_namespaces(self):
         self.assertEqual(k8s.namespace_name('metering-wasm-verify'), 'metering-wasm-verify')
         for name in ('default', 'istio-system', 'ai-gateway-ns', 'metering-wasm-',

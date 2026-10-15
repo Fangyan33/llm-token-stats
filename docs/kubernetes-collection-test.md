@@ -37,6 +37,8 @@ make k8s-test
 
 `make k8s-test` 编译二进制和 Wasm、构建并导入 Observer / Consumer / fixture 测试镜像，然后在 `metering-wasm-verify` 命名空间部署。网关使用原始 `docker.io/istio/proxyv2:1.13.5`，不挂载 Wasm。重复执行会先清理同名且带有本测试归属标签的旧测试环境；无归属标签时拒绝删除。原 `istio-system` 网关不参与发布。
 
+三个测试镜像的版本统一取当前 HEAD 上的 Git tag，无 tag 时取至少 12 位 commit 短 hash，例如 `metering-observer:v1.2.3` 或 `metering-observer:2d36b71036b8`。同一提交有多个 tag 时按 Git 版本排序取最高项，轻量 / 附注 tag 均支持；不使用历史提交的 tag。不符合 Docker tag 限制的 Git tag 会使构建失败。版本解析由 [image_tag.py](../scripts/image_tag.py) 提供，与 README 的服务镜像构建命令一致。随机 run-id 仅用于测试隔离，镜像版本及完整镜像名另存于 `images.json` 和成功结果 `result.json`。
+
 可指定另一个已安装相同版本 Istio 的 kind 集群及测试命名空间：
 
 ```sh

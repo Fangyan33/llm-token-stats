@@ -13,6 +13,7 @@ import urllib.error
 import urllib.request
 import uuid
 from pathlib import Path
+from image_tag import resolve_image_tag
 
 ROOT = Path(__file__).resolve().parents[1]
 OWNER_KEY = 'app.kubernetes.io/part-of'
@@ -224,8 +225,10 @@ class Harness:
         self.host = host
 
     def build_images(self):
-        self.images = {name: 'metering-' + name + ':k8s-' + self.run_id
+        self.image_tag = resolve_image_tag(ROOT)
+        self.images = {name: 'metering-' + name + ':' + self.image_tag
                        for name in ('observer', 'consumer', 'fixture')}
+        write_json(self.output / 'images.json', {'image_tag': self.image_tag, 'images': self.images})
         for name, image in self.images.items():
             print('构建测试镜像：' + image, flush=True)
             dockerfile = ROOT / ('deploy/k8s-test/fixture.Dockerfile' if name == 'fixture'
@@ -506,6 +509,7 @@ class Harness:
             write_json(self.output / 'existing-gateway-after.json', after)
             require(before == after, '既有 istio-system 网关身份或重启次数发生变化')
             summary = {'status': 'passed', 'context': self.args.context, 'namespace': self.namespace,
+                       'image_tag': self.image_tag, 'images': self.images,
                        'wasm_sha256': self.sha, 'kafka_topic': self.topic, 'consumer': consumer,
                        'requests': results, 'existing_gateway_unchanged': True}
             write_json(self.output / 'result.json', summary)

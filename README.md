@@ -51,11 +51,11 @@ make manifest   # 生成 dist/collection-manifest.json，记录工具版本与�
 
 ### Observer 与 Consumer 镜像
 
-两个 Dockerfile 的 Go 服务二进制都从源码构建；Observer 镜像另外复制宿主机 `make wasm` 生成的插件，构建镜像前必须先生成该文件。以下以 `linux/amd64` 为例，镜像仓库和标签请按实际发布环境设置：
+两个 Dockerfile 的 Go 服务二进制都从源码构建；Observer 镜像另外复制宿主机 `make wasm` 生成的插件，构建镜像前必须先生成该文件。镜像版本统一由 `scripts/image_tag.py` 生成：当前提交有 Git tag 时使用该 tag，没有时使用至少 12 位 commit 短 hash，例如 `observer:v1.2.3` 或 `observer:2d36b71036b8`。同一提交有多个 tag 时按 Git 版本排序取最高项；历史提交的 tag 不用于当前版本。Git tag 必须符合 Docker tag 字符与长度限制，不兼容时直接报错。以下以 `linux/amd64` 为例，镜像仓库请按实际发布环境设置：
 
 ```sh
 export IMAGE_REGISTRY=registry.example.com/llm-token-stats
-export IMAGE_TAG="$(git rev-parse --short=12 HEAD)"
+export IMAGE_TAG="$(python3 scripts/image_tag.py)"
 export OBSERVER_IMAGE="$IMAGE_REGISTRY/observer:$IMAGE_TAG"
 export CONSUMER_IMAGE="$IMAGE_REGISTRY/consumer:$IMAGE_TAG"
 
@@ -415,7 +415,7 @@ make local-infra-up
 make k8s-test
 ```
 
-默认 context 为 `kind-kind`，测试命名空间为 `metering-wasm-verify`。测试会保留资源与 `.tmp/k8s-collection/` 下的结果，重复执行会清理归属于本测试的旧环境。网关仍使用原始 `istio/proxyv2:1.13.5`，没有挂载或打包 Wasm。完整前置条件、断言与自定义参数见[测试用例](docs/kubernetes-collection-test.md)，实际结果见[验证记录](docs/spec/plan/gateway-collection-verification.md)。
+默认 context 为 `kind-kind`，测试命名空间为 `metering-wasm-verify`。Observer、Consumer、fixture 镜像统一使用 Git tag 或 commit 短 hash 作为版本；随机 run-id 继续用于测试 topic、消费组及诊断目录。测试会保留资源与 `.tmp/k8s-collection/` 下的结果，重复执行会清理归属于本测试的旧环境。网关仍使用原始 `istio/proxyv2:1.13.5`，没有挂载或打包 Wasm。完整前置条件、断言与自定义参数见[测试用例](docs/kubernetes-collection-test.md)，实际结果见[验证记录](docs/spec/plan/gateway-collection-verification.md)。
 
 ```sh
 kubectl --context kind-kind -n metering-wasm-verify get deployment,pod,svc

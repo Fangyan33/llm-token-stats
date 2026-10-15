@@ -21,6 +21,8 @@ python3 scripts/local_collection.py stop
 
 产物在 `dist/`：`observer`、`consumer`、`fixture`、`gateway-observer-v1.wasm` 和摘要清单。CI 运行契约检查、Go 竞态测试、服务构建及固定 TinyGo 镜像构建/ABI 检查；真实集成测试需单独启动 Docker 栈。
 
+镜像版本使用 `python3 scripts/image_tag.py` 解析：当前 HEAD 有 Git tag 时取该 tag，无 tag 时取至少 12 位 commit 短 hash；多个 tag 按 Git 版本排序取最高项，历史 tag 不沿用，不兼容 Docker tag 的名称会报错。README 的服务镜像构建与 `make k8s-test` 使用同一规则；Kubernetes 测试的 topic / 消费组仍通过随机 run-id 隔离。
+
 本地栈的已发布端口统一绑定 `0.0.0.0`，可使用服务器 IP 从远端访问：
 
 | 组件 | 宿主机端口 |

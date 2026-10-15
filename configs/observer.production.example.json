@@ -7,6 +7,7 @@
     "password_env": "KAFKA_PASSWORD"
   },
   "observer": {
+    "wasm_download": {"listen": ":9093", "file": "/usr/share/metering/wasm/gateway-observer-v1.wasm"},
     "listen": ":9090",
     "health_listen": ":9091",
     "max_connections": 128,

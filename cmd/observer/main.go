@@ -2,15 +2,18 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	pb "github.com/Fangyan33/llm-token-stats/gen/observation/v1"
 	"github.com/Fangyan33/llm-token-stats/internal/config"
 	"github.com/Fangyan33/llm-token-stats/internal/health"
 	"github.com/Fangyan33/llm-token-stats/internal/observation"
 	"github.com/Fangyan33/llm-token-stats/internal/producer"
+	"github.com/Fangyan33/llm-token-stats/internal/wasmdownload"
 	"google.golang.org/grpc"
 	"log"
 	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"sync"
@@ -56,8 +59,20 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 	h := &health.State{}
-	h.Ready.Store(true)
 	health.Start(ctx, c.Observer.Health, h)
+	var downloads *wasmdownload.Server
+	if c.Observer.WasmDownload != nil {
+		downloads, err = wasmdownload.New(*c.Observer.WasmDownload, h)
+		if err != nil {
+			log.Fatal(err)
+		}
+		go func() {
+			if err := downloads.Serve(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				log.Print("wasm_http_serve_failure")
+				cancel()
+			}
+		}()
+	}
 	p, err := producer.New(ctx, c.Kafka, h, func() { os.Exit(2) })
 	if err != nil {
 		log.Fatal(err)
@@ -68,9 +83,15 @@ func main() {
 	}
 	server := grpc.NewServer(grpc.ForceServerCodec(observation.Codec{}), grpc.MaxRecvMsgSize(32768), grpc.MaxConcurrentStreams(128), grpc.InitialWindowSize(65535), grpc.InitialConnWindowSize(65535))
 	pb.RegisterObservationServiceServer(server, &observation.Server{Cfg: c.Observer, Sink: p, Health: h})
+	h.Ready.Store(true)
 	go func() {
 		<-ctx.Done()
 		h.Ready.Store(false)
+		if downloads != nil {
+			shutdown, stop := context.WithTimeout(context.Background(), time.Second)
+			downloads.Shutdown(shutdown)
+			stop()
+		}
 		done := make(chan struct{})
 		go func() { server.GracefulStop(); close(done) }()
 		select {

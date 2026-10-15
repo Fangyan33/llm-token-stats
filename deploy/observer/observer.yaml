@@ -12,7 +12,7 @@ spec:
         - name: observer
           image: REPLACE_OBSERVER_IMAGE_DIGEST
           args: [--config, /config/observer.json]
-          ports: [{name: grpc, containerPort: 9090}, {name: health, containerPort: 9091}]
+          ports: [{name: grpc, containerPort: 9090}, {name: health, containerPort: 9091}, {name: http-wasm, containerPort: 9093}]
           env:
             - name: POD_UID
               valueFrom: {fieldRef: {fieldPath: metadata.uid}}
@@ -35,4 +35,4 @@ kind: Service
 metadata: {name: metering-observer, namespace: metering}
 spec:
   selector: {app: metering-observer}
-  ports: [{name: grpc, port: 9090, targetPort: grpc}, {name: health, port: 9091, targetPort: health}]
+  ports: [{name: grpc, port: 9090, targetPort: grpc}, {name: health, port: 9091, targetPort: health}, {name: http-wasm, port: 9093, targetPort: http-wasm}]

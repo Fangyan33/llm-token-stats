@@ -27,7 +27,14 @@ spec:
               vm_config:
                 vm_id: gateway-observer-v1
                 runtime: envoy.wasm.runtime.v8
-                code: {local: {filename: /etc/istio/wasm/gateway-observer-v1.wasm}}
+                code:
+                  remote:
+                    http_uri:
+                      uri: REPLACE_WASM_URL
+                      cluster: REPLACE_WASM_CLUSTER
+                      timeout: 5s
+                    sha256: REPLACE_WASM_SHA256
+                    retry_policy: {num_retries: 0}
               configuration:
                 '@type': type.googleapis.com/google.protobuf.StringValue
                 value: REPLACE_WITH_DEFAULT_DISABLED_RENDERED_CONFIG_JSON

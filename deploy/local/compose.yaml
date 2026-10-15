@@ -30,7 +30,7 @@ services:
     image: alpine:latest
     command: [/app/observer, --config, /config/observer.json]
     volumes: ['../../dist:/app:ro', './observer.json:/config/observer.json:ro']
-    ports: ['0.0.0.0:19090:9090', '0.0.0.0:19091:9091']
+    ports: ['0.0.0.0:19090:9090', '0.0.0.0:19091:9091', '0.0.0.0:19093:9093']
   consumer:
     image: alpine:latest
     command: [/app/consumer, --config, /config/consumer.json]
@@ -44,7 +44,7 @@ services:
     image: istio/proxyv2:1.13.5
     entrypoint: [/usr/local/bin/envoy]
     command: [-c, /config/envoy.json, --concurrency, '2', --log-level, warning]
-    volumes: ['../../dist:/app:ro', './envoy.json:/config/envoy.json:ro']
+    volumes: ['../../dist/envoy.remote.json:/config/envoy.json:ro']
     ports: ['0.0.0.0:18080:8080', '0.0.0.0:19000:9901']
 volumes:
   kafka-data:

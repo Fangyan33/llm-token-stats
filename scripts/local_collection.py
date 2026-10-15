@@ -1,10 +1,30 @@
 """Isolated local collection harness. Never migrates an external database."""
-import argparse,json,os,re,socket,subprocess,time
+import argparse,hashlib,json,os,re,socket,subprocess,time,urllib.error,urllib.request
 from pathlib import Path
+from wasm_artifact import remote_source
 ROOT=Path(__file__).resolve().parents[1]
 BASE=['docker','compose','-f',str(ROOT/'deploy/local/compose.yaml')]
 def run(*args,input=None,capture_output=False):
  return subprocess.run([*BASE,*args],input=input,text=True,check=True,cwd=ROOT,capture_output=capture_output)
+def render_gateway():
+ cfg=json.loads((ROOT/'deploy/local/envoy.json').read_text())
+ remote=remote_source(ROOT/'dist/gateway-observer-v1.wasm','http://observer:9093/wasm/gateway-observer-v1.wasm','observer-wasm')
+ filters=cfg['static_resources']['listeners'][0]['filter_chains'][0]['filters'][0]['typed_config']['http_filters']
+ wasm=next(f['typed_config']['config'] for f in filters if f['name']=='envoy.filters.http.wasm')
+ wasm['vm_config']['code']={'remote':remote}
+ target=ROOT/'dist/envoy.remote.json'
+ target.parent.mkdir(parents=True,exist_ok=True)
+ target.write_text(json.dumps(cfg,indent=2)+'\n')
+ return remote['sha256']
+def wait_download(expected):
+ client=urllib.request.build_opener(urllib.request.ProxyHandler({}))
+ for _ in range(45):
+  try:
+   with client.open('http://127.0.0.1:19093/wasm/gateway-observer-v1.wasm',timeout=1) as response:
+    if hashlib.sha256(response.read()).hexdigest()==expected:return
+  except (OSError,urllib.error.URLError):pass
+  time.sleep(1)
+ raise RuntimeError('Observer Wasm download readiness or checksum failure')
 def external_host():
  env_file=ROOT/'deploy/local/.env'
  configured=env_file.exists() and re.search(r'^\s*(?:export\s+)?KAFKA_EXTERNAL_HOST\s*=',env_file.read_text(),re.M)
@@ -79,6 +99,7 @@ def migrate_storage():
 def up():
  for name in ['observer','consumer','fixture','gateway-observer-v1.wasm']:
   if not (ROOT/'dist'/name).is_file():raise RuntimeError('Run make build wasm first')
+ expected=render_gateway()
  external_host()
  migrate_storage()
  run('up','-d','kafka','doris')
@@ -97,7 +118,11 @@ def up():
   if result.returncode==0:break
   time.sleep(2)
  else:raise RuntimeError('Kafka readiness timeout')
- run('up','-d','fixture','observer','consumer','gateway')
+ run('up','-d','fixture','observer','consumer')
+ # Mounted executables/artifacts may change without a Compose configuration change.
+ run('restart','fixture','observer','consumer')
+ wait_download(expected)
+ run('up','-d','--force-recreate','gateway')
 if __name__=='__main__':
  p=argparse.ArgumentParser();p.add_argument('action',choices=['up','stop']);args=p.parse_args()
  if args.action=='up':up()

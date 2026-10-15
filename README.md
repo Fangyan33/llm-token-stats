@@ -12,6 +12,7 @@ flowchart LR
     Gateway --> Model[模型入口服务 A]
     Auth[现有鉴权服务 ext_authz] -. 可信身份元数据 .-> Gateway
     Gateway --- Wasm[网关内 Wasm 插件]
+    Gateway -. 加载时 HTTP 下载 Wasm .-> Observer
     Wasm -. 有界 gRPC 观察流 .-> Observer
     Observer -->|原生 Kafka Producer| Kafka
     Kafka --> Consumer
@@ -22,7 +23,7 @@ flowchart LR
 | --- | --- | --- |
 | Istio / Envoy 网关 | 执行鉴权、路由和业务转发，向 Wasm 提供可信路由及身份元数据 | 复用现有入口网关；本地使用 `istio/proxyv2:1.13.5` 中的 Envoy |
 | Gateway Observer Wasm | 按路由、方法和路径白名单选择请求；有界观察正文，必要时补充 `stream_options.include_usage`，旁路发送观察消息 | 已实现；加载在网关内，不是独立服务，也不直接连接 Kafka |
-| Observer | 接收观察流，分配请求 ID，解析 JSON / SSE usage，生成 `request_started`、`usage_observed` 事件，通过原生 Producer 发送 Kafka | 已实现；入口为 `cmd/observer/`，提供 gRPC、健康检查和指标 |
+| Observer | 接收观察流，分配请求 ID，解析 JSON / SSE usage，生成 `request_started`、`usage_observed` 事件，通过原生 Producer 发送 Kafka | 已实现；入口为 `cmd/observer/`，提供 gRPC、健康检查、指标及独立 HTTP Wasm 下载端口 |
 | Kafka | 缓冲结构化事件，按分区保存消费位置，为 Consumer 重放提供数据 | 外部基础设施；本地由 Compose 启动 |
 | Consumer | 校验事件与摘要、去重并保留冲突证据；写入 Doris 明细、拒绝诊断、日期通知和批次凭据；全部可见后提交 offset | 已实现；入口为 `cmd/consumer/`，多个副本使用同一 consumer group 分摊分区 |
 | Doris | 保存事件、请求视图、冲突标记和消费协调状态，支持 SQL 查询 | 已提供迁移；本地使用单 FE / BE，生产使用独立集群 |
@@ -50,48 +51,51 @@ make manifest   # 生成 dist/collection-manifest.json，记录工具版本与�
 
 ### Observer 与 Consumer 镜像
 
-两个 Dockerfile 都从源码构建，不依赖宿主机的 `dist/` 二进制。以下以 `linux/amd64` 为例，镜像仓库和标签请按实际发布环境设置：
+两个 Dockerfile 的 Go 服务二进制都从源码构建；Observer 镜像另外复制宿主机 `make wasm` 生成的插件，构建镜像前必须先生成该文件。以下以 `linux/amd64` 为例，镜像仓库和标签请按实际发布环境设置：
 
 ```sh
 export IMAGE_REGISTRY=registry.example.com/llm-token-stats
 export IMAGE_TAG="$(git rev-parse --short=12 HEAD)"
 export OBSERVER_IMAGE="$IMAGE_REGISTRY/observer:$IMAGE_TAG"
 export CONSUMER_IMAGE="$IMAGE_REGISTRY/consumer:$IMAGE_TAG"
-export GATEWAY_IMAGE="$IMAGE_REGISTRY/gateway-observer:$IMAGE_TAG"
 
+make wasm
 docker build --platform linux/amd64 -f deploy/observer/Dockerfile -t "$OBSERVER_IMAGE" .
 docker build --platform linux/amd64 -f deploy/consumer/Dockerfile -t "$CONSUMER_IMAGE" .
 docker push "$OBSERVER_IMAGE"
 docker push "$CONSUMER_IMAGE"
 ```
 
-### 将 Wasm 打包进网关镜像
+### Wasm 打包、下载与摘要
 
-EnvoyFilter 引用的文件必须已存在于网关容器的 `/etc/istio/wasm/gateway-observer-v1.wasm`。可在实际使用的网关基础镜像上增加该文件，保留原镜像的入口和运行配置：
+Observer 镜像将同一份 `dist/gateway-observer-v1.wasm` 放在 `/usr/share/metering/wasm/gateway-observer-v1.wasm`。根目录 `.dockerignore` 只放行这份 Wasm，不将其他构建产物送入镜像。网关复用已有 Istio 镜像，通过 Observer 下载插件；插件随 Observer 镜像发布，无需独立 Deployment。
 
-```sh
-make wasm
-export GATEWAY_BASE_IMAGE=istio/proxyv2:1.13.5
+生产配置启用以下可选下载服务；省略 `wasm_download` 时保留原有行为：
 
-docker build --platform linux/amd64 \
-  --build-arg GATEWAY_BASE_IMAGE="$GATEWAY_BASE_IMAGE" \
-  -t "$GATEWAY_IMAGE" -f - dist <<'DOCKERFILE'
-ARG GATEWAY_BASE_IMAGE
-FROM ${GATEWAY_BASE_IMAGE}
-COPY gateway-observer-v1.wasm /etc/istio/wasm/gateway-observer-v1.wasm
-DOCKERFILE
-
-docker push "$GATEWAY_IMAGE"
+```json
+"wasm_download": {
+  "listen": ":9093",
+  "file": "/usr/share/metering/wasm/gateway-observer-v1.wasm"
+}
 ```
 
-这里以 `dist/` 为构建上下文，因为根目录 `.dockerignore` 排除了 `dist/`。生产应将 `GATEWAY_BASE_IMAGE` 设置为实际网关镜像的固定 digest，并确认 Wasm 文件对网关运行用户可读；也可以通过只读卷提供同一路径。Wasm 不需要独立 Deployment。
+接口为 `GET/HEAD /wasm/gateway-observer-v1.wasm`，只提供这一文件。默认集群地址为 `http://metering-observer.metering.svc.cluster.local:9093/wasm/gateway-observer-v1.wasm`。下载服务不调用 Kafka，最多 8 个并发下载，超限返回 503；读头超时 3 秒、写超时 30 秒。启用时文件不可读、Wasm 文件头非法或端口绑定失败会阻止 Observer 启动。
 
-推送完成后记录三个镜像的仓库 digest，部署时使用完整的 `仓库地址@sha256:摘要`：
+启动本地栈后，下载并核对实际内容；生产可先在另一个终端执行 `kubectl -n metering port-forward service/metering-observer 19093:9093`，再使用相同命令：
+
+```sh
+curl --noproxy '*' --fail --output dist/gateway-observer.download.wasm \
+  http://127.0.0.1:19093/wasm/gateway-observer-v1.wasm
+sha256sum dist/gateway-observer-v1.wasm dist/gateway-observer.download.wasm
+```
+
+两份摘要必须相同。渲染器读取打包时的同一份 Wasm 计算 `code.remote.sha256`，配置 HTTP 下载集群及 5 秒下载超时，不额外重试。这里使用固定版本 Envoy 的原生远程加载；现有 EnvoyFilter 不依赖 Istio agent 重写成文件路径。下载只发生在插件加载时，不进入逐请求的业务转发流程，首次加载仍有下载等待。
+
+推送完成后记录两个服务镜像的仓库 digest，部署时使用完整的 `仓库地址@sha256:摘要`：
 
 ```sh
 docker image inspect --format '{{json .RepoDigests}}' "$OBSERVER_IMAGE"
 docker image inspect --format '{{json .RepoDigests}}' "$CONSUMER_IMAGE"
-docker image inspect --format '{{json .RepoDigests}}' "$GATEWAY_IMAGE"
 ```
 
 Kafka、Doris 使用基础设施镜像；Fixture 由本地 Compose 挂载编译产物运行，无需发布生产镜像。
@@ -104,7 +108,7 @@ Kafka、Doris 使用基础设施镜像；Fixture 由本地 Compose 挂载编译�
 make test build wasm local-up local-test
 ```
 
-该命令依次完成检查、编译和 Wasm ABI 验证，启动 Kafka、Doris、Fixture、Observer、Consumer、Envoy，然后执行真实链路集成测试。`make local-up` 会等待基础设施就绪，应用 `001/002/004/005` Doris 迁移，并创建 24 分区、72 小时保留的测试 topic；它本身不会编译代码。配置与编排位于 [deploy/local/](deploy/local/compose.yaml)。
+该命令依次完成检查、编译和 Wasm ABI 验证，启动 Kafka、Doris、Fixture、Observer、Consumer、Envoy，然后执行真实链路集成测试。`make local-up` 会等待基础设施就绪，应用 `001/002/004/005` Doris 迁移，并创建 24 分区、72 小时保留的测试 topic。它本身不编译代码，会重新渲染下载摘要，重启使用挂载产物的 Fixture、Observer、Consumer，校验下载文件后重建网关。网关只挂载生成的配置，不挂载 Wasm。配置与编排位于 [deploy/local/](deploy/local/compose.yaml)。
 
 `make test` 不启动容器、不写 Doris；`make local-test` 验证实际 Envoy → Observer → Kafka → Consumer → Doris 链路，包括 JSON / SSE、未知用量、重放去重、冲突、未知 schema 暂停、写入确认丢失和超时边界。测试使用合成数据，也会留下诊断记录。
 
@@ -113,7 +117,7 @@ make test build wasm local-up local-test
 | 组件 | 宿主机端口 |
 | --- | --- |
 | 网关 / Envoy admin | `18080` / `19000` |
-| Observer gRPC / 健康与指标 | `19090` / `19091` |
+| Observer gRPC / 健康与指标 / Wasm 下载 | `19090` / `19091` / `19093` |
 | Consumer 健康与指标 | `19092` |
 | Kafka 外部客户端 | `29092` |
 | Doris SQL / FE HTTP / BE HTTP | `19030` / `18030` / `18040` |
@@ -149,10 +153,9 @@ DBeaver 使用 MySQL 驱动连接 `服务器IP:19030`，数据库 `metering`、�
 docker compose -f deploy/local/compose.yaml ps
 docker compose -f deploy/local/compose.yaml logs --tail=100 observer consumer gateway
 
-# 修改代码后重新构建，并重启使用挂载产物的进程
-make build wasm
-docker compose -f deploy/local/compose.yaml restart observer consumer fixture gateway
-make local-test
+# 修改代码后重新构建；local-up 重算下载摘要并重启相关进程
+make build wasm local-up
+GOFLAGS='-count=1' make local-test
 
 # 停止全部联调组件，保留数据
 python3 scripts/local_collection.py stop
@@ -172,9 +175,9 @@ Kafka、Doris 数据保存在命名卷中；不要用 `down -v` 清理需要保�
 | ext_authz / Auth | 通过现有网关鉴权配置接入，返回 `api_key_id`、`customer_id`、`application_id` 的可信 dynamic metadata；仓库中的 Fixture 不用于生产 |
 | Kafka | 使用平台维护的有持久卷、多 Broker 的集群或托管服务；配置 TLS / SASL、ACL 和监控。仓库未提供生产 Kafka 集群安装清单 |
 | Doris | 使用 Doris Operator 或独立 FE / BE 集群，配置持久卷、备份、副本、动态分区与独立账号；[doris.yaml](deploy/doris/doris.yaml) 是单节点开发样例 |
-| 网络与身份 | 网关仅访问 Observer gRPC；Observer 仅生产指定 topic；Consumer 消费指定 topic/group，并访问 Doris SQL 和 Stream Load。通过 NetworkPolicy 与网格授权限制来源，放通必要 DNS 与基础设施流量 |
+| 网络与身份 | 网关访问 Observer gRPC（9090）和 Wasm HTTP 下载（9093）；Observer 仅生产指定 topic；Consumer 消费指定 topic/group，并访问 Doris SQL 和 Stream Load。通过 NetworkPolicy 与网格授权限制来源，放通必要 DNS 与基础设施流量 |
 
-本文服务模板固定在 `metering` 命名空间，网关过滤器固定在 `istio-system`。若环境使用其他名称，需要同步修改模板、服务 DNS 和 Wasm 的 `observer_cluster`。按现有 Istio 安装方式为 `metering` 配置 sidecar 注入和 mTLS；Observer 自身的 gRPC 监听不提供 TLS，网关到 Observer 的认证与加密由网格承担。模板没有自动创建这些网格和网络策略。
+本文服务模板固定在 `metering` 命名空间，网关过滤器固定在 `istio-system`。若环境使用其他名称，需要同步修改模板、服务 DNS、Wasm 的 `observer_cluster`，以及渲染参数 `--wasm-url`、`--wasm-cluster`。按现有 Istio 安装方式为 `metering` 配置 sidecar 注入和 mTLS；Observer 自身的 gRPC 和下载 HTTP 监听不提供 TLS，网关到 Observer 的认证与加密由网格承担。模板没有自动创建这些网格和网络策略。
 
 ### 2. 初始化 Kafka 与 Doris
 
@@ -239,7 +242,7 @@ cp configs/gateway-observer.example.json "$DEPLOY_DIR/gateway-observer.json"
 
 | 配置 | 必须确认的内容 |
 | --- | --- |
-| Observer | Kafka Broker、CA 和认证环境变量名；`accepted_config_versions`、`accepted_adapter_ids`、`accepted_routes`；资源预算 |
+| Observer | Kafka Broker、CA 和认证环境变量名；`accepted_config_versions`、`accepted_adapter_ids`、`accepted_routes`；资源预算；`wasm_download` 的镜像内路径与下载端口 |
 | Consumer | 同一 Kafka topic、稳定的 `group_id`、历史版本及路由注册；Doris `fe_url`、`allowed_load_hosts`；攒批大小与时间 |
 | Wasm | 实际可信路由、方法、路径、`service_id`、`adapter_id`、`config_version`、Observer cluster；保持默认关闭，通过渲染器显式启用 |
 
@@ -294,7 +297,6 @@ kubectl -n metering create configmap metering-consumer \
 ```sh
 export OBSERVER_IMAGE_DIGEST='registry.example.com/llm-token-stats/observer@sha256:替换为实际摘要'
 export CONSUMER_IMAGE_DIGEST='registry.example.com/llm-token-stats/consumer@sha256:替换为实际摘要'
-export GATEWAY_IMAGE_DIGEST='registry.example.com/llm-token-stats/gateway-observer@sha256:替换为实际摘要'
 
 python3 - <<'PY'
 import os
@@ -320,14 +322,12 @@ kubectl -n metering get pods,svc
 
 模板默认 Observer 2 副本、Consumer 1 副本。扩容 Consumer 时保留同一 group，实际并行度受 topic 分区数限制；Observer 需同时检查 HTTP/2 长连接的负载分布。配置和 Secret 更新后，使用 `kubectl rollout restart deployment/对应名称 -n metering` 重启服务。升级配置版本时先让 Observer 接受新旧版本，再更新网关，Consumer 保留在线数据窗口内的历史注册。
 
-### 5. 部署网关镜像并按 Pod 渲染 Wasm 配置
+### 5. 核对下载服务并按 Pod 渲染 Wasm 配置
 
-先通过现有 Istio 发布配置准备独立灰度网关，保留原网关的服务、端口、路由、鉴权与网格设置。以下假设其 Deployment 名为 `istio-ingressgateway-canary`，容器名为 `istio-proxy`；若名称不同请替换：
+先确认 Observer 所有副本已使用目标镜像且下载内容与发布产物摘要一致，再通过现有 Istio 发布配置准备独立灰度网关，保留已有网关镜像、服务、端口、路由、鉴权与网格设置。以下假设其 Deployment 名为 `istio-ingressgateway-canary`；若名称不同请替换：
 
 ```sh
 export GATEWAY_DEPLOYMENT=istio-ingressgateway-canary
-kubectl -n istio-system set image deployment/"$GATEWAY_DEPLOYMENT" \
-  istio-proxy="$GATEWAY_IMAGE_DIGEST"
 kubectl -n istio-system rollout status deployment/"$GATEWAY_DEPLOYMENT" --timeout=5m
 kubectl -n istio-system get pods -l istio=ingressgateway -o wide
 
@@ -339,12 +339,15 @@ kubectl -n istio-system label pod "$GATEWAY_POD" \
 
 python3 scripts/render_gateway_filter.py \
   --config "$DEPLOY_DIR/gateway-observer.json" \
+  --wasm-file dist/gateway-observer-v1.wasm \
+  --wasm-url http://metering-observer.metering.svc.cluster.local:9093/wasm/gateway-observer-v1.wasm \
+  --wasm-cluster 'outbound|9093||metering-observer.metering.svc.cluster.local' \
   --gateway-pod-uid "$GATEWAY_POD_UID" \
   --output "$DEPLOY_DIR/envoyfilter.$GATEWAY_POD_UID.disabled.yaml"
 kubectl apply -f "$DEPLOY_DIR/envoyfilter.$GATEWAY_POD_UID.disabled.yaml"
 ```
 
-渲染器会验证 Wasm 配置、写入实际 Pod UID、生成唯一 EnvoyFilter 名称，并将选择器限定到该 Pod。不要直接 apply [EnvoyFilter 模板](deploy/gateway/envoyfilter.yaml)，也不要把一个 Pod UID 写入整个 Deployment 的模板标签。
+渲染器会验证 Wasm 配置及产物文件头、计算文件 SHA-256、写入实际 Pod UID、生成唯一 EnvoyFilter 名称，并将选择器限定到该 Pod。不要直接 apply [EnvoyFilter 模板](deploy/gateway/envoyfilter.yaml)，也不要把一个 Pod UID 写入整个 Deployment 的模板标签。
 
 在实际路由配置中登记可信名称。若网关在 Wasm 执行位置无法读取 `route_name`，需保证最终选中的 Envoy Route 带有以下 metadata；由现有网关路由配置或专用路由补丁管理，不是单独可 apply 的 Kubernetes 对象：
 
@@ -362,7 +365,7 @@ istioctl proxy-config all "$GATEWAY_POD" -n istio-system -o json \
   > "$DEPLOY_DIR/gateway-config-dump.json"
 ```
 
-确认过滤器顺序为 **ext_authz → Wasm → router**，Wasm 文件加载成功，Observer outbound cluster 存在并使用 HTTP/2，网格 mTLS 与授权有效。默认 cluster 名为 `outbound|9090||metering-observer.metering.svc.cluster.local`，依赖实际服务发现；文件存在或 Service 已创建本身不足以证明链路就绪。
+确认过滤器顺序为 **ext_authz → Wasm → router**，远程 Wasm 加载成功，HTTP 下载集群 `outbound|9093||metering-observer.metering.svc.cluster.local` 与 HTTP/2 采集集群 `outbound|9090||metering-observer.metering.svc.cluster.local` 均存在，网格 mTLS、网络策略与授权允许访问相应端口。集群名称依赖实际服务发现；Service 已创建或健康探针成功本身不足以证明下载和采集链路就绪。
 
 ### 6. 启用、验证与回退
 
@@ -371,6 +374,9 @@ istioctl proxy-config all "$GATEWAY_POD" -n istio-system -o json \
 ```sh
 python3 scripts/render_gateway_filter.py \
   --config "$DEPLOY_DIR/gateway-observer.json" \
+  --wasm-file dist/gateway-observer-v1.wasm \
+  --wasm-url http://metering-observer.metering.svc.cluster.local:9093/wasm/gateway-observer-v1.wasm \
+  --wasm-cluster 'outbound|9093||metering-observer.metering.svc.cluster.local' \
   --gateway-pod-uid "$GATEWAY_POD_UID" --enable \
   --output "$DEPLOY_DIR/envoyfilter.$GATEWAY_POD_UID.enabled.yaml"
 kubectl apply -f "$DEPLOY_DIR/envoyfilter.$GATEWAY_POD_UID.enabled.yaml"
@@ -380,7 +386,9 @@ kubectl apply -f "$DEPLOY_DIR/envoyfilter.$GATEWAY_POD_UID.enabled.yaml"
 
 Consumer 默认按分区最多 5000 条 / 4 MiB，或等待 15 秒后攒批写入。Doris 不可用时暂停相应分区并保留冻结批次；未知 schema 同样暂停，不跳过。恢复位置落后于 Kafka earliest 时记录缺口并暂停，需按[恢复说明](docs/collection-components.md#consumer-恢复与统计边界)处置，不能用 latest 掩盖丢失数据。
 
-回退时先重新应用同一 Pod 的关闭配置；若模块加载或 ABI 错误导致配置无法生效，再移除该 Pod 专属过滤器：
+服务只提供当前镜像内的一个版本。升级先发布 Observer，等待所有副本下载摘要一致，再更新网关 URL／摘要配置；滚动期间旧摘要可能下载失败，允许暂时缺少采集。已加载插件可继续运行，旧网关重启不保证还能下载旧文件。恢复服务后需触发插件重新安装或重启网关，并按实际 Pod UID 重新渲染配置；原样重复 apply 同一配置不保证触发下载，不承诺自动恢复。版本回退须先恢复对应 Observer 镜像，再恢复对应网关配置。
+
+需要立即停止采集时，先重新应用同一 Pod 的关闭配置；若模块加载或 ABI 错误导致配置无法生效，再移除该 Pod 专属过滤器：
 
 ```sh
 kubectl apply -f "$DEPLOY_DIR/envoyfilter.$GATEWAY_POD_UID.disabled.yaml"

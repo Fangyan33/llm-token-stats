@@ -6,6 +6,7 @@
     "topic": "llm-metering-events"
   },
   "observer": {
+    "wasm_download": {"listen": ":9093", "file": "dist/gateway-observer-v1.wasm"},
     "listen": "0.0.0.0:9090",
     "health_listen": "0.0.0.0:9091",
     "producer_id": "observer-test",

@@ -1,6 +1,6 @@
 # LLM 请求用量计量与统计设计
 
-状态：评审稿｜修订日期：2026-10-13。目标环境为 **Istio 1.13.5、Kubernetes 1.22**。本文不代表已部署或已通过性能验收。
+状态：评审稿｜修订日期：2026-10-15。目标环境为 **Istio 1.13.5、Kubernetes 1.22**。本文不代表已部署或已通过性能验收。
 
 ## 1. 目标与已确认边界
 
@@ -151,7 +151,7 @@ Root/VM 销毁仍会取消其调用；SDK 回调也不能访问已失效的业�
 
 fail_open 不能覆盖所有安装错误：该版本说明 on_start/on_configure 失败可能导致 xDS 配置被拒绝，初始启动时也可能无法启动代理。因此不把“插件失败放行”宣传为任意发布或资源故障都无风险。
 
-优先使用随网关镜像/本地文件预置的固定版本 Wasm，避免运行期间依赖远端下载；仍需验证 ABI、配置和初始化，通过单独测试网关及少量业务路由灰度。Istio 1.13.5 的 WasmPlugin 转换代码未给 PluginConfig 设置 FailOpen，因此选择 EnvoyFilter 显式配置，不照搬新版 WasmPlugin 的 failStrategy 字段。[固定 Istio 转换实现][16]
+Wasm 随 Observer 镜像发布，由其独立 HTTP 下载端口提供固定文件；网关使用 EnvoyFilter 原生 `code.remote`、HTTP 集群和文件 SHA-256 加载，无需构建定制网关镜像。下载只发生在插件加载时，首次加载有下载等待；单次超时 5 秒、额外重试 0 次。只保留当前版本，下载失败允许暂时缺少采集，恢复后显式重新加载；回退先恢复匹配的 Observer 镜像再恢复网关配置。仍需验证 ABI、配置和初始化，通过单独测试网关及少量业务路由灰度。Istio 1.13.5 的 WasmPlugin 转换代码未给 PluginConfig 设置 FailOpen，因此选择 EnvoyFilter 显式配置，不照搬新版 WasmPlugin 的 failStrategy 字段。[固定 Istio 转换实现][16]
 
 “不影响业务”在本方案中的可验收含义是：不新增业务转发节点、不修改业务内容/路由、不等待 Observer/Kafka、不因旁路故障主动拒绝请求。Wasm 回调本身在 Envoy 工作线程上运行，复制、序列化及发送会使用 CPU/内存，不能承诺零时延或零资源风险。必须压测并设置硬上限。
 
@@ -442,7 +442,7 @@ Kafka 按 72 小时保留并配足磁盘，避免更小的字节上限提前清�
 以下 1–3 项为阶段 0 验证，4–6 项为一期实施；二期建设计费、账单发布与调整单，三期建设对账与结算确认。一期包含一年原始数据及日/月汇总；归档不进入一期实施，Consumer、汇总 Worker 和门户仍需按各自工作包完成。
 
 1. 固定版本鉴权 PoC：PostgreSQL + Auth + Istio CUSTOM/ext_authz，验证 API Key、401/403/503、动态元数据和 fail-closed。
-2. 固定版本采集 PoC：EnvoyFilter + 本地 Wasm，验证过滤器顺序、usage 参数改写、通用异步 gRPC 和 fail_open 的真实边界。
+2. 固定版本采集 PoC：EnvoyFilter + Observer HTTP 下载 Wasm（SHA-256 固定），验证过滤器顺序、usage 参数改写、通用异步 gRPC 和 fail_open 的真实边界。
 3. 验证 root 持有旁路流、最终消息生命周期、有界流控与取消；Observer 故障时先证明业务不会等待统计。
 4. 打通一个 JSON 与一个 SSE 服务：可信元数据、片段解析、一次定稿、两事件与 Kafka。
 5. 接入 tokenizer、资源限制、消费者幂等、日/月汇总及独立网关/鉴权指标对照。

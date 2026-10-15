@@ -1,6 +1,6 @@
 # 网关请求采集开发实现方案
 
-版本：V1.9｜日期：2026-10-13｜状态：采集组件已实现，公开旧版 Envoy/Kafka/Doris 本地联调已通过；私有环境与性能验收待执行，详见[运行说明](collection-components.md)。
+版本：V1.9｜日期：2026-10-15｜状态：采集组件已实现，公开旧版 Envoy/Kafka/Doris 本地联调已通过；私有环境与性能验收待执行，详见[运行说明](collection-components.md)。
 
 依据：[原技术方案](token-metering-design.md)、[功能设计概览及开发周期](token-metering-functional-overview-and-schedule.md)、[API Key Auth 服务方案](api-key-auth-service-implementation.md)。本文细化一期中“鉴权后采集到 Doris 明细入库”的采集子项；一期的估算、日/月汇总、客户查询与看板在后续子项完成；归档为后续可选项，不能以本文验收代替一期整体验收。本文中的 SQL、协议和配置供后续实现使用；Go 代码标明为伪代码的部分不能直接编译。
 
@@ -865,7 +865,7 @@ sha256sum ../../dist/gateway-observer-v1.wasm
 
 使用 TinyGo 默认 GC 首先验证长期内存复用，不用 `-gc=leaking` 回避兼容问题。产物检查 imports/exports、ABI marker、gRPC 回调和随机源；然后在真实 Envoy 镜像跑加载/请求测试。固定 Go、TinyGo、SDK patch、依赖锁、构建镜像 digest 和 wasm SHA-256 到发布清单。构建成功不等于旧运行时已兼容。
 
-WASM 预置到带版本文件名的网关镜像或只读挂载，不运行时远程下载。Observer/Consumer 使用普通 apps/v1 Deployment，起步至少两个 Observer 副本；Consumer 副本数不超过有效分区数。资源初值和副本数通过第 11 节容量模型修正。
+WASM 随 Observer 镜像打包到 `/usr/share/metering/wasm/gateway-observer-v1.wasm`，通过可选 `observer.wasm_download` 服务的 9093 HTTP 端口提供 `GET/HEAD /wasm/gateway-observer-v1.wasm`。网关使用 EnvoyFilter 原生 `code.remote`，指定 HTTP 下载集群、实际文件 SHA-256、5 秒超时和 0 次额外重试，保留 `fail_open: true`；不用将插件构建进网关镜像。下载服务独立于 Kafka/采集解析，最多 8 个并发下载；读头超时 3 秒、写超时 30 秒。首次加载有下载等待，文件不可读、文件头非法或下载端口绑定失败阻止 Observer 启动；省略下载配置保持旧行为。仅提供当前版本，发布先更新 Observer 所有副本并核对摘要，再更新网关；期间下载失败允许缺少采集，恢复后需显式重新加载。回退先恢复匹配的 Observer 镜像再恢复网关配置，具体命令见[组件运行说明](collection-components.md#observer-wasm-下载服务)。Observer/Consumer 使用普通 apps/v1 Deployment，起步至少两个 Observer 副本；Consumer 副本数不超过有效分区数。资源初值和副本数通过第 11 节容量模型修正。
 
 ## 10. 指标、故障及上线
 

@@ -24,18 +24,23 @@ type Kafka struct {
 	PasswordEnv string   `json:"password_env"`
 }
 type Observer struct {
-	Listen           string   `json:"listen"`
-	Health           string   `json:"health_listen"`
-	ProducerID       string   `json:"producer_id"`
-	MaxActive        int      `json:"max_active_streams"`
-	ParserBudget     int64    `json:"parser_budget_bytes"`
-	MaxObservationMS int      `json:"max_observation_ms"`
-	AcceptedConfigs  []string `json:"accepted_config_versions"`
-	AcceptedAdapters []string `json:"accepted_adapter_ids"`
-	Routes           []Route  `json:"accepted_routes"`
-	Flags            []string `json:"response_flags_allowlist"`
-	Details          []string `json:"response_code_details_allowlist"`
-	MaxConnections   int      `json:"max_connections"`
+	WasmDownload     *WasmDownload `json:"wasm_download"`
+	Listen           string        `json:"listen"`
+	Health           string        `json:"health_listen"`
+	ProducerID       string        `json:"producer_id"`
+	MaxActive        int           `json:"max_active_streams"`
+	ParserBudget     int64         `json:"parser_budget_bytes"`
+	MaxObservationMS int           `json:"max_observation_ms"`
+	AcceptedConfigs  []string      `json:"accepted_config_versions"`
+	AcceptedAdapters []string      `json:"accepted_adapter_ids"`
+	Routes           []Route       `json:"accepted_routes"`
+	Flags            []string      `json:"response_flags_allowlist"`
+	Details          []string      `json:"response_code_details_allowlist"`
+	MaxConnections   int           `json:"max_connections"`
+}
+type WasmDownload struct {
+	Listen string `json:"listen"`
+	File   string `json:"file"`
 }
 type Doris struct {
 	FE           string   `json:"fe_url"`
@@ -84,6 +89,14 @@ func Read(path string) (Config, error) {
 	return c, nil
 }
 func (c *Config) ObserverDefaults() error {
+	if w := c.Observer.WasmDownload; w != nil {
+		if w.Listen == "" {
+			w.Listen = ":9093"
+		}
+		if !text(w.File, 4096) || !text(w.Listen, 256) {
+			return fmt.Errorf("config_wasm_download")
+		}
+	}
 	if c.Observer.Listen == "" {
 		c.Observer.Listen = ":9090"
 	}

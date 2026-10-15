@@ -82,8 +82,16 @@
                             "vm_id": "gateway-observer-v1",
                             "runtime": "envoy.wasm.runtime.v8",
                             "code": {
-                              "local": {
-                                "filename": "/app/gateway-observer-v1.wasm"
+                              "remote": {
+                                "http_uri": {
+                                  "uri": "http://observer:9093/wasm/gateway-observer-v1.wasm",
+                                  "cluster": "observer-wasm",
+                                  "timeout": "5s"
+                                },
+                                "sha256": "RENDER_FROM_WASM_ARTIFACT",
+                                "retry_policy": {
+                                  "num_retries": 0
+                                }
                               }
                             }
                           },
@@ -183,6 +191,30 @@
           ]
         },
         "http2_protocol_options": {}
+      },
+      {
+        "name": "observer-wasm",
+        "connect_timeout": "1s",
+        "type": "STRICT_DNS",
+        "load_assignment": {
+          "cluster_name": "observer-wasm",
+          "endpoints": [
+            {
+              "lb_endpoints": [
+                {
+                  "endpoint": {
+                    "address": {
+                      "socket_address": {
+                        "address": "observer",
+                        "port_value": 9093
+                      }
+                    }
+                  }
+                }
+              ]
+            }
+          ]
+        }
       }
     ]
   }

@@ -1,11 +1,15 @@
 import importlib.util
+import hashlib
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
 
 
 spec = importlib.util.spec_from_file_location(
@@ -26,6 +30,22 @@ def env_path(temp):
 
 
 class LocalCollectionTests(unittest.TestCase):
+    def test_gateway_render_replaces_local_source_and_refreshes_checksum(self):
+        with tempfile.TemporaryDirectory() as temp, patch.object(local, 'ROOT', Path(temp)):
+            source = Path(temp) / 'deploy/local/envoy.json'
+            source.parent.mkdir(parents=True)
+            source.write_text((Path(__file__).resolve().parents[1] / 'deploy/local/envoy.json').read_text())
+            artifact = Path(temp) / 'dist/gateway-observer-v1.wasm'
+            artifact.parent.mkdir()
+            for suffix in [b'first', b'second']:
+                data = b'\x00asm\x01\x00\x00\x00' + suffix
+                artifact.write_bytes(data)
+                self.assertEqual(local.render_gateway(), hashlib.sha256(data).hexdigest())
+                text = (Path(temp) / 'dist/envoy.remote.json').read_text()
+                self.assertIn(hashlib.sha256(data).hexdigest(), text)
+                self.assertNotIn('"local":', text)
+                self.assertNotIn('filename', text)
+
     def test_external_host_preserves_other_env_settings(self):
         with tempfile.TemporaryDirectory() as temp, patch.object(local, "ROOT", Path(temp)), \
                 patch.dict(os.environ, {"KAFKA_EXTERNAL_HOST": "192.168.1.10"}, clear=True):

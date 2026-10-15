@@ -2,6 +2,33 @@ package config
 
 import "testing"
 
+func TestObserverWasmDownloadConfiguration(t *testing.T) {
+	for _, path := range []string{"../../configs/observer.local.json", "../../deploy/local/observer.json", "../../configs/observer.production.example.json"} {
+		t.Run(path, func(t *testing.T) {
+			t.Setenv("POD_UID", "observer-test")
+			c, err := Read(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := c.ObserverDefaults(); err != nil || c.Observer.WasmDownload == nil || c.Observer.WasmDownload.File == "" {
+				t.Fatalf("example config: %v", err)
+			}
+			c.Observer.WasmDownload.Listen = ""
+			if err := c.ObserverDefaults(); err != nil || c.Observer.WasmDownload.Listen != ":9093" {
+				t.Fatalf("default listener: %v", err)
+			}
+			c.Observer.WasmDownload.File = ""
+			if err := c.ObserverDefaults(); err == nil {
+				t.Fatal("missing file accepted")
+			}
+			c.Observer.WasmDownload = nil
+			if err := c.ObserverDefaults(); err != nil {
+				t.Fatalf("legacy config: %v", err)
+			}
+		})
+	}
+}
+
 func TestConsumerFlushConfiguration(t *testing.T) {
 	for _, tc := range []struct {
 		name, path string

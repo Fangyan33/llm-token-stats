@@ -1,8 +1,8 @@
 # 网关采集组件运行说明
 
-更新日期：2026-10-14。[实现计划](../spec/plan/gateway-collection-implementation.md)已落地到三个可构建组件。业务仍直接经过网关到模型服务；Wasm 旁路发送有界片段，Observer 解析后使用原生 Producer 写 Kafka，Consumer 确认 Doris 可见性后提交 offset。仅产生 `request_started`、`usage_observed`，未知值保留 null/unknown。
+更新日期：2026-10-15。[实现计划](spec/plan/gateway-collection-implementation.md)已落地到三个可构建组件。业务仍直接经过网关到模型服务；Wasm 旁路发送有界片段，Observer 解析后使用原生 Producer 写 Kafka，Consumer 确认 Doris 可见性后提交 offset。仅产生 `request_started`、`usage_observed`，未知值保留 null/unknown。
 
-本轮命令、故障处理及资源归零证据见[本地验证记录](../spec/plan/gateway-collection-verification.md)，实际镜像 digest 见[镜像记录](../deploy/local/images.lock.json)。
+本轮命令、故障处理及资源归零证据见[本地验证记录](spec/plan/gateway-collection-verification.md)，实际镜像 digest 见[镜像记录](../deploy/local/images.lock.json)。
 
 ## 构建与本地运行
 
@@ -26,7 +26,7 @@ python3 scripts/local_collection.py stop
 | 网关 / Envoy admin | 18080 / 19000 |
 | Kafka 客户端 | 29092 |
 | Doris SQL（MySQL 协议）/ FE HTTP / BE HTTP | 19030 / 18030 / 18040 |
-| Observer gRPC / 健康、指标 | 19090 / 19091 |
+| Observer gRPC / 健康、指标 / Wasm 下载 | 19090 / 19091 / 19093 |
 | Consumer 健康、指标 | 19092 |
 | 模型 fixture HTTP / 合成 ext_authz gRPC | 18081 / 19002 |
 
@@ -39,7 +39,7 @@ KAFKA_EXTERNAL_HOST=192.168.227.128 make local-up
 
 Kafka 容器内客户端仍使用 `kafka:9092`。重建容器时 Kafka 日志及 Doris FE/BE 数据由命名卷保留；首次从旧版无持久卷配置启动时，脚本先停栈，将原数据备份到 `.tmp/local-storage-*` 并迁移到卷，再重建容器。已有不匹配的目标卷会使迁移停止，避免覆盖或合并历史。不要使用 `docker compose down -v` 删除数据卷。
 
-`make local-up` 只初始化该 Compose 栈，应用 001/002/004/005 migration，并创建 24 分区、72 小时保留、delete 策略的测试 topic。明文 Kafka、合成鉴权、副本数 1 与 Doris root 空密码仅用于开发联调；生产按原方案配置认证、副本、min ISR 和最小权限账号。
+`make local-up` 在 `dist/envoy.remote.json` 渲染实际 Wasm 摘要，重启 Fixture/Observer/Consumer，核对下载内容后重建网关。网关只挂载配置，插件来自 Observer HTTP 下载。更新本地产物后运行 `make build wasm local-up`，再运行 `GOFLAGS='-count=1' make local-test`，不能仅重启旧网关而沿用旧摘要。脚本只初始化该 Compose 栈，应用 001/002/004/005 migration，并创建 24 分区、72 小时保留、delete 策略的测试 topic。明文 Kafka、合成鉴权、副本数 1 与 Doris root 空密码仅用于开发联调；生产按原方案配置认证、副本、min ISR 和最小权限账号。
 
 普通 JSON / SSE 合成请求：
 
@@ -80,20 +80,47 @@ make generate
 
 入口为 `observer --config PATH`、`consumer --config PATH`。服务配置严格拒绝未知字段；Observer/Consumer 分别读取自己接受的 config_version 和 route/service 注册。网关升级前先让 Observer 接受新旧配置，Consumer 保留在线窗口内的历史注册，避免合法重放被误拒收。
 
-部署模板在 [Observer](../deploy/observer/observer.yaml)、[Consumer](../deploy/consumer/consumer.yaml)、[EnvoyFilter](../deploy/gateway/envoyfilter.yaml)。先构建 Dockerfile 镜像，替换 image digest，建立 metering namespace、对应 ConfigMap/Secret，再使用模板。生产配置示例在 `configs/*.production.example.json`，其中地址是待核对的样例，不代表已部署。Kafka 支持挂载 CA/客户端证书与 SASL PLAIN 环境变量；Doris DSN、HTTP 用户及密码从 Secret 环境变量读取。DSN 必须显式配置连接、读写超时、UTC 会话；禁止将密码写入配置或提交仓库。需要受控网络与网格 mTLS，模板没有代替真实认证、网络策略或 G0 验收。
+部署模板在 [Observer](../deploy/observer/observer.yaml)、[Consumer](../deploy/consumer/consumer.yaml)、[EnvoyFilter](../deploy/gateway/envoyfilter.yaml)。先 `make wasm`，再构建 Observer/Consumer Dockerfile 镜像，替换 image digest，建立 metering namespace、对应 ConfigMap/Secret，再使用模板。生产配置示例在 `configs/*.production.example.json`，其中地址是待核对的样例，不代表已部署。Kafka 支持挂载 CA/客户端证书与 SASL PLAIN 环境变量；Doris DSN、HTTP 用户及密码从 Secret 环境变量读取。DSN 必须显式配置连接、读写超时、UTC 会话；禁止将密码写入配置或提交仓库。需要受控网络与网格 mTLS，模板没有代替真实认证、网络策略或 G0 验收。
 
 EnvoyFilter 模板不可原样 apply；必须校验渲染后的 JSON。按一个实际网关 Pod UID 渲染，默认关闭：
 
 ```sh
 python3 scripts/render_gateway_filter.py \
   --gateway-pod-uid 7f6c2a90-4b13-4b68-9d21-67283e0c5f44 \
+  --wasm-file dist/gateway-observer-v1.wasm \
+  --wasm-url http://metering-observer.metering.svc.cluster.local:9093/wasm/gateway-observer-v1.wasm \
+  --wasm-cluster 'outbound|9093||metering-observer.metering.svc.cluster.local' \
   --output dist/envoyfilter.disabled.yaml
 # G0/G1 通过后，为该 Pod 使用显式 --enable。
 ```
 
-将目标网关 Pod 的 `metering-instance` 标签设置为其实际 UID，确保每份渲染只选中那个 Pod；每次 Pod 重建重新渲染，不能把同一个实例 ID 共享给整个 Deployment。Wasm 文件须预置只读挂载/镜像路径；模板插在 router 前，要求 ext_authz 已在它之前，以真实 config_dump 核验。每 Worker 一份 Root，初始 2 Worker；热更新存活代数、Pod 选择及回退需另做灰度验收。路由可信 metadata 由网关路由配置提供，不由这个过滤器自动创建。
+将目标网关 Pod 的 `metering-instance` 标签设置为其实际 UID，确保每份渲染只选中那个 Pod；每次 Pod 重建重新渲染，不能把同一个实例 ID 共享给整个 Deployment。Wasm 使用远程 URL、HTTP 集群和实际文件 SHA-256 加载，不要求网关镜像预置文件；模板插在 router 前，要求 ext_authz 已在它之前，以真实 config_dump 核验。每 Worker 一份 Root，初始 2 Worker；热更新存活代数、Pod 选择及回退需另做灰度验收。路由可信 metadata 由网关路由配置提供，不由这个过滤器自动创建。
 
 Doris Stream Load 只向 `allowed_load_hosts` 发送凭据，拒绝未登记跳转及 HTTPS 降级到 HTTP。每个 label 的冻结内容摘要参与命名；超时或确认丢失后先查询原事务为 VISIBLE，再核对全部行键。`Label Already Exists` 不是成功判据。
+
+## Observer Wasm 下载服务
+
+Observer 镜像复制 `make wasm` 的 `dist/gateway-observer-v1.wasm` 到 `/usr/share/metering/wasm/gateway-observer-v1.wasm`；`.dockerignore` 仅放行这一产物。打包、摘要渲染与发布清单应使用同一份文件，避免重新编译后继续使用旧摘要。默认生产配置如下：
+
+```json
+"wasm_download": {
+  "listen": ":9093",
+  "file": "/usr/share/metering/wasm/gateway-observer-v1.wasm"
+}
+```
+
+字段位于 `observer` 中。省略该对象即关闭服务；启用后 `file` 必填，`listen` 缺省为 `:9093`，文件不可读、文件头非法或端口绑定失败会阻止启动。服务启动时打开固定文件，只有重启才切换产物。仅接受 `GET/HEAD /wasm/gateway-observer-v1.wasm`，返回 `application/wasm`、文件 SHA-256 ETag 与 `Cache-Control: no-store`；其他路径为 404、其他方法为 405。最多 8 个并发下载，超限 503；读头超时 3 秒、写超时 30 秒。处理下载不等待 Kafka，也不经过 gRPC 解析预算；指标为 `metering_wasm_download_requests_total`、`metering_wasm_download_busy_total`，没有动态标签。
+
+```sh
+# 本地联调；生产可另开终端执行 kubectl -n metering port-forward service/metering-observer 19093:9093
+curl --noproxy '*' --fail --output dist/gateway-observer.download.wasm \
+  http://127.0.0.1:19093/wasm/gateway-observer-v1.wasm
+sha256sum dist/gateway-observer-v1.wasm dist/gateway-observer.download.wasm
+```
+
+网关使用原生 `code.remote` 加载，下载超时 5 秒、额外重试 0 次、`fail_open: true`。保留 HTTP_FILTER 直接插入方式，不依赖 Istio agent 的 ECDS 文件重写。下载 HTTP 集群默认是 `outbound|9093||metering-observer.metering.svc.cluster.local`；采集 gRPC 仍使用 9090 的 HTTP/2 集群，不能混用。生产须核对实际集群存在，NetworkPolicy、网格 mTLS 与授权允许相应流量；下载端口默认 ClusterIP 内网访问，Observer 本身不终止 TLS、不提供下载鉴权。首次加载有下载等待，已运行的业务请求不会逐次下载。
+
+仅保留当前镜像的单个文件。先更新所有 Observer 副本并核对下载摘要，再更新网关配置。滚动期间旧摘要可能校验失败，允许暂时缺少采集；已加载实例可继续运行，但旧网关重启后不保证取得旧文件。下载服务恢复后需要触发插件重新安装或重启网关；Pod 重建后仍须按新 UID 渲染。原样重复 apply 同一配置不保证触发下载，不承诺自动恢复。版本回退先恢复对应 Observer 镜像，再恢复其匹配的网关配置。需要立即停采时关闭或删除该 Pod 的采集过滤器；`fail_open` 不覆盖任意初始化、ABI 或资源故障。
 
 ## Consumer 恢复与统计边界
 
@@ -113,7 +140,7 @@ Consumer 按 Kafka 分区跨多次拉取攒批：达到 `max_batch_rows`（默�
 
 ## 验证记录与未完成门槛
 
-本地使用公开 `istio/proxyv2:1.13.5` 中的 Envoy，静态配置运行，过滤器顺序为 ext_authz → Wasm → router；Kafka 3.9.2、Doris 4.1.3。这验证固定 Envoy hostcall 和数据链路，尚未验证用户私有镜像、完整 Istio 控制面、Kubernetes 1.22 的真实发布。
+本地使用公开 `istio/proxyv2:1.13.5` 中的 Envoy，静态配置运行并通过 Observer 下载 Wasm，过滤器顺序为 ext_authz → Wasm → router；Kafka 3.9.2、Doris 4.1.3。这验证固定 Envoy hostcall 和数据链路，尚未验证用户私有镜像、完整 Istio 控制面、Kubernetes 1.22 的真实发布。
 
 2026-10-14 已将所有本地发布端口切换到 `0.0.0.0`，通过服务器 IPv4 地址验证全部 11 个 TCP 端口、健康检查、Doris SQL 和 Kafka 元数据连接。切换前的 108 条原始事件、129 条消费凭据及 24 个 Kafka 分区的消费位置、日志末尾位置均保持一致；数据备份保留在 `.tmp/local-storage-*`。重新执行 `make test build wasm` 与禁用缓存的 `make local-test` 均通过，集成测试实际写入和查询 Doris；再次调用存储迁移检查不会重建已有挂载卷的容器。
 

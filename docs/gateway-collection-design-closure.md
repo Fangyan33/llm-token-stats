@@ -1,6 +1,6 @@
 # 网关采集设计闭环与验收清单
 
-修订日期：2026-10-13。插件、SDK 扩展、Observer、Consumer 已实现并完成公开旧版 Envoy/Kafka/Doris 本地联调；生产完整门槛未验收。实现结果与已确认的请求头 Continue 调整见[运行说明](collection-components.md)。本文与[开发实现方案](gateway-request-collection-implementation.md)共同构成采集子项的实施依据。
+修订日期：2026-10-15。插件、SDK 扩展、Observer、Consumer 已实现并完成公开旧版 Envoy/Kafka/Doris 本地联调；生产完整门槛未验收。实现结果与已确认的请求头 Continue 调整见[运行说明](collection-components.md)。本文与[开发实现方案](gateway-request-collection-implementation.md)共同构成采集子项的实施依据。
 
 ## 1. 交付物与变更规则
 
@@ -18,6 +18,8 @@ Schema 描述类型和固定字段集；UTF-8 字节上限、跨字段状态、K
 字段顺序以事件 Schema 的 properties 顺序为规范 Go struct 顺序；usage 顺序为 input、output、cached_read、cached_write、reasoning、reported_total，各子项按 value、source 排列。Consumer 重编码顺序固定，使用 Go encoding/json 默认转义；raw_usage_json 的字符串内容作为冻结依据原样保留，不按另一个 JSON 排序器改写。辅助校验器提供相同顺序和转义的摘要参考，正式 Go 实现仍须与它做 golden 对照。
 
 新增字段或改变含义须提升 Kafka schema_version，并先发布可读取新旧版本的 Consumer 与数据库，再发布 Producer；不得直接修改已上线 v1 struct 重算旧摘要。观察协议字段号独立演进，2 已 reserved。go_package 已固定为 github.com/Fangyan33/llm-token-stats/gen/observation/v1；生成工具版本见运行说明。
+
+Wasm 文件随 Observer 镜像发布，由独立 HTTP 下载服务提供单个当前版本；网关以远程 URL 和实际文件 SHA-256 加载。更新文件先完成 Observer 全副本发布和下载摘要核对，再切换网关；旧摘要下载失败允许暂时缺少采集，恢复后显式重新加载。文件版本回退先恢复对应 Observer 镜像，再恢复网关配置。该文件发布顺序与下述采集注册版本兼容要求同时满足。
 
 配置发布先让 Observer 接受新版本及仍存活的旧 Root 版本，再更新网关；回退同样先核查接纳清单。Consumer 保留所有在线窗口内历史 config_version/route/service 登记，不能因为网关移除路由或旧版本而拒收合法重放。白名单限制新采集与历史事件校验分别管理。
 

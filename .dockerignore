@@ -6,5 +6,6 @@
 .private
 .tmp
 bin
-dist
+dist/*
+!dist/gateway-observer-v1.wasm
 __pycache__

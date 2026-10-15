@@ -51,7 +51,7 @@ UUIDv4 不包含时间。`request_started_at_ms` 仍由网关观察并作为事�
 | `observation_scope` | 字符串 / 否 | 当前固定为 `gateway_response`，表示网关可见的一次逻辑响应，并非所有上游尝试。 |
 | `producer_id` | 字符串 / 否 | 生成事件的 Observer 实例标识。 |
 | `gateway_instance_id` | 字符串 / 否 | 观察该请求的网关实例标识。 |
-| `config_version` | 字符串 / 否 | 请求开始时固定的采集配置版本，用于解释当时的采集规则。 |
+| `config_version` | 字符串 / 否 | 请求开始时固定的采集配置版本，用于解释当时的采集规则。固定为 `collection-v1` |
 | `adapter_id` | 字符串 / 否 | 解析上游协议的适配器 ID；当前接入范围固定为 `chat_completions_v1`。 |
 | `route_name` | 字符串 / 否 | 网关可信路由名称；事件不携带原始 URL 或 query。 |
 | `service_id` | 字符串 / 否 | 路由配置确定的目标业务服务标识，不从客户端请求猜测。 |

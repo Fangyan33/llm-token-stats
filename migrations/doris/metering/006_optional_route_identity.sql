@@ -1,5 +1,31 @@
 -- Current contract projections; initialize after 001/002. No legacy decoder or hash path.
-CREATE OR REPLACE VIEW metering.requests AS
+CREATE OR REPLACE VIEW metering.requests (
+    request_date COMMENT 'UTC 请求日期，由 request_started_at_ms 换算，不由事件到达时间或 UUID 推导',
+    logical_request_id COMMENT 'Observer 为一次观察生成的规范 UUIDv4；请求级主标识及 Kafka key',
+    start_variants COMMENT '该逻辑请求的开始事件内容变体数；大于 1 表示冲突，不是调用次数',
+    usage_variants COMMENT '该逻辑请求的结果事件内容变体数；0 表示未观察结果，大于 1 表示冲突',
+    request_started_at_ms COMMENT '网关观察到请求头的 Unix 毫秒时间；决定 UTC 统计日期',
+    x_request_id COMMENT '网关可见的 X-Request-Id，仅辅助关联；可空、可重复，不用于授权或去重',
+    customer_id COMMENT '与 api_key_id 同次成功解析得到的客户 ID；未知为 NULL，不采信客户端自报 ID',
+    service_id COMMENT '服务接口返回的服务 ID；未实现或失败为 NULL，不使用默认服务补值',
+    provider_id COMMENT '服务接口返回的服务所属供应商 ID；未知为 NULL，不代表隐藏的实际执行方',
+    cluster_name COMMENT 'Observer 配置固定的集群名称，业务请求不能覆盖',
+    deployment_environment COMMENT 'Observer 固定部署环境：production、test 或 development',
+    request_host COMMENT '规范入口 DNS 域名；转小写并去端口及末尾根点，非法输入为 NULL',
+    mapping_status COMMENT '服务解析状态：mapped、unknown_host、invalid_host、lookup_not_implemented、lookup_timeout、lookup_unavailable、lookup_invalid_response、lookup_overloaded、lookup_rate_limited；当前合法输入为未实现占位',
+    mapping_version COMMENT '成功服务解析快照的规范 SHA-256，绑定 Host、集群、环境及服务和供应商；未知为 NULL',
+    customer_mapping_status COMMENT '客户解析状态：mapped、unknown_api_key、invalid_api_key、lookup_not_implemented、lookup_timeout、lookup_unavailable、lookup_invalid_response、lookup_overloaded、lookup_rate_limited；当前合法输入为未实现占位',
+    customer_mapping_version COMMENT '成功客户解析快照的规范 SHA-256，绑定部署上下文、API Key ID 和客户；未知为 NULL',
+    response_model COMMENT '响应上报的模型名或 ID，可能不同于请求模型；未取得或非法时为 NULL',
+    usage_status COMMENT '唯一结果事件的用量状态；无结果为 not_observed，多结果变体为 conflict',
+    observation_status COMMENT '唯一结果事件的观察完整度；无结果为 not_observed，多结果变体为 conflict',
+    input_tokens COMMENT '输入 token 总量；NULL 表示未知，0 表示服务报告的有效零值；子项不与父项重复相加',
+    output_tokens COMMENT '输出 token 总量；NULL 表示未知，0 表示服务报告的有效零值；子项不与父项重复相加',
+    request_finished_at_ms COMMENT '有效网关 End 提供的请求结束 Unix 毫秒时间；未收到有效 End 时为 NULL',
+    terminal_observed COMMENT '是否收到有效网关 End：1 是、0 否；为 0 时请求结束时间必须为 NULL',
+    business_outcome COMMENT '有没有观察到响应完整结束？response_complete、stream_incomplete 或 unknown；start 为 NULL',
+    has_conflict COMMENT '请求是否有内容、时间、日期、归属或持久冲突标记：1 是、0 否；为 1 时禁止用于有效统计'
+) AS
 SELECT a.request_date, a.logical_request_id, a.start_variants, a.usage_variants,
        a.request_started_at_ms, a.x_request_id, a.customer_id, a.service_id, a.provider_id, a.cluster_name, a.deployment_environment, a.request_host, a.mapping_status, a.mapping_version, a.customer_mapping_status, a.customer_mapping_version,
        CASE WHEN a.usage_variants = 1 THEN a.response_model END AS response_model,
@@ -41,7 +67,42 @@ FROM (
 ) a
 LEFT JOIN metering.request_conflict_ids m ON a.logical_request_id = m.logical_request_id;
 
-CREATE OR REPLACE VIEW metering.request_statistics AS
+CREATE OR REPLACE VIEW metering.request_statistics (
+    request_date COMMENT 'UTC 请求日期，由 request_started_at_ms 换算，不由事件到达时间或 UUID 推导',
+    logical_request_id COMMENT 'Observer 为一次观察生成的规范 UUIDv4；请求级主标识及 Kafka key',
+    start_variants COMMENT '该逻辑请求的开始事件内容变体数；大于 1 表示冲突，不是调用次数',
+    usage_variants COMMENT '该逻辑请求的结果事件内容变体数；0 表示未观察结果，大于 1 表示冲突',
+    started_count COMMENT '该日期内同一逻辑请求的不同开始时间数量；大于 1 表示时间冲突',
+    identity_count COMMENT '该日期内同一逻辑请求的不同十五项归属与部署快照数量；大于 1 表示冲突',
+    customer_id COMMENT '与 api_key_id 同次成功解析得到的客户 ID；未知为 NULL，不采信客户端自报 ID',
+    provider_id COMMENT '服务接口返回的服务所属供应商 ID；未知为 NULL，不代表隐藏的实际执行方',
+    api_key_id COMMENT '客户接口返回的稳定 API Key ID；未知为 NULL，绝不是原始 Bearer token',
+    service_id COMMENT '服务接口返回的服务 ID；未实现或失败为 NULL，不使用默认服务补值',
+    cluster_name COMMENT 'Observer 配置固定的集群名称，业务请求不能覆盖',
+    deployment_environment COMMENT 'Observer 固定部署环境：production、test 或 development',
+    request_host COMMENT '规范入口 DNS 域名；转小写并去端口及末尾根点，非法输入为 NULL',
+    mapping_status COMMENT '服务解析状态：mapped、unknown_host、invalid_host、lookup_not_implemented、lookup_timeout、lookup_unavailable、lookup_invalid_response、lookup_overloaded、lookup_rate_limited；当前合法输入为未实现占位',
+    mapping_version COMMENT '成功服务解析快照的规范 SHA-256，绑定 Host、集群、环境及服务和供应商；未知为 NULL',
+    customer_mapping_status COMMENT '客户解析状态：mapped、unknown_api_key、invalid_api_key、lookup_not_implemented、lookup_timeout、lookup_unavailable、lookup_invalid_response、lookup_overloaded、lookup_rate_limited；当前合法输入为未实现占位',
+    customer_mapping_version COMMENT '成功客户解析快照的规范 SHA-256，绑定部署上下文、API Key ID 和客户；未知为 NULL',
+    identity_status COMMENT '客户归属状态：known 或 invalid；仅完整客户解析成功为 known，不表示鉴权判定',
+    request_model COMMENT '请求正文中可靠提取的模型名或 ID；未取得或非法时为 NULL',
+    response_model COMMENT '响应上报的模型名或 ID，可能不同于请求模型；未取得或非法时为 NULL',
+    usage_eligible COMMENT '这条用量是否符合有效统计条件，可以作为统计候选？1 是、0 否；不表示可收费',
+    http_status COMMENT '网关可见的 HTTP 响应状态码；未知或开始事件为 NULL',
+    terminal_observed COMMENT '是否收到有效网关 End：1 是、0 否；为 0 时请求结束时间必须为 NULL',
+    input_tokens COMMENT '输入 token 总量；NULL 表示未知，0 表示服务报告的有效零值；子项不与父项重复相加',
+    output_tokens COMMENT '输出 token 总量；NULL 表示未知，0 表示服务报告的有效零值；子项不与父项重复相加',
+    input_tokens_source COMMENT '输入 token 总量的来源：reported 或 unknown；开始事件为 NULL，不实现估算',
+    output_tokens_source COMMENT '输出 token 总量的来源：reported 或 unknown；开始事件为 NULL，不实现估算',
+    cached_read_tokens COMMENT '输入中的缓存读取 token 子项；NULL 表示未知，0 表示服务报告的有效零值；子项不与父项重复相加',
+    cached_write_tokens COMMENT '输入中的缓存写入 token 子项；NULL 表示未知，0 表示服务报告的有效零值；子项不与父项重复相加',
+    reasoning_tokens COMMENT '输出中的推理 token 子项；NULL 表示未知，0 表示服务报告的有效零值；子项不与父项重复相加',
+    reported_total_tokens COMMENT '服务单独上报的总 token 数；NULL 表示未知，0 表示服务报告的有效零值；子项不与父项重复相加',
+    has_conflict COMMENT '日期内请求变体、时间或归属冲突，或命中跨日期持久冲突标记时为 1；汇总 SQL 据此排除',
+    model COMMENT '统计模型维度，优先响应模型、其次请求模型；两者均缺失用空串表示未知',
+    usage_source COMMENT '统计用量来源分组：reported、unknown、missing、mixed；estimated_model 和 estimated_generic 为预留估算分类'
+) AS
 SELECT a.*,
        CASE WHEN a.start_variants > 1 OR a.usage_variants > 1
                  OR a.started_count > 1 OR a.identity_count > 1

@@ -87,8 +87,10 @@ Doris 显式事务不能包含 DDL；REPLACE PARTITION 与发布状态写入分�
 
 ## 7. 迁移与验收
 
-当前新契约使用全新隔离库执行 Doris 001、002、004、005、006；已有旧模型库保留，不原地套用 CREATE TABLE IF NOT EXISTS。003 只调整同模型的保留期，不能升级旧字段。006 初始化唯一新模型请求视图，诊断 route_name 不参与身份比较；新契约使用隔离库和 topic，不接纳旧格式。旧 [PostgreSQL usage 迁移](../migrations/postgres/usage/001_summary_refresh_state.sql)已退役为空操作说明，不执行建库或建表；真实 Auth 数据源在独立工作包确定，不属于本次初始化。
+当前新契约使用全新隔离库执行 Doris 001、002、004、005、006、007；已有旧模型库保留，不原地套用 CREATE TABLE IF NOT EXISTS。003 只调整同模型的保留期，不能升级旧字段。006 初始化唯一新模型请求视图，诊断 route_name 不参与身份比较；新契约使用隔离库和 topic，不接纳旧格式。旧 [PostgreSQL usage 迁移](../migrations/postgres/usage/001_summary_refresh_state.sql)已退役为空操作说明，不执行建库或建表；真实 Auth 数据源在独立工作包确定，不属于本次初始化。
 
 若某个环境曾试验旧状态表，先停止所有旧 Worker，保存 Kafka 进度、成功 refresh_id、覆盖范围和未完成任务；将已发布分区核验后迁入 Doris 状态，未确认日期重新生成初始化/修复通知，再从 Kafka committed offset 恢复 Consumer。纯 Doris 切换验证完成前保留旧状态备份；本次文档/DDL 更新不自动删除已部署数据库。仅建新表不能证明历史覆盖。
 
 验收至少覆盖通知重放、批次重新分组可额外重算但不累计用量、所有日期的跨日冲突通知、通知/凭据写入分别失败、提交失败/rebalance、确认丢失、计算期间新通知、零行发布、每个发布阶段崩溃、run/状态写入间崩溃、月份自动发现日版本变化、覆盖缺口、查询前后版本变化、CronJob 漏调/重试/手动并发、Lease 失效与保守接管、孤儿 SQL/临时分区及元数据容量。Consumer 已完成的本地子项以验证记录为准；Worker、发布和查询部分仍只有参考方案及 DDL，不能把 Consumer 联调通过扩展为这些场景全部通过。
+
+各实体表和视图的作用、写入者、读取者及完整字段说明见[数据库表与字段文档](doris-database-schema.md)。007 仅同步当前模型的数据库注释。

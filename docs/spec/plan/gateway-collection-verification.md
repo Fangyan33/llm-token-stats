@@ -213,3 +213,21 @@ Kubernetes 运行 ID：`cb5990b85930`。镜像由当前工作区构建，tag 按
 本地诊断在 `.tmp/identity-final-make-test.log`、`.tmp/identity-final-local-test.log`、`.tmp/identity-k8s-final-test.log`；Kubernetes 结构化证据在 `.tmp/k8s-collection/kind-kind/metering-wasm-verify/cb5990b85930/`，清理核对在 `.tmp/identity-k8s-cleanup-check.json`。这些目录不提交，不含原始密钥；本文保留必要摘要及请求 ID。
 
 本节只验收当前接口占位、采集模型和本地合成链路。真实第三方请求/响应、鉴权、异步执行/缓存及外部联调尚未实现；真实 Auth、汇总 Worker、查询 API、生产容量与完整 G0–G5 仍须各自实施及验收。
+
+## 2026-10-16 Doris 字段注释与表职责文档
+
+当前模型补齐 12 张实体表的表用途注释和 211 个字段注释，以及 7 个逻辑视图的 299 个字段注释。[数据库表与字段文档](../../doris-database-schema.md)为每个对象单列作用、写入者、读取者、粒度、键、关系、保留及实现状态；未来 Worker 与查询能力明确标记未实现。001/002/004/005/006 包含新注释，007 仅同步已有当前模型的元数据；本地和 Kubernetes 初始化链纳入 007，使用 utf8mb4 保留中文注释。
+
+| 检查 | 实际结果 |
+| --- | --- |
+| 目标库 | 仅更新 metering_development；原 metering 及历史 metering_k8s_* 的列结构、默认值、键和注释元数据与更新前一致 |
+| 注释覆盖 | information_schema 核对实体表用途 12/12、实体字段 211/211、视图字段 299/299，均非空 |
+| 空库初始化 | 在项目专属临时库执行完整初始化及 007；类型、可空性、默认值、字段顺序和键标识与原当前模型一致，全部视图可查询 |
+| 重复执行 | 临时库载入合成样本后重复执行 007，两次核对实体与视图完整数据相同；现有开发库重复更新后稳定业务字段及结构相同 |
+| 在线审计说明 | 当前 Consumer 补偿巡检持续刷新 request_conflict_ids.detected_at 和 summary_dirty_notifications.created_at。在线数据核对排除这两个后台审计时间；独立临时库则核对完整数据，未为测试停止 Consumer |
+| 查询与文档 | 仓库所有视图 SELECT 与注释前逐一核对相同；文档由 SQL 注释与实时编译元数据生成，再生成内容一致；007 可由生成器复现 |
+| 采集冒烟 | 注释更新后 JSON、SSE、缺 usage 请求均 HTTP 200，各入库两事件，共 6 条；正常用量仍 known、10/4，缺 usage 仍 unknown、NULL/NULL，身份占位仍 invalid、usage_eligible=0 |
+| 静态检查 | make test：61 项 Python 测试、契约校验、主模块与独立插件 Go 竞态测试通过；文档链接和 git diff --check 通过 |
+| 清理 | 本次 metering_comments_verify_* 临时验证库已删除；开发数据及已有历史验证库保留 |
+
+注释覆盖与元数据/数据摘要记录在 `.tmp/doris-comments-verification/`。本次未改变采集事件、消费提交屏障、字段类型、唯一键、分区或视图查询口径；未重新执行完整 Kubernetes 部署或生产 G0–G5，本次实际数据库验证使用既有本地 Doris 4.1.3。

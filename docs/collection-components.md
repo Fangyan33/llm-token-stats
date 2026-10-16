@@ -45,7 +45,7 @@ KAFKA_EXTERNAL_HOST=192.168.227.128 make local-up
 
 Kafka 容器内客户端仍使用 `kafka:9092`。重建容器时 Kafka 日志及 Doris FE/BE 数据由命名卷保留；首次从旧版无持久卷配置启动时，脚本先停栈，将原数据备份到 `.tmp/local-storage-*` 并迁移到卷，再重建容器。已有不匹配的目标卷会使迁移停止，避免覆盖或合并历史。不要使用 `docker compose down -v` 删除数据卷。
 
-`make local-up` 在 `dist/envoy.remote.json` 渲染实际 Wasm 摘要，重启 Fixture/Observer/Consumer，核对下载内容后重建网关。网关只挂载配置，插件来自 Observer HTTP 下载。更新本地产物后运行 `make build wasm local-up`，再运行 `GOFLAGS='-count=1' make local-test`，不能仅重启旧网关而沿用旧摘要。脚本只初始化该 Compose 栈，应用 001/002/004/005/006 migration，在独立 metering_development 库执行新初始化，并创建 24 分区、72 小时保留、delete 策略的 llm-metering-development topic。明文 Kafka、合成鉴权、副本数 1 与 Doris root 空密码仅用于开发联调；生产按原方案配置认证、副本、min ISR 和最小权限账号。
+`make local-up` 在 `dist/envoy.remote.json` 渲染实际 Wasm 摘要，重启 Fixture/Observer/Consumer，核对下载内容后重建网关。网关只挂载配置，插件来自 Observer HTTP 下载。更新本地产物后运行 `make build wasm local-up`，再运行 `GOFLAGS='-count=1' make local-test`，不能仅重启旧网关而沿用旧摘要。脚本只初始化该 Compose 栈，应用 001/002/004/005/006/007 migration，在独立 metering_development 库执行新初始化，并创建 24 分区、72 小时保留、delete 策略的 llm-metering-development topic。明文 Kafka、合成鉴权、副本数 1 与 Doris root 空密码仅用于开发联调；生产按原方案配置认证、副本、min ISR 和最小权限账号。
 
 普通 JSON / SSE 合成请求：
 
@@ -168,3 +168,5 @@ G0–G5 仍须独立完成：私有镜像/真实 Auth、HTTP2 慢上传与断开
 Observer 必填 cluster_name、deployment_environment，service_lookup/customer_lookup 各有可空 uri。当前不实现真实 HTTP、鉴权或网络缓存，不要求第三方 Secret。输入非法先记录 invalid_host/invalid_api_key，合法输入的两个占位记录 lookup_not_implemented。两事件复用快照，客户失败使 identity_status=invalid、usage_eligible=false，不清除原始已观察 usage。
 
 Consumer 的 doris.database、DSN、Stream Load 和证据/巡检 SQL 使用同一经过校验的库名。初始化使用 `python3 scripts/render_doris_sql.py --database 数据库 migrations/doris/metering/001_init.sql`，对其余初始化 SQL 同样渲染。本地默认 metering_development，新 Kubernetes 测试每次用 metering_k8s_<run-id>；不修改旧 metering 库及其消息，清理保留测试库作为证据。普通 Docker 联调使用合成 token 和隔离明文网络；生产/真实密钥只允许已验证的网格 mTLS/TLS。
+
+数据库字段及每张表的作用见[数据库表与字段文档](doris-database-schema.md)。007_schema_comments.sql 为已有当前模型库补齐注释，不更改数据类型、键或分区；旧 metering 库不在本次更新范围。

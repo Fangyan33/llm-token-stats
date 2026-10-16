@@ -179,7 +179,7 @@ class Harness:
 
     def sql(self, sql):
         sql = render_sql(sql, getattr(self, 'database', 'metering_development'))
-        return run([*COMPOSE, 'exec', '-T', 'doris', 'mysql', '-uroot', '-h127.0.0.1',
+        return run([*COMPOSE, 'exec', '-T', 'doris', 'mysql', '--default-character-set=utf8mb4', '-uroot', '-h127.0.0.1',
                     '-P9030', '-N', '-e', sql]).stdout
 
     def cleanup(self):
@@ -543,7 +543,7 @@ class Harness:
         self.kafka('topics', '--create', '--topic', self.topic, '--partitions', '3', '--replication-factor', '1',
                    '--config', 'retention.ms=86400000')
         try:
-            for name in ('001_init.sql','002_usage_summaries.sql','004_summary_coordination.sql','005_consumer_recovery.sql','006_optional_route_identity.sql'):
+            for name in ('001_init.sql','002_usage_summaries.sql','004_summary_coordination.sql','005_consumer_recovery.sql','006_optional_route_identity.sql','007_schema_comments.sql'):
                 self.sql((ROOT / 'migrations/doris/metering' / name).read_text())
             manifest = self.manifest()
             write_json(self.output / 'resources.json', manifest)

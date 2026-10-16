@@ -115,8 +115,8 @@ def infra_up():
  columns=run('exec','-T','doris','mysql','-uroot','-h127.0.0.1','-P9030','-N','-e',guard,capture_output=True).stdout.splitlines()
  if columns and ('application_id' in columns or not {'request_host','provider_id','customer_mapping_status'}<=set(columns)):
   raise RuntimeError('Incompatible existing Doris schema; choose an isolated database, never overwrite shared tables')
- for name in ['001_init.sql','002_usage_summaries.sql','004_summary_coordination.sql','005_consumer_recovery.sql','006_optional_route_identity.sql']:
-  run('exec','-T','doris','mysql','-uroot','-h127.0.0.1','-P9030',input=render_sql((ROOT/'migrations/doris/metering'/name).read_text(),json.loads((ROOT/'deploy/local/consumer.json').read_text())['doris']['database']))
+ for name in ['001_init.sql','002_usage_summaries.sql','004_summary_coordination.sql','005_consumer_recovery.sql','006_optional_route_identity.sql','007_schema_comments.sql']:
+  run('exec','-T','doris','mysql','--default-character-set=utf8mb4','-uroot','-h127.0.0.1','-P9030',input=render_sql((ROOT/'migrations/doris/metering'/name).read_text(),json.loads((ROOT/'deploy/local/consumer.json').read_text())['doris']['database']))
  for _ in range(45):
   result=subprocess.run([*BASE,'exec','-T','kafka','/opt/kafka/bin/kafka-topics.sh','--bootstrap-server','kafka:9092','--create','--if-not-exists','--topic',json.loads((ROOT/'deploy/local/observer.json').read_text())['kafka']['topic'],'--partitions','24','--replication-factor','1','--config','retention.ms=259200000','--config','cleanup.policy=delete'],capture_output=True)
   if result.returncode==0:break

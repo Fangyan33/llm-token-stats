@@ -110,7 +110,7 @@ Kafka、Doris 使用基础设施镜像；Fixture 由本地 Compose 挂载编译�
 make test build wasm local-up local-test
 ```
 
-该命令依次完成检查、编译和 Wasm ABI 验证，启动 Kafka、Doris、Fixture、Observer、Consumer、Envoy，然后执行真实链路集成测试。`make local-up` 会等待基础设施就绪，应用 `001/002/004/005/006` Doris 迁移，在独立 metering_development 库初始化新表，并创建 24 分区、72 小时保留的 llm-metering-development topic。它本身不编译代码，会重新渲染下载摘要，重启使用挂载产物的 Fixture、Observer、Consumer，校验下载文件后重建网关。网关只挂载生成的配置，不挂载 Wasm。配置与编排位于 [deploy/local/](deploy/local/compose.yaml)。
+该命令依次完成检查、编译和 Wasm ABI 验证，启动 Kafka、Doris、Fixture、Observer、Consumer、Envoy，然后执行真实链路集成测试。`make local-up` 会等待基础设施就绪，应用 `001/002/004/005/006/007` Doris 迁移，在独立 metering_development 库初始化新表，并创建 24 分区、72 小时保留的 llm-metering-development topic。它本身不编译代码，会重新渲染下载摘要，重启使用挂载产物的 Fixture、Observer、Consumer，校验下载文件后重建网关。网关只挂载生成的配置，不挂载 Wasm。配置与编排位于 [deploy/local/](deploy/local/compose.yaml)。
 
 `make test` 不启动容器、不写 Doris；`make local-test` 验证实际 Envoy → Observer → Kafka → Consumer → Doris 链路，包括 JSON / SSE、未知用量、重放去重、冲突、未知 schema 暂停、写入确认丢失和超时边界。测试使用合成数据，也会留下诊断记录。
 
@@ -200,7 +200,7 @@ kafka-topics.sh --bootstrap-server "$KAFKA_BOOTSTRAP" \
 
 上述副本配置需要至少 3 个可用 Broker；24 分区是容量验收初值。同一采集部署周期不在线调整分区数。为 Observer 配置 topic 生产权限，为 Consumer 配置 topic 消费和 group 权限；现有 topic 的参数要另行核对，`--if-not-exists` 不会更新已有配置。
 
-Doris 新库按 `001 → 002 → 004 → 005 → 006` 顺序执行迁移。仓库 SQL 的副本数为开发值 1，需先生成经过审查的生产副本；以下示例改为 3，要求实际 BE 数量和存储资源满足条件：
+Doris 新库按 `001 → 002 → 004 → 005 → 006 → 007` 顺序执行迁移。仓库 SQL 的副本数为开发值 1，需先生成经过审查的生产副本；以下示例改为 3，要求实际 BE 数量和存储资源满足条件：
 
 ```sh
 export DEPLOY_DIR="$PWD/.private/deploy"
@@ -213,15 +213,15 @@ from pathlib import Path
 target = Path(os.environ['DEPLOY_DIR']) / 'doris'
 for name in ('001_init.sql', '002_usage_summaries.sql',
              '004_summary_coordination.sql', '005_consumer_recovery.sql',
-             '006_optional_route_identity.sql'):
+             '006_optional_route_identity.sql', '007_schema_comments.sql'):
     sql = (Path('migrations/doris/metering') / name).read_text()
     sql = re.sub(r'("replication_num"\s*=\s*)"1"', r'\g<1>"3"', sql)
     (target / name).write_text(sql)
 PY
 
 # 在能够连接 FE SQL 的管理环境执行；认证配置由 Secret 安全提供。
-for migration in 001_init.sql 002_usage_summaries.sql 004_summary_coordination.sql 005_consumer_recovery.sql 006_optional_route_identity.sql; do
-  mysql --defaults-extra-file=/run/secrets/doris/admin.cnf \
+for migration in 001_init.sql 002_usage_summaries.sql 004_summary_coordination.sql 005_consumer_recovery.sql 006_optional_route_identity.sql 007_schema_comments.sql; do
+  mysql --defaults-extra-file=/run/secrets/doris/admin.cnf --default-character-set=utf8mb4 \
     --init-command="SET time_zone = '+00:00'" < "$DEPLOY_DIR/doris/$migration" || exit 1
 done
 mysql --defaults-extra-file=/run/secrets/doris/admin.cnf \
@@ -366,7 +366,7 @@ kubectl apply -f "$DEPLOY_DIR/envoyfilter.$GATEWAY_POD_UID.disabled.yaml"
 
 Observer / Consumer 使用 accepted_service_ids 对已映射服务精确接纳；未映射事件的 service_id/provider_id 同时为 null，允许保留为质量诊断。旧 accepted_routes、Wasm identity_namespace/identity_fields 和规则 service_id 已删除，配置严格拒绝这些字段。配置版本、适配器及事件状态一致性检查继续保留。
 
-功能尚未上线，统一更新唯一协议、代码、配置和新开发库，不接纳旧格式消息，也不双写旧表。001/002/004/005/006 是同一新模型的初始化链，006 不承担旧数据兼容。已有旧结构库不能直接用 CREATE IF NOT EXISTS 升级；改用隔离库、独立 topic/group，保留旧数据。
+功能尚未上线，统一更新唯一协议、代码、配置和新开发库，不接纳旧格式消息，也不双写旧表。001/002/004/005/006/007 是同一新模型的初始化链，006 不承担旧数据兼容。已有旧结构库不能直接用 CREATE IF NOT EXISTS 升级；改用隔离库、独立 topic/group，保留旧数据。
 
 Bearer 只作为短暂查询输入；接口占位不会产生已知客户，真实用量可为 known，但身份 invalid，usage_eligible 始终为 false。检查实际代理配置：
 
@@ -464,6 +464,7 @@ python3 scripts/cleanup_k8s_collection.py
 - [归属接口实现与后续对接边界](docs/spec/plan/host-service-provider-implementation.md)
 - [网关采集实现方案](docs/gateway-request-collection-implementation.md)
 - [Kafka 事件接入说明](docs/kafka-event-integration-guide.md)
+- [Doris 数据库表职责与完整字段字典](docs/doris-database-schema.md)
 - [Doris 部署与迁移说明](deploy/doris/README.md)
 - [日 / 月汇总设计](docs/daily-monthly-summary-design.md)、[Doris 协调设计](docs/doris-summary-coordination.md)
 - [API Key 鉴权设计](docs/api-key-auth-service-implementation.md)

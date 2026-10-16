@@ -4,17 +4,20 @@
 
 本页 SQL 初始化当前唯一契约，应用字段已删除，增加供应商、部署上下文及两类解析状态。使用 render_doris_sql.py --database 库名 SQL文件 渲染到隔离库，Consumer 的 doris.database 和 DSN 必须一致。旧结构共享库不能原样套用新 DDL；本地默认 metering_development，K8s 每次另建测试库。
 
+完整表职责、上下游关系及字段说明见[数据库表与字段文档](../../docs/doris-database-schema.md)。新建库的注释包含在初始化 SQL；已有当前模型库执行 007_schema_comments.sql 补注释，CREATE TABLE IF NOT EXISTS 本身不会更新已有注释。007 不升级旧字段，执行前确认目标库。
+
 在仓库根目录启动：
 
 ~~~sh
 docker compose -f deploy/doris/compose.yaml up -d --wait
 docker compose -f deploy/doris/compose.yaml exec doris mysql -uroot -h127.0.0.1 -P9030 -e "SHOW FRONTENDS; SHOW BACKENDS;"
 docker compose -f deploy/doris/compose.yaml exec doris mysql -uroot -h127.0.0.1 -P9030 -e 'ADMIN SET FRONTEND CONFIG ("dynamic_partition_enable" = "true");'
-python3 scripts/render_doris_sql.py --database metering_development migrations/doris/metering/001_init.sql | docker compose -f deploy/doris/compose.yaml exec -T doris mysql -uroot -h127.0.0.1 -P9030
-python3 scripts/render_doris_sql.py --database metering_development migrations/doris/metering/002_usage_summaries.sql | docker compose -f deploy/doris/compose.yaml exec -T doris mysql -uroot -h127.0.0.1 -P9030
-python3 scripts/render_doris_sql.py --database metering_development migrations/doris/metering/004_summary_coordination.sql | docker compose -f deploy/doris/compose.yaml exec -T doris mysql -uroot -h127.0.0.1 -P9030
-python3 scripts/render_doris_sql.py --database metering_development migrations/doris/metering/005_consumer_recovery.sql | docker compose -f deploy/doris/compose.yaml exec -T doris mysql -uroot -h127.0.0.1 -P9030
-python3 scripts/render_doris_sql.py --database metering_development migrations/doris/metering/006_optional_route_identity.sql | docker compose -f deploy/doris/compose.yaml exec -T doris mysql -uroot -h127.0.0.1 -P9030
+python3 scripts/render_doris_sql.py --database metering_development migrations/doris/metering/001_init.sql | docker compose -f deploy/doris/compose.yaml exec -T doris mysql --default-character-set=utf8mb4 -uroot -h127.0.0.1 -P9030
+python3 scripts/render_doris_sql.py --database metering_development migrations/doris/metering/002_usage_summaries.sql | docker compose -f deploy/doris/compose.yaml exec -T doris mysql --default-character-set=utf8mb4 -uroot -h127.0.0.1 -P9030
+python3 scripts/render_doris_sql.py --database metering_development migrations/doris/metering/004_summary_coordination.sql | docker compose -f deploy/doris/compose.yaml exec -T doris mysql --default-character-set=utf8mb4 -uroot -h127.0.0.1 -P9030
+python3 scripts/render_doris_sql.py --database metering_development migrations/doris/metering/005_consumer_recovery.sql | docker compose -f deploy/doris/compose.yaml exec -T doris mysql --default-character-set=utf8mb4 -uroot -h127.0.0.1 -P9030
+python3 scripts/render_doris_sql.py --database metering_development migrations/doris/metering/006_optional_route_identity.sql | docker compose -f deploy/doris/compose.yaml exec -T doris mysql --default-character-set=utf8mb4 -uroot -h127.0.0.1 -P9030
+python3 scripts/render_doris_sql.py --database metering_development migrations/doris/metering/007_schema_comments.sql | docker compose -f deploy/doris/compose.yaml exec -T doris mysql --default-character-set=utf8mb4 -uroot -h127.0.0.1 -P9030
 docker compose -f deploy/doris/compose.yaml exec doris mysql -uroot -h127.0.0.1 -P9030 -e "SHOW TABLES FROM metering_development;"
 ~~~
 
@@ -24,7 +27,7 @@ Schema 采用 Unique Key (request_date, logical_request_id, event_id, payload_ha
 
 Consumer 已实现，构建与本地链路见[组件运行说明](../../docs/collection-components.md)；汇总 Worker 和查询 API 留待后续工作包，建表不启动刷新任务。采集与汇总协调表见[004 Doris migration](../../migrations/doris/metering/004_summary_coordination.sql)，通知、消费批次凭据和发布状态保存在同一 Doris 集群，无额外 PostgreSQL 依赖；旧 PostgreSQL usage migration 已退役。调度采用独立 Go usage-worker，默认每分钟 CronJob --once；单个发布者保护、查询版本校验及旧状态切换见[Doris 协调设计](../../docs/doris-summary-coordination.md)。真实 Auth 属独立工作包，不是本次采集部署依赖。写入建议采用 Stream Load：每批固定 label，Expect: 100-continue、format: json、read_json_by_line: true、max_filter_ratio: 0、timezone: +00:00，检查响应 Status、行数和可见性，并确认冲突标记、日期通知及批次凭据后再提交 Kafka offset。label 保留期有限，长期重放依赖 Unique Key；不同内容仍必须保留为独立变体。未知 schema 版本暂停对应 Kafka 分区。
 
-新开发模型统一部署，不接收旧格式或保留旧摘要比较路径。旧数据留在原库；新库按 001/002/004/005/006 初始化，006 不承担历史模型迁移。
+新开发模型统一部署，不接收旧格式或保留旧摘要比较路径。旧数据留在原库；新库按 001/002/004/005/006/007 初始化，006 不承担历史模型迁移。
 
 本示例不自动执行 migration；避免服务启动时以 root 反复改表。生产采用受控迁移与独立账号。
 
@@ -39,11 +42,12 @@ kubectl apply -f deploy/doris/doris.yaml
 kubectl rollout status statefulset/doris --timeout=5m
 kubectl exec doris-0 -- mysql -uroot -h127.0.0.1 -P9030 -e "SHOW FRONTENDS; SHOW BACKENDS;"
 kubectl exec doris-0 -- mysql -uroot -h127.0.0.1 -P9030 -e 'ADMIN SET FRONTEND CONFIG ("dynamic_partition_enable" = "true");'
-python3 scripts/render_doris_sql.py --database metering_development migrations/doris/metering/001_init.sql | kubectl exec -i doris-0 -- mysql -uroot -h127.0.0.1 -P9030
-python3 scripts/render_doris_sql.py --database metering_development migrations/doris/metering/002_usage_summaries.sql | kubectl exec -i doris-0 -- mysql -uroot -h127.0.0.1 -P9030
-python3 scripts/render_doris_sql.py --database metering_development migrations/doris/metering/004_summary_coordination.sql | kubectl exec -i doris-0 -- mysql -uroot -h127.0.0.1 -P9030
-python3 scripts/render_doris_sql.py --database metering_development migrations/doris/metering/005_consumer_recovery.sql | kubectl exec -i doris-0 -- mysql -uroot -h127.0.0.1 -P9030
-python3 scripts/render_doris_sql.py --database metering_development migrations/doris/metering/006_optional_route_identity.sql | kubectl exec -i doris-0 -- mysql -uroot -h127.0.0.1 -P9030
+python3 scripts/render_doris_sql.py --database metering_development migrations/doris/metering/001_init.sql | kubectl exec -i doris-0 -- mysql --default-character-set=utf8mb4 -uroot -h127.0.0.1 -P9030
+python3 scripts/render_doris_sql.py --database metering_development migrations/doris/metering/002_usage_summaries.sql | kubectl exec -i doris-0 -- mysql --default-character-set=utf8mb4 -uroot -h127.0.0.1 -P9030
+python3 scripts/render_doris_sql.py --database metering_development migrations/doris/metering/004_summary_coordination.sql | kubectl exec -i doris-0 -- mysql --default-character-set=utf8mb4 -uroot -h127.0.0.1 -P9030
+python3 scripts/render_doris_sql.py --database metering_development migrations/doris/metering/005_consumer_recovery.sql | kubectl exec -i doris-0 -- mysql --default-character-set=utf8mb4 -uroot -h127.0.0.1 -P9030
+python3 scripts/render_doris_sql.py --database metering_development migrations/doris/metering/006_optional_route_identity.sql | kubectl exec -i doris-0 -- mysql --default-character-set=utf8mb4 -uroot -h127.0.0.1 -P9030
+python3 scripts/render_doris_sql.py --database metering_development migrations/doris/metering/007_schema_comments.sql | kubectl exec -i doris-0 -- mysql --default-character-set=utf8mb4 -uroot -h127.0.0.1 -P9030
 kubectl exec doris-0 -- mysql -uroot -h127.0.0.1 -P9030 -e "USE metering_development; SHOW DYNAMIC PARTITION TABLES;"
 ~~~
 

@@ -1,6 +1,8 @@
 # 一期日汇总与月汇总设计
 
-状态：设计及 DDL，修订日期：2026-10-13。采集与汇总协调全部使用 Doris，无额外 PostgreSQL 依赖。刷新 Worker、Consumer 衔接和统计 HTTP API 尚待实现；建表不会自动生成汇总数据。
+状态：设计及 DDL，修订日期：2026-10-16。采集与汇总协调全部使用 Doris，无额外 PostgreSQL 依赖。Consumer 已实现通知、凭据及恢复屏障；刷新 Worker 和统计 HTTP API 尚待实现，建表不会自动生成汇总数据。
+
+当前 DDL/SQL 已删除应用维度，使用服务/供应商、客户/API Key 及固定集群/环境。Observer 的两个查询仍为占位，正常部署的客户未知，只保留原始质量事件；本页已知客户的日/月 SQL 验证使用明确标注的合成事件，不表示真实第三方已对接。Worker 和正式发布仍未实现。
 
 ## 1. 一期范围与保留期
 
@@ -20,13 +22,14 @@
 
 ## 2. 汇总维度与数据口径
 
-日/月采用相同的六个维度：customer_id、application_id、api_key_id、service_id、model、usage_source。唯一键为统计日期/月加这六个维度；不同层级报表通过 GROUP BY 合并，不另存容易重复累计的“客户总计行”。主体使用事件发生时的可信身份快照，密钥轮换或客户重命名不改历史归属。
+日/月采用相同的八个维度：cluster_name、deployment_environment、customer_id、api_key_id、service_id、provider_id、model、usage_source。唯一键为统计日期/月加这八个维度；不同层级报表通过 GROUP BY 合并，不另存容易重复累计的“客户总计行”。主体使用事件发生时的可信身份快照，密钥轮换或客户重命名不改历史归属。
 
+- 原始服务/供应商未知为 NULL；仅汇总键用空串表示未知桶。已知客户总量包含未知服务桶，具体供应商不接收未知桶；客户未知只进入质量统计。生产、测试、开发按部署维度分组，不默认混合。
 - model 优先采用结果事件 response_model，其次 request_model；都未知时保存空串，由界面显示“未知模型”。
 - usage_source 按输入、输出两项确定：reported、estimated_model、estimated_generic、mixed、unknown、missing。missing 表示没有结果事件；unknown 表示结果已有但输入或输出未知。一个上报、一个估算归 mixed。采集子项当前仅产生 reported/unknown；估算来源须先完成协议升级，再接入汇总。
 - 一个 logical_request_id 计一次，不把 request_started 与 usage_observed 计成两次调用。只有结果事件时也记录一次已观察请求，并单独统计是否有开始事件。
 - 同内容重放依靠原始表 Unique Key 去重。事件内容冲突、开始时间冲突、跨日期 UUID 冲突或身份冲突整请求排除，不用 MAX 任意挑选版本进入客户统计。
-- 无效身份或缺少客户/应用/API Key 的请求不进入客户汇总。管理员数据质量页面从原始/冲突记录统计排除数量，不把它们归给空客户或其他客户。
+- 无效身份或缺少客户/API Key 的请求不进入客户汇总。管理员数据质量页面从原始/冲突记录统计排除数量，不把它们归给空客户或其他客户。
 - request_statistics 按日期与请求 ID 形成一行中间投影，先判断冲突再按客户分组；跨日期冲突依赖 Consumer 持久写入 request_conflict_ids。模型或客户过滤必须发生在冲突判断之后。
 
 两张汇总表使用 Unique Key Merge-on-Write 保存整批结果，不使用对 Kafka 事件直接 SUM 的增量 Aggregate Key 表或同步求和物化视图。
@@ -102,7 +105,7 @@ CronJob 的 Forbid 仅防同一调度对象并发，程序仍须统一发布者�
 ## 7. 查询契约（一期待实现）
 
 - GET /v1/metering/events：一年内在线明细，只访问 Doris，不依赖归档。
-- GET /v1/metering/usage/daily：UTC 日期 from/to 左闭右开，按客户/应用/API Key/服务/模型/来源过滤及分页。
+- GET /v1/metering/usage/daily：UTC 日期 from/to 左闭右开，按集群/环境/客户/API Key/服务/供应商/模型/来源过滤及分页。
 - GET /v1/metering/usage/monthly：UTC 月首 from/to 左闭右开，按相同维度过滤及分页。
 - GET /v1/metering/summary/status：管理员查看任务状态、水位及覆盖缺口。
 
@@ -114,11 +117,11 @@ CronJob 的 Forbid 仅防同一调度对象并发，程序仍须统一发布者�
 - [002 汇总表与请求投影](../migrations/doris/metering/002_usage_summaries.sql)：日/月表与 request_statistics。
 - [003 一年保留迁移](../migrations/doris/metering/003_raw_retention_one_year.sql)：已有表属性迁移；CREATE IF NOT EXISTS 不会更新旧表。
 - [004 Doris 协调表](../migrations/doris/metering/004_summary_coordination.sql)：日期通知、批次凭据、任务输入/审计和发布状态；旧 PostgreSQL usage 迁移已退役。
-- [006 路由身份兼容迁移](../migrations/doris/metering/006_optional_route_identity.sql)：更新 requests / request_statistics，统一按排除诊断 route_name 的身份字段比较新旧记录；不回填事件或自动撤销历史冲突。
+- [006 当前身份投影初始化](../migrations/doris/metering/006_optional_route_identity.sql)：更新 requests / request_statistics，统一按含服务/供应商、客户及部署上下文的当前身份字段比较；不提供旧模型兼容，不回写事件或撤销冲突。
 - [日准备](../scripts/sql/refresh_usage_daily.sql)、[日发布](../scripts/sql/publish_usage_daily.sql)、[月准备](../scripts/sql/refresh_usage_monthly.sql)、[月发布](../scripts/sql/publish_usage_monthly.sql)：分阶段执行的参考模板，必须由未来 Worker 校验和协调。
 
 迁移与旧 PostgreSQL 试验状态的受控切换见[协调设计第 7 节](doris-summary-coordination.md#7-迁移与验收)。迁移前停止旧汇总/归档 Worker、CronJob 和其他分区清理器。开启各 FE dynamic_partition_enable 并持久化配置；确认分区范围与调度状态后开放 Consumer 写入。扩大期限不能恢复此前已删除的数据。SQL 模板参数只能由 Worker 生成，并验证 ISO 日期、允许的表名、分区名、UUID 与 64 位十六进制水位，不把客户输入直接拼进 SQL。
 
 验收必须覆盖：同内容重放不增量；冲突到达撤销先前分组；开始/结果跨午夜及跨月；缺失结果、无效身份、有效零值与 NULL；混合来源；各维度月合计等于日合计；零行重算删除旧分组；临时准备失败及发布后崩溃；并发新事件不丢 dirty；一年前日/月仍可查；730 日与 24 月边界；客户隔离、查询前后版本变化、CronJob 重复执行、发布者保护失效及保守接管、各 Doris 状态写入分别失败、日发布后崩溃仍触发月刷新、元数据容量及目标峰值压测。
 
-[临时分区与原子替换](https://doris.apache.org/docs/4.x/data-operate/delete/table-temp-partition/)是本发布设计采用的 Doris 机制；当前没有实际数据库连接，DDL 与模板仍需在目标 Doris 4.1.3 验证。
+[临时分区与原子替换](https://doris.apache.org/docs/4.x/data-operate/delete/table-temp-partition/)是本发布设计采用的 Doris 机制。当前初始化 DDL 和日/月准备、发布参考模板已在本地 Doris 4.1.3 执行；模板使用明确标注的合成身份验证供应商/部署分组、未知服务桶、未知客户排除和 NULL/零。未实现 Worker，发布状态协议、故障恢复和查询一致性仍须单独验收，见[本次验证记录](spec/plan/gateway-collection-verification.md)。

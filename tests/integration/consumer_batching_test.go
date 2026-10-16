@@ -63,7 +63,7 @@ func startBatchingConsumer(t *testing.T, topic, group string, rows, bytes int) *
 	c := config.Config{
 		Kafka: config.Kafka{Brokers: []string{"127.0.0.1:29092"}, Topic: topic},
 		Consumer: config.Consumer{Group: group, Rows: rows, Bytes: bytes, FlushMS: 500,
-			AcceptedConfigs: []string{"collection-v1"}, Routes: []config.Route{{RouteName: "llm-chat", ServiceID: "model-service-a"}}},
+			AcceptedConfigs: []string{"collection-v1"}, AcceptedServices: []string{"model-service-a"}},
 		Doris: s.Cfg,
 	}
 	if err := c.ConsumerDefaults(); err != nil {
@@ -113,10 +113,10 @@ func TestConsumerBatchingAndRebalance(t *testing.T) {
 	h1 := startBatchingConsumer(t, topic, group, 5000, 4<<20)
 	waitBatchCommit(t, cl, topic, group, 0, 5000)
 	var count int
-	if err = db.QueryRow("SELECT COUNT(*) FROM metering.consumer_batch_receipts WHERE kafka_topic=? AND kafka_partition=0 AND first_offset=0 AND next_offset=5000", topic).Scan(&count); err != nil || count != 1 {
+	if err = db.QueryRow("SELECT COUNT(*) FROM metering_development.consumer_batch_receipts WHERE kafka_topic=? AND kafka_partition=0 AND first_offset=0 AND next_offset=5000", topic).Scan(&count); err != nil || count != 1 {
 		t.Fatalf("configured 5000-row batch was split: count=%d err=%v", count, err)
 	}
-	if err = db.QueryRow("SELECT COUNT(*) FROM metering.ingest_rejections WHERE kafka_topic=?", topic).Scan(&count); err != nil || count != 5000 {
+	if err = db.QueryRow("SELECT COUNT(*) FROM metering_development.ingest_rejections WHERE kafka_topic=?", topic).Scan(&count); err != nil || count != 5000 {
 		t.Fatalf("batch rows missing: count=%d err=%v", count, err)
 	}
 	eventually(t, func() bool { return h1.health.Ready.Load() })
@@ -128,7 +128,7 @@ func TestConsumerBatchingAndRebalance(t *testing.T) {
 	waitBatchCommit(t, cl, topic, group, 0, 5001)
 	waitBatchCommit(t, cl, topic, group, 1, 1)
 	eventually(t, func() bool { return h1.health.Ready.Load() && h2.health.Ready.Load() })
-	if err = db.QueryRow("SELECT COUNT(*) FROM metering.ingest_rejections WHERE kafka_topic=?", topic).Scan(&count); err != nil || count != 5002 {
+	if err = db.QueryRow("SELECT COUNT(*) FROM metering_development.ingest_rejections WHERE kafka_topic=?", topic).Scan(&count); err != nil || count != 5002 {
 		t.Fatalf("rebalance lost or duplicated rows: count=%d err=%v", count, err)
 	}
 }
@@ -142,7 +142,7 @@ func TestConsumerBatchByteLimit(t *testing.T) {
 	startBatchingConsumer(t, topic, group, 5000, 32768)
 	waitBatchCommit(t, cl, topic, group, 0, 2)
 	var count int
-	if err := db.QueryRow("SELECT COUNT(*) FROM metering.consumer_batch_receipts WHERE kafka_topic=? AND kafka_partition=0 AND next_offset-first_offset=1", topic).Scan(&count); err != nil || count != 2 {
+	if err := db.QueryRow("SELECT COUNT(*) FROM metering_development.consumer_batch_receipts WHERE kafka_topic=? AND kafka_partition=0 AND next_offset-first_offset=1", topic).Scan(&count); err != nil || count != 2 {
 		t.Fatalf("byte limit did not split batches: count=%d err=%v", count, err)
 	}
 }
@@ -166,7 +166,7 @@ func TestConsumerShutdownReplaysPartialBatch(t *testing.T) {
 	startBatchingConsumer(t, topic, group, 5000, 4<<20)
 	waitBatchCommit(t, cl, topic, group, 0, 1)
 	var count int
-	if err := db.QueryRow("SELECT COUNT(*) FROM metering.ingest_rejections WHERE kafka_topic=?", topic).Scan(&count); err != nil || count != 1 {
+	if err := db.QueryRow("SELECT COUNT(*) FROM metering_development.ingest_rejections WHERE kafka_topic=?", topic).Scan(&count); err != nil || count != 1 {
 		t.Fatalf("shutdown replay lost or duplicated a record: count=%d err=%v", count, err)
 	}
 }

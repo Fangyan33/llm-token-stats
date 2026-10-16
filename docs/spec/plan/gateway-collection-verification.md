@@ -2,6 +2,8 @@
 
 日期：2026-10-13。实现见[计划](gateway-collection-implementation.md)，使用方法与未验收门槛见[运行说明](../../collection-components.md)。本记录是公开固定 Envoy 的本地合成验证，不代表私有集群或生产容量验收。
 
+本文按日期保留历史证据，旧章节只代表当时的契约，不是当前兼容要求。当前[归属接口实现](host-service-provider-implementation.md)的 Bearer 输入、供应商/部署字段、占位状态及删除应用字段的验证见最后的 2026-10-16 记录；真实第三方 HTTP、真实 Auth、汇总 Worker 和生产 G0–G5 仍未完成。
+
 ## 工具与产物
 
 - Go 1.25.0，TinyGo 0.40.1（LLVM 20.1.1），SDK 基底 v0.24.0；扩展摘要与二进制 SHA-256 由 `make manifest` 保存到 `dist/collection-manifest.json`。
@@ -160,7 +162,7 @@ Kubernetes 运行 ID 为 `b67af2b4169c`；正例、反例、已激活配置、�
 
 ## 2026-10-15 route_name 作为辅助诊断字段
 
-本节为当前实现与验收结果；上一节记录通配入口的最初版本。入口继续仅按 `POST` 与去掉查询串后的精确路径 `/v1/chat/completions` 筛选，配置 `route_name: "*"` 仅控制选择。事件记录请求头阶段实际可读的 Envoy 路由名，缺失、无效或超长时用 `unknown`；计量 metadata 不冒充实际路由。路由快照在请求内不变，不参与客户归属、服务接纳、稳定身份比较或价格选择。
+本节为当时的实现与验收结果；上一节记录通配入口的最初版本。入口继续仅按 `POST` 与去掉查询串后的精确路径 `/v1/chat/completions` 筛选，配置 `route_name: "*"` 仅控制选择。事件记录请求头阶段实际可读的 Envoy 路由名，缺失、无效或超长时用 `unknown`；计量 metadata 不冒充实际路由。路由快照在请求内不变，不参与客户归属、服务接纳、稳定身份比较或价格选择。
 
 Observer / Consumer 改用 `accepted_service_ids`，兼容旧 `accepted_routes` 中的 service_id，新旧清单不能同时配置。新身份摘要排除 route_name；006 migration、Consumer 跨日期冲突查询和启动 / 周期审计统一从九个类型化身份字段比较新旧记录，不直接比较不同版本的旧摘要，不回填原始事件或自动清除持久冲突标记。同一 event_id 的不同内容仍保留冲突。已有部署先暂停旧 Consumer、执行 006，再升级 Consumer / Observer 和 Wasm；本地共享 Doris 已应用 006。
 
@@ -175,3 +177,39 @@ Observer / Consumer 改用 `accepted_service_ids`，兼容旧 `accepted_routes` 
 | Kubernetes Consumer 归属 | 独立 topic/group `llm-metering-k8s-03888bc89ca7`，提交事件合计 6；缩容后 Empty / 0 成员，恢复后 Stable / 1 成员。最终 5 个 Pod 全就绪、0 次重启；原 istio-system 网关未改变 |
 
 本次测试镜像版本为 `84028685dbf8`；Wasm SHA-256 为 `c63cf60efb6bd07c29a4e45676acac1f913179fb872a9d49fa19a75e75434636`。Kubernetes 证据保存在 `.tmp/k8s-collection/kind-kind/metering-wasm-verify/03888bc89ca7/result.json`，资源保留供检查，清理使用 `make k8s-clean`。本节证明本地合成链路，生产 G0–G5 仍须独立验收。
+
+## 2026-10-16 Host / Bearer 归属接口与唯一事件模型
+
+本节为当前契约的实现及本地验收结果，对应[实现计划](host-service-provider-implementation.md)的 P0–P7。删除应用字段、静态服务上报和身份元数据读取，不保留旧消息/配置兼容分支。Wasm 只临时发送入口 authority 和指定 Authorization: Bearer token；Observer 固定集群/环境，调用两个类型明确的 resolver。当前合法输入均立即返回 lookup_not_implemented，不连接 PG、不构造第三方 HTTP 客户端，不做缓存、重试或假成功归属；URI 空/非空均不启用网络调用。
+
+| 验证 | 实际结果 |
+| --- | --- |
+| `make test` | 契约检查、52 项 Python 测试、主模块和独立插件 Go 竞态测试通过；覆盖 Host 规范化、Bearer/重复头、非法输入跳过查询、独立失败、半成功拒绝、快照和凭据清理 |
+| 构建 / ABI / 生成 | `make build wasm` 通过；固定 protoc 29.3、protoc-gen-go 1.36.5、protoc-gen-go-grpc 1.5.1 再生成内容不变；最终 `make manifest` 与全部产物摘要一致 |
+| 完整 Compose 链路 | `GOFLAGS='-count=1' make local-test` 全部通过，333.724s；覆盖 JSON/SSE/unknown、八类忽略请求、重放/跨日期与归属冲突、黑洞、确认丢失、正文边界、Consumer 攒批/再均衡/恢复、四类下载故障及恢复 |
+| 输入及隐私专项 | 实际旧版 Envoy 拒绝重复 Authorization 的采集身份，业务仍返回 200；六类输入各产生两条事件。独立 Kafka reader 核对全部 12 条记录的 key/value，Doris event_json 和 Observer/Consumer/网关/fixture 日志未包含本次随机合成哨兵 token；拒收诊断不保存敏感/已删除字段另有 Consumer 单元测试 |
+| 成功归属与隔离 | 只在单元测试注入成功 resolver；服务/客户失败互不清除对方。Consumer 实际合成事件覆盖客户、供应商和环境快照冲突及启动巡检；空服务清单允许合法未知服务质量事件，已映射未登记服务仍拒收 |
+| 汇总参考 SQL | 用新契约合成 Kafka 事件在 Doris 4.1.3 执行日/月准备与发布模板；验证集群/环境/供应商分组、未知服务空串键桶、未知客户排除、未知用量 NULL 和服务上报零。没有实现 Worker 或第三方 API，不将此项描述为真实客户归属或发布状态协议验收 |
+| Kubernetes 实际部署 | K8S-WASM-001 在 Kubernetes 1.22.17 / Istio 1.13.5 通过；两 Observer、独立 Consumer、fixture 与原始 Istio 网关共 5 Pod Ready，重启为 0；STRICT mTLS 下远程下载与 gRPC 采集成功 |
+| Kubernetes 数据与消费 | 三个请求各两条事件，共 6 条；cluster_name=kind、deployment_environment=test、request_host=wasm-verify.local，两类状态均 lookup_not_implemented。四项 ID 和两个映射版本均 NULL，identity_status=invalid、usage_eligible=0，正常用量仍为 10/4；缺 usage 为 NULL/unknown |
+| Kubernetes 隔离与恢复 | 专属 topic/group `llm-metering-k8s-cb5990b85930`，专属库 `metering_k8s_cb5990b85930`；3 个分区起点与批次凭据可见，已提交 6 条事件。缩容 Kubernetes Consumer 后组成员为 0，恢复后为 1，位点保持；Compose Consumer 不参与本次消费 |
+| 入口 / 原网关 | 八个忽略请求 selected 保持 3→3，Doris 事件为 0；原 istio-system 网关 Pod 身份和重启次数保持不变 |
+| 清理及数据保留 | `make k8s-clean` 实际执行两次均成功；测试 namespace、topic/group 已不存在，共享 Compose 全部服务继续运行；保留本次 Doris 6 条事件。原共享 metering 库仍为旧结构、287 条历史事件，未原地改表或接入新事件 |
+
+Kubernetes 运行 ID：`cb5990b85930`。镜像由当前工作区构建，tag 按 HEAD 解析为 `d02a46c6c97a`，Wasm SHA-256 为 `c4b0ae3e6fd24f5db2a2b69771e6e5cbd2e095b573ab118347a50bc9d046f6bb`。
+
+| 镜像 | 实际本地镜像 ID |
+| --- | --- |
+| metering-observer:d02a46c6c97a | sha256:c534196c1b8d6625cb08d0285128a0258454583a2697552d56a47b70d5852226 |
+| metering-consumer:d02a46c6c97a | sha256:4af1f6163c27fe10a9a403b1083a5fe92c527b7155b26e4cd7b489b85839f6ba |
+| metering-fixture:d02a46c6c97a | sha256:aec65a7b1b05ea796c86a722103a80470a799ce8e6fac4b11054dacf7d420d70 |
+
+| 场景 | logical_request_id | 观察用量 |
+| --- | --- | --- |
+| json | `10e46fff-43eb-4b55-a400-a35955e06b0f` | known，10 / 4 |
+| sse | `936912c8-0b44-431a-8123-8102c2a96cc1` | known，10 / 4 |
+| unknown | `676405bb-7bc0-45ea-826e-39629cfe66db` | unknown，None / None |
+
+本地诊断在 `.tmp/identity-final-make-test.log`、`.tmp/identity-final-local-test.log`、`.tmp/identity-k8s-final-test.log`；Kubernetes 结构化证据在 `.tmp/k8s-collection/kind-kind/metering-wasm-verify/cb5990b85930/`，清理核对在 `.tmp/identity-k8s-cleanup-check.json`。这些目录不提交，不含原始密钥；本文保留必要摘要及请求 ID。
+
+本节只验收当前接口占位、采集模型和本地合成链路。真实第三方请求/响应、鉴权、异步执行/缓存及外部联调尚未实现；真实 Auth、汇总 Worker、查询 API、生产容量与完整 G0–G5 仍须各自实施及验收。

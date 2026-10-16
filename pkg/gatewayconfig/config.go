@@ -13,7 +13,7 @@ func Decode(b []byte) (Config, error) {
 	if len(b) > 65536 || strictjson.Decode(b, &c) != nil {
 		return c, errors.New("config_invalid")
 	}
-	if c.SchemaVersion != 1 || !str(c.ConfigVersion, 128) || !str(c.GatewayInstanceID, 128) || !str(c.ObserverCluster, 256) || c.IdentityNamespace != "envoy.filters.http.ext_authz" || c.IdentityFields.ApiKeyID != "api_key_id" || c.IdentityFields.CustomerID != "customer_id" || c.IdentityFields.ApplicationID != "application_id" || len(c.Routes) > 128 {
+	if c.SchemaVersion != 1 || !str(c.ConfigVersion, 128) || !str(c.GatewayInstanceID, 128) || !str(c.ObserverCluster, 256) || len(c.Routes) > 128 {
 		return c, errors.New("config_invalid")
 	}
 	if c.Enabled && strings.Contains(c.GatewayInstanceID, "RENDER_") {
@@ -21,7 +21,7 @@ func Decode(b []byte) (Config, error) {
 	}
 	seen := map[string]bool{}
 	for _, r := range c.Routes {
-		if !str(r.RouteName, 128) || seen[r.RouteName] || !str(r.ServiceID, 128) || r.AdapterID != "chat_completions_v1" || len(r.Methods) != 1 || r.Methods[0] != "POST" || len(r.Paths) < 1 || len(r.Paths) > 16 {
+		if !str(r.RouteName, 128) || seen[r.RouteName] || r.AdapterID != "chat_completions_v1" || len(r.Methods) != 1 || r.Methods[0] != "POST" || len(r.Paths) < 1 || len(r.Paths) > 16 {
 			return c, errors.New("config_route")
 		}
 		seen[r.RouteName] = true
@@ -47,7 +47,7 @@ func Decode(b []byte) (Config, error) {
 		}
 	}
 	chunks := (c.RequestBodyMaxBytes + c.ChunkBytes - 1) / c.ChunkBytes
-	if c.ChunkBytes > 16384 || c.RequestBodyMaxBytes > 262144 || c.ResponseBodyMaxBytes > 8388608 || c.RewriteTimeoutMS > 2000 || c.ObservationMaxMS > 600000 || c.AckMaxBytes > 1024 || c.MetadataMaxBytes > 4096 || c.CallbackMaxBytes > c.ChunkBytes*c.CallbackMaxChunks || c.StreamInflightBytes < c.RequestBodyMaxBytes+chunks*256+8192 || c.StreamInflightMessages < chunks+4 || c.RootInflightBytes < c.StreamInflightBytes || c.RootInflightMessages < c.StreamInflightMessages || c.RewriteReservationBytes < c.RequestBodyMaxBytes*4 || c.RootRewriteBudgetBytes < c.RewriteReservationBytes*c.RootMaxRewrites || c.TickMS > c.AckTimeoutMS || c.ObserverCluster == "" {
+	if c.ChunkBytes > 16384 || c.RequestBodyMaxBytes > 262144 || c.ResponseBodyMaxBytes > 8388608 || c.RewriteTimeoutMS > 2000 || c.ObservationMaxMS > 600000 || c.AckMaxBytes > 1024 || c.MetadataMaxBytes < 6144 || c.MetadataMaxBytes > 6144 || c.CallbackMaxBytes > c.ChunkBytes*c.CallbackMaxChunks || c.StreamInflightBytes < c.RequestBodyMaxBytes+chunks*256+8192 || c.StreamInflightMessages < chunks+4 || c.RootInflightBytes < c.StreamInflightBytes || c.RootInflightMessages < c.StreamInflightMessages || c.RewriteReservationBytes < c.RequestBodyMaxBytes*4 || c.RootRewriteBudgetBytes < c.RewriteReservationBytes*c.RootMaxRewrites || c.TickMS > c.AckTimeoutMS || c.ObserverCluster == "" {
 		return c, errors.New("config_budget")
 	}
 	return c, nil

@@ -9,8 +9,6 @@
     "config_version",
     "gateway_instance_id",
     "observer_cluster",
-    "identity_namespace",
-    "identity_fields",
     "routes",
     "chunk_bytes",
     "callback_max_bytes",
@@ -55,29 +53,6 @@
       "minLength": 1,
       "maxLength": 256
     },
-    "identity_namespace": {
-      "const": "envoy.filters.http.ext_authz"
-    },
-    "identity_fields": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": [
-        "api_key_id",
-        "customer_id",
-        "application_id"
-      ],
-      "properties": {
-        "api_key_id": {
-          "const": "api_key_id"
-        },
-        "customer_id": {
-          "const": "customer_id"
-        },
-        "application_id": {
-          "const": "application_id"
-        }
-      }
-    },
     "routes": {
       "type": "array",
       "maxItems": 128,
@@ -88,7 +63,6 @@
           "route_name",
           "methods",
           "paths",
-          "service_id",
           "adapter_id"
         ],
         "properties": {
@@ -118,11 +92,6 @@
               "maxLength": 1024,
               "pattern": "^/[^?#*\\[\\]{}()|^$\\\\]*$"
             }
-          },
-          "service_id": {
-            "type": "string",
-            "minLength": 1,
-            "maxLength": 128
           },
           "adapter_id": {
             "const": "chat_completions_v1"
@@ -222,8 +191,9 @@
     },
     "metadata_max_bytes": {
       "type": "integer",
-      "minimum": 1,
-      "maximum": 4096
+      "minimum": 6144,
+      "maximum": 6144,
+      "default": 6144
     },
     "ack_max_bytes": {
       "type": "integer",

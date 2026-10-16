@@ -10,8 +10,11 @@ import (
 	"github.com/Fangyan33/llm-token-stats/internal/config"
 	"github.com/Fangyan33/llm-token-stats/internal/events"
 	"github.com/Fangyan33/llm-token-stats/internal/health"
+	"github.com/Fangyan33/llm-token-stats/internal/identitylookup"
 	"github.com/Fangyan33/llm-token-stats/internal/producer"
+	"github.com/Fangyan33/llm-token-stats/pkg/credentials"
 	"github.com/Fangyan33/llm-token-stats/pkg/observationwire"
+	"github.com/Fangyan33/llm-token-stats/pkg/requesthost"
 	"github.com/Fangyan33/llm-token-stats/pkg/routeinfo"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -38,12 +41,14 @@ func (Codec) Unmarshal(b []byte, v any) error {
 
 type Server struct {
 	pb.UnimplementedObservationServiceServer
-	Cfg    config.Observer
-	Sink   producer.Sink
-	Health *health.State
-	active atomic.Int64
-	bytes  atomic.Int64
-	Random io.Reader
+	Cfg              config.Observer
+	Sink             producer.Sink
+	Health           *health.State
+	active           atomic.Int64
+	bytes            atomic.Int64
+	Random           io.Reader
+	ServiceResolver  identitylookup.ServiceResolver
+	CustomerResolver identitylookup.CustomerResolver
 }
 
 func (s *Server) reserve(n int64) bool {
@@ -107,6 +112,10 @@ func (s *Server) Observe(stream pb.ObservationService_ObserveServer) error {
 			select {
 			case recv <- received{f, err}:
 			case <-ctx.Done():
+				if st := f.GetStart(); st != nil {
+					clear(st.ApiKey)
+					st.ApiKey = nil
+				}
 				return
 			}
 			if err != nil {
@@ -225,7 +234,7 @@ func (s *Server) Observe(stream pb.ObservationService_ObserveServer) error {
 		e.ObservationStatus = &observation
 		e.BusinessOutcome = &business
 		e.AnomalyCodes = append([]string{}, p.Anomalies...)
-		if start.IdentityStatus != "known" {
+		if e.IdentityStatus != "known" {
 			e.AnomalyCodes = events.Add(e.AnomalyCodes, "identity_invalid")
 		}
 		e.UsageStatus, _ = events.Status(p.Usage)
@@ -277,6 +286,9 @@ func (s *Server) Observe(stream pb.ObservationService_ObserveServer) error {
 			var end *pb.End
 			if start == nil {
 				st := f.GetStart()
+				if st != nil {
+					defer func() { clear(st.ApiKey); st.ApiKey = nil }()
+				}
 				valid = valid && st != nil && s.validStart(st)
 				if !valid {
 					return status.Error(codes.InvalidArgument, "protocol_error")
@@ -285,17 +297,22 @@ func (s *Server) Observe(stream pb.ObservationService_ObserveServer) error {
 				if err != nil {
 					return status.Error(codes.Unavailable, "random_source")
 				}
+				snapshot := s.resolve(ctx, st)
+				if snapshot.ServiceID != nil && !config.AcceptsService(s.Cfg.AcceptedServices, *snapshot.ServiceID) {
+					s.Health.Count("lookup_service_unregistered")
+					return status.Error(codes.InvalidArgument, "service_registration")
+				}
 				start = st
 				st.RouteName = routeinfo.Name(st.RouteName)
-				known := validIdentity(st.ApiKeyId) && validIdentity(st.CustomerId) && validIdentity(st.ApplicationId) && st.IdentityStatus == "known"
-				if !known {
-					st.ApiKeyId = nil
-					st.CustomerId = nil
-					st.ApplicationId = nil
-					st.IdentityStatus = "invalid"
-				}
-				e = &events.Event{SchemaVersion: 1, EventID: id + ":start", EventType: "request_started", LogicalRequestID: id, XRequestID: st.XRequestId, ObservationID: id, ObservationScope: "gateway_response", ProducerID: s.Cfg.ProducerID, GatewayInstanceID: st.GatewayInstanceId, ConfigVersion: st.ConfigVersion, AdapterID: st.AdapterId, RouteName: st.RouteName, ServiceID: st.ServiceId, ApiKeyID: st.ApiKeyId, CustomerID: st.CustomerId, ApplicationID: st.ApplicationId, IdentityStatus: st.IdentityStatus, RequestStartedAtMs: st.RequestStartedAtMs, EventCreatedAtMs: time.Now().UnixMilli(), UsageStatus: "not_applicable", RawUsageJSON: "{}", AnomalyCodes: []string{}}
-				if !known {
+				e = &snapshot
+				e.SchemaVersion, e.EventID, e.EventType = 1, id+":start", "request_started"
+				e.LogicalRequestID, e.ObservationID, e.ObservationScope = id, id, "gateway_response"
+				e.XRequestID, e.ProducerID, e.GatewayInstanceID = st.XRequestId, s.Cfg.ProducerID, st.GatewayInstanceId
+				e.ConfigVersion, e.AdapterID, e.RouteName = st.ConfigVersion, st.AdapterId, st.RouteName
+				e.RequestStartedAtMs, e.EventCreatedAtMs = st.RequestStartedAtMs, time.Now().UnixMilli()
+				e.UsageStatus, e.RawUsageJSON = "not_applicable", "{}"
+				e.AnomalyCodes = []string{}
+				if e.IdentityStatus != "known" {
 					e.AnomalyCodes = events.Add(e.AnomalyCodes, "identity_invalid")
 				}
 				if st.RequestStartedAtMs < time.Now().UnixMilli()-300000 {
@@ -309,7 +326,9 @@ func (s *Server) Observe(stream pb.ObservationService_ObserveServer) error {
 				s.Sink.Emit(&copy)
 				continue
 			}
-			if f.GetStart() != nil {
+			if st := f.GetStart(); st != nil {
+				clear(st.ApiKey)
+				st.ApiKey = nil
 				valid = false
 			}
 			if h := f.GetResponseHeaders(); h != nil {
@@ -406,10 +425,7 @@ func (s *Server) Observe(stream pb.ObservationService_ObserveServer) error {
 func validIdentity(s *string) bool     { return s != nil && validString(*s, 128) }
 func validString(s string, n int) bool { return len(s) > 0 && len(s) <= n && utf8.ValidString(s) }
 func (s *Server) validStart(st *pb.Start) bool {
-	if st.RequestStartedAtMs < 1 || st.RequestStartedAtMs > 253402300799999 || st.RequestStartedAtMs > time.Now().UnixMilli()+300000 || st.Method != "POST" || !validString(st.GatewayInstanceId, 128) || !validString(st.ConfigVersion, 128) || !validString(st.ServiceId, 128) || st.AdapterId != "chat_completions_v1" || !events.Has(s.Cfg.AcceptedConfigs, st.ConfigVersion) || !events.Has(s.Cfg.AcceptedAdapters, st.AdapterId) || len(st.RequestContentType) > 128 || len(st.RequestContentEncoding) > 128 {
-		return false
-	}
-	if st.IdentityStatus != "known" && st.IdentityStatus != "invalid" {
+	if st.RequestStartedAtMs < 1 || st.RequestStartedAtMs > 253402300799999 || st.RequestStartedAtMs > time.Now().UnixMilli()+300000 || st.Method != "POST" || !validString(st.GatewayInstanceId, 128) || !validString(st.ConfigVersion, 128) || st.AdapterId != "chat_completions_v1" || !events.Has(s.Cfg.AcceptedConfigs, st.ConfigVersion) || !events.Has(s.Cfg.AcceptedAdapters, st.AdapterId) || len(st.RequestContentType) > 128 || len(st.RequestContentEncoding) > 128 {
 		return false
 	}
 	if st.XRequestId != nil {
@@ -422,5 +438,48 @@ func (s *Server) validStart(st *pb.Start) bool {
 			}
 		}
 	}
-	return config.AcceptsService(s.Cfg.AcceptedServices, s.Cfg.Routes, st.ServiceId)
+	return true
+}
+
+func (s *Server) resolve(ctx context.Context, st *pb.Start) events.Event {
+	defer func() { clear(st.ApiKey); st.ApiKey = nil }()
+	e := events.Event{ClusterName: s.Cfg.ClusterName, DeploymentEnvironment: s.Cfg.DeploymentEnvironment, IdentityStatus: "invalid", MappingStatus: "invalid_host", CustomerMappingStatus: "invalid_api_key"}
+	host := requesthost.Normalize(st.RequestAuthority)
+	st.RequestAuthority = ""
+	if host != "" {
+		e.RequestHost = events.Ptr(host)
+		resolver := s.ServiceResolver
+		if resolver == nil {
+			resolver = identitylookup.UnimplementedServiceResolver{}
+		}
+		result, err := resolver.Resolve(ctx, identitylookup.ServiceLookupRequest{RequestHost: host, ClusterName: s.Cfg.ClusterName, DeploymentEnvironment: s.Cfg.DeploymentEnvironment})
+		if err != nil {
+			e.MappingStatus = identitylookup.Failure(err)
+		} else if !identitylookup.ValidID(result.ServiceID) || !identitylookup.ValidID(result.ProviderID) {
+			e.MappingStatus = "lookup_invalid_response"
+		} else {
+			e.ServiceID, e.ProviderID = events.Ptr(result.ServiceID), events.Ptr(result.ProviderID)
+			e.MappingStatus = "mapped"
+			e.MappingVersion = events.Ptr(events.Tuple([]any{1, e.ClusterName, e.DeploymentEnvironment, host, result.ServiceID, result.ProviderID}))
+		}
+	}
+	if credentials.ValidToken(st.ApiKey) {
+		resolver := s.CustomerResolver
+		if resolver == nil {
+			resolver = identitylookup.UnimplementedCustomerResolver{}
+		}
+		result, err := resolver.Resolve(ctx, st.ApiKey)
+		if err != nil {
+			e.CustomerMappingStatus = identitylookup.Failure(err)
+		} else if !identitylookup.ValidID(result.APIKeyID) || !identitylookup.ValidID(result.CustomerID) {
+			e.CustomerMappingStatus = "lookup_invalid_response"
+		} else {
+			e.ApiKeyID, e.CustomerID = events.Ptr(result.APIKeyID), events.Ptr(result.CustomerID)
+			e.CustomerMappingStatus, e.IdentityStatus = "mapped", "known"
+			e.CustomerMappingVersion = events.Ptr(events.Tuple([]any{1, e.ClusterName, e.DeploymentEnvironment, result.APIKeyID, result.CustomerID}))
+		}
+	}
+	s.Health.Count("service_mapping_" + e.MappingStatus)
+	s.Health.Count("customer_mapping_" + e.CustomerMappingStatus)
+	return e
 }

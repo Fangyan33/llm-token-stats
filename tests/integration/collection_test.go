@@ -33,7 +33,7 @@ import (
 	"github.com/twmb/franz-go/pkg/kmsg"
 )
 
-const dsn = "root@tcp(127.0.0.1:19030)/metering?timeout=5s&readTimeout=5s&writeTimeout=5s&interpolateParams=true&time_zone=%27%2B00%3A00%27"
+const dsn = "root@tcp(127.0.0.1:19030)/metering_development?timeout=5s&readTimeout=5s&writeTimeout=5s&interpolateParams=true&time_zone=%27%2B00%3A00%27"
 
 func uuid(t *testing.T) string {
 	t.Helper()
@@ -104,6 +104,8 @@ func TestCollectionEndToEnd(t *testing.T) {
 			req, _ := http.NewRequest("POST", "http://127.0.0.1:18080/v1/chat/completions", bytes.NewReader(b))
 			req.Header.Set("Content-Type", "application/json")
 			req.Header.Set("x-request-id", xid)
+			req.Header.Set("Authorization", "Bearer synthetic-sentinel-key")
+			req.Host = "model.example.invalid"
 			res, err := (&http.Client{Timeout: 10 * time.Second}).Do(req)
 			if err != nil {
 				t.Fatal(err)
@@ -126,11 +128,14 @@ func TestCollectionEndToEnd(t *testing.T) {
 			var eligible int
 			var input, output sql.NullInt64
 			eventually(t, func() bool {
-				return db.QueryRow("SELECT logical_request_id,event_json,kafka_partition,usage_status,observation_status,usage_eligible,input_tokens,output_tokens FROM metering.events_raw WHERE x_request_id=? AND event_type='usage_observed'", xid).Scan(&id, &raw, &part, &status, &observation, &eligible, &input, &output) == nil
+				return db.QueryRow("SELECT logical_request_id,event_json,kafka_partition,usage_status,observation_status,usage_eligible,input_tokens,output_tokens FROM metering_development.events_raw WHERE x_request_id=? AND event_type='usage_observed'", xid).Scan(&id, &raw, &part, &status, &observation, &eligible, &input, &output) == nil
 			})
 			var event events.Event
 			if err = json.Unmarshal([]byte(raw), &event); err != nil || event.RouteName != "unknown" {
 				t.Fatal("unnamed Envoy route must be recorded as unknown")
+			}
+			if event.MappingStatus != "lookup_not_implemented" || event.CustomerMappingStatus != "lookup_not_implemented" || event.IdentityStatus != "invalid" || event.ServiceID != nil || event.ProviderID != nil || event.ApiKeyID != nil || event.CustomerID != nil || strings.Contains(raw, "synthetic-sentinel-key") {
+				t.Fatal("unsafe or fabricated mapping")
 			}
 			if observation != "complete" {
 				t.Fatalf("observation=%s", observation)
@@ -139,19 +144,19 @@ func TestCollectionEndToEnd(t *testing.T) {
 				if status != "unknown" || eligible != 0 || input.Valid || output.Valid {
 					t.Fatal("unknown usage became zero or eligible")
 				}
-			} else if status != "known" || eligible != 1 || input.Int64 != 10 || output.Int64 != 4 {
+			} else if status != "known" || eligible != 0 || input.Int64 != 10 || output.Int64 != 4 {
 				t.Fatal("reported usage mismatch")
 			}
 			var count int
-			if err = db.QueryRow("SELECT COUNT(*) FROM metering.events_raw WHERE logical_request_id=?", id).Scan(&count); err != nil || count != 2 {
+			if err = db.QueryRow("SELECT COUNT(*) FROM metering_development.events_raw WHERE logical_request_id=?", id).Scan(&count); err != nil || count != 2 {
 				t.Fatalf("event count=%d err=%v", count, err)
 			}
-			offset := publish(t, cl, "llm-metering-events", part, id, []byte(raw))
+			offset := publish(t, cl, "llm-metering-development", part, id, []byte(raw))
 			eventually(t, func() bool {
 				var n int
-				return db.QueryRow("SELECT COUNT(*) FROM metering.consumer_batch_receipts WHERE kafka_topic='llm-metering-events' AND kafka_partition=? AND first_offset<=? AND next_offset>?", part, offset, offset).Scan(&n) == nil && n > 0
+				return db.QueryRow("SELECT COUNT(*) FROM metering_development.consumer_batch_receipts WHERE kafka_topic='llm-metering-development' AND kafka_partition=? AND first_offset<=? AND next_offset>?", part, offset, offset).Scan(&n) == nil && n > 0
 			})
-			if err = db.QueryRow("SELECT COUNT(*) FROM metering.events_raw WHERE logical_request_id=?", id).Scan(&count); err != nil || count != 2 {
+			if err = db.QueryRow("SELECT COUNT(*) FROM metering_development.events_raw WHERE logical_request_id=?", id).Scan(&count); err != nil || count != 2 {
 				t.Fatal("identical replay was not deduplicated")
 			}
 			if tc.name == "json" {
@@ -159,17 +164,17 @@ func TestCollectionEndToEnd(t *testing.T) {
 				json.Unmarshal([]byte(raw), &e)
 				e.ProducerID = "synthetic-variant"
 				variant, _ := events.Canonical(&e)
-				publish(t, cl, "llm-metering-events", part, id, variant)
+				publish(t, cl, "llm-metering-development", part, id, variant)
 				eventually(t, func() bool {
 					var n int
-					return db.QueryRow("SELECT COUNT(*) FROM metering.request_conflict_ids WHERE logical_request_id=?", id).Scan(&n) == nil && n == 1
+					return db.QueryRow("SELECT COUNT(*) FROM metering_development.request_conflict_ids WHERE logical_request_id=?", id).Scan(&n) == nil && n == 1
 				})
-				if err = db.QueryRow("SELECT has_conflict FROM metering.requests WHERE logical_request_id=?", id).Scan(&count); err != nil || count != 1 {
+				if err = db.QueryRow("SELECT has_conflict FROM metering_development.requests WHERE logical_request_id=?", id).Scan(&count); err != nil || count != 1 {
 					t.Fatal("conflict leaked into valid request projection")
 				}
 				eventually(t, func() bool {
 					var n int
-					return db.QueryRow("SELECT COUNT(*) FROM metering.summary_dirty_notifications WHERE reason='CONFLICT' AND kafka_partition=?", part).Scan(&n) == nil && n > 0
+					return db.QueryRow("SELECT COUNT(*) FROM metering_development.summary_dirty_notifications WHERE reason='CONFLICT' AND kafka_partition=?", part).Scan(&n) == nil && n > 0
 				})
 			}
 		})
@@ -200,7 +205,7 @@ func TestCollectionEndToEnd(t *testing.T) {
 		}
 		var count int
 		where := "'" + strings.Join(ids, "','") + "'"
-		if err := db.QueryRow("SELECT COUNT(*) FROM metering.events_raw WHERE x_request_id IN (" + where + ")").Scan(&count); err != nil || count != 0 {
+		if err := db.QueryRow("SELECT COUNT(*) FROM metering_development.events_raw WHERE x_request_id IN (" + where + ")").Scan(&count); err != nil || count != 0 {
 			t.Fatal("non-whitelisted request generated events")
 		}
 	})
@@ -243,7 +248,7 @@ func localStore(t *testing.T, target string) *doris.Store {
 	t.Setenv("METERING_TEST_USER", "root")
 	t.Setenv("METERING_TEST_PASS", "")
 	u, _ := url.Parse(target)
-	s, err := doris.New(config.Doris{FE: target, AllowedHosts: []string{u.Host}, DSNEnv: "METERING_TEST_DSN", UsernameEnv: "METERING_TEST_USER", PasswordEnv: "METERING_TEST_PASS", Database: "metering"})
+	s, err := doris.New(config.Doris{FE: target, AllowedHosts: []string{u.Host}, DSNEnv: "METERING_TEST_DSN", UsernameEnv: "METERING_TEST_USER", PasswordEnv: "METERING_TEST_PASS", Database: "metering_development"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -280,7 +285,7 @@ func TestStreamLoadConfirmationLoss(t *testing.T) {
 	defer proxy.Close()
 	s := localStore(t, proxy.URL)
 	id := uuid(t)
-	rows := []map[string]any{{"group_id": "test-confirmation-" + id, "kafka_topic": "llm-metering-events", "kafka_partition": 0, "origin_id": events.Hash([]byte(id)), "initial_offset": 0, "created_at": consumer.Stamp(time.Now())}}
+	rows := []map[string]any{{"group_id": "test-confirmation-" + id, "kafka_topic": "llm-metering-development", "kafka_partition": 0, "origin_id": events.Hash([]byte(id)), "initial_offset": 0, "created_at": consumer.Stamp(time.Now())}}
 	body := consumer.EncodeRows(rows)
 	label := "test_confirmation_" + events.Hash(body)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -311,7 +316,7 @@ func TestUnknownSchemaPausesPartition(t *testing.T) {
 		t.Fatalf("create local test topic: %v", err)
 	}
 	s := localStore(t, "http://127.0.0.1:18040")
-	c := config.Config{Kafka: config.Kafka{Brokers: []string{"127.0.0.1:29092"}, Topic: topic}, Consumer: config.Consumer{Group: group, AcceptedConfigs: []string{"collection-v1"}, Routes: []config.Route{{RouteName: "llm-chat", ServiceID: "model-service-a"}}}, Doris: s.Cfg}
+	c := config.Config{Kafka: config.Kafka{Brokers: []string{"127.0.0.1:29092"}, Topic: topic}, Consumer: config.Consumer{Group: group, AcceptedConfigs: []string{"collection-v1"}, AcceptedServices: []string{"model-service-a"}}, Doris: s.Cfg}
 	if err = c.ConsumerDefaults(); err != nil {
 		t.Fatal(err)
 	}
@@ -328,7 +333,7 @@ func TestUnknownSchemaPausesPartition(t *testing.T) {
 	publish(t, cl, topic, 0, "synthetic", []byte(`{}`))
 	eventually(t, func() bool {
 		var n int
-		return db.QueryRow("SELECT COUNT(*) FROM metering.consumer_batch_receipts WHERE kafka_topic=? AND next_offset=1", topic).Scan(&n) == nil && n == 1
+		return db.QueryRow("SELECT COUNT(*) FROM metering_development.consumer_batch_receipts WHERE kafka_topic=? AND next_offset=1", topic).Scan(&n) == nil && n == 1
 	})
 	// The version sentinel is deliberately sent after the preceding batch commits.
 	ctx, cancel = context.WithTimeout(context.Background(), 10*time.Second)
@@ -370,7 +375,7 @@ func TestProducerBlackholeIsBounded(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	h := &health.State{}
-	p, err := producer.New(ctx, config.Kafka{Brokers: []string{l.Addr().String()}, Topic: "llm-metering-events"}, h, func() { t.Error("producer failed to close within watchdog budget") })
+	p, err := producer.New(ctx, config.Kafka{Brokers: []string{l.Addr().String()}, Topic: "llm-metering-development"}, h, func() { t.Error("producer failed to close within watchdog budget") })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -435,6 +440,8 @@ func TestHTTPRewriteBoundariesAndTimeout(t *testing.T) {
 			req, _ := http.NewRequest("POST", "http://127.0.0.1:18080/v1/chat/completions", reader)
 			req.Header.Set("Content-Type", "application/json")
 			req.Header.Set("x-request-id", xid)
+			req.Header.Set("Authorization", "Bearer synthetic-sentinel-key")
+			req.Host = "model.example.invalid"
 			res, err := (&http.Client{Timeout: 10 * time.Second}).Do(req)
 			if err != nil {
 				t.Fatal(err)
@@ -451,7 +458,7 @@ func TestHTTPRewriteBoundariesAndTimeout(t *testing.T) {
 				}
 				eventually(t, func() bool {
 					var n int
-					return db.QueryRow("SELECT COUNT(*) FROM metering.events_raw WHERE logical_request_id=? AND x_request_id=?", id, xid).Scan(&n) == nil && n == 2
+					return db.QueryRow("SELECT COUNT(*) FROM metering_development.events_raw WHERE logical_request_id=? AND x_request_id=?", id, xid).Scan(&n) == nil && n == 2
 				})
 			}
 			if tc.slow {
@@ -459,7 +466,7 @@ func TestHTTPRewriteBoundariesAndTimeout(t *testing.T) {
 					var status string
 					var input sql.NullInt64
 					var terminal, eligible int
-					return db.QueryRow("SELECT observation_status,input_tokens,terminal_observed,usage_eligible FROM metering.events_raw WHERE x_request_id=? AND event_type='usage_observed'", xid).Scan(&status, &input, &terminal, &eligible) == nil && status != "complete" && !input.Valid && terminal == 0 && eligible == 0
+					return db.QueryRow("SELECT observation_status,input_tokens,terminal_observed,usage_eligible FROM metering_development.events_raw WHERE x_request_id=? AND event_type='usage_observed'", xid).Scan(&status, &input, &terminal, &eligible) == nil && status != "complete" && !input.Valid && terminal == 0 && eligible == 0
 				})
 			}
 		})

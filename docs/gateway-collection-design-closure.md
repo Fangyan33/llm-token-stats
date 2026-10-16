@@ -2,6 +2,8 @@
 
 修订日期：2026-10-15。插件、SDK 扩展、Observer、Consumer 已实现并完成公开旧版 Envoy/Kafka/Doris 本地联调；生产完整门槛未验收。实现结果与已确认的请求头 Continue 调整见[运行说明](collection-components.md)。本文与[开发实现方案](gateway-request-collection-implementation.md)共同构成采集子项的实施依据。
 
+归属接口及占位已实现，详见[实现计划](spec/plan/host-service-provider-implementation.md)。当前 Start 只携带 Host 与临时 Bearer token，Observer 固定集群/环境并调用两个未实现 resolver；合法输入归属未知，原始 usage 保留。application_id、身份元数据配置和静态服务上报已删除，真实 HTTP/第三方鉴权未实现。
+
 ## 1. 交付物与变更规则
 
 | 契约 | 唯一文件 | 使用方 |
@@ -17,13 +19,13 @@ Schema 描述类型和固定字段集；UTF-8 字节上限、跨字段状态、K
 
 字段顺序以事件 Schema 的 properties 顺序为规范 Go struct 顺序；usage 顺序为 input、output、cached_read、cached_write、reasoning、reported_total，各子项按 value、source 排列。Consumer 重编码顺序固定，使用 Go encoding/json 默认转义；raw_usage_json 的字符串内容作为冻结依据原样保留，不按另一个 JSON 排序器改写。辅助校验器提供相同顺序和转义的摘要参考，正式 Go 实现仍须与它做 golden 对照。
 
-新增字段或改变含义须提升 Kafka schema_version，并先发布可读取新旧版本的 Consumer 与数据库，再发布 Producer；不得直接修改已上线 v1 struct 重算旧摘要。观察协议字段号独立演进，2 已 reserved。go_package 已固定为 github.com/Fangyan33/llm-token-stats/gen/observation/v1；生成工具版本见运行说明。
+功能尚未上线，本次归属变更按新计划直接修改唯一 schema、DDL、编码和合成样例，不新增双版本 Consumer 或旧格式兼容路径。正式上线后的契约演进再单独制定版本与发布顺序，不能回写已产生事件或重算其旧摘要。观察字段删除后标记 reserved，不能复用编号；Start 的 5、7、8、9、10 和消息的 2 已 reserved。go_package 已固定为 github.com/Fangyan33/llm-token-stats/gen/observation/v1；生成工具版本见运行说明。
 
 Wasm 文件随 Observer 镜像发布，由独立 HTTP 下载服务提供单个当前版本；网关以远程 URL 和实际文件 SHA-256 加载。更新文件先完成 Observer 全副本发布和下载摘要核对，再切换网关；旧摘要下载失败允许暂时缺少采集，恢复后显式重新加载。文件版本回退先恢复对应 Observer 镜像，再恢复网关配置。该文件发布顺序与下述采集注册版本兼容要求同时满足。
 
 配置发布先让 Observer 接受新版本及仍存活的旧 Root 版本，再更新网关；回退同样先核查接纳清单。Consumer 保留所有在线窗口内历史 config_version/route/service 登记，不能因为网关移除路由或旧版本而拒收合法重放。白名单限制新采集与历史事件校验分别管理。
 
-当前入口用 `route_name: "*"` 忽略路由名，只按 POST 和精确路径 `/v1/chat/completions` 筛选；缺少路由 metadata 也可采集。事件 route_name 为真实 Envoy HTTP 路由名，不可读时为 `unknown`，仅用于诊断；service_id / adapter_id 仍来自配置。Observer / Consumer 按 accepted_service_ids 接纳；兼容旧 accepted_routes 中的 service_id，保留历史事件原文。路由不进入稳定身份比较；[006 migration](../migrations/doris/metering/006_optional_route_identity.sql) 使新旧数据按相同字段比较，不回填原始证据或撤销既有冲突标记。
+当前入口 route_name=* 只按 POST 和精确路径筛选。事件记录实际路由名或 unknown，仅诊断；adapter_id 来自规则，service/provider 由 Observer 接口解析，当前为 null。Consumer/Observer 只对 mapped 服务执行 accepted_service_ids 精确登记检查；未知服务保留质量事件。006 初始化同一新模型的类型化身份投影，不维护旧格式或旧摘要兼容。
 
 ## 2. 本轮关闭的设计缺口
 
@@ -46,8 +48,8 @@ Wasm 文件随 Observer 镜像发布，由独立 HTTP 下载服务提供单个�
 
 | 消息 | 强制校验 |
 | --- | --- |
-| Start | frame_seq=1、每流一次、schema_version=1；时间为 [1,253402300799999] Unix 毫秒且不超前 5 分钟；method=POST；实例/配置/路由/服务与身份 ID 各 ≤128 字节，adapter ≤64；可信身份缺项或无效统一置 null、标 invalid；模型不在 Start；x_request_id 符合主方案 |
-| Start 接纳 | adapter/config_version 在 Observer 发布白名单中，service_id 在服务白名单中，route_name 可缺失；未接纳不分配 UUID、不产生事件；ID 随有效流只生成一次 |
+| Start | frame_seq=1、每流一次、schema_version=1；时间为 [1,253402300799999] Unix 毫秒且不超前 5 分钟；method=POST；实例/配置各 ≤128 字节，adapter 固定 chat_completions_v1；route_name 不是准入条件，缺失/超长归一为 unknown；authority ≤512 字节、临时 api_key ≤4096 字节；Start 不含任何归属 ID，模型不在 Start，x_request_id 符合主方案 |
+| Start 接纳 | adapter/config_version 在 Observer 发布白名单中，服务 resolver 成功时其 service_id 在服务白名单中，未映射允许 null，route_name 可缺失；未接纳不分配 UUID、不产生事件；ID 随有效流只生成一次 |
 | Content-Type / Encoding | 只读取指定头，各 ≤128 字节；JSON 仅 application/json，SSE 仅 text/event-stream（忽略媒体类型大小写，允许参数）；无编码或 identity 支持，不尝试猜测或解压；未知类型产出固定异常码 |
 | ResponseHeaders | 一次最终响应，状态 200–599，1xx 不发送；必须在响应正文前；同一方向 EOS 后不得继续正文 |
 | BodyChunk | Direction 仅 REQUEST/RESPONSE；frame_seq 连续，每方向 body_seq 从1连续、offset 从0连续；加法检查溢出；零字节帧只允许首次宣告 EOS，不能无限空帧占 CPU |
@@ -110,7 +112,7 @@ Doris 与 Kafka 不使用分布式事务，此处依靠固定事件、幂等表�
 
 G0/G1 未通过不得进入网关灰度；G2/G3 未通过不得扩大采集；G4/G5 未通过不得宣布生产验收。设计阶段不伪造集群地址、镜像 digest、容量或测试报告；SDK PoC 失败须记录事实重新评审方案。
 
-发布记录至少保存：采集开始 UTC 日期、环境版本/digest、WASM及SDK补丁摘要、协议版本、插件/Observer/Consumer接受白名单、Kafka分区/保留/ACL、Doris采集/汇总迁移版本及Auth PostgreSQL迁移版本、单个发布Worker的调度/保护配置、采集Worker数/最大存活代数、资源上限、每个G门槛的报告位置与负责人、上一版镜像/配置及回退验证。记录不含密钥与正文。
+发布记录至少保存：采集开始 UTC 日期、环境版本/digest、WASM及SDK补丁摘要、协议版本、插件/Observer/Consumer接受白名单、Kafka分区/保留/ACL、Doris采集/汇总迁移版本及已有 Auth 接入版本、单个发布Worker的调度/保护配置、采集Worker数/最大存活代数、资源上限、每个G门槛的报告位置与负责人、上一版镜像/配置及回退验证。记录不含密钥与正文。
 
 ## 7. 可复现的离线检查
 

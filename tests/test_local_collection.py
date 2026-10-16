@@ -38,6 +38,18 @@ class LocalCollectionTests(unittest.TestCase):
             local.infra_up()
         starts = [call.args for call in compose.call_args_list if call.args[0] == 'up']
         self.assertEqual(starts, [('up', '-d', 'kafka', 'doris')])
+        guard = next(call.args[-1] for call in compose.call_args_list
+                     if isinstance(call.args[-1], str) and 'information_schema.columns' in call.args[-1])
+        self.assertIn("table_schema='metering_development'", guard)
+
+    def test_incompatible_database_is_rejected_before_ddl(self):
+        readiness = result('BackendId\tAlive\n1\ttrue\n')
+        with patch.object(local, 'external_host'), patch.object(local, 'migrate_storage'), \
+                patch.object(local, 'run', return_value=result('application_id\n')) as compose, \
+                patch.object(local.subprocess, 'run', return_value=readiness):
+            with self.assertRaisesRegex(RuntimeError, 'Incompatible existing Doris schema'):
+                local.infra_up()
+        self.assertFalse(any(call.kwargs.get('input') for call in compose.call_args_list))
 
     def test_gateway_render_replaces_local_source_and_refreshes_checksum(self):
         with tempfile.TemporaryDirectory() as temp, patch.object(local, 'ROOT', Path(temp)):

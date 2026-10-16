@@ -1,8 +1,10 @@
 # Doris 采集与汇总协调设计
 
-修订日期：2026-10-13。状态：设计与参考 DDL；Consumer、usage-worker、查询 API 和调度保护尚待实现，未执行目标集群验收。
+修订日期：2026-10-16。状态：Consumer 已实现日期通知、批次凭据、冲突巡检和恢复屏障，并完成本地链路验证；usage-worker、查询 API、调度及发布保护仍为设计与参考 DDL，尚未完成生产验收。Consumer 的证据与边界见[组件运行说明](collection-components.md)。
 
-采集与汇总使用 Kafka 和 Doris，通知、处理水位、刷新输入及发布状态全部保存在 Doris。无需为这条链路新增 PostgreSQL 实例、schema、连接或账号。Auth 的 PostgreSQL 仍按[鉴权方案](api-key-auth-service-implementation.md)保存身份和密钥，不参与计量汇总协调。统计口径、保留期及查询 API 见[日/月汇总设计](daily-monthly-summary-design.md)。
+当前唯一归属模型已删除应用字段，加入服务/供应商及部署上下文；查询接口暂为未实现占位，Consumer 不访问 PG 或第三方 API。实际汇总 Worker/发布状态及查询 API 仍待实施。
+
+采集与汇总使用 Kafka 和 Doris，通知、处理水位、刷新输入及发布状态全部保存在 Doris。无需为这条链路新增 PostgreSQL 实例、schema、连接或账号。已有鉴权系统独立管理身份/凭证，不向采集链路增加 PostgreSQL 依赖，见[鉴权职责](api-key-auth-service-implementation.md)。统计口径、保留期及查询 API 见[日/月汇总设计](daily-monthly-summary-design.md)。
 
 ## 1. 数据表与写入责任
 
@@ -85,8 +87,8 @@ Doris 显式事务不能包含 DDL；REPLACE PARTITION 与发布状态写入分�
 
 ## 7. 迁移与验收
 
-新环境执行 Doris 001、002、004、005、006；已有 Doris 环境按需执行 003 保留期迁移，再执行缺失的后续迁移，并核对实际 schema。006 更新请求视图，诊断 route_name 不参与新旧记录的身份比较；升级前暂停旧 Consumer，再更新 Consumer / Observer 和 Wasm。旧 [PostgreSQL usage 迁移](../migrations/postgres/usage/001_summary_refresh_state.sql)已退役为空操作说明，不执行建库或建表；Auth PostgreSQL migration 不受影响。
+当前新契约使用全新隔离库执行 Doris 001、002、004、005、006；已有旧模型库保留，不原地套用 CREATE TABLE IF NOT EXISTS。003 只调整同模型的保留期，不能升级旧字段。006 初始化唯一新模型请求视图，诊断 route_name 不参与身份比较；新契约使用隔离库和 topic，不接纳旧格式。旧 [PostgreSQL usage 迁移](../migrations/postgres/usage/001_summary_refresh_state.sql)已退役为空操作说明，不执行建库或建表；真实 Auth 数据源在独立工作包确定，不属于本次初始化。
 
 若某个环境曾试验旧状态表，先停止所有旧 Worker，保存 Kafka 进度、成功 refresh_id、覆盖范围和未完成任务；将已发布分区核验后迁入 Doris 状态，未确认日期重新生成初始化/修复通知，再从 Kafka committed offset 恢复 Consumer。纯 Doris 切换验证完成前保留旧状态备份；本次文档/DDL 更新不自动删除已部署数据库。仅建新表不能证明历史覆盖。
 
-验收至少覆盖通知重放、批次重新分组可额外重算但不累计用量、所有日期的跨日冲突通知、通知/凭据写入分别失败、提交失败/rebalance、确认丢失、计算期间新通知、零行发布、每个发布阶段崩溃、run/状态写入间崩溃、月份自动发现日版本变化、覆盖缺口、查询前后版本变化、CronJob 漏调/重试/手动并发、Lease 失效与保守接管、孤儿 SQL/临时分区及元数据容量。当前仅交付参考方案及 DDL，不能宣称这些场景已经通过。
+验收至少覆盖通知重放、批次重新分组可额外重算但不累计用量、所有日期的跨日冲突通知、通知/凭据写入分别失败、提交失败/rebalance、确认丢失、计算期间新通知、零行发布、每个发布阶段崩溃、run/状态写入间崩溃、月份自动发现日版本变化、覆盖缺口、查询前后版本变化、CronJob 漏调/重试/手动并发、Lease 失效与保守接管、孤儿 SQL/临时分区及元数据容量。Consumer 已完成的本地子项以验证记录为准；Worker、发布和查询部分仍只有参考方案及 DDL，不能把 Consumer 联调通过扩展为这些场景全部通过。

@@ -28,13 +28,9 @@ func check(_ any, ctx context.Context, dec func(any) error, _ grpc.UnaryServerIn
 	if err := dec(&req); err != nil {
 		return nil, err
 	}
-	meta := []byte{}
-	for _, p := range [][2]string{{"api_key_id", "key-test"}, {"customer_id", "customer-test"}, {"application_id", "app-test"}} {
-		entry := w.String(nil, 1, p[0])
-		entry = w.Bytes(entry, 2, w.String(nil, 3, p[1]))
-		meta = w.Bytes(meta, 1, entry)
-	}
-	res := raw(w.Bytes(w.Bytes(w.Bytes(nil, 1, nil), 3, nil), 4, meta))
+	defer clear(req)
+	res := raw(w.Bytes(nil, 1, nil))
+
 	return &res, nil
 }
 func main() {

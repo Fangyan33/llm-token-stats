@@ -2,6 +2,8 @@
 
 状态：后续可选方案，修订日期：2026-10-13。当前不交付 archive-worker、归档状态 schema、S3/MinIO 部署或归档查询接口；一期仅依赖 Doris 一年明细、日/月汇总及[Doris 协调状态](doris-summary-coordination.md)，采集与汇总无需额外 PostgreSQL。
 
+当前代码只交付采集/Consumer 和汇总 DDL/参考 SQL，尚无日/月 Worker 或归档运行组件。本文为可选目标；归属字段采用[接口实现](spec/plan/host-service-provider-implementation.md)的唯一事件模型，不在归档侧重新查询 PG 或第三方 API 改写历史归属。
+
 ## 1. 何时采用
 
 一期原始事件按 UTC 请求日期分区，在线保留 365 个日期。日/月汇总独立保留约两年。只有后续需要保存超过一年明细、长期恢复或降低在线存储成本时，才评估归档工作包；归档保存期限、查询时效和对象存储费用届时另行确认。

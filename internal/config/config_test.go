@@ -86,46 +86,54 @@ func TestConsumerFlushConfiguration(t *testing.T) {
 	}
 }
 
-func TestServiceAdmissionAndLegacyConfiguration(t *testing.T) {
+func TestServiceRegistration(t *testing.T) {
 	for _, component := range []string{"observer", "consumer"} {
-		for _, mode := range []string{"services", "legacy_routes", "legacy_without_route", "missing", "duplicate", "mixed"} {
-			t.Run(component+"/"+mode, func(t *testing.T) {
-				t.Setenv("POD_UID", "observer-test")
-				c, err := Read("../../configs/" + component + ".local.json")
-				if err != nil {
-					t.Fatal(err)
-				}
-				services := []string{"model-service-a"}
-				var routes []Route
-				switch mode {
-				case "legacy_routes":
-					services = nil
-					routes = []Route{{RouteName: "old-route", ServiceID: "model-service-a"}, {RouteName: "*", ServiceID: "model-service-a"}}
-				case "legacy_without_route":
-					services = nil
-					routes = []Route{{ServiceID: "model-service-a"}}
-				case "missing":
-					services = nil
-				case "duplicate":
-					services = append(services, services[0])
-				case "mixed":
-					routes = []Route{{ServiceID: "other"}}
-				}
-				if component == "observer" {
-					c.Observer.AcceptedServices, c.Observer.Routes = services, routes
-					err = c.ObserverDefaults()
-				} else {
-					c.Consumer.AcceptedServices, c.Consumer.Routes = services, routes
-					err = c.ConsumerDefaults()
-				}
-				valid := mode == "services" || mode == "legacy_routes" || mode == "legacy_without_route"
-				if (err == nil) != valid {
-					t.Fatalf("configuration error: %v", err)
-				}
-				if valid && (!AcceptsService(services, routes, "model-service-a") || AcceptsService(services, routes, "unregistered")) {
-					t.Fatal("service allowlist bypassed")
-				}
-			})
+		for _, services := range [][]string{nil, {"model-service-a"}, {"model-service-a", "model-service-a"}} {
+			t.Setenv("POD_UID", "observer-test")
+			c, err := Read("../../configs/" + component + ".local.json")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if component == "observer" {
+				c.Observer.AcceptedServices = services
+				err = c.ObserverDefaults()
+			} else {
+				c.Consumer.AcceptedServices = services
+				err = c.ConsumerDefaults()
+			}
+			if (err == nil) != (len(services) < 2) {
+				t.Fatal("registration validation")
+			}
+			if AcceptsService(services, "other") {
+				t.Fatal("unregistered service")
+			}
+		}
+	}
+}
+func TestLookupContextAndURI(t *testing.T) {
+	for _, change := range []func(*Observer){
+		func(o *Observer) { o.ClusterName = "" }, func(o *Observer) { o.DeploymentEnvironment = "staging" },
+		func(o *Observer) { o.ServiceLookup.URI = "https://user:password@example.invalid/" },
+		func(o *Observer) { o.CustomerLookup.URI = "https://example.invalid/?api_key=secret" },
+		func(o *Observer) { o.ServiceLookup.URI = "relative/path" },
+	} {
+		c, err := Read("../../configs/observer.local.json")
+		if err != nil {
+			t.Fatal(err)
+		}
+		change(&c.Observer)
+		if c.ObserverDefaults() == nil {
+			t.Fatal("invalid lookup configuration accepted")
+		}
+	}
+	for _, name := range []string{"metering", "metering_isolated_123", "x"} {
+		if !DatabaseName(name) {
+			t.Fatal("valid database rejected")
+		}
+	}
+	for _, name := range []string{"", "metering.bad", "metering`", "x;DROP DATABASE metering", "a-b"} {
+		if DatabaseName(name) {
+			t.Fatal("unsafe database accepted")
 		}
 	}
 }

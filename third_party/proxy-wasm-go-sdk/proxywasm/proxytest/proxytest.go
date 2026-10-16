@@ -285,6 +285,25 @@ func (h *hostEmulator) ProxySetProperty(pathPtr *byte, pathSize int, dataPtr *by
 // impl internal.ProxyWasmHost
 func (h *hostEmulator) ProxyGetProperty(pathPtr *byte, pathSize int, dataPtrPtr **byte, dataSizePtr *int) internal.Status {
 	path := internal.RawBytePtrToString(pathPtr, pathSize)
+	if strings.HasPrefix(path, "request\x00headers\x00") {
+		stream := h.httpStreams[internal.VMStateGetActiveContextID()]
+		if stream == nil {
+			return internal.StatusNotFound
+		}
+		key := strings.TrimPrefix(path, "request\x00headers\x00")
+		var values []string
+		for _, pair := range stream.requestHeaders {
+			if strings.EqualFold(pair[0], key) {
+				values = append(values, pair[1])
+			}
+		}
+		data := []byte(strings.Join(values, ","))
+		if len(data) == 0 {
+			return internal.StatusNotFound
+		}
+		*dataPtrPtr, *dataSizePtr = &data[0], len(data)
+		return internal.StatusOK
+	}
 	if _, ok := h.properties[path]; !ok {
 		return internal.StatusNotFound
 	}

@@ -1,10 +1,12 @@
 # Kafka 计量事件应用接入指南
 
-本文面向订阅计量事件的应用开发者，依据 [网关请求采集开发实现方案](gateway-request-collection-implementation.md) 中的 **schema_version=1 设计契约**编写。该方案目前是开发设计，尚未完成真实 Kafka 集群联调；实际 Broker 地址、认证方式、访问权限和上线版本由部署环境提供。
+本文面向订阅计量事件的应用开发者，描述[网关请求采集开发实现方案](gateway-request-collection-implementation.md)对应的当前 **schema_version=1 契约**。采集、Kafka 和 Doris 已有真实本地链路验证，记录见[验证记录](spec/plan/gateway-collection-verification.md)；生产 Broker、认证权限及完整 G0–G5 尚需在实际环境验收。
+
+本页描述唯一有效事件模型：应用维度已删除，归属由 Observer 的服务/客户接口解析，目前均为未实现占位。合法输入的 ID 和版本为 null，mapping_status/customer_mapping_status 为 lookup_not_implemented，identity_status=invalid、usage_eligible=false，usage 可仍为 known。当前不发第三方请求，也不发送或接收原始 api_key 事件字段。
 
 正式字段契约见 [事件 Schema](../api/events/v1/metering-event.schema.json)，合成事件见 [testdata/collection](../testdata/collection)。运行时还须执行 UTF-8 字节、状态关系、来源与 Kafka key 校验；[离线校验器](../scripts/validate_collection_contracts.py)提供可复现参考。Doris Consumer 的写入/冲突/dirty/提交恢复顺序见[闭环清单](gateway-collection-design-closure.md#5-consumer-提交与恢复屏障)。
 
-采集与汇总协调使用 Doris 保存日期通知、消费批次凭据和发布状态，无额外 PostgreSQL 依赖；Consumer 在这些记录确认可见后提交自己的 offset，参见[Doris 协调设计](doris-summary-coordination.md)。这些是平台内部处理元数据，不加入 schema_version=1 Kafka value，也不要求其他订阅应用建设同样的状态表；各应用仍按自己的幂等处理结果提交消费进度。
+采集与汇总协调使用 Doris 保存日期通知、消费批次凭据和发布状态，无额外 PostgreSQL 依赖。Consumer 在原始/拒收记录、冲突标记、日期通知及批次凭据确认可见后提交 offset，不等待尚未实现的 Worker 发布汇总；发布状态由未来 Worker 负责，参见[Doris 协调设计](doris-summary-coordination.md)。这些内部处理元数据不加入 schema_version=1 Kafka value，也不要求其他订阅应用建设同样的状态表；各应用仍按自己的幂等处理结果提交进度。
 
 ## 1. 接入信息
 
@@ -53,12 +55,17 @@ UUIDv4 不包含时间。`request_started_at_ms` 仍由网关观察并作为事�
 | `gateway_instance_id` | 字符串 / 否 | 观察该请求的网关实例标识。 |
 | `config_version` | 字符串 / 否 | 请求开始时固定的采集配置版本，用于解释当时的采集规则。固定为 `collection-v1` |
 | `adapter_id` | 字符串 / 否 | 解析上游协议的适配器 ID；当前接入范围固定为 `chat_completions_v1`。 |
-| `route_name` | 字符串 / 否 | 真实 Envoy HTTP 路由名；不可读时为 `unknown`。仅用于诊断、审计，不参与身份一致性、准入或价格选择；不是 VirtualService 名称或后端 ID。字段保留非空字符串，业务上可缺失；历史 `*` 原文保留。事件不携带原始 URL 或 query。 |
-| `service_id` | 字符串 / 否 | 路由配置确定的目标业务服务标识，不从客户端请求猜测。 |
-| `api_key_id` | 字符串 / 是 | Auth 给出的稳定 API Key ID，不是密钥原文；身份信息缺失时为 `null`。 |
-| `customer_id` | 字符串 / 是 | 鉴权时的客户归属快照；用于租户范围过滤。 |
-| `application_id` | 字符串 / 是 | 鉴权时的应用归属快照。 |
-| `identity_status` | 字符串 / 否 | `known` 表示上述三个身份 ID 齐全，`invalid` 表示可信身份信息不完整；后者不进入有效用量统计。 |
+| `route_name` | 字符串 / 否 | 真实 Envoy HTTP 路由名；不可读时为 `unknown`。仅用于诊断、审计，不参与身份一致性、准入或价格选择；不是 VirtualService 名称或后端 ID。字段保留非空字符串，业务上可缺失；当前网关不输出 `*`，Consumer 不按诊断值判断身份。事件不携带原始 URL 或 query。 |
+| `request_host` | 字符串 / 是 | 规范入口 DNS 域名；非法输入为 null，不保存 URL/query。 |
+| `cluster_name` | 字符串 / 否 | Observer 配置的固定集群名称，客户端不可覆盖。 |
+| `deployment_environment` | 字符串 / 否 | Observer 固定 production/test/development。 |
+| `provider_id` | 字符串 / 是 | 服务接口返回的供应商归属；未实现或失败为 null。 |
+| `mapping_status` / `customer_mapping_status` | 字符串 / 否 | 两类查询各自的固定状态，当前合法输入为 lookup_not_implemented，非法为 invalid_host/invalid_api_key。 |
+| `mapping_version` / `customer_mapping_version` | 字符串 / 是 | 成功结果的规范 SHA-256 摘要；未知时为 null。 |
+| `service_id` | 字符串 / 是 | Observer 按 request_host + 固定集群/环境查询服务；占位或失败为 null，不填默认服务。 |
+| `api_key_id` | 字符串 / 是 | 客户查询接口返回的稳定 API Key ID，不是原始 token；未实现或失败时为 null。 |
+| `customer_id` | 字符串 / 是 | 与 api_key_id 同次查询得到的客户快照，二者成对成功；不从身份元数据补值。 |
+| `identity_status` | 字符串 / 否 | 客户接口完整成功时 known，否则 invalid；不表示鉴权判定，invalid 不进入有效客户汇总。 |
 | `request_started_at_ms` | 整数 / 否 | 网关观察到请求头的开始时间，也是统计归属和 UTC `request_date` 的来源；与 UUIDv4 独立，同一请求的两种事件必须一致。 |
 | `observation_ended_at_ms` | 整数 / 是 | Observer 结束本次观察的时间；start 尚未结束时为 `null`。它不等于网关确认业务请求结束。 |
 | `request_finished_at_ms` | 整数 / 是 | 网关有效 End 中取得的请求结束时间；未收到有效 End 时为 `null`，不能补当前时间。 |
@@ -108,7 +115,7 @@ UUIDv4 不包含时间。`request_started_at_ms` 仍由网关观察并作为事�
 | `terminal_observed` / `observation_status` | `false` / `null` | 按网关 End 和实际采集完整性填写 |
 | 模型、HTTP、结果等后续字段 | 未取得时为 `null` | 已可靠取得时填写，否则仍为 `null` |
 
-两个事件都携带请求开始时间、服务、路由及身份快照，故只有结果事件到达时仍能归属。这里的“事件到达”仅表示应用从 Kafka 读到记录，不证明另一条事件必然存在。
+两个事件都携带请求开始时间、服务/客户解析状态、部署上下文及路由快照，故仅结果事件也能解释已知或未知归属。这里的“事件到达”仅表示应用从 Kafka 读到记录，不证明另一条事件必然存在。
 
 ## 3. 完整的结果事件示例
 
@@ -128,10 +135,17 @@ UUIDv4 不包含时间。`request_started_at_ms` 仍由网关观察并作为事�
   "config_version": "collection-v1",
   "adapter_id": "chat_completions_v1",
   "route_name": "llm-chat",
+  "request_host": "model.example.invalid",
+  "cluster_name": "fixture-cluster",
+  "deployment_environment": "test",
   "service_id": "model-service-a",
+  "provider_id": "provider-a",
+  "mapping_version": "48a5034f65608f6895d3e529dafbb6f3c152e2058951074d7ce7ccaeaa6bc7da",
+  "mapping_status": "mapped",
   "api_key_id": "key-42",
   "customer_id": "customer-7",
-  "application_id": "app-3",
+  "customer_mapping_version": "7cca1d652cd89a6f3257c9bfb4c9e8bf4d044af5513e0fa7ad7be5dd7cc861e1",
+  "customer_mapping_status": "mapped",
   "identity_status": "known",
   "request_started_at_ms": 1789862400000,
   "observation_ended_at_ms": 1789862401200,
@@ -149,12 +163,30 @@ UUIDv4 不包含时间。`request_started_at_ms` 仍由网关观察并作为事�
   "usage_status": "known",
   "usage_eligible": true,
   "usage": {
-    "input_tokens": {"value": 1000, "source": "reported"},
-    "output_tokens": {"value": 500, "source": "reported"},
-    "cached_read_tokens": {"value": 200, "source": "reported"},
-    "cached_write_tokens": {"value": 300, "source": "reported"},
-    "reasoning_tokens": {"value": 100, "source": "reported"},
-    "reported_total_tokens": {"value": 1500, "source": "reported"}
+    "input_tokens": {
+      "value": 1000,
+      "source": "reported"
+    },
+    "output_tokens": {
+      "value": 500,
+      "source": "reported"
+    },
+    "cached_read_tokens": {
+      "value": 200,
+      "source": "reported"
+    },
+    "cached_write_tokens": {
+      "value": 300,
+      "source": "reported"
+    },
+    "reasoning_tokens": {
+      "value": 100,
+      "source": "reported"
+    },
+    "reported_total_tokens": {
+      "value": 1500,
+      "source": "reported"
+    }
   },
   "raw_usage_json": "{\"prompt_tokens\":1000,\"completion_tokens\":500,\"total_tokens\":1500,\"prompt_tokens_details\":{\"cached_tokens\":200,\"cache_write_tokens\":300},\"completion_tokens_details\":{\"reasoning_tokens\":100}}",
   "raw_usage_truncated": false,
@@ -413,7 +445,7 @@ public class MeteringConsumer {
 
 **A：只有数字可靠、采集完整、身份有效，并通过相关检查，才是有效统计候选。**
 
-条件包括适配成功、`observation_status=complete`、`usage_status=known`、`identity_status=known`，以及没有用量/身份冲突和使结果失效的异常。身份有效指 API Key ID、客户 ID、应用 ID 齐全。
+条件包括适配成功、`observation_status=complete`、`usage_status=known`、`identity_status=known`，以及没有用量/身份冲突和使结果失效的异常。身份有效指客户接口返回的 API Key ID、客户 ID 齐全且 customer_mapping_status=mapped。当前占位部署不产生有效客户身份。
 
 `true` 不代表收费资格；下游仍需按 `event_id` 去重，并排除事件或请求冲突。`false` 不代表没有消耗 token，也不代表调用失败，记录仍可用于异常排查和采集质量分析。开始事件固定为 `false`。
 

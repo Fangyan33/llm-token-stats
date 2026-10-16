@@ -112,7 +112,7 @@ func (w *Worker) setup(ctx context.Context, p int32) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	rows, err := w.Store.DB.QueryContext(ctx, "SELECT DISTINCT initial_offset FROM metering.consumer_partition_origins WHERE group_id=? AND kafka_topic=? AND kafka_partition=?", w.Cfg.Consumer.Group, w.Cfg.Kafka.Topic, p)
+	rows, err := w.Store.DB.QueryContext(ctx, "SELECT DISTINCT initial_offset FROM "+w.Store.Database()+".consumer_partition_origins WHERE group_id=? AND kafka_topic=? AND kafka_partition=?", w.Cfg.Consumer.Group, w.Cfg.Kafka.Topic, p)
 	if err != nil {
 		return 0, errors.New("origin_query")
 	}
@@ -332,7 +332,7 @@ func (w *Worker) audit(ctx context.Context) {
 
 	c, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
-	rows, err := w.Store.DB.QueryContext(c, "SELECT DISTINCT logical_request_id FROM metering.events_raw GROUP BY logical_request_id HAVING COUNT(DISTINCT request_started_at_ms)>1 OR COUNT(DISTINCT request_date)>1 OR COUNT(DISTINCT "+doris.IdentityKeySQL+")>1 OR SUM(CASE WHEN event_type='request_started' THEN 1 ELSE 0 END)>1 OR SUM(CASE WHEN event_type='usage_observed' THEN 1 ELSE 0 END)>1")
+	rows, err := w.Store.DB.QueryContext(c, "SELECT DISTINCT logical_request_id FROM "+w.Store.Database()+".events_raw GROUP BY logical_request_id HAVING COUNT(DISTINCT request_started_at_ms)>1 OR COUNT(DISTINCT request_date)>1 OR COUNT(DISTINCT "+doris.IdentityKeySQL+")>1 OR SUM(CASE WHEN event_type='request_started' THEN 1 ELSE 0 END)>1 OR SUM(CASE WHEN event_type='usage_observed' THEN 1 ELSE 0 END)>1")
 	if err != nil {
 		w.Health.Count("audit_failure")
 		return
@@ -417,7 +417,7 @@ func (w *Worker) watermarks(ctx context.Context) bool {
 		}
 		var origin int64
 		var count int
-		err = w.Store.DB.QueryRowContext(c, "SELECT COUNT(DISTINCT initial_offset),MIN(initial_offset) FROM metering.consumer_partition_origins WHERE group_id=? AND kafka_topic=? AND kafka_partition=?", w.Cfg.Consumer.Group, w.Cfg.Kafka.Topic, p).Scan(&count, &origin)
+		err = w.Store.DB.QueryRowContext(c, "SELECT COUNT(DISTINCT initial_offset),MIN(initial_offset) FROM "+w.Store.Database()+".consumer_partition_origins WHERE group_id=? AND kafka_topic=? AND kafka_partition=?", w.Cfg.Consumer.Group, w.Cfg.Kafka.Topic, p).Scan(&count, &origin)
 		if err != nil || count != 1 {
 			cancel()
 			w.Health.Count("watermark_untrusted")
@@ -429,7 +429,7 @@ func (w *Worker) watermarks(ctx context.Context) bool {
 			w.Health.Count("watermark_gap")
 			return false
 		}
-		rs, err := w.Store.DB.QueryContext(c, "SELECT first_offset,next_offset FROM metering.consumer_batch_receipts WHERE kafka_topic=? AND kafka_partition=? ORDER BY first_offset", w.Cfg.Kafka.Topic, p)
+		rs, err := w.Store.DB.QueryContext(c, "SELECT first_offset,next_offset FROM "+w.Store.Database()+".consumer_batch_receipts WHERE kafka_topic=? AND kafka_partition=? ORDER BY first_offset", w.Cfg.Kafka.Topic, p)
 		if err != nil {
 			cancel()
 			return false
@@ -463,7 +463,7 @@ func (w *Worker) watermarks(ctx context.Context) bool {
 			return false
 		}
 		var gaps int
-		err = w.Store.DB.QueryRowContext(c, "SELECT COUNT(*) FROM metering.consumer_partition_gaps WHERE group_id=? AND kafka_topic=? AND kafka_partition=?", w.Cfg.Consumer.Group, w.Cfg.Kafka.Topic, p).Scan(&gaps)
+		err = w.Store.DB.QueryRowContext(c, "SELECT COUNT(*) FROM "+w.Store.Database()+".consumer_partition_gaps WHERE group_id=? AND kafka_topic=? AND kafka_partition=?", w.Cfg.Consumer.Group, w.Cfg.Kafka.Topic, p).Scan(&gaps)
 		cancel()
 		if err != nil || gaps > 0 {
 			w.Health.Count("watermark_untrusted")

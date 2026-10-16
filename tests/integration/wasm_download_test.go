@@ -165,7 +165,7 @@ func TestRemoteWasmFailureAndRecovery(t *testing.T) {
 			ready()
 			id := request()
 			var count int
-			if err := db.QueryRow("SELECT COUNT(*) FROM metering.events_raw WHERE x_request_id=?", id).Scan(&count); err != nil || count != 0 {
+			if err := db.QueryRow("SELECT COUNT(*) FROM metering_development.events_raw WHERE x_request_id=?", id).Scan(&count); err != nil || count != 0 {
 				t.Fatalf("failed plugin produced events: count=%d err=%v", count, err)
 			}
 			if scenario != "unavailable" && requests.Load() != 1 {
@@ -177,7 +177,7 @@ func TestRemoteWasmFailureAndRecovery(t *testing.T) {
 			ready()
 			id = request()
 			eventually(t, func() bool {
-				return db.QueryRow("SELECT COUNT(*) FROM metering.events_raw WHERE x_request_id=? AND event_type='usage_observed' AND usage_status='known'", id).Scan(&count) == nil && count == 1
+				return db.QueryRow("SELECT COUNT(*) FROM metering_development.events_raw WHERE x_request_id=? AND event_type='usage_observed' AND usage_status='known'", id).Scan(&count) == nil && count == 1
 			})
 		})
 	}

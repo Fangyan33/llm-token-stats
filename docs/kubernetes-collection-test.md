@@ -2,10 +2,12 @@
 
 用例编号：**K8S-WASM-001**。固定环境为 **Kubernetes 1.22.17 + Istio 1.13.5**，通过真实控制面验证网关远程下载 Wasm、旁路采集和 Consumer 入库。脚本位于 [k8s_collection.py](../scripts/k8s_collection.py)，测试清单位于 [deploy/k8s-test](../deploy/k8s-test/fixtures.yaml)。这项本地合成测试不代表生产 G0–G5 验收。
 
+当前已删除 application_id。Wasm 只从 Authorization: Bearer 提取临时 api_key，并发送入口 authority；Observer 使用配置的 cluster_name/deployment_environment，分别通过服务和客户查询接口取得归属。两个接口目前只有未实现占位，合法输入产生 lookup_not_implemented，service_id/provider_id/api_key_id/customer_id 及映射版本为 null，identity_status=invalid、usage_eligible=false，原始 usage 保留。URI 可留空，填写也不会发起 HTTP；不访问 PG、不读身份元数据补值，密钥不进入事件、数据库或日志。 本页验收只覆盖占位链路；真实第三方对接尚未实施。
+
 ## 拓扑与前置条件
 
 ```text
-合成请求 → Kubernetes 测试网关 → Kubernetes fixture（合成鉴权与模型）
+合成请求 → Kubernetes 测试网关 → Kubernetes fixture（合成访问允许与模型）
                      │ 下载 Wasm / gRPC 旁路
                      ↓
              Kubernetes Observer × 2
@@ -55,7 +57,7 @@ kubectl --context kind-kind -n metering-wasm-verify port-forward service/wasm-ga
 在另一个终端发送合成 SSE 请求：
 
 ```sh
-curl --noproxy '*' -N -H 'Host: wasm-verify.local' -H 'Content-Type: application/json' \
+curl --noproxy '*' -N -H 'Host: wasm-verify.local' -H 'Authorization: Bearer synthetic-test-key' -H 'Content-Type: application/json' \
   --data '{"model":"fixture","stream":true,"messages":[{"role":"user","content":"synthetic Kubernetes verification"}]}' \
   http://127.0.0.1:28080/v1/chat/completions
 ```
@@ -71,9 +73,10 @@ curl --noproxy '*' -N -H 'Host: wasm-verify.local' -H 'Content-Type: application
 | Pod 匹配 | 错误 NAME 不安装采集过滤器，业务健康请求仍为 200；恢复实际 Pod NAME / NAMESPACE 后重新加载 |
 | 请求过滤 | 使用 `route_name: "*"`；真实 HTTP 路由命名为 `synthetic-model-route`，不注入计量 route metadata，仍采集 POST 精确路径；JSON 场景附查询串也命中 |
 | 忽略请求 | GET / HEAD / OPTIONS / PUT，及 POST 的其它路径、尾斜杠、子路径共 8 个反例均不增加网关 selected 计数，Doris 事件为 0 |
-| 普通 JSON | HTTP 200，Doris 中恰有两条对应事件；用量 known、输入 10、输出 4、complete、usage_eligible=1 |
-| SSE | HTTP 200，返回 `[DONE]`，Doris 事件与正常 JSON 用量一致；fixture 要求 include_usage，间接验证网关改写 |
+| 普通 JSON | HTTP 200，Doris 中恰有两条对应事件；用量 known、输入 10、输出 4、complete、usage_eligible=0，身份 invalid |
+| SSE | HTTP 200，返回 `[DONE]`，Doris 事件与正常 JSON 用量及占位身份一致；fixture 要求 include_usage，间接验证网关改写 |
 | SSE 缺 usage | HTTP 200，事件 unknown，输入 / 输出 NULL，complete、usage_eligible=0 |
+| 归属占位 | 四项 ID 和两个版本为 NULL，两种状态为 lookup_not_implemented，cluster_name 为测试集群、environment=test、request_host=wasm-verify.local；密钥不入事件 |
 | 数据来源 | 三个请求的 gateway_instance_id 为实际网关 Pod UID，producer_id 属于 Kubernetes Observer，kafka_topic 为本次独立 topic，事件 route_name 为真实 HTTP 路由名 `synthetic-model-route`；若该版本属性不可读则为 `unknown`，两事件保持一致，不允许写 `*` |
 | 独立 Consumer | 3 个分区无积压，已有记录的分区提交位点合计为 6（空分区允许尚无提交）；Doris 有对应分区起点及可见批次回执；缩容 Kubernetes Consumer 至 0 后该组为 Empty / 0 成员，恢复至 1 后为 Stable / 1 成员且原消费位点保持 |
 | 原网关隔离 | 测试前后 `istio-system` 原网关 Pod 名称、UID 和容器重启次数一致 |
@@ -95,5 +98,7 @@ make k8s-clean K8S_TEST_ARGS='--context kind-dev --kind-cluster dev --namespace 
 ```
 
 [清理脚本](../scripts/cleanup_k8s_collection.py)校验测试命名空间前缀与归属标签，先删除整个测试命名空间（包括 Consumer、网关、Observer、fixture、过滤器、ConfigMap、Secret），再删除该次独立 Kafka 消费组及 topic。可重复执行；如果命名空间已被手工删除，使用本地状态继续清理 Kafka。该脚本也支持清理前期同名且带有测试归属标签、尚无 run-id 的临时验证命名空间。
+
+每次在 Compose Doris 初始化独立 metering_k8s_<run-id>，Consumer 的 SQL/Stream Load 均使用该库，不改共享 metering 表。清理保留该测试库以便追溯。
 
 清理保留原网关、Compose 服务和数据卷、原有 topic / 消费组、Doris 历史测试行及本地结果文件；Doris 中的测试行通过请求 ID / 独立 topic 追溯，不执行共享数据库删行。手工启动的 port-forward 由调用终端停止。

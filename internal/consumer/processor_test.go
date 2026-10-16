@@ -1,6 +1,7 @@
 package consumer
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -42,7 +43,7 @@ func batch(t *testing.T) *Batch {
 	if err != nil {
 		t.Fatal(err)
 	}
-	c := config.Consumer{Bytes: 4 << 20, AcceptedConfigs: []string{e.ConfigVersion}, Routes: []config.Route{{RouteName: e.RouteName, ServiceID: e.ServiceID}}}
+	c := config.Consumer{Bytes: 4 << 20, AcceptedConfigs: []string{e.ConfigVersion}, AcceptedServices: []string{*e.ServiceID}}
 	result, err := Freeze([]*kgo.Record{{Topic: "llm-metering-events", Partition: 0, Offset: 10, Key: []byte(e.LogicalRequestID), Value: b, Timestamp: time.UnixMilli(e.EventCreatedAtMs)}}, c, time.UnixMilli(e.EventCreatedAtMs))
 	if err != nil {
 		t.Fatal(err)
@@ -94,28 +95,59 @@ func TestAdmissionIndependentOfDiagnosticRoute(t *testing.T) {
 	if err := json.Unmarshal(data, &original); err != nil {
 		t.Fatal(err)
 	}
-	for _, legacy := range []bool{false, true} {
-		for _, route := range []string{"unknown", "actual-route.named-match", "*", "llm-chat"} {
-			for _, service := range []string{original.ServiceID, "unregistered"} {
-				e := original
-				e.RouteName, e.ServiceID = route, service
-				payload, _ := events.Canonical(&e)
-				c := config.Consumer{Bytes: 4 << 20, AcceptedConfigs: []string{e.ConfigVersion}, AcceptedServices: []string{original.ServiceID}}
-				if legacy {
-					c.AcceptedServices = nil
-					c.Routes = []config.Route{{RouteName: "different-rule", ServiceID: original.ServiceID}}
+	for _, route := range []string{"unknown", "actual-route.named-match", "*", "llm-chat"} {
+		for _, service := range []string{*original.ServiceID, "unregistered"} {
+			e := original
+			e.RouteName, e.ServiceID = route, events.Ptr(service)
+			payload, _ := events.Canonical(&e)
+			c := config.Consumer{Bytes: 4 << 20, AcceptedConfigs: []string{e.ConfigVersion}, AcceptedServices: []string{*original.ServiceID}}
+
+			b, err := Freeze([]*kgo.Record{{Topic: "llm-metering-events", Offset: 1, Key: []byte(e.LogicalRequestID), Value: payload, Timestamp: time.UnixMilli(e.EventCreatedAtMs)}}, c, time.UnixMilli(e.EventCreatedAtMs))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if service != *original.ServiceID {
+				if len(b.Events) != 0 || len(b.Rejected) != 1 || b.Rejected[0]["reason"] != "event_registration" {
+					t.Fatal("unregistered service accepted")
 				}
-				b, err := Freeze([]*kgo.Record{{Topic: "llm-metering-events", Offset: 1, Key: []byte(e.LogicalRequestID), Value: payload, Timestamp: time.UnixMilli(e.EventCreatedAtMs)}}, c, time.UnixMilli(e.EventCreatedAtMs))
-				if err != nil {
-					t.Fatal(err)
-				}
-				if service != original.ServiceID {
-					if len(b.Events) != 0 || len(b.Rejected) != 1 || b.Rejected[0]["reason"] != "event_registration" {
-						t.Fatal("unregistered service accepted")
-					}
-				} else if len(b.Events) != 1 || len(b.Rejected) != 0 || b.Events[0].RouteName != route || b.Raw[0]["route_name"] != route || b.Raw[0]["payload_hash"] != events.Hash(payload) {
-					t.Fatal("diagnostics blocked ingestion or historical payload changed")
-				}
+			} else if len(b.Events) != 1 || len(b.Rejected) != 0 || b.Events[0].RouteName != route || b.Raw[0]["route_name"] != route || b.Raw[0]["payload_hash"] != events.Hash(payload) {
+				t.Fatal("diagnostics blocked ingestion or historical payload changed")
+			}
+		}
+	}
+}
+
+func TestUnknownServiceWithEmptyAdmissionAndSensitiveRejections(t *testing.T) {
+	data, err := os.ReadFile("../../testdata/collection/usage-known.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var e events.Event
+	if json.Unmarshal(data, &e) != nil {
+		t.Fatal("fixture")
+	}
+	e.ServiceID, e.ProviderID, e.MappingVersion = nil, nil, nil
+	e.MappingStatus = "lookup_not_implemented"
+	payload, _ := events.Canonical(&e)
+	cfg := config.Consumer{Bytes: 4 << 20, AcceptedConfigs: []string{e.ConfigVersion}}
+	now := time.UnixMilli(e.EventCreatedAtMs)
+	record := &kgo.Record{Topic: "test", Offset: 1, Key: []byte(e.LogicalRequestID), Value: payload, Timestamp: now}
+	b, err := Freeze([]*kgo.Record{record}, cfg, now)
+	if err != nil || len(b.Events) != 1 || len(b.Rejected) != 0 || !b.Events[0].UsageEligible {
+		t.Fatal("unknown service blocked known customer usage")
+	}
+	for _, field := range []string{"api_key", "application_id"} {
+		var obj map[string]any
+		json.Unmarshal(payload, &obj)
+		obj[field] = "synthetic-sensitive-sentinel"
+		record.Value, _ = json.Marshal(obj)
+		b, err = Freeze([]*kgo.Record{record}, cfg, now)
+		if err != nil || len(b.Events) != 0 || len(b.Rejected) != 1 {
+			t.Fatal("sensitive or removed field accepted")
+		}
+		for _, load := range b.Loads {
+			if bytes.Contains(load, []byte("synthetic-sensitive-sentinel")) {
+				t.Fatal("rejection retained sensitive input")
 			}
 		}
 	}

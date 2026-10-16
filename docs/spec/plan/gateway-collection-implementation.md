@@ -4,7 +4,7 @@
 
 ## 目标
 
-实现 Wasm → 双向 gRPC → Observer → Kafka → Consumer → Doris，交付可构建组件、部署模板和可复现本地联调。Auth 使用合成可信元数据；估算、汇总 Worker、查询 API、门户和计费属于后续工作。
+实现 Wasm → 双向 gRPC → Observer → Kafka → Consumer → Doris，交付可构建组件、部署模板和可复现本地联调。Auth fixture 只模拟访问允许，归属通过 Observer 查询占位保持未知；估算、汇总 Worker、查询 API、门户和计费属于后续工作。
 
 ## 已确认决策
 
@@ -27,8 +27,8 @@
 
 ## 接口与故障约束
 
-- 协议服务名、字段号和事件 schema v1 保持不变；可选事件字段显式输出 null，固定 struct 编码和 SHA-256 摘要。
-- Wasm 在规则启用/POST/精确路径过滤后才读取身份正文、分配观察资源。当前 `route_name: "*"` 忽略实际路由名及其 metadata；精确路由规则仍兼容。事件记录真实 Envoy 路由名或 unknown，仅供诊断；Observer / Consumer 按 accepted_service_ids 接纳，旧 accepted_routes 只提取服务 ID。身份一致性排除路由，通过 006 migration 兼容旧摘要；历史事件原文重放，同事件不同内容仍冲突。改写只编辑 include_usage，超时/超限恢复透传；正文前缀只观察一次。
+- 协议服务名和 schema_version=1 保持不变；删除的 Start 字段号保留为 reserved，新增 authority=16/api_key=17；可选事件字段显式输出 null，固定 struct 编码和 SHA-256 摘要。
+- Wasm 在规则启用/POST/精确路径过滤后才读取 Host/Bearer 与正文、分配观察资源。当前 `route_name: "*"` 忽略实际路由名及其 metadata；精确路由规则仍兼容。事件记录真实 Envoy 路由名或 unknown，仅供诊断；Observer / Consumer 按 accepted_service_ids 接纳，旧 accepted_routes 已删除。身份一致性排除路由，006 初始化同一新模型视图；只接纳当前格式事件，同事件不同内容仍冲突。改写只编辑 include_usage，超时/超限恢复透传；正文前缀只观察一次。
 - ACK 只确认已处理帧，不等待 Kafka；发送失败不补发，无正文持久化或恢复队列。
 - Consumer 未知 schema 暂停该分区；永久非法消息仅保存坐标/摘要/固定原因。事务未知须确认原 label，凭据只发送到允许的 FE/BE。
 - 新消费组先持久登记最早可用 offset；已有组缺少可信起点需显式接管配置。保留期缺口登记后暂停，显式恢复，不跳到最新。
@@ -56,3 +56,7 @@ Observer 新增可选固定文件下载服务，Wasm 随 Observer 镜像发布�
 ## 2026-10-15 本地 Istio 部署修正
 
 真实 kind 集群验证发现启动后追加 UID 标签不能命中旧版代理标签快照；渲染器改为必填 Pod 名称，按启动元数据 NAME/NAMESPACE 匹配，UID 继续作为采集实例 ID。Istio 的 outbound 集群名包含竖线，插件显式生成服务 DNS/端口形式的 gRPC authority，保留集群路由和 TLS/SNI。独立测试命名空间已部署并完成 JSON/SSE/unknown 入库，具体环境与边界见验证记录。
+
+## 2026-10-16 Host 与 API Key 归属映射增量计划
+
+当前归属接口已实现并以未实现占位运行：Wasm 临时发送入口 authority 与 Authorization: Bearer token，Observer 固定集群/环境并调用服务/客户 resolver；合法输入的四项 ID 和版本为 null，两类状态为 lookup_not_implemented，原始 usage 保留，identity_status=invalid、usage_eligible=false。真实 HTTP、第三方鉴权和网络缓存未实现；应用维度及 PG 归属读取均已删除。 详见[归属接口计划](host-service-provider-implementation.md)，前面历史记录不作为旧模型兼容要求。

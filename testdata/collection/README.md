@@ -1,5 +1,7 @@
 # 采集事件合成样例
 
-六份 JSON 是合成事件；保留具名路由示例，以覆盖历史事件重放。运行时未知诊断路由使用 `unknown`，历史事件中的路由名或 `*` 不改写。缺失、具名和通配历史路由的兼容性由事件、插件及集成测试覆盖。
+六份 JSON 是当前唯一 schema_version=1 契约的合成金样，覆盖开始、已知/部分/未知/零用量及冲突。应用字段已删除，包含规范 request_host、固定集群/环境、provider_id、两类状态与版本。
 
-对应 `.canonical` 保存规范事件字节；`.hashes` 第一行为完整规范事件的 SHA-256，第二行为当前身份摘要。身份摘要按 `service_id`、`api_key_id`、`customer_id`、`application_id`、`identity_status`、`config_version`、`gateway_instance_id`、`adapter_id`、`x_request_id` 构造 JSON 数组，不含诊断 `route_name`。本次仅更新第二行；原事件及内容摘要保持不变。旧数据库摘要的读取兼容由 [006 migration](../../migrations/doris/metering/006_optional_route_identity.sql) 与 Consumer 的类型化字段比较实现。
+这些样例故意包含 mapped 合成客户和服务，用于检验编码、Consumer 与汇总；正常 Observer 仍注入未实现查询接口，只产生未知归属，不得把样例当成真实第三方返回。
+
+.canonical 保存规范事件字节；.hashes 两行依次为完整事件 SHA-256 与身份摘要。身份元组为 `[service_id, provider_id, api_key_id, customer_id, identity_status, config_version, gateway_instance_id, adapter_id, x_request_id, cluster_name, deployment_environment, mapping_status, mapping_version, customer_mapping_status, customer_mapping_version]`，规范 JSON 保留 null，不含原始密钥、独立路由或模型字段。Go、Python、SQL 使用同一顺序，不保留旧金样或旧摘要兼容路径。

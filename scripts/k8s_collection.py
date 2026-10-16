@@ -14,6 +14,7 @@ import urllib.request
 import uuid
 from pathlib import Path
 from image_tag import resolve_image_tag
+from render_doris_sql import render_sql, database_name
 
 ROOT = Path(__file__).resolve().parents[1]
 OWNER_KEY = 'app.kubernetes.io/part-of'
@@ -85,7 +86,8 @@ def wasm_configs(dump):
             and v.get('typed_config', {}).get('config', {}).get('name') == 'gateway-observer']
 
 
-def local_configs(host, topic, group):
+def local_configs(host, topic, group, database="metering_development"):
+    database_name(database)
     require(bool(re.fullmatch(r'[A-Za-z0-9_.-]+', host))
             and host not in ('localhost', '0.0.0.0') and not host.startswith('127.'),
             'Compose Kafka 的 EXTERNAL 地址必须能从 Pod 访问，不能是回环地址')
@@ -95,11 +97,13 @@ def local_configs(host, topic, group):
     consumer = json.loads((ROOT / 'configs/consumer.production.example.json').read_text())
     consumer['kafka'] = copy.deepcopy(kafka)
     consumer['consumer'].update(group_id=group, flush_interval_ms=1000)
+    consumer['doris']['database'] = database
+    observer['observer'].update(cluster_name='kind', deployment_environment='test')
     # 本地 all-in-one 的 FE 重定向到容器内 127.0.0.1；使用已发布的 BE 直连。
     consumer['doris']['fe_url'] = 'http://' + host + ':18040'
     consumer['doris']['allowed_load_hosts'] = [host + ':18040']
     credentials = {
-        'DORIS_DSN': ('root@tcp(' + host + ':19030)/metering?timeout=5s&readTimeout=30s'
+        'DORIS_DSN': ('root@tcp(' + host + ':19030)/' + database + '?timeout=5s&readTimeout=30s'
                       '&writeTimeout=10s&interpolateParams=true&time_zone=%27%2B00%3A00%27'),
         'DORIS_USER': 'root', 'DORIS_PASSWORD': '',
     }
@@ -116,16 +120,21 @@ def validate_events(results, rows, gateway_uid, producer_ids, topic):
         require(len({row[11] for row in matches}) == 1
                 and matches[0][11] in ('synthetic-model-route', 'unknown'),
                 '事件必须记录真实 HTTP 路由名或 unknown，且请求内保持不变')
+        require(all(row[12:16] == ['NULL'] * 4 and row[16:18] == ['lookup_not_implemented'] * 2
+                    and row[19:21] == ['test', 'wasm-verify.local'] and row[21:23] == ['NULL'] * 2
+                    for row in matches), '占位归属、上下文或版本错误')
         usage = next(row for row in matches if row[1] == 'usage_observed')
         require(usage[6] == 'complete', '观察结果不完整')
         expected = ['unknown', 'NULL', 'NULL'] if result['scenario'] == 'unknown' else ['known', '10', '4']
-        require(usage[3:6] == expected and usage[7] == ('0' if result['scenario'] == 'unknown' else '1'),
+        require(usage[3:6] == expected and usage[7] == '0',
                 '用量或 unknown/NULL 语义不符合预期')
         result.update(logical_request_id=usage[2], usage_status=usage[3],
                       input_tokens=None if usage[4] == 'NULL' else int(usage[4]),
                       output_tokens=None if usage[5] == 'NULL' else int(usage[5]),
                       gateway_instance_id=usage[8], observer_producer_id=usage[9],
-                      kafka_topic=usage[10], route_name=usage[11], event_count=len(matches))
+                      kafka_topic=usage[10], route_name=usage[11], event_count=len(matches),
+                      mapping_status=usage[16],customer_mapping_status=usage[17],
+                      cluster_name=usage[18],deployment_environment=usage[19],request_host=usage[20])
 
 
 def offsets_caught_up(raw, topic):
@@ -169,6 +178,7 @@ class Harness:
                     '--bootstrap-server', 'kafka:9092', *args]).stdout
 
     def sql(self, sql):
+        sql = render_sql(sql, getattr(self, 'database', 'metering_development'))
         return run([*COMPOSE, 'exec', '-T', 'doris', 'mysql', '-uroot', '-h127.0.0.1',
                     '-P9030', '-N', '-e', sql]).stdout
 
@@ -224,7 +234,7 @@ class Harness:
         local_configs(host, 'preflight', 'preflight')
         for name in ('observer', 'consumer', 'fixture', 'gateway-observer-v1.wasm'):
             require((ROOT / 'dist' / name).is_file(), '请先执行 make build wasm')
-        self.sql('SELECT COUNT(*) FROM metering.consumer_partition_origins;')
+        self.sql('SELECT 1;')
         self.host = host
 
     def build_images(self):
@@ -245,7 +255,8 @@ class Harness:
 
     def manifest(self):
         resources = []
-        observer, consumer, credentials = local_configs(self.host, self.topic, self.group)
+        observer, consumer, credentials = local_configs(self.host, self.topic, self.group, self.database)
+        observer['observer']['cluster_name'] = self.args.kind_cluster
         for name, config in (('observer', observer), ('consumer', consumer)):
             raw = self.kubectl('create', '--dry-run=client', '-f', 'deploy/' + name + '/' + name + '.yaml', '-o', 'json')
             for resource in decode_resources(raw):
@@ -349,7 +360,7 @@ class Harness:
                         process.wait(timeout=5)
 
     def request(self, path, body=None, request_id=None, method=None):
-        headers = {'Host': 'wasm-verify.local', 'Content-Type': 'application/json'}
+        headers = {'Host': 'wasm-verify.local', 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + self.credential}
         if request_id:
             headers['x-request-id'] = request_id
         request = urllib.request.Request(self.url + path, headers=headers,
@@ -386,7 +397,9 @@ class Harness:
                             'content_type': headers.get('Content-Type')})
         ids = ','.join("'" + r['x_request_id'] + "'" for r in results)
         sql = ('SELECT x_request_id,event_type,logical_request_id,usage_status,input_tokens,output_tokens,'
-               'observation_status,usage_eligible,gateway_instance_id,producer_id,kafka_topic,route_name '
+               'observation_status,usage_eligible,gateway_instance_id,producer_id,kafka_topic,route_name,'
+               'service_id,provider_id,api_key_id,customer_id,mapping_status,customer_mapping_status,'
+               'cluster_name,deployment_environment,request_host,mapping_version,customer_mapping_version '
                'FROM metering.events_raw WHERE x_request_id IN (' + ids + ') ORDER BY x_request_id,event_type;')
 
         def events():
@@ -395,6 +408,9 @@ class Harness:
         rows = wait_for('Kubernetes Consumer 写入 Doris', events, 90)
         producers = {p['metadata']['uid'] for p in self.pods('metering-observer')}
         validate_events(results, rows, self.gateway_uid, producers, self.topic)
+        require(all(row[18] == self.args.kind_cluster for row in rows), '集群配置未固定')
+        raw = self.sql('SELECT event_json FROM metering.events_raw WHERE x_request_id IN (' + ids + ');')
+        require(self.credential not in raw and '"api_key"' not in raw, '事件包含原始凭证')
         write_json(self.output / 'requests.result.json', results)
         return results
 
@@ -508,6 +524,8 @@ class Harness:
 
     def test(self):
         self.run_id = uuid.uuid4().hex[:12]
+        self.database = 'metering_k8s_' + self.run_id
+        self.credential = 'synthetic-' + uuid.uuid4().hex
         self.output = self.base / self.run_id
         self.output.mkdir(parents=True)
         print('本地 Kubernetes / Istio 部署用例；诊断目录：' + str(self.output), flush=True)
@@ -525,6 +543,8 @@ class Harness:
         self.kafka('topics', '--create', '--topic', self.topic, '--partitions', '3', '--replication-factor', '1',
                    '--config', 'retention.ms=86400000')
         try:
+            for name in ('001_init.sql','002_usage_summaries.sql','004_summary_coordination.sql','005_consumer_recovery.sql','006_optional_route_identity.sql'):
+                self.sql((ROOT / 'migrations/doris/metering' / name).read_text())
             manifest = self.manifest()
             write_json(self.output / 'resources.json', manifest)
             self.apply(manifest)
@@ -546,7 +566,9 @@ class Harness:
             require(before == after, '既有 istio-system 网关身份或重启次数发生变化')
             summary = {'status': 'passed', 'context': self.args.context, 'namespace': self.namespace,
                        'image_tag': self.image_tag, 'images': self.images,
-                       'wasm_sha256': self.sha, 'kafka_topic': self.topic, 'consumer': consumer,
+                       'wasm_sha256': self.sha, 'kafka_topic': self.topic, 'doris_database': self.database,
+                       'cluster_name':self.args.kind_cluster,'deployment_environment':'test',
+                       'lookup_implementation':'unimplemented','consumer': consumer,
                        'requests': results, 'ignored_requests': ignored, 'existing_gateway_unchanged': True}
             write_json(self.output / 'result.json', summary)
             print(json.dumps(summary, ensure_ascii=False, indent=2), flush=True)

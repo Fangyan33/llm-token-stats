@@ -15,13 +15,13 @@ import (
 	"github.com/twmb/franz-go/pkg/kgo"
 )
 
-// Mix persisted legacy hashes with current writes, using the real Doris views
-// and Consumer evidence query. Payload conflict detection must stay strict.
-func TestDiagnosticRouteIdentityCompatibility(t *testing.T) {
+// Exercise the single contract, real Doris projections and startup audit.
+// Diagnostic route changes must not turn into identity conflicts.
+func TestDiagnosticRouteIdentityAndSnapshotConflicts(t *testing.T) {
 	s := localStore(t, "http://127.0.0.1:18040")
 	cl := kafka(t)
 	topic, group := batchingTopic(t, cl)
-	for _, mode := range []string{"legacy_route", "legacy_wildcard", "tenant_conflict"} {
+	for _, mode := range []string{"diagnostic_route", "tenant_conflict", "provider_conflict", "environment_conflict"} {
 		t.Run(mode, func(t *testing.T) {
 			now := time.Now()
 			id := uuid(t)
@@ -47,6 +47,12 @@ func TestDiagnosticRouteIdentityCompatibility(t *testing.T) {
 					if mode == "tenant_conflict" {
 						e.CustomerID = events.Ptr("different-customer")
 					}
+					if mode == "provider_conflict" {
+						e.ProviderID = events.Ptr("different-provider")
+					}
+					if mode == "environment_conflict" {
+						e.DeploymentEnvironment = "production"
+					}
 				}
 				e.RouteName, e.RequestStartedAtMs, e.EventCreatedAtMs = route, now.UnixMilli(), now.UnixMilli()
 				data, _ = events.Canonical(&e)
@@ -56,15 +62,8 @@ func TestDiagnosticRouteIdentityCompatibility(t *testing.T) {
 				}
 				return b
 			}
-			oldRoute := "old-route"
-			if mode == "legacy_wildcard" {
-				oldRoute = "*"
-			}
-			start := freeze("request-started", oldRoute, 0)
-			e := start.Events[0]
-			legacyHash := events.Tuple([]any{e.ServiceID, e.ApiKeyID, e.CustomerID, e.ApplicationID, e.IdentityStatus, e.ConfigVersion, e.GatewayInstanceID, e.RouteName, e.AdapterID, e.XRequestID})
-			start.Raw[0]["identity_hash"] = legacyHash
-			start.Loads["events_raw"] = consumer.EncodeRows(start.Raw)
+			start := freeze("request-started", "old-route", 0)
+			expectedHash := events.IdentityHash(start.Events[0])
 			if err := p.Process(ctx, start); err != nil {
 				t.Fatal(err)
 			}
@@ -79,25 +78,25 @@ func TestDiagnosticRouteIdentityCompatibility(t *testing.T) {
 				t.Helper()
 				for _, view := range []string{"requests", "request_statistics"} {
 					var conflict int
-					if err := s.DB.QueryRowContext(ctx, "SELECT has_conflict FROM metering."+view+" WHERE logical_request_id=?", id).Scan(&conflict); err != nil || conflict != want {
+					if err := s.DB.QueryRowContext(ctx, "SELECT has_conflict FROM metering_development."+view+" WHERE logical_request_id=?", id).Scan(&conflict); err != nil || conflict != want {
 						t.Fatalf("%s conflict=%d want=%d: %v", view, conflict, want, err)
 					}
 				}
 				var marks, eligible int
-				if err := s.DB.QueryRowContext(ctx, "SELECT COUNT(*) FROM metering.request_conflict_ids WHERE logical_request_id=?", id).Scan(&marks); err != nil || marks != want {
+				if err := s.DB.QueryRowContext(ctx, "SELECT COUNT(*) FROM metering_development.request_conflict_ids WHERE logical_request_id=?", id).Scan(&marks); err != nil || marks != want {
 					t.Fatalf("persistent conflict=%d: %v", marks, err)
 				}
-				if err := s.DB.QueryRowContext(ctx, "SELECT COUNT(*) FROM metering.usage_effective WHERE logical_request_id=?", id).Scan(&eligible); err != nil || eligible != 1-want {
+				if err := s.DB.QueryRowContext(ctx, "SELECT COUNT(*) FROM metering_development.usage_effective WHERE logical_request_id=?", id).Scan(&eligible); err != nil || eligible != 1-want {
 					t.Fatalf("effective usage=%d: %v", eligible, err)
 				}
 			}
 			wantConflict := 0
-			if mode == "tenant_conflict" {
+			if mode != "diagnostic_route" {
 				wantConflict = 1
 			}
 			assertConflict(wantConflict)
 			if wantConflict == 0 {
-				// Start a real Worker after both hash versions are persisted. Its
+				// Start a real Worker after both events are persisted. Its
 				// startup audit must not permanently quarantine this healthy pair.
 				worker := startBatchingConsumer(t, topic, group, 5000, 4<<20)
 				eventually(t, func() bool { return worker.health.Ready.Load() })
@@ -107,11 +106,11 @@ func TestDiagnosticRouteIdentityCompatibility(t *testing.T) {
 			}
 			var count int
 			var stored string
-			if err := s.DB.QueryRowContext(ctx, "SELECT COUNT(*) FROM metering.events_raw WHERE logical_request_id=?", id).Scan(&count); err != nil || count != 2 {
+			if err := s.DB.QueryRowContext(ctx, "SELECT COUNT(*) FROM metering_development.events_raw WHERE logical_request_id=?", id).Scan(&count); err != nil || count != 2 {
 				t.Fatalf("replay changed row count=%d: %v", count, err)
 			}
-			if err := s.DB.QueryRowContext(ctx, "SELECT identity_hash FROM metering.events_raw WHERE logical_request_id=? AND event_type='request_started'", id).Scan(&stored); err != nil || stored != legacyHash {
-				t.Fatalf("legacy evidence rewritten: %v", err)
+			if err := s.DB.QueryRowContext(ctx, "SELECT identity_hash FROM metering_development.events_raw WHERE logical_request_id=? AND event_type='request_started'", id).Scan(&stored); err != nil || stored != expectedHash {
+				t.Fatalf("immutable evidence rewritten: %v", err)
 			}
 			// Even a diagnostic-only change is a different immutable event payload.
 			variant := freeze("usage-known", "different.actual-route", 2)

@@ -25,20 +25,19 @@ message ObservationFrame {
 }
 
 message Start {
+  reserved 5, 7, 8, 9, 10;
+  reserved "service_id", "api_key_id", "customer_id", "application_id", "identity_status";
   int64 request_started_at_ms = 1;
   string gateway_instance_id = 2;  // Pod UID，不是客户端输入
   string config_version = 3;
   string route_name = 4;           // 真实 Envoy 路由名，仅诊断；不可读为 unknown，不作为接纳条件
-  string service_id = 5;
   string adapter_id = 6;
-  optional string api_key_id = 7;
-  optional string customer_id = 8;
-  optional string application_id = 9;
-  string identity_status = 10;
   string method = 11;
   string request_content_type = 12;
   string request_content_encoding = 13;
   bool request_end_stream = 14;
+  string request_authority = 16;   // Entry authority, at most 512 UTF-8 bytes
+  bytes api_key = 17;              // Transient Bearer token, at most 4096 bytes; never log
   optional string x_request_id = 15; // 网关可见的 X-Request-Id，仅辅助关联
 }
 

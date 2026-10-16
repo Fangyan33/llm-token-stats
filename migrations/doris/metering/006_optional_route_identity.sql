@@ -1,10 +1,7 @@
--- Optional diagnostic route names are not stable request identity.
--- Apply after 001/002 and before running the upgraded Consumer.
--- Derive equality keys from typed fields for ALL rows, including legacy hashes.
--- No raw payloads/hashes, immutable conflict marks, or summaries are rewritten.
+-- Current contract projections; initialize after 001/002. No legacy decoder or hash path.
 CREATE OR REPLACE VIEW metering.requests AS
 SELECT a.request_date, a.logical_request_id, a.start_variants, a.usage_variants,
-       a.request_started_at_ms, a.x_request_id, a.customer_id, a.service_id,
+       a.request_started_at_ms, a.x_request_id, a.customer_id, a.service_id, a.provider_id, a.cluster_name, a.deployment_environment, a.request_host, a.mapping_status, a.mapping_version, a.customer_mapping_status, a.customer_mapping_version,
        CASE WHEN a.usage_variants = 1 THEN a.response_model END AS response_model,
        CASE WHEN a.usage_variants = 0 THEN 'not_observed'
             WHEN a.usage_variants = 1 THEN a.usage_status ELSE 'conflict' END AS usage_status,
@@ -24,11 +21,13 @@ FROM (
            SUM(CASE WHEN event_type = 'usage_observed' THEN 1 ELSE 0 END) AS usage_variants,
            COUNT(DISTINCT request_started_at_ms) AS started_count,
            COUNT(DISTINCT request_date) AS date_count,
-           COUNT(DISTINCT CAST(JSON_ARRAY(service_id, api_key_id, customer_id, application_id, identity_status, config_version, gateway_instance_id, adapter_id, x_request_id) AS STRING)) AS identity_count,
+           COUNT(DISTINCT CAST(JSON_ARRAY(service_id, provider_id, api_key_id, customer_id, identity_status, config_version, gateway_instance_id, adapter_id, x_request_id, cluster_name, deployment_environment, mapping_status, mapping_version, customer_mapping_status, customer_mapping_version) AS STRING)) AS identity_count,
            MIN(request_started_at_ms) AS request_started_at_ms,
            MAX(x_request_id) AS x_request_id,
            MAX(customer_id) AS customer_id,
+           MAX(provider_id) AS provider_id,
            MAX(service_id) AS service_id,
+           MAX(cluster_name) AS cluster_name, MAX(deployment_environment) AS deployment_environment, MAX(request_host) AS request_host, MAX(mapping_status) AS mapping_status, MAX(mapping_version) AS mapping_version, MAX(customer_mapping_status) AS customer_mapping_status, MAX(customer_mapping_version) AS customer_mapping_version,
            MAX(CASE WHEN event_type = 'usage_observed' THEN response_model END) AS response_model,
            MAX(CASE WHEN event_type = 'usage_observed' THEN usage_status END) AS usage_status,
            MAX(CASE WHEN event_type = 'usage_observed' THEN observation_status END) AS observation_status,
@@ -59,9 +58,10 @@ FROM (
            SUM(CASE WHEN event_type = 'request_started' THEN 1 ELSE 0 END) AS start_variants,
            SUM(CASE WHEN event_type = 'usage_observed' THEN 1 ELSE 0 END) AS usage_variants,
            COUNT(DISTINCT request_started_at_ms) AS started_count,
-           COUNT(DISTINCT CAST(JSON_ARRAY(service_id, api_key_id, customer_id, application_id, identity_status, config_version, gateway_instance_id, adapter_id, x_request_id) AS STRING)) AS identity_count,
-           MAX(customer_id) AS customer_id, MAX(application_id) AS application_id,
+           COUNT(DISTINCT CAST(JSON_ARRAY(service_id, provider_id, api_key_id, customer_id, identity_status, config_version, gateway_instance_id, adapter_id, x_request_id, cluster_name, deployment_environment, mapping_status, mapping_version, customer_mapping_status, customer_mapping_version) AS STRING)) AS identity_count,
+           MAX(customer_id) AS customer_id, MAX(provider_id) AS provider_id,
            MAX(api_key_id) AS api_key_id, MAX(service_id) AS service_id,
+           MAX(cluster_name) AS cluster_name, MAX(deployment_environment) AS deployment_environment, MAX(request_host) AS request_host, MAX(mapping_status) AS mapping_status, MAX(mapping_version) AS mapping_version, MAX(customer_mapping_status) AS customer_mapping_status, MAX(customer_mapping_version) AS customer_mapping_version,
            MAX(identity_status) AS identity_status,
            MAX(request_model) AS request_model,
            MAX(CASE WHEN event_type = 'usage_observed' THEN response_model END) AS response_model,

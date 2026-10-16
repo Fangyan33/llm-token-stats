@@ -6,8 +6,10 @@
 -- One-replica / eight-bucket values are development examples.
 CREATE TABLE IF NOT EXISTS metering.usage_daily (
     stat_date DATE NOT NULL,
+    cluster_name VARCHAR(128) NOT NULL,
+    deployment_environment VARCHAR(16) NOT NULL,
     customer_id VARCHAR(128) NOT NULL,
-    application_id VARCHAR(128) NOT NULL,
+    provider_id VARCHAR(128) NOT NULL,
     api_key_id VARCHAR(128) NOT NULL,
     service_id VARCHAR(128) NOT NULL,
     model VARCHAR(1024) NOT NULL,
@@ -36,7 +38,7 @@ CREATE TABLE IF NOT EXISTS metering.usage_daily (
     source_watermark CHAR(64) NOT NULL,
     refreshed_at DATETIME(3) NOT NULL
 )
-UNIQUE KEY(stat_date, customer_id, application_id, api_key_id, service_id, model, usage_source)
+UNIQUE KEY(stat_date, cluster_name, deployment_environment, customer_id, provider_id, api_key_id, service_id, model, usage_source)
 PARTITION BY RANGE(stat_date) ()
 DISTRIBUTED BY HASH(customer_id, api_key_id) BUCKETS 8
 PROPERTIES (
@@ -46,8 +48,10 @@ PROPERTIES (
 
 CREATE TABLE IF NOT EXISTS metering.usage_monthly (
     stat_month DATE NOT NULL,
+    cluster_name VARCHAR(128) NOT NULL,
+    deployment_environment VARCHAR(16) NOT NULL,
     customer_id VARCHAR(128) NOT NULL,
-    application_id VARCHAR(128) NOT NULL,
+    provider_id VARCHAR(128) NOT NULL,
     api_key_id VARCHAR(128) NOT NULL,
     service_id VARCHAR(128) NOT NULL,
     model VARCHAR(1024) NOT NULL,
@@ -76,7 +80,7 @@ CREATE TABLE IF NOT EXISTS metering.usage_monthly (
     source_watermark CHAR(64) NOT NULL,
     refreshed_at DATETIME(3) NOT NULL
 )
-UNIQUE KEY(stat_month, customer_id, application_id, api_key_id, service_id, model, usage_source)
+UNIQUE KEY(stat_month, cluster_name, deployment_environment, customer_id, provider_id, api_key_id, service_id, model, usage_source)
 PARTITION BY RANGE(stat_month) ()
 DISTRIBUTED BY HASH(customer_id, api_key_id) BUCKETS 8
 PROPERTIES (
@@ -105,9 +109,10 @@ FROM (
            SUM(CASE WHEN event_type = 'request_started' THEN 1 ELSE 0 END) AS start_variants,
            SUM(CASE WHEN event_type = 'usage_observed' THEN 1 ELSE 0 END) AS usage_variants,
            COUNT(DISTINCT request_started_at_ms) AS started_count,
-           COUNT(DISTINCT identity_hash) AS identity_count,
-           MAX(customer_id) AS customer_id, MAX(application_id) AS application_id,
+           COUNT(DISTINCT CAST(JSON_ARRAY(service_id, provider_id, api_key_id, customer_id, identity_status, config_version, gateway_instance_id, adapter_id, x_request_id, cluster_name, deployment_environment, mapping_status, mapping_version, customer_mapping_status, customer_mapping_version) AS STRING)) AS identity_count,
+           MAX(customer_id) AS customer_id, MAX(provider_id) AS provider_id,
            MAX(api_key_id) AS api_key_id, MAX(service_id) AS service_id,
+           MAX(cluster_name) AS cluster_name, MAX(deployment_environment) AS deployment_environment, MAX(request_host) AS request_host, MAX(mapping_status) AS mapping_status, MAX(mapping_version) AS mapping_version, MAX(customer_mapping_status) AS customer_mapping_status, MAX(customer_mapping_version) AS customer_mapping_version,
            MAX(identity_status) AS identity_status,
            MAX(request_model) AS request_model,
            MAX(CASE WHEN event_type = 'usage_observed' THEN response_model END) AS response_model,

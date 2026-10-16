@@ -35,7 +35,7 @@ services:
     image: alpine:latest
     command: [/app/consumer, --config, /config/consumer.json]
     environment:
-      DORIS_DSN: 'root@tcp(doris:9030)/metering?timeout=5s&readTimeout=30s&writeTimeout=10s&interpolateParams=true&time_zone=%27%2B00%3A00%27'
+      DORIS_DSN: 'root@tcp(doris:9030)/metering_development?timeout=5s&readTimeout=30s&writeTimeout=10s&interpolateParams=true&time_zone=%27%2B00%3A00%27'
       DORIS_USER: root
       DORIS_PASSWORD: ''
     volumes: ['../../dist:/app:ro', './consumer.json:/config/consumer.json:ro']

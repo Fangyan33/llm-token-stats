@@ -17,8 +17,10 @@ ROOT = Path(__file__).resolve().parents[1]
 MAX_EVENT_BYTES = 32768
 INT64_MAX = 9223372036854775807
 IDENTITY_FIELDS = (
-    "service_id", "api_key_id", "customer_id", "application_id", "identity_status",
+    "service_id", "provider_id", "api_key_id", "customer_id", "identity_status",
     "config_version", "gateway_instance_id", "adapter_id", "x_request_id",
+    "cluster_name", "deployment_environment", "mapping_status", "mapping_version",
+    "customer_mapping_status", "customer_mapping_version",
 )
 TOKEN_NAMES = (
     "input_tokens", "output_tokens", "cached_read_tokens", "cached_write_tokens",
@@ -204,7 +206,24 @@ def validate_event(event, kafka_key=None, now_ms=None, input_size=None):
     require(event["event_id"] == request_id + suffix, "event_id_mismatch")
     if kafka_key is not None:
         require(kafka_key == request_id.encode("utf-8"), "kafka_key_mismatch")
-    identity_known = all(event[n] is not None for n in ("api_key_id", "customer_id", "application_id"))
+    host = event['request_host']
+    if host is not None:
+        import ipaddress
+        require(host == host.lower() and len(host) <= 253 and not host.endswith('.'), 'request_host_canonical')
+        require(all(re.fullmatch(r'[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?', part) for part in host.split('.')), 'request_host_dns')
+        try: ipaddress.ip_address(host)
+        except ValueError: pass
+        else: raise ContractError('request_host_ip')
+    service_mapped = event['mapping_status'] == 'mapped'
+    require(service_mapped == all(event[n] is not None for n in ('service_id','provider_id','mapping_version')), 'service_mapping')
+    if not service_mapped:
+        require(all(event[n] is None for n in ('service_id','provider_id','mapping_version')), 'partial_service_mapping')
+    require((event['mapping_status'] == 'invalid_host') == (host is None), 'host_mapping')
+    customer_mapped = event['customer_mapping_status'] == 'mapped'
+    require(customer_mapped == all(event[n] is not None for n in ('api_key_id','customer_id','customer_mapping_version')), 'customer_mapping')
+    if not customer_mapped:
+        require(all(event[n] is None for n in ('api_key_id','customer_id','customer_mapping_version')), 'partial_customer_mapping')
+    identity_known = all(event[n] is not None for n in ("api_key_id", "customer_id"))
     require((event["identity_status"] == "known") == identity_known, "identity_status_mismatch")
     if not identity_known:
         require("identity_invalid" in event["anomaly_codes"], "identity_invalid_code")
@@ -268,7 +287,7 @@ def validate_config(config, release=False):
     names = []
     for rule in config["routes"]:
         names.append(rule["route_name"])
-        for name in ("route_name", "service_id"):
+        for name in ("route_name",):
             require(utf8_size(rule[name]) <= 128, "route_id_bytes")
         for path in rule["paths"]:
             require(utf8_size(path) <= 1024 and not any(c.isspace() for c in path), "path_bytes_or_whitespace")
@@ -305,7 +324,8 @@ def validate_repository():
     for message in re.findall(r"message\s+\w+\s*\{(.*?)^\}", proto, re.S | re.M):
         numbers = re.findall(r"^\s*(?:optional\s+)?\w+\s+\w+\s*=\s*(\d+)", message, re.M)
         require(len(numbers) == len(set(numbers)), "duplicate_proto_field_number")
-        reserved = re.findall(r"reserved\s+(\d+)\s*;", message)
+        reserved = [number for clause in re.findall(r"reserved\s+([\d,\s]+);", message)
+                    for number in re.findall(r"\d+", clause)]
         require(not set(numbers).intersection(reserved), "reserved_proto_field_reused")
     require("reserved 2;" in proto and "rpc Observe(stream ObservationFrame) returns (stream ObservationAck);" in proto, "proto_service_contract")
     config = load(ROOT / "configs/gateway-observer.example.json")
@@ -320,7 +340,7 @@ def validate_repository():
     fields = load(ROOT / "api/events/v1/metering-event.schema.json")["properties"]
     require(set(fields) - {"usage"} <= columns, "event_doris_column_drift")
     require(all(n in columns and n + "_source" in columns for n in TOKEN_NAMES), "token_doris_column_drift")
-    # Identity comparison must agree across new hashes, legacy reads and both
+    # Identity comparison must agree across hashes, evidence reads and both
     # database projections; route diagnostics must never re-enter this key.
     identity_sql = "CAST(JSON_ARRAY(" + ", ".join(IDENTITY_FIELDS) + ") AS STRING)"
     store = (ROOT / "internal/doris/store.go").read_text(encoding="utf-8")

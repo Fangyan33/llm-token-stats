@@ -49,7 +49,7 @@ func Freeze(rs []*kgo.Record, c config.Consumer, now time.Time) (*Batch, error) 
 			if reason == "unknown_schema" {
 				return nil, ErrPause
 			}
-		} else if !events.Has(c.AcceptedConfigs, e.ConfigVersion) || !config.AcceptsService(c.AcceptedServices, c.Routes, e.ServiceID) || e.ResponseFlags != nil && !events.Has(c.Flags, *e.ResponseFlags) || e.ResponseCodeDetails != nil && !events.Has(c.Details, *e.ResponseCodeDetails) {
+		} else if !events.Has(c.AcceptedConfigs, e.ConfigVersion) || e.ServiceID != nil && !config.AcceptsService(c.AcceptedServices, *e.ServiceID) || e.ResponseFlags != nil && !events.Has(c.Flags, *e.ResponseFlags) || e.ResponseCodeDetails != nil && !events.Has(c.Details, *e.ResponseCodeDetails) {
 			reason = "event_registration"
 			err = errors.New(reason)
 		}

@@ -2,21 +2,23 @@
 
 版本：V1.9｜日期：2026-10-15｜状态：采集组件已实现，公开旧版 Envoy/Kafka/Doris 本地联调已通过；私有环境与性能验收待执行，详见[运行说明](collection-components.md)。
 
-依据：[原技术方案](token-metering-design.md)、[功能设计概览及开发周期](token-metering-functional-overview-and-schedule.md)、[API Key Auth 服务方案](api-key-auth-service-implementation.md)。本文细化一期中“鉴权后采集到 Doris 明细入库”的采集子项；一期的估算、日/月汇总、客户查询与看板在后续子项完成；归档为后续可选项，不能以本文验收代替一期整体验收。本文中的 SQL、协议和配置供后续实现使用；Go 代码标明为伪代码的部分不能直接编译。
+依据：[原技术方案](token-metering-design.md)、[功能设计概览及开发周期](token-metering-functional-overview-and-schedule.md)、[API Key Auth 服务方案](api-key-auth-service-implementation.md)。本文细化一期中“鉴权后采集到 Doris 明细入库”的采集子项；一期的估算、日/月汇总、客户查询与看板在后续子项完成；归档为后续可选项，不能以本文验收代替一期整体验收。本文的协议、配置和初始化 SQL 描述当前实现，Go 代码中明确标记的伪代码仅说明流程；汇总 Worker、估算和查询 API 的相关段落仍是待实施设计。
 
 设计闭环交付物、协议业务校验、请求改写衔接、Consumer 恢复屏障与 G0–G5 上线证据见[闭环与验收清单](gateway-collection-design-closure.md)。正式契约文件为实施依据，本文片段由离线脚本检查一致性。
+
+当前已删除 application_id。Wasm 只从 Authorization: Bearer 提取临时 api_key，并发送入口 authority；Observer 使用配置的 cluster_name/deployment_environment，分别通过服务和客户查询接口取得归属。两个接口目前只有未实现占位，合法输入产生 lookup_not_implemented，service_id/provider_id/api_key_id/customer_id 及映射版本为 null，identity_status=invalid、usage_eligible=false，原始 usage 保留。URI 可留空，填写也不会发起 HTTP；不访问 PG、不读身份元数据补值，密钥不进入事件、数据库或日志。 真实 HTTP 适配为后续工作。
 
 ## 1. 范围与技术决策
 
 | 项目 | 一期采集子项决策 |
 | --- | --- |
 | 业务环境 | Istio 1.13.5、Kubernetes 1.22，先在实际私有网关镜像验证 |
-| 网关插件 | Go + TinyGo，Proxy-Wasm，EnvoyFilter 加载本地固定文件 |
+| 网关插件 | Go + TinyGo、Proxy-Wasm；插件随 Observer 镜像发布，EnvoyFilter 原生 code.remote 下载并校验 SHA-256 |
 | 接收与消费 | Go Observer、Go Consumer，独立部署 |
 | 数据路径 | WASM → 双向 gRPC → Observer → Kafka → Consumer → Doris |
 | 协议 | 兼容 Chat Completions 的 JSON 和 SSE，包括工具调用、多候选 |
 | 用量 | 只提取有效服务 usage；缺失字段为 null/unknown；一期采集子项不估算，估算属于一期后续子项 |
-| 配置 | 采集参数使用版本化 JSON/YAML、ConfigMap；采集组件不建设管理 API，身份与 API Key 由独立 Auth + PostgreSQL 管理 |
+| 配置 | 采集运行参数使用严格 JSON，通过 ConfigMap 挂载；Kubernetes 清单使用 YAML；采集组件不建设管理 API，归属由 Observer 的类型明确查询接口解析，当前占位，不访问 PostgreSQL |
 | 存储 | Doris 保存类型化原始事件、冲突证据、去重/请求视图及汇总通知、消费凭据和发布状态；原始事件按 UTC 请求日期分区保留 365 个日期；采集与汇总无需额外 PostgreSQL |
 | 故障策略 | 业务不等待采集，采集超限或失败放弃，无落盘、重传及恢复队列 |
 | 查询交付 | 一期采集子项提供计量查询 ID、事件字段、SQL 和联调查询样例；一年内在线事件 HTTP API、门户和大范围导出任务属于一期后续子项；外部归档历史检索为可选项 |
@@ -32,12 +34,12 @@
 | --- | --- |
 | Envoy | 原方案追溯到 Istio Envoy 提交 `e2e40d8d667e1b7c752d27980307f22d9f73e9ee`，标识为 `1.21.3-dev`；实际镜像另记 digest |
 | SDK | 以 `github.com/tetratelabs/proxy-wasm-go-sdk v0.24.0` 为可复现 PoC 基底，在仓库内维护最小 gRPC 扩展，禁止直接依赖浮动 main |
-| Go / TinyGo | 当前工作环境为 Go 1.25.0、TinyGo 0.40.1；仅作为首轮编译候选，不宣称已兼容旧 Envoy；通过后记录构建镜像 digest |
+| Go / TinyGo | 当前固定 Go 1.25.0、TinyGo 0.40.1，已通过公开 Istio 1.13.5 Envoy 与本地 Kubernetes 联调；私有镜像及生产性能仍须验收 |
 | Kafka 客户端 | `github.com/twmb/franz-go v1.18.1` 为本文 API 核查基线，生产依赖按验证结果锁定 go.mod/go.sum |
 | Kafka / Doris | 复用目标环境，实施前记录服务端实际版本；本文避免依赖新版 JSON 列、刷新物化视图等能力 |
 | Protobuf / gRPC-Go | Observer 使用标准生成代码；WASM 使用小型定长上界编解码器，双方以同一 `.proto` 做兼容测试 |
 
-本地 SDK v0.24.0 的 `abi_hostcalls.go` 未实现 gRPC stream/send/cancel，不能直接写一个不存在的 `DispatchGrpcStream` 调用。其普通 HTTP callout 在调用者 context 被删除后还会跳过回调。因此本方案明确包含 SDK 扩展工作，而不是只写业务过滤器。[SDK 固定源码](https://github.com/tetratelabs/proxy-wasm-go-sdk/tree/v0.24.0/proxywasm/internal)
+上游 SDK v0.24.0 的 `abi_hostcalls.go` 没有 gRPC stream/send/cancel 封装，其普通 HTTP callout 在调用者 context 被删除后还会跳过回调。本仓库已在 third_party/proxy-wasm-go-sdk/ 实现所需扩展、Root token 注册和回调清理，变更见其中 PATCHES.md；构建必须使用该固定副本。[SDK 固定源码](https://github.com/tetratelabs/proxy-wasm-go-sdk/tree/v0.24.0/proxywasm/internal)
 
 SDK 原仓库已归档，选它是为了固定可审查的最小基底；扩展代码、依赖审计及维护归本项目。PoC 若不能通过，停止发布，记录失败证据并重新评审语言/运行时方案，不自动改为逐片 HTTP 请求或同步 ext_proc。[SDK 仓库状态](https://github.com/tetratelabs/proxy-wasm-go-sdk)
 
@@ -47,8 +49,7 @@ SDK 原仓库已归档，选它是为了固定可审查的最小基底；扩展�
 flowchart LR
     C[调用方] --> X[ingressgateway: ext_authz]
     X -. gRPC Check .-> H[API Key Auth]
-    H --> P[(PostgreSQL)]
-    X -->|允许 + 身份元数据| W[ingressgateway: Go WASM]
+    X -->|访问允许 + 原 Bearer| W[ingressgateway: Go WASM]
     W --> R[ingressgateway: router]
     R --> A[模型服务 A]
     W -. 有界异步 gRPC .-> O[Go Observer]
@@ -60,26 +61,15 @@ flowchart LR
 
 WASM 仅做有界 usage 参数编辑，不提取业务用量、不运行 tokenizer、不使用 Go 网络库直连 Kafka。Observer 不承接业务路由；接收正文只为当前解析，完成或放弃后释放。任何组件的日志、错误、trace、死信记录都不得含正文或密钥。
 
-### 2.1 路由、身份与过滤器顺序
+### 2.1 路由、归属与过滤器顺序
 
-1. 在 ingressgateway HTTP filter chain 中，把插件放在 `envoy.filters.http.ext_authz` 之后、router 之前；顺序以真实 `config_dump` 确认。Auth 及 PostgreSQL 设计见独立文档。
-2. 必须在请求头阶段按第 2.3 节执行“规则显式启用 + 方法 + 路径”联合白名单。当前 `route_name: "*"` 忽略路由名，所有到达该观察位置的 `POST /v1/chat/completions` 均进入采集流程；精确路由筛选保留兼容。服务 ID 来自配置，不从客户端路径推断；Observer 的 gRPC 接口路径不在白名单中。
-3. 一期采集子项统计基数为到达该观察位置且命中完整白名单的请求，不包含同路由上的普通查询。鉴权前被拒绝的请求可能不经过插件，单列网关指标，不混入完整率分母。
-4. 可信身份来自 Auth 的 `CheckResponse.dynamic_metadata`，由 Envoy 写入 `filter_metadata.envoy.filters.http.ext_authz` namespace。
-5. 不信任客户端传入的 API Key ID、客户 ID、应用 ID；一期采集子项不支持把任意请求头配置为身份来源。
+ext_authz → Wasm → router 以真实 config_dump 核验。鉴权只决定业务访问；Wasm 命中启用/POST/精确路径后才读取入口 authority 和 Authorization: Bearer token。旧身份 metadata 配置和静态 service_id 已删除，不接受客户端自报 ID。
 
-| 逻辑字段 | 示例元数据叶子 | 处理规则 |
-| --- | --- | --- |
-| api_key_id | `envoy.filters.http.ext_authz.api_key_id` | Auth 返回的稳定 ID；不记录密钥原文 |
-| customer_id | `envoy.filters.http.ext_authz.customer_id` | 鉴权时的客户快照 |
-| application_id | `envoy.filters.http.ext_authz.application_id` | 鉴权时的应用快照 |
-| `identity_status` | 插件生成 | 三项齐全为 `known`；鉴权成功却缺失任一字段时标记 `invalid` 并记录 `identity_invalid` 异常码，不猜归属；业务按 ext_authz 结果继续 |
-| service_id / adapter_id | 路由配置 | 必填；不在配置中的路由不采集 |
-| config_version | 插件配置 | 开始时固定，同一请求后续不切换版本 |
+Observer 使用固定 cluster_name、deployment_environment 和可空 service_lookup.uri/customer_lookup.uri。ServiceResolver 输入规范 Host/集群/环境，返回 service_id/provider_id；CustomerResolver 输入临时 token，返回 api_key_id/customer_id。当前两个占位立即返回 lookup_not_implemented；非法输入先为 invalid_host/invalid_api_key。事件中四项 ID 和版本均为 null，identity_status=invalid、usage_eligible=false，原始 usage 保留。两个事件固定同一归属快照，Consumer 不回源查询。
 
-SDK `GetProperty` 路径候选为 `metadata/filter_metadata/envoy.filters.http.ext_authz/api_key_id` 等叶子路径；namespace 含点号时的实际路径分段、返回值编码及鉴权执行顺序必须在固定 Envoy PoC 验证。鉴权成功但元数据缺失属于接入错误，该请求可继续业务，但计量身份标 invalid，不能从普通请求头补齐。[属性读取接口](https://github.com/tetratelabs/proxy-wasm-go-sdk/blob/v0.24.0/proxywasm/hostcall.go)
+Host 原输入最多 512 UTF-8 字节，校验端口后剥离、转小写、去掉一个尾根点，仅接受最长 253 ASCII 字节的 DNS/Punycode 域名，拒绝 IP、通配、路径/query 或非法标签。token 最长 4096 字节，来源固定 Bearer，不回退其他头；重复 Authorization 的逗号合并值也拒绝。固定 Envoy 的[HeadersWrapper](https://raw.githubusercontent.com/istio/envoy/e2e40d8d667e1b7c752d27980307f22d9f73e9ee/source/extensions/filters/common/expr/context.h)提供指定请求头属性的合并语义，避开普通取头仅首值的行为。
 
-模型名称/模型 ID（`request_model`、`response_model`）只接受合法 UTF-8，上限统一为 **1024 字节**，按解码后的字符串 UTF-8 字节数计量，不按字符数或 JSON 转义文本长度计量。其他身份 ID 保持 128 字节上限。超长或非法编码标为无效、不截断；模型字段写 null 并记录 `invalid_model`，合法 usage 仍可采集。模型名不承担鉴权职责。Observer 和 Consumer 必须使用同一模型长度校验契约；Doris 使用可空 `VARCHAR(1024)`，长度按 UTF-8 字节校验。只读取明确列出的头：`:method`、仅用于本地过滤的 `:path`、状态、Content-Type、Content-Encoding，以及用于辅助关联的 `x-request-id`；不发送原始头集合、路径、URL query、Authorization、Cookie、工具参数或错误响应文本。记录路由名代替原始 URL。
+原始 token 仅在受保护观察链路和必要内存中临时存在，处理后清理，绝不进入 Kafka、Doris、日志/追踪或错误；不修改业务原 Authorization。模型仍限定合法 UTF-8、最多 1024 字节，无效置 null/invalid_model，不影响合法 usage。除指定 authority、Bearer、方法、状态、Content-Type/Encoding 与 x-request-id 外不上传头集合，原 URL/query、Cookie、正文和工具参数不持久化。
 
 ### 2.2 请求标识及时间
 
@@ -120,12 +110,12 @@ Consumer 校验 UUIDv4 格式和 Kafka key 后，以事件中的 `request_starte
 
 本节为实现和上线验收的强制约束；“白名单请求”均指命中以下完整条件的请求。
 
-1. **默认忽略**：全局 enabled 必须为 true，命中规则显式 enabled=true、方法和路径同时命中，才标记 selected。当前单条规则使用 `route_name: "*"`，忽略实际路由名，路由属性或 metadata 不可读时仍按 method/path 匹配；缺少规则或规则禁用时不采集。只有整个值 `*` 具有通配含义，不支持 `llm-*` 等部分模式。精确路由模式仍从 Envoy 可信路由属性取得名称，读取不到时不命中该精确规则；不接受客户端 Header 控制开关、路由名、service_id 或 adapter_id。事件的 service_id/adapter_id 固定为命中规则的配置值；route_name 单独读取真实 Envoy 属性，缺失、超过 128 UTF-8 字节、无效或通配值时写 `unknown`，不使用兼容计量 metadata 冒充真实路由。该诊断快照在请求内不变，不参与服务准入、身份一致性或价格选择。
+1. **默认忽略**：全局 enabled 必须为 true，命中规则显式 enabled=true、方法和路径同时命中，才标记 selected。当前单条规则使用 `route_name: "*"`，忽略实际路由名，路由属性或 metadata 不可读时仍按 method/path 匹配；缺少规则或规则禁用时不采集。只有整个值 `*` 具有通配含义，不支持 `llm-*` 等部分模式。精确路由模式先读 Envoy route_name 属性，缺失时兼容读取可信 route_metadata.filter_metadata.metering.route_name，二者都不可读才不命中；不接受客户端 Header 控制开关、路由名、service_id 或 adapter_id。事件的 adapter_id 固定为命中规则配置，service_id/provider_id 由 Observer 接口确定；route_name 单独读取真实 Envoy 属性，缺失、超过 128 UTF-8 字节、无效或通配值时写 `unknown`，不使用兼容计量 metadata 冒充真实路由。该诊断快照在请求内不变，不参与服务准入、身份一致性或价格选择。
 2. **一期采集子项只允许 Chat Completions**：adapter_id 固定为 chat_completions_v1，methods 固定为 ["POST"]，paths 为非空精确路径列表，默认 ["/v1/chat/completions"]。部署使用自定义路径时必须逐条配置并验证；路径禁止通配符、前缀、包含或正则匹配。GET、HEAD、OPTIONS、指标、健康检查和模型列表接口不得进入采集；未来其他协议需独立适配器和评审。
 3. **路径口径固定**：使用 Wasm 请求头回调当时可见的 :path，去掉第一个 ? 及其后的查询串后逐字节匹配；插件不额外 URL 解码、大小写折叠、合并斜杠或去除尾斜杠。网关此前已做的规范化以实际可见结果为准。路径和 query 不上报、不入库、不记日志或指标标签。规则按该观察位置配置，不使用上游重写后的路径猜测；路径重写及执行顺序须在固定镜像 PoC 验证。
 4. **先过滤再分配**：HTTP context 初始 selected=false，只保存必要标志。未命中时不请求 Observer 分配 logical_request_id、不读取身份或正文、不申请改写/观察额度、不建立观察 gRPC 流、不发送 Start/BodyChunk/End、不添加计量响应头，所有后续回调直接 Continue（结束回调直接返回）。不得为这类请求产生两类 Kafka 事件，包括 unknown 占位事件；只增加本地忽略计数。Envoy/SDK 基础 HTTP context 的创建不等于分配计量状态。
 5. **请求内固定结果**：命中后固定规则、config_version 和 selected，后续配置更新、响应状态、usage 缺失不得改变本次选择。Content-Type、Content-Encoding、请求体中的 model/stream、是否携带 API Key 均不能替代入口白名单。内容类型/压缩不支持仅影响改写和解析；命中的失败响应、非法正文或断流仍按现有有界流程尝试产生可观察事件，未知用量不得补零，不承诺两事件必达。
-6. **鉴权独立**：不采集不代表免鉴权；普通查询按其自身鉴权策略处理。命中请求仍从 ext_authz 获取可信身份；鉴权前被拒绝的请求不在本观察位置的分母中。Observer/Consumer 的 schema、adapter_id/config_version 校验仅为防御性校验，不能替代入口过滤；现有事件不携带原始路径，不声称下游能重新验证全部匹配条件。
+6. **鉴权独立**：不采集不代表免鉴权；普通查询按其自身鉴权策略处理。命中请求从 Bearer/Host 输入经 Observer 接口解析归属，当前接口未实现；鉴权前被拒绝的请求不在本观察位置的分母中。Observer/Consumer 的 schema、adapter_id/config_version 校验仅为防御性校验，不能替代入口过滤；现有事件不携带原始路径，不声称下游能重新验证全部匹配条件。
 
 规则匹配先检查全局开关及 POST 方法，再按配置顺序选择首先命中路由名（精确名或 `*`）的规则，检查该规则开关及精确路径；先命中的规则禁用或路径不匹配时不会继续回退到后续规则。忽略原因分别为 disabled、method、route_disabled、path、route，指标为 `metering_requests_ignored_<原因>_total`，每请求只计一次；`*` 规则不会因缺少路由名而忽略。规则上限 128 条，每规则最多 16 个路径，每路径最多 1024 UTF-8 字节；请求头读取上限同时由网关配置约束，禁止无界复制。
 
@@ -165,20 +155,19 @@ message ObservationFrame {
 }
 
 message Start {
+  reserved 5, 7, 8, 9, 10;
+  reserved "service_id", "api_key_id", "customer_id", "application_id", "identity_status";
   int64 request_started_at_ms = 1;
   string gateway_instance_id = 2;  // Pod UID，不是客户端输入
   string config_version = 3;
   string route_name = 4;           // 真实 Envoy 路由名，仅诊断；不可读为 unknown，不作为接纳条件
-  string service_id = 5;
   string adapter_id = 6;
-  optional string api_key_id = 7;
-  optional string customer_id = 8;
-  optional string application_id = 9;
-  string identity_status = 10;
   string method = 11;
   string request_content_type = 12;
   string request_content_encoding = 13;
   bool request_end_stream = 14;
+  string request_authority = 16;   // Entry authority, at most 512 UTF-8 bytes
+  bytes api_key = 17;              // Transient Bearer token, at most 4096 bytes; never log
   optional string x_request_id = 15; // 网关可见的 X-Request-Id，仅辅助关联
 }
 
@@ -219,7 +208,7 @@ message ObservationAck {
 }
 ```
 
-`example.com` 仅为仓库尚无正式 Go module path 时的占位符；建工程时一次性替换。字段号发布后不复用，新增字段保持向后兼容。WASM → Observer 的观察流使用未知协议 `schema_version` 时拒绝该观察流，不影响业务；Kafka 事件的未知 `schema_version` 由 Consumer 暂停相应分区且不提交 offset，按第 8 节处理。
+go_package 已固定为 `github.com/Fangyan33/llm-token-stats/gen/observation/v1`，不再使用 example.com 占位。字段号删除后标记 reserved，不复用。当前尚未上线的归属变更按新计划直接修改唯一契约；正式上线后的契约变更需另行制定版本演进与发布顺序。WASM → Observer 的观察流使用未知协议 `schema_version` 时拒绝该观察流，不影响业务；Kafka 事件的未知 `schema_version` 由 Consumer 暂停相应分区且不提交 offset，按第 8 节处理。
 
 ### 3.2 消息顺序、ACK 与缺片
 
@@ -395,7 +384,7 @@ func (p *PluginContext) OnTick() {
 | end_ack_timeout_ms | uint32/毫秒 | 2000 | End 发送后清理旁路 |
 | observation_max_ms | uint32/毫秒 | 600000 | 10 分钟后停止观察，业务继续 |
 | tick_ms | uint32/毫秒 | 100 | 有界处理到期项 |
-| metadata_max_bytes | uint32/字节 | 4096 | 无效元数据跳过/取消 |
+| metadata_max_bytes | uint32/字节 | 6144 | 无效元数据跳过/取消 |
 | ack_max_bytes | uint32/字节 | 1024 | 取消旁路 |
 
 在途字节按“Protobuf 序列化长度 + 5 字节 gRPC 消息头”计算；账本只留序号、长度与时间，不留可重传正文。发送成功只表示 hostcall 接纳。失败后释放未提交预留，取消已提交旁路并一次性清理账本；迟到 ACK 不得再次释放。
@@ -410,9 +399,9 @@ WASM 线性内存高水位未必返还操作系统；验收检查长时间复用
 
 ### 5.1 状态管理
 
-gRPC-Go 每流一个处理器，不为每片启动 goroutine。每个流在首次 Recv 前非阻塞申请活动流槽及一份 32 KiB 接收预留，再把消息转入另行记账的解析状态；不能接收完所有消息才检查内存。gRPC 内部帧/连接缓冲不包含在这份预留中，需同时约束连接数、HTTP/2 窗口及并发流。ACK 写协程每流最多一个；状态由单流串行处理，写侧只读最新 ACK 快照。接收消息上限 32 KiB，活动流上限 4096，解析状态总预算 256 MiB，进程 memory limit 初值 1 GiB；额外运行时/连接内存纳入压测。
+gRPC-Go 每流一个处理器，另有最多一个接收协程和一个 ACK 写协程，不为每片启动 goroutine。每个流在首次 Recv 前非阻塞申请活动流槽及 3 × 32 KiB = 96 KiB 固定接收预留，覆盖已解码帧、一个排队帧及正在接收的帧；解析缓冲另行记账，不能接收完所有消息才检查内存。gRPC 内部帧/连接缓冲不包含在这份预留中，需同时约束连接数、HTTP/2 窗口及并发流。ACK 写协程每流最多一个；状态由单流串行处理，写侧只读最新 ACK 快照。接收消息上限 32 KiB，活动流上限 4096，解析状态总预算 256 MiB，进程 memory limit 初值 1 GiB；额外运行时/连接内存纳入压测。活动流数量和 256 MiB 字节预算分别检查，不能承诺 4096 个流能同时取得固定预留及正文解析空间。
 
-收到合法 Start 后先按第 2.2 节生成并固定 `logical_request_id`，立即回传带 ID 的 Start ACK，再尝试发送 `request_started`；ACK 和 Kafka 发送互不等待，Kafka 失败不重开观察流或重新分配 ID。请求 JSON 最多保存 256 KiB，以获得 model/stream；保存期间计入全局预算。响应普通 JSON 最多 1 MiB；SSE 只保存当前事件和 usage 候选，单事件最大 256 KiB。全流传入响应最多 8 MiB。限制 UTF-8、JSON 深度 64、JSON 元素数 100000；避免一次巨大对象耗尽 CPU。
+收到合法 Start 后调用不保留密钥的占位 resolver，固定 Host/集群/环境和两类状态并清理临时 token，并按第 2.2 节生成并固定 `logical_request_id`，立即回传带 ID 的 Start ACK，再尝试发送 `request_started`；ACK 和 Kafka 发送互不等待，Kafka 失败不重开观察流或重新分配 ID。请求 JSON 最多保存 256 KiB，以获得 model/stream；保存期间计入全局预算。响应普通 JSON 最多 1 MiB；SSE 只保存当前事件和 usage 候选，单事件最大 256 KiB。全流传入响应最多 8 MiB。限制 UTF-8、JSON 深度 64、JSON 元素数 100000；避免一次巨大对象耗尽 CPU。
 
 Observer 每处理至多 64 KiB 解析数据检查 deadline 和资源预算。单流累计解析 CPU 预算以处理耗时近似限额 100 ms 做测试初值；这是协作式检查，不宣称能中断 Go 标准库中任意解析操作。小块解析、大小/深度上限和进程隔离共同限制风险。
 
@@ -518,11 +507,18 @@ sequenceDiagram
   "gateway_instance_id": "gateway-pod-uid",
   "config_version": "collection-v1",
   "adapter_id": "chat_completions_v1",
-  "route_name": "unknown",
+  "route_name": "llm-chat",
+  "request_host": "model.example.invalid",
+  "cluster_name": "fixture-cluster",
+  "deployment_environment": "test",
   "service_id": "model-service-a",
+  "provider_id": "provider-a",
+  "mapping_version": "48a5034f65608f6895d3e529dafbb6f3c152e2058951074d7ce7ccaeaa6bc7da",
+  "mapping_status": "mapped",
   "api_key_id": "key-42",
   "customer_id": "customer-7",
-  "application_id": "app-3",
+  "customer_mapping_version": "7cca1d652cd89a6f3257c9bfb4c9e8bf4d044af5513e0fa7ad7be5dd7cc861e1",
+  "customer_mapping_status": "mapped",
   "identity_status": "known",
   "request_started_at_ms": 1789862400000,
   "observation_ended_at_ms": 1789862401200,
@@ -540,12 +536,30 @@ sequenceDiagram
   "usage_status": "known",
   "usage_eligible": true,
   "usage": {
-    "input_tokens": {"value": 1000, "source": "reported"},
-    "output_tokens": {"value": 500, "source": "reported"},
-    "cached_read_tokens": {"value": 200, "source": "reported"},
-    "cached_write_tokens": {"value": 300, "source": "reported"},
-    "reasoning_tokens": {"value": 100, "source": "reported"},
-    "reported_total_tokens": {"value": 1500, "source": "reported"}
+    "input_tokens": {
+      "value": 1000,
+      "source": "reported"
+    },
+    "output_tokens": {
+      "value": 500,
+      "source": "reported"
+    },
+    "cached_read_tokens": {
+      "value": 200,
+      "source": "reported"
+    },
+    "cached_write_tokens": {
+      "value": 300,
+      "source": "reported"
+    },
+    "reasoning_tokens": {
+      "value": 100,
+      "source": "reported"
+    },
+    "reported_total_tokens": {
+      "value": 1500,
+      "source": "reported"
+    }
   },
   "raw_usage_json": "{\"prompt_tokens\":1000,\"completion_tokens\":500,\"total_tokens\":1500,\"prompt_tokens_details\":{\"cached_tokens\":200,\"cache_write_tokens\":300},\"completion_tokens_details\":{\"reasoning_tokens\":100}}",
   "raw_usage_truncated": false,
@@ -606,9 +620,9 @@ ACK 与 Kafka 发送完全解耦；即便两条事件只有一条成功入 Kafka
 | 状态 | TINYINT、VARCHAR | 0 与 NULL 含义不同；布尔值在 SQL 列中用 0/1 |
 | Kafka 坐标 | VARCHAR、INT、BIGINT | 重放后同一键可能保留任一次写入的坐标 |
 
-`identity_hash` 对下列固定顺序的字段构造 JSON 数组并计算 SHA-256：`service_id`、`api_key_id`、`customer_id`、`application_id`、`identity_status`、`config_version`、`gateway_instance_id`、`adapter_id`、`x_request_id`。`route_name` 为可缺失的诊断维度（以 `unknown` 占位），不进入身份摘要。使用规范事件序列化器编码 UTF-8、JSON null 和转义；不可用简单字符串拼接代替，以免空值与分隔符造成歧义。模型是观察结果，不纳入稳定身份摘要。`payload_hash` 和 `identity_hash` 均由 Consumer 对同一个已校验事件对象计算。
+`identity_hash` 对固定元组 `[service_id, provider_id, api_key_id, customer_id, identity_status, config_version, gateway_instance_id, adapter_id, x_request_id, cluster_name, deployment_environment, mapping_status, mapping_version, customer_mapping_status, customer_mapping_version]` 规范 JSON 编码后取 SHA-256。null 保留，路由和模型不是独立身份字段；mapping_version 绑定规范 Host，版本不含原始密钥。Consumer 证据、巡检及 SQL 投影使用同一顺序。
 
-[006 migration](../migrations/doris/metering/006_optional_route_identity.sql) 更新 requests / request_statistics：对全部新旧记录，以相同九个类型化身份字段构造 JSON 数组比较；Consumer 的跨日期冲突查询采用同样字段。旧 identity_hash 含 route_name，不能直接与新版摘要比较，也不要求回填。历史 event_json、payload_hash、路由原值保持不变；同一 event_id 即使只改路由名也属于不同内容，仍保留冲突。既有 request_conflict_ids 不自动删除。部署顺序为暂停旧 Consumer → 执行 006 → 升级 Consumer / Observer 和白名单 → 发布新 Wasm。
+006 初始化当前请求视图，按唯一新契约比较类型化身份字段；不实现旧格式/hash 兼容。旧开发数据使用独立库保留，新契约不读取旧格式消息。
 
 事件表按 UTC 请求日期每日分区，拒绝诊断表按 Kafka 记录 UTC 日期每日分区，均在线保留一年：365 个 UTC 日期（当天及前 364 天）。Doris 动态分区创建与清理，time_unit=DAY、start=-364、end=2、time_zone=UTC；各 FE 须开启并持久化动态分区配置。Consumer 不接收超出在线窗口的历史事件，也不把过滤行视为成功。日/月汇总独立保留并由 usage-worker 刷新，见[一期日/月汇总设计](daily-monthly-summary-design.md)；归档为[后续可选设计](archive-optional-design.md)，一期不部署。`request_conflict_ids` 长期保留冲突 UUIDv4，不随事件分区到期删除，避免较早冲突变体过期后较晚变体恢复有效。UUIDv4 不得重用。[动态分区](https://doris.apache.org/docs/4.x/table-design/data-partitioning/dynamic-partitioning/)
 
@@ -702,9 +716,19 @@ Consumer/Doris 故障可以依赖 Kafka 72 小时保留恢复，与禁止采集�
   "config_version": "collection-v1",
   "gateway_instance_id": "RENDER_FROM_POD_UID",
   "observer_cluster": "outbound|9090||metering-observer.metering.svc.cluster.local",
-  "identity_namespace": "envoy.filters.http.ext_authz",
-  "identity_fields": {"api_key_id": "api_key_id", "customer_id": "customer_id", "application_id": "application_id"},
-  "routes": [{"route_name": "*", "enabled": true, "methods": ["POST"], "paths": ["/v1/chat/completions"], "service_id": "model-service-a", "adapter_id": "chat_completions_v1"}],
+  "routes": [
+    {
+      "route_name": "*",
+      "enabled": true,
+      "methods": [
+        "POST"
+      ],
+      "paths": [
+        "/v1/chat/completions"
+      ],
+      "adapter_id": "chat_completions_v1"
+    }
+  ],
   "chunk_bytes": 16384,
   "callback_max_bytes": 65536,
   "callback_max_chunks": 4,
@@ -723,7 +747,7 @@ Consumer/Doris 故障可以依赖 Kafka 72 小时保留恢复，与禁止采集�
   "end_ack_timeout_ms": 2000,
   "observation_max_ms": 600000,
   "tick_ms": 100,
-  "metadata_max_bytes": 4096,
+  "metadata_max_bytes": 6144,
   "ack_max_bytes": 1024
 }
 ```
@@ -734,50 +758,102 @@ Consumer/Doris 故障可以依赖 Kafka 72 小时保留恢复，与禁止采集�
 
 ### 9.2 Observer 和 Consumer 配置契约
 
-```yaml
-observer:
-  listen: ":9090"
-  max_recv_message_bytes: 32768
-  max_active_streams: 4096
-  parser_budget_bytes: 268435456
-  request_json_max_bytes: 262144
-  response_json_max_bytes: 1048576
-  sse_event_max_bytes: 262144
-  response_total_max_bytes: 8388608
-  json_max_depth: 64
-  json_max_elements: 100000
-  parser_work_budget_ms: 100
-  max_observation_ms: 605000
-  ack_every_frames: 8
-  ack_interval_ms: 10
-  ack_write_timeout_ms: 2000
-  accepted_adapter_ids: [chat_completions_v1]
-  accepted_config_versions: [collection-v1]
-  accepted_service_ids: [model-service-a]
-  response_flags_allowlist: []
-  response_code_details_allowlist: []
-  producer_slots: 256
-  producer_watchdog_ms: 3000
-  producer_close_timeout_ms: 1000
-kafka:
-  topic: llm-metering-events
-  bootstrap_servers: ["kafka.example.internal:9093"]
-  tls_secret: metering-kafka-tls
-  sasl_secret: metering-kafka-sasl
-consumer:
-  group_id: llm-metering-doris-v1
-  accepted_service_ids: [model-service-a]
-  max_batch_rows: 5000
-  max_batch_bytes: 4194304
-  flush_interval_ms: 15000
-  doris_database: metering
-  summary_notifications_table: summary_dirty_notifications
-  batch_receipts_table: consumer_batch_receipts
+服务只读取严格 JSON，不读取 YAML，也不接受未定义字段。以下两个完整样例分别与 [Observer 配置](../configs/observer.production.example.json)、[Consumer 配置](../configs/consumer.production.example.json)一致；地址和 Secret 环境变量仍需按实际部署准备。
+
+Observer：
+
+```json
+{
+  "kafka": {
+    "bootstrap_servers": [
+      "kafka.kafka.svc.cluster.local:9093"
+    ],
+    "topic": "llm-metering-events",
+    "ca_file": "/secrets/kafka/ca.crt",
+    "username_env": "KAFKA_USERNAME",
+    "password_env": "KAFKA_PASSWORD"
+  },
+  "observer": {
+    "wasm_download": {
+      "listen": ":9093",
+      "file": "/usr/share/metering/wasm/gateway-observer-v1.wasm"
+    },
+    "listen": ":9090",
+    "health_listen": ":9091",
+    "max_connections": 128,
+    "max_active_streams": 4096,
+    "parser_budget_bytes": 268435456,
+    "max_observation_ms": 605000,
+    "accepted_config_versions": [
+      "collection-v1"
+    ],
+    "accepted_adapter_ids": [
+      "chat_completions_v1"
+    ],
+    "accepted_service_ids": [
+      "model-service-a"
+    ],
+    "cluster_name": "REPLACE_CLUSTER_NAME",
+    "deployment_environment": "production",
+    "service_lookup": {
+      "uri": ""
+    },
+    "customer_lookup": {
+      "uri": ""
+    }
+  }
+}
 ```
 
-Consumer 使用同一 Doris 集群完成通知和批次凭据写入，不配置汇总 PostgreSQL DSN。usage-worker 与 Observer/Consumer 独立部署，默认每分钟 CronJob 的 --once 模式，单个发布者保护及状态表见[Doris 协调设计](doris-summary-coordination.md#4-单个-go-发布-worker-与调度)。
+Consumer：
 
-Secret 只通过挂载/环境引用，不写入 ConfigMap 或文档样例。Observer 为每个有效 Start 从 `crypto/rand` 取得 UUIDv4 所需随机字节；随机源失败时拒绝该观察流并报警，持续失败使 `/readyz` 不通过。Observer 配置可接纳的 adapter_id/config_version 白名单与插件配置一起发布，避免未知适配器被静默当通用 JSON。健康检查分 `/livez`（进程可运行）和 `/readyz`（可接纳观察）；Kafka 故障触发发送熔断和指标，不通过 liveness 造成无限重启风暴，除非 watchdog 已确认客户端不能释放。
+```json
+{
+  "kafka": {
+    "bootstrap_servers": [
+      "kafka.kafka.svc.cluster.local:9093"
+    ],
+    "topic": "llm-metering-events",
+    "ca_file": "/secrets/kafka/ca.crt",
+    "username_env": "KAFKA_USERNAME",
+    "password_env": "KAFKA_PASSWORD"
+  },
+  "consumer": {
+    "health_listen": ":9092",
+    "group_id": "llm-metering-doris-v1",
+    "max_batch_rows": 5000,
+    "max_batch_bytes": 4194304,
+    "flush_interval_ms": 15000,
+    "accepted_config_versions": [
+      "collection-v1"
+    ],
+    "accepted_service_ids": [
+      "model-service-a"
+    ],
+    "initial_offsets": [],
+    "gap_resume_offsets": []
+  },
+  "doris": {
+    "fe_url": "http://doris-fe.doris.svc.cluster.local:8030",
+    "allowed_load_hosts": [
+      "doris-fe.doris.svc.cluster.local:8030",
+      "doris-be-0.doris-be.doris.svc.cluster.local:8040"
+    ],
+    "database": "metering",
+    "dsn_env": "DORIS_DSN",
+    "username_env": "DORIS_USER",
+    "password_env": "DORIS_PASSWORD"
+  }
+}
+```
+
+max_recv_message_bytes=32768、request_json_max_bytes=262144、response_json_max_bytes=1048576、sse_event_max_bytes=262144、response_total_max_bytes=8388608、JSON 深度 64/元素 100000、parser_work_budget_ms=100、每 8 帧或 10ms 累计 ACK、ACK 写超时 2000ms，以及 Producer 的 256 槽/3000ms watchdog/1000ms 关闭期限均是当前代码中的固定限制，不是可配置字段。不能把这些名字写入服务 JSON。Kafka 使用 ca_file/cert_file/key_file 与 username_env/password_env，不接受 tls_secret/sasl_secret；Doris 使用独立 doris 对象，不接受 consumer.doris_database 或可自定义的通知/凭据表名。
+
+Observer 的 producer_id 未配置时取 POD_UID，Deployment 已通过 Downward API 注入。Consumer 的 doris.database 接受经过白名单语法校验的库名；DSN 必须与它一致。Store、巡检、Stream Load 和经 render_doris_sql.py 渲染的初始化 SQL 使用同一个库，本地为 metering_development，K8s 每次另建独立库。
+
+Consumer 使用同一 Doris 集群完成通知和批次凭据写入，不配置汇总 PostgreSQL DSN。usage-worker 尚未实现；每分钟 CronJob --once、发布者保护及状态表属于[Doris 协调设计](doris-summary-coordination.md#4-单个-go-发布-worker-与调度)中的待实施部分。
+
+Secret 只通过挂载/环境引用，不写入配置。Observer 的 adapter/config/service 登记须与 Wasm 配置同步；随机源失败拒绝观察流并使 readyz 失败。Kafka 故障不阻塞 ACK 或业务，只有 watchdog 发现客户端关闭超过期限才退出进程；livez/readyz/metrics 边界见运行说明。
 
 ### 9.3 EnvoyFilter 和服务发现
 
@@ -842,7 +918,7 @@ spec:
 
 部署前运行 `istioctl analyze` 和实际镜像配置验证，检查 filter 顺序、WASM 路径及 SHA-256、cluster 存在、路由名称、指标导出及 canary selector。EnvoyFilter 的 fail_open 仅解决适用的运行故障，不覆盖错误安装。[固定 Wasm 配置](https://github.com/istio/envoy/blob/e2e40d8d667e1b7c752d27980307f22d9f73e9ee/api/envoy/extensions/wasm/v3/wasm.proto)
 
-### 9.4 后续代码组织与构建
+### 9.4 当前代码组织与构建
 
 ```text
 api/observation/v1/observation.proto
@@ -857,10 +933,10 @@ migrations/doris/              # 本文 SQL
 testdata/                          # 合成协议样例，无真实业务正文
 ```
 
-插件的 go.mod 以 `replace` 指向仓库 SDK 扩展目录。构建命令候选：
+插件的 go.mod 以 `replace` 指向仓库 SDK 扩展目录。根目录执行 `make build wasm`；单独构建插件的等价命令：
 
 ```bash
-# 在插件模块目录执行；SDK patch 完成后才有可构建目标。
+# 在 plugins/gateway-observer/ 目录执行；使用仓库内已实现的 SDK patch。
 tinygo build -target=wasi -scheduler=none -o ../../dist/gateway-observer-v1.wasm .
 sha256sum ../../dist/gateway-observer-v1.wasm
 ```
@@ -893,7 +969,7 @@ WASM 随 Observer 镜像打包到 `/usr/share/metering/wasm/gateway-observer-v1.
 | Auth 超时或不可用；数据库故障且无有效正向缓存 | 返回 503 | 请求不进入采集；Auth 记录具体内部错误，单独统计鉴权错误 |
 | 数据库故障但未过期正向缓存命中 | 按缓存结果继续鉴权 | 鉴权允许的请求照常采集，缓存不得超出原 TTL |
 | Key 无效、吊销或越权 | 返回 401/403，不到达模型服务 | 请求不进入采集；鉴权指标保留固定原因码 |
-| 鉴权成功但身份 metadata 缺失 | 业务按 ext_authz 结果继续 | 标 `identity_status=invalid` 并告警，不从客户端头补齐；该用量不进入有效统计 |
+| 客户查询未实现、失败或 Bearer 输入非法 | 业务按独立鉴权结果继续 | 标 `identity_status=invalid`、`usage_eligible=false` 并记录固定解析状态；保留观察用量，不从客户端自报 ID 补齐 |
 | Observer 拒绝/无 ACK | 原链路继续 | 额度/期限到达取消，不重连原请求 |
 | 单回调/正文超限 | 原链路继续 | 取消观察，已有内容只按 partial/unknown 定稿 |
 | 插件 trap | 按 fail_open 实际行为验证 | 本次数据可能全部缺失 |
@@ -905,7 +981,7 @@ WASM 随 Observer 镜像打包到 `/usr/share/metering/wasm/gateway-observer-v1.
 
 ### 10.3 灰度与回退
 
-1. 先按 Auth 方案部署 PostgreSQL、Auth 和测试 Key，在独立测试网关验证 ext_authz、身份 metadata、401/403/503、上游凭证与过滤器顺序。
+1. 在独立测试网关核对已有鉴权与 ext_authz → Wasm → router 顺序，确认 Wasm 能读取入口 authority 和原始 Bearer。当前使用仅允许访问的 Auth fixture 与合成 token，不部署 PG 或第三方 API；真实 Auth 单独验收。
 2. 验证 SDK/ABI、身份与路由、旁路故障、初始化失败；所有阻断项通过后才能灰度。
 3. 先发布 Doris（含冲突 ID 标记表）和 Consumer，再发布 Observer；以合成事件验证表和 offset，再启用带 `metering-canary=true` 的少量网关、单路由。
 4. 采集开关默认关闭，通过发布配置打开。监控相同请求负载下业务 P99 首包差值、错误率、RSS/CPU、drop 比例；累计至少 24 小时长流测试。
@@ -961,7 +1037,7 @@ data: [DONE]
 | prompt_tokens=0、缺失、负数、浮点、超 Int64 | 0 合法，缺失/非法为 null；异常原因可区分 |
 | cache/reasoning 包含量、total 冲突 | 不重复相加；冲突保留依据并排除有效用量 |
 | 多个不同终结 usage | usage_conflict，一次定稿，不“最后覆盖” |
-| 身份伪造头、可信元数据缺失 | 不接受头；鉴权成功但缺 metadata 标 `identity_status=invalid`、`identity_invalid` 异常码并报警，不跨客户猜归属 |
+| 身份伪造头、非法 Bearer 与未实现查询 | 不采信自报 ID；非法输入不调用接口，合法输入返回 `lookup_not_implemented`；客户未知时记录 `identity_invalid`，不跨客户猜归属 |
 | 正确/无效/吊销/越权 API Key | 正确 Key 的身份快照进入两类事件；其余请求在 WASM 前被拒绝 |
 | 请求体大于回调/累计上限 | 读取前判超限；业务字节不丢；采集有界放弃 |
 | 不支持压缩/协议 | 元数据可记录，usage 未知，不尝试业务改写 |
@@ -1010,7 +1086,7 @@ SDK 单元测试验证 hostcall 签名和回调注册/清理；标准 Protobuf �
 
 | 顺序 | 工作包 | 完成条件 |
 | --- | --- | --- |
-| 1 | Auth 前置能力 | 按独立方案完成 PostgreSQL、ext_authz、API Key 生命周期和可信 metadata |
+| 1 | 入口与归属边界 | 核对已有鉴权顺序、Bearer/Host 和网格 mTLS；部署查询占位，真实 Auth 及第三方对接另行实施 |
 | 2 | 真实镜像与身份接入核查 | 固定镜像/过滤器顺序/元数据/路由样例，提供最小 JSON/SSE 服务 |
 | 3 | SDK gRPC 扩展、TinyGo PoC | 编译、加载、Continue、ACK、Root 生命周期、取消与长时内存验证通过 |
 | 4 | 协议和插件 | 配置校验、白名单、ID、usage 参数改写与有界 Pause/恢复、分片、资源额度与指标实现，旁路故障不等待 |
@@ -1019,7 +1095,7 @@ SDK 单元测试验证 hostcall 签名和回调注册/清理；标准 Protobuf �
 | 7 | Doris | DDL/视图/查询在目标版本执行；重放及跨日期冲突均正确 |
 | 8 | 联调与灰度 | Auth/采集压测、故障演练、独立基数、回退验证和发布清单归档 |
 
-需要环境提供的事实是镜像 digest、固定版本 ext_authz 元数据读取结果、路由名、服务协议样例、Kafka/Doris 版本及地址、峰值与流长。Auth 还需要 PostgreSQL、客户/应用初始数据、受保护入口和上游凭证策略，详见独立方案。未提供项记录在接入清单，不用虚构生产配置填补。
+需要环境提供的事实是镜像 digest、入口 Host/Bearer 可见性、固定集群/环境、mTLS、路由名、服务协议样例、Kafka/Doris 版本及地址、峰值与流长。真实 Auth 与第三方 API 合同、凭据及轮换策略在各自工作包确认；当前占位不要求 PG、外部凭据或假客户目录。
 
 ## 12. 文档核查状态与参考
 

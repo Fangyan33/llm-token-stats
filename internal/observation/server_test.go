@@ -6,6 +6,7 @@ import (
 	"github.com/Fangyan33/llm-token-stats/internal/config"
 	"github.com/Fangyan33/llm-token-stats/internal/events"
 	"github.com/Fangyan33/llm-token-stats/internal/health"
+	"github.com/Fangyan33/llm-token-stats/internal/identitylookup"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/test/bufconn"
@@ -28,13 +29,17 @@ func (s *sink) Emit(e *events.Event) {
 	s.es = append(s.es, &copy)
 }
 func TestObserveEOSAndOnceFinalization(t *testing.T) {
-	for _, mode := range []string{"trailers_eos", "bad_end", "resource_limit", "missing_route", "other_route", "legacy_wildcard", "overlong_route"} {
+	for _, mode := range []string{"trailers_eos", "bad_end", "resource_limit", "missing_route", "other_route", "legacy_wildcard", "overlong_route", "unimplemented"} {
 		t.Run(mode, func(t *testing.T) {
 			badEnd, limited := mode == "bad_end", mode == "resource_limit"
 			l := bufconn.Listen(1 << 20)
 			h := &health.State{}
 			k := &sink{}
-			srv := &Server{Cfg: config.Observer{ProducerID: "test", MaxActive: 4, ParserBudget: 64 << 20, MaxObservationMS: 5000, AcceptedConfigs: []string{"v1"}, AcceptedAdapters: []string{"chat_completions_v1"}, Routes: []config.Route{{RouteName: "chat", ServiceID: "a"}}}, Sink: k, Health: h}
+			srv := &Server{Cfg: config.Observer{ProducerID: "test", ClusterName: "test-cluster", DeploymentEnvironment: "test", MaxActive: 4, ParserBudget: 64 << 20, MaxObservationMS: 5000, AcceptedConfigs: []string{"v1"}, AcceptedAdapters: []string{"chat_completions_v1"}, AcceptedServices: []string{"a"}}, Sink: k, Health: h, ServiceResolver: serviceFake{}, CustomerResolver: customerFake{}}
+			if mode == "unimplemented" {
+				srv.ServiceResolver = nil
+				srv.CustomerResolver = nil
+			}
 			if limited {
 				srv.Cfg.ParserBudget = 3 * 32768
 			}
@@ -53,7 +58,7 @@ func TestObserveEOSAndOnceFinalization(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			st := &pb.Start{RequestStartedAtMs: time.Now().UnixMilli(), GatewayInstanceId: "gateway", ConfigVersion: "v1", RouteName: "chat", ServiceId: "a", AdapterId: "chat_completions_v1", IdentityStatus: "known", ApiKeyId: events.Ptr("k"), CustomerId: events.Ptr("c"), ApplicationId: events.Ptr("a"), Method: "POST", RequestContentType: "application/json"}
+			st := &pb.Start{RequestStartedAtMs: time.Now().UnixMilli(), GatewayInstanceId: "gateway", ConfigVersion: "v1", RouteName: "chat", AdapterId: "chat_completions_v1", RequestAuthority: "Model.Example.invalid:443", ApiKey: []byte("synthetic-key"), Method: "POST", RequestContentType: "application/json"}
 			wantRoute := "chat"
 			switch mode {
 			case "missing_route":
@@ -105,8 +110,11 @@ func TestObserveEOSAndOnceFinalization(t *testing.T) {
 			if _, err = events.Decode(b, []byte(e.LogicalRequestID), time.Now()); err != nil {
 				t.Fatal(err)
 			}
-			if !badEnd && !limited && !e.UsageEligible {
+			if !badEnd && !limited && mode != "unimplemented" && !e.UsageEligible {
 				t.Fatal("not eligible", e.AnomalyCodes)
+			}
+			if mode == "unimplemented" && (e.UsageEligible || e.MappingStatus != "lookup_not_implemented" || e.CustomerMappingStatus != "lookup_not_implemented" || e.IdentityStatus != "invalid" || e.UsageStatus != "known") {
+				t.Fatal("stub changed usage or invented identity")
 			}
 			if (badEnd || limited) && (e.TerminalObserved || e.UsageEligible) {
 				t.Fatal("bad end accepted")
@@ -116,4 +124,16 @@ func TestObserveEOSAndOnceFinalization(t *testing.T) {
 			}
 		})
 	}
+}
+
+type serviceFake struct{}
+
+func (serviceFake) Resolve(context.Context, identitylookup.ServiceLookupRequest) (identitylookup.ServiceIdentity, error) {
+	return identitylookup.ServiceIdentity{ServiceID: "a", ProviderID: "p"}, nil
+}
+
+type customerFake struct{}
+
+func (customerFake) Resolve(context.Context, []byte) (identitylookup.CustomerIdentity, error) {
+	return identitylookup.CustomerIdentity{APIKeyID: "k", CustomerID: "c"}, nil
 }

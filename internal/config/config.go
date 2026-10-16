@@ -5,17 +5,13 @@ import (
 	"crypto/x509"
 	"fmt"
 	"github.com/Fangyan33/llm-token-stats/pkg/strictjson"
+	"net/url"
 	"os"
 	"regexp"
 	"time"
 	"unicode/utf8"
 )
 
-// Route is the legacy service registration format; route_name is ignored for admission.
-type Route struct {
-	RouteName string `json:"route_name"`
-	ServiceID string `json:"service_id"`
-}
 type Kafka struct {
 	Brokers     []string `json:"bootstrap_servers"`
 	Topic       string   `json:"topic"`
@@ -25,21 +21,28 @@ type Kafka struct {
 	UsernameEnv string   `json:"username_env"`
 	PasswordEnv string   `json:"password_env"`
 }
+type Lookup struct {
+	URI string `json:"uri"`
+}
+
 type Observer struct {
-	WasmDownload     *WasmDownload `json:"wasm_download"`
-	Listen           string        `json:"listen"`
-	Health           string        `json:"health_listen"`
-	ProducerID       string        `json:"producer_id"`
-	MaxActive        int           `json:"max_active_streams"`
-	ParserBudget     int64         `json:"parser_budget_bytes"`
-	MaxObservationMS int           `json:"max_observation_ms"`
-	AcceptedConfigs  []string      `json:"accepted_config_versions"`
-	AcceptedAdapters []string      `json:"accepted_adapter_ids"`
-	AcceptedServices []string      `json:"accepted_service_ids"`
-	Routes           []Route       `json:"accepted_routes"`
-	Flags            []string      `json:"response_flags_allowlist"`
-	Details          []string      `json:"response_code_details_allowlist"`
-	MaxConnections   int           `json:"max_connections"`
+	ClusterName           string        `json:"cluster_name"`
+	DeploymentEnvironment string        `json:"deployment_environment"`
+	ServiceLookup         Lookup        `json:"service_lookup"`
+	CustomerLookup        Lookup        `json:"customer_lookup"`
+	WasmDownload          *WasmDownload `json:"wasm_download"`
+	Listen                string        `json:"listen"`
+	Health                string        `json:"health_listen"`
+	ProducerID            string        `json:"producer_id"`
+	MaxActive             int           `json:"max_active_streams"`
+	ParserBudget          int64         `json:"parser_budget_bytes"`
+	MaxObservationMS      int           `json:"max_observation_ms"`
+	AcceptedConfigs       []string      `json:"accepted_config_versions"`
+	AcceptedAdapters      []string      `json:"accepted_adapter_ids"`
+	AcceptedServices      []string      `json:"accepted_service_ids"`
+	Flags                 []string      `json:"response_flags_allowlist"`
+	Details               []string      `json:"response_code_details_allowlist"`
+	MaxConnections        int           `json:"max_connections"`
 }
 type WasmDownload struct {
 	Listen string `json:"listen"`
@@ -67,7 +70,6 @@ type Consumer struct {
 	Resume           []Position `json:"gap_resume_offsets"`
 	AcceptedConfigs  []string   `json:"accepted_config_versions"`
 	AcceptedServices []string   `json:"accepted_service_ids"`
-	Routes           []Route    `json:"accepted_routes"`
 	Flags            []string   `json:"response_flags_allowlist"`
 	Details          []string   `json:"response_code_details_allowlist"`
 }
@@ -126,7 +128,7 @@ func (c *Config) ObserverDefaults() error {
 	if c.Observer.ProducerID == "" {
 		c.Observer.ProducerID = os.Getenv("POD_UID")
 	}
-	if !text(c.Observer.ProducerID, 128) || c.Observer.MaxActive < 1 || c.Observer.MaxActive > 4096 || c.Observer.ParserBudget < 3*32768 || c.Observer.ParserBudget > 256<<20 || c.Observer.MaxObservationMS < 1 || c.Observer.MaxObservationMS > 605000 || c.Observer.MaxConnections < 1 || c.Observer.MaxConnections > 128 || !registration(c.Observer.AcceptedConfigs, c.Observer.AcceptedServices, c.Observer.Routes) || len(c.Observer.AcceptedAdapters) != 1 || c.Observer.AcceptedAdapters[0] != "chat_completions_v1" || !codes(c.Observer.Flags) || !codes(c.Observer.Details) {
+	if !text(c.Observer.ClusterName, 128) || !Environment(c.Observer.DeploymentEnvironment) || !lookupURI(c.Observer.ServiceLookup.URI) || !lookupURI(c.Observer.CustomerLookup.URI) || !text(c.Observer.ProducerID, 128) || c.Observer.MaxActive < 1 || c.Observer.MaxActive > 4096 || c.Observer.ParserBudget < 3*32768 || c.Observer.ParserBudget > 256<<20 || c.Observer.MaxObservationMS < 1 || c.Observer.MaxObservationMS > 605000 || c.Observer.MaxConnections < 1 || c.Observer.MaxConnections > 128 || !registration(c.Observer.AcceptedConfigs, c.Observer.AcceptedServices) || len(c.Observer.AcceptedAdapters) != 1 || c.Observer.AcceptedAdapters[0] != "chat_completions_v1" || !codes(c.Observer.Flags) || !codes(c.Observer.Details) {
 		return fmt.Errorf("config_observer")
 	}
 	return nil
@@ -150,7 +152,7 @@ func (c *Config) ConsumerDefaults() error {
 	if c.Doris.Database == "" {
 		c.Doris.Database = "metering"
 	}
-	if !text(c.Consumer.Group, 128) || c.Consumer.Rows < 1 || c.Consumer.Rows > 5000 || c.Consumer.Bytes < 32768 || c.Consumer.Bytes > 4<<20 || c.Consumer.FlushMS < 1 || c.Consumer.FlushMS > 15000 || c.Doris.Database != "metering" || !registration(c.Consumer.AcceptedConfigs, c.Consumer.AcceptedServices, c.Consumer.Routes) || len(c.Doris.AllowedHosts) == 0 || !codes(c.Consumer.Flags) || !codes(c.Consumer.Details) {
+	if !text(c.Consumer.Group, 128) || c.Consumer.Rows < 1 || c.Consumer.Rows > 5000 || c.Consumer.Bytes < 32768 || c.Consumer.Bytes > 4<<20 || c.Consumer.FlushMS < 1 || c.Consumer.FlushMS > 15000 || !DatabaseName(c.Doris.Database) || !registration(c.Consumer.AcceptedConfigs, c.Consumer.AcceptedServices) || len(c.Doris.AllowedHosts) == 0 || !codes(c.Consumer.Flags) || !codes(c.Consumer.Details) {
 		return fmt.Errorf("config_consumer")
 	}
 	for _, ps := range [][]Position{c.Consumer.Initial, c.Consumer.Resume} {
@@ -179,36 +181,13 @@ func codes(xs []string) bool {
 	}
 	return true
 }
-func registration(configs, services []string, routes []Route) bool {
-	if len(configs) == 0 || len(configs) > 1024 || len(services)+len(routes) == 0 || len(services)+len(routes) > 1024 || len(services) > 0 && len(routes) > 0 {
-		return false
-	}
-	if !codesConfig(configs) || !codesConfig(services) {
-		return false
-	}
-	seen := map[Route]bool{}
-	for _, r := range routes {
-		if !text(r.ServiceID, 128) || seen[r] {
-			return false
-		}
-		seen[r] = true
-	}
-	return true
+func registration(configs, services []string) bool {
+	return len(configs) > 0 && len(configs) <= 1024 && len(services) <= 1024 && codesConfig(configs) && codesConfig(services)
 }
-
-// AcceptsService also reads legacy accepted_routes without using its route names.
-// Defaults reject simultaneous new and legacy lists to avoid ambiguous admission.
-func AcceptsService(services []string, routes []Route, service string) bool {
+func AcceptsService(services []string, service string) bool {
 	for _, s := range services {
 		if s == service {
 			return true
-		}
-	}
-	if len(services) == 0 {
-		for _, r := range routes {
-			if r.ServiceID == service {
-				return true
-			}
 		}
 	}
 	return false
@@ -248,3 +227,16 @@ func (k Kafka) TLS() (*tls.Config, error) {
 	return t, nil
 }
 func Duration(ms int) time.Duration { return time.Duration(ms) * time.Millisecond }
+
+// DatabaseName is the only accepted unquoted SQL identifier grammar.
+var databaseName = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_]{0,63}$`)
+
+func DatabaseName(name string) bool { return databaseName.MatchString(name) }
+func Environment(s string) bool     { return s == "production" || s == "test" || s == "development" }
+func lookupURI(s string) bool {
+	if s == "" {
+		return true
+	}
+	u, err := url.Parse(s)
+	return err == nil && len(s) <= 2048 && (u.Scheme == "https" || u.Scheme == "http") && u.Hostname() != "" && u.User == nil && u.RawQuery == "" && u.Fragment == "" && u.Opaque == ""
+}

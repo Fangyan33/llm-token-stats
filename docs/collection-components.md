@@ -4,6 +4,8 @@
 
 本轮命令、故障处理及资源归零证据见[本地验证记录](spec/plan/gateway-collection-verification.md)，实际镜像 digest 见[镜像记录](../deploy/local/images.lock.json)。
 
+当前已删除 application_id。Wasm 只从 Authorization: Bearer 提取临时 api_key，并发送入口 authority；Observer 使用配置的 cluster_name/deployment_environment，分别通过服务和客户查询接口取得归属。两个接口目前只有未实现占位，合法输入产生 lookup_not_implemented，service_id/provider_id/api_key_id/customer_id 及映射版本为 null，identity_status=invalid、usage_eligible=false，原始 usage 保留。URI 可留空，填写也不会发起 HTTP；不访问 PG、不读身份元数据补值，密钥不进入事件、数据库或日志。 [归属接口实现计划](spec/plan/host-service-provider-implementation.md)定义后续真实 HTTP 对接边界。
+
 ## 构建与本地运行
 
 需要 Go 1.25.0、TinyGo 0.40.1、Python 3.10+、Docker Compose。插件使用独立模块及仓库内 SDK v0.24.0 扩展副本，依赖由 go.mod/go.sum 锁定。
@@ -34,7 +36,7 @@ python3 scripts/local_collection.py stop
 | Consumer 健康、指标 | 19092 |
 | 模型 fixture HTTP / 合成 ext_authz gRPC | 18081 / 19002 |
 
-DBeaver 使用 MySQL 驱动连接 `服务器IP:19030`，数据库 `metering`、用户 `root`、密码为空。Kafka 的监听地址为 `0.0.0.0`，但 `advertised.listeners` 必须公布客户端可达的实际 IP 或域名；`make local-up` 默认识别服务器 IPv4 地址并保存到已忽略的 `deploy/local/.env`，也可先设置 `KAFKA_EXTERNAL_HOST`。多网卡或 NAT 环境使用客户端实际可达地址：
+DBeaver 使用 MySQL 驱动连接 `服务器IP:19030`，数据库 `metering_development`、用户 `root`、密码为空。Kafka 的监听地址为 `0.0.0.0`，但 `advertised.listeners` 必须公布客户端可达的实际 IP 或域名；`make local-up` 默认识别服务器 IPv4 地址并保存到已忽略的 `deploy/local/.env`，也可先设置 `KAFKA_EXTERNAL_HOST`。多网卡或 NAT 环境使用客户端实际可达地址：
 
 ```sh
 KAFKA_EXTERNAL_HOST=192.168.227.128 make local-up
@@ -43,19 +45,19 @@ KAFKA_EXTERNAL_HOST=192.168.227.128 make local-up
 
 Kafka 容器内客户端仍使用 `kafka:9092`。重建容器时 Kafka 日志及 Doris FE/BE 数据由命名卷保留；首次从旧版无持久卷配置启动时，脚本先停栈，将原数据备份到 `.tmp/local-storage-*` 并迁移到卷，再重建容器。已有不匹配的目标卷会使迁移停止，避免覆盖或合并历史。不要使用 `docker compose down -v` 删除数据卷。
 
-`make local-up` 在 `dist/envoy.remote.json` 渲染实际 Wasm 摘要，重启 Fixture/Observer/Consumer，核对下载内容后重建网关。网关只挂载配置，插件来自 Observer HTTP 下载。更新本地产物后运行 `make build wasm local-up`，再运行 `GOFLAGS='-count=1' make local-test`，不能仅重启旧网关而沿用旧摘要。脚本只初始化该 Compose 栈，应用 001/002/004/005/006 migration，并创建 24 分区、72 小时保留、delete 策略的测试 topic。明文 Kafka、合成鉴权、副本数 1 与 Doris root 空密码仅用于开发联调；生产按原方案配置认证、副本、min ISR 和最小权限账号。
+`make local-up` 在 `dist/envoy.remote.json` 渲染实际 Wasm 摘要，重启 Fixture/Observer/Consumer，核对下载内容后重建网关。网关只挂载配置，插件来自 Observer HTTP 下载。更新本地产物后运行 `make build wasm local-up`，再运行 `GOFLAGS='-count=1' make local-test`，不能仅重启旧网关而沿用旧摘要。脚本只初始化该 Compose 栈，应用 001/002/004/005/006 migration，在独立 metering_development 库执行新初始化，并创建 24 分区、72 小时保留、delete 策略的 llm-metering-development topic。明文 Kafka、合成鉴权、副本数 1 与 Doris root 空密码仅用于开发联调；生产按原方案配置认证、副本、min ISR 和最小权限账号。
 
 普通 JSON / SSE 合成请求：
 
 ```sh
-curl -N -H 'Content-Type: application/json' \
+curl -N -H 'Host: model.example.invalid' -H 'Authorization: Bearer synthetic-test-key' -H 'Content-Type: application/json' \
   --data '{"model":"fixture","stream":true,"messages":[{"role":"user","content":"synthetic fixture"}]}' \
   http://127.0.0.1:18080/v1/chat/completions
 curl http://127.0.0.1:19091/metrics
 curl http://127.0.0.1:19092/readyz
 ```
 
-fixture 只模拟 ext_authz 可信元数据与模型 usage，不实现真实密钥鉴权或模型调用。集成测试写入合成事件及隔离的未知版本测试 topic/group；这些诊断事实保留在本地库，测试不会清理已有业务数据。all-in-one Doris 的 BE 注册地址是回环地址，因此本地 Consumer 直连 `doris:8040`；生产 FE→BE 重定向需登记全部实际 FE/BE 地址。
+fixture 只模拟 ext_authz 访问允许与模型 usage，不实现真实密钥鉴权或模型调用。集成测试写入合成事件及隔离的未知版本测试 topic/group；这些诊断事实保留在本地库，测试不会清理已有业务数据。all-in-one Doris 的 BE 注册地址是回环地址，因此本地 Consumer 直连 `doris:8040`；生产 FE→BE 重定向需登记全部实际 FE/BE 地址。
 
 ## 协议生成与版本
 
@@ -76,14 +78,14 @@ make generate
 - 改写预算与观察预算独立；Observer 不可用仍可补充参数。超限、超时或 JSON 无效时恢复原文，响应正文一直 Continue。旧版真实慢上传 PoC 中，Root 异步 Resume 后尾片可能不再完整经过 Wasm 回调，因此超时恢复会在有界前缀后取消观察，结果保留 partial/unknown，不宣称完整用量。JSON 校验限制深度 64、元素 100000、单对象键 8192；超限取消解析/原文放行。这些额外保护可能使复杂合法 JSON 降级，不能宣称所有请求均能改写。
 - 当前 Wasm 配置资源整数还限制在有符号 32 位正值范围，防止 TinyGo wasm32 的长度转换溢出；给出的初值全部满足。预发布仍必须运行 Schema 与关系校验。
 - 当前默认规则为 `route_name: "*"`，忽略路由名，只采集 `POST /v1/chat/completions`；路由属性或 metadata 缺失也可命中。路径去掉查询串后精确匹配，其它方法、尾斜杠、子路径和不同路径均忽略。精确路由规则仍支持：先读取可信 `route_name`，缺失时读取 `route_metadata.filter_metadata.metering.route_name`，都不可读时该精确规则不命中。规则按配置顺序选择，不读取客户端提供的路由或身份头。
-- 事件 `route_name` 使用真实 Envoy `route_name` 属性；不可读、无效或超长时为 `unknown`，计量 metadata 仅兼容精确规则匹配，不充当真实路由名。它是辅助诊断字段，不参与身份一致性、服务准入或价格选择；`service_id` / `adapter_id` 仍为配置值。Observer / Consumer 使用 `accepted_service_ids`；旧 `accepted_routes` 兼容读取且只取 service_id，新旧清单不能同时配置。历史事件（含 `*`）原文重放。升级先暂停旧 Consumer、应用 [006 migration](../migrations/doris/metering/006_optional_route_identity.sql)，更新下游和白名单，再发布 Wasm。新旧身份一致性均按排除路由的字段比较；不改写历史事件或删除旧冲突标记，同事件内容不同仍判为冲突。
+服务及供应商由 Observer 的服务查询接口解析，客户/API Key ID 由客户接口解析，当前均为占位状态。route_name 仅诊断，不参与身份摘要；旧 accepted_routes、身份元数据配置及规则 service_id 已删除。同一事件不同内容仍冲突。
 - trailers 只产生零字节 EOS BodyChunk，不上传其内容。End 校验两个方向的片序、偏移、字节总数及 EOS；HTTP context 删除后只由 Root+token 处理迟到 ACK，不能延长业务生命周期。
 - 上游重复伪造的计量响应头先全部移除；Start ACK 已到才加入一个 Observer UUID。快响应允许头缺失；有头也不保证事件已入 Kafka/Doris。
 - 固定 franz-go 的 `RecordRetries(0)` 阻止首次发送，实际使用 1 表示仅一次尝试。发送超时/重试次数耗尽保守计为 uncertain，不补发。3 秒 watchdog 关闭超龄 Producer，额外 1 秒内不能释放则退出进程。
 
 ## 服务配置与部署
 
-入口为 `observer --config PATH`、`consumer --config PATH`。服务配置严格拒绝未知字段；Observer/Consumer 分别读取自己接受的 config_version 和 route/service 注册。网关升级前先让 Observer 接受新旧配置，Consumer 保留在线窗口内的历史注册，避免合法重放被误拒收。
+入口为 `observer --config PATH`、`consumer --config PATH`。服务配置严格拒绝未知字段；Observer/Consumer 分别读取自己接受的 config_version 和 service 注册。本次采用唯一新契约并初始化隔离库；正常同契约重放仍需保留对应 config/service 注册，禁止混入旧格式消息。
 
 部署模板在 [Observer](../deploy/observer/observer.yaml)、[Consumer](../deploy/consumer/consumer.yaml)、[EnvoyFilter](../deploy/gateway/envoyfilter.yaml)。先 `make wasm`，再构建 Observer/Consumer Dockerfile 镜像，替换 image digest，建立 metering namespace、对应 ConfigMap/Secret，再使用模板。生产配置示例在 `configs/*.production.example.json`，其中地址是待核对的样例，不代表已部署。Kafka 支持挂载 CA/客户端证书与 SASL PLAIN 环境变量；`kafka.topic` 支持合法 Kafka 名称，Observer 与 Consumer 必须配置一致，生产约定使用 `llm-metering-events`，隔离测试使用专属 topic。Doris DSN、HTTP 用户及密码从 Secret 环境变量读取。DSN 必须显式配置连接、读写超时、UTC 会话；禁止将密码写入配置或提交仓库。需要受控网络与网格 mTLS，模板没有代替真实认证、网络策略或 G0 验收。
 
@@ -160,3 +162,9 @@ Consumer 按 Kafka 分区跨多次拉取攒批：达到 `max_batch_rows`（默�
 真实本地集成覆盖普通 JSON、SSE/响应 trailers、Start ACK 关联、unknown 保留 NULL、非白名单请求、相同事件重放去重、不同变体冲突隔离、日期通知/凭据、未知版本暂停；HTTP1 chunked 中途停顿超过 2 秒、256 KiB 边界/边界加一/1 MiB 请求的上游正文摘要保持原样，超时观察降为 partial/unknown，正常延迟响应中的计量 ID 与事件一致；真实 BE 写入后断开 HTTP 确认，仍确认原 label 与行键；独立 TCP Kafka 黑洞验证发送不阻塞及有界超时/watchdog。测试及失败诊断由 `make local-test` 重现。
 
 G0–G5 仍须独立完成：私有镜像/真实 Auth、HTTP2 慢上传与断开/热更新故障交叉、真实 Pod 崩溃及 rebalance 压测、Kafka 保留期丢失后运维恢复、峰值两倍/24 小时/10 分钟 SSE、首包/明细/查询延迟、灰度回退与旧代释放。已有本地证据不等于这些门槛全部通过。
+
+## 归属配置与隔离库
+
+Observer 必填 cluster_name、deployment_environment，service_lookup/customer_lookup 各有可空 uri。当前不实现真实 HTTP、鉴权或网络缓存，不要求第三方 Secret。输入非法先记录 invalid_host/invalid_api_key，合法输入的两个占位记录 lookup_not_implemented。两事件复用快照，客户失败使 identity_status=invalid、usage_eligible=false，不清除原始已观察 usage。
+
+Consumer 的 doris.database、DSN、Stream Load 和证据/巡检 SQL 使用同一经过校验的库名。初始化使用 `python3 scripts/render_doris_sql.py --database 数据库 migrations/doris/metering/001_init.sql`，对其余初始化 SQL 同样渲染。本地默认 metering_development，新 Kubernetes 测试每次用 metering_k8s_<run-id>；不修改旧 metering 库及其消息，清理保留测试库作为证据。普通 Docker 联调使用合成 token 和隔离明文网络；生产/真实密钥只允许已验证的网格 mTLS/TLS。

@@ -3,7 +3,7 @@ package gatewayconfig
 import "testing"
 
 func TestWildcardRouteFiltersOnlyPostAndExactPath(t *testing.T) {
-	c := Config{Enabled: true, Routes: []Route{{RouteName: "*", Enabled: true, Methods: []string{"POST"}, Paths: []string{"/v1/chat/completions"}, ServiceID: "model-service-a"}}}
+	c := Config{Enabled: true, Routes: []Route{{RouteName: "*", Enabled: true, Methods: []string{"POST"}, Paths: []string{"/v1/chat/completions"}}}}
 	for _, tc := range []struct {
 		name, route, method, path string
 		want                      bool
@@ -26,7 +26,7 @@ func TestWildcardRouteFiltersOnlyPostAndExactPath(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			rule, _, ok := c.Match(tc.route, tc.method, tc.path)
-			if ok != tc.want || ok && (rule.RouteName != "*" || rule.ServiceID != "model-service-a") {
+			if ok != tc.want || ok && (rule.RouteName != "*") {
 				t.Fatalf("Match = (%+v, %t), want selected=%t", rule, ok, tc.want)
 			}
 		})

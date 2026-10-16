@@ -3,15 +3,17 @@
     "bootstrap_servers": [
       "kafka:9092"
     ],
-    "topic": "llm-metering-events"
+    "topic": "llm-metering-development"
   },
   "consumer": {
     "health_listen": "0.0.0.0:9092",
-    "group_id": "llm-metering-doris-v1",
+    "group_id": "llm-metering-development",
     "accepted_config_versions": [
       "collection-v1"
     ],
-    "accepted_service_ids": ["model-service-a"]
+    "accepted_service_ids": [
+      "model-service-a"
+    ]
   },
   "doris": {
     "fe_url": "http://doris:8040",
@@ -19,7 +21,7 @@
       "doris:8030",
       "doris:8040"
     ],
-    "database": "metering",
+    "database": "metering_development",
     "dsn_env": "DORIS_DSN",
     "username_env": "DORIS_USER",
     "password_env": "DORIS_PASSWORD"

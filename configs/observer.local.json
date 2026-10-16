@@ -3,10 +3,13 @@
     "bootstrap_servers": [
       "kafka:9092"
     ],
-    "topic": "llm-metering-events"
+    "topic": "llm-metering-development"
   },
   "observer": {
-    "wasm_download": {"listen": ":9093", "file": "dist/gateway-observer-v1.wasm"},
+    "wasm_download": {
+      "listen": ":9093",
+      "file": "dist/gateway-observer-v1.wasm"
+    },
     "listen": "0.0.0.0:9090",
     "health_listen": "0.0.0.0:9091",
     "producer_id": "observer-test",
@@ -16,6 +19,16 @@
     "accepted_adapter_ids": [
       "chat_completions_v1"
     ],
-    "accepted_service_ids": ["model-service-a"]
+    "accepted_service_ids": [
+      "model-service-a"
+    ],
+    "cluster_name": "local-cluster",
+    "deployment_environment": "development",
+    "service_lookup": {
+      "uri": ""
+    },
+    "customer_lookup": {
+      "uri": ""
+    }
   }
 }

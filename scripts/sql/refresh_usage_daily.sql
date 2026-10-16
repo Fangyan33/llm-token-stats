@@ -12,8 +12,8 @@ VALUES [('{{stat_date}}'), ('{{next_date}}'));
 ALTER TABLE metering.usage_daily ADD TEMPORARY PARTITION tp{{refresh_token}}
 VALUES [('{{stat_date}}'), ('{{next_date}}'));
 INSERT INTO metering.usage_daily TEMPORARY PARTITION (tp{{refresh_token}})
-(stat_date, customer_id, application_id, api_key_id, service_id, model, usage_source, request_count, started_request_count, usage_observed_request_count, usage_missing_request_count, eligible_usage_request_count, ineligible_usage_request_count, http_2xx_request_count, http_error_request_count, terminal_missing_request_count, input_tokens, output_tokens, total_tokens, cached_read_tokens, cached_write_tokens, reasoning_tokens, reported_total_tokens, cached_read_known_requests, cached_write_known_requests, reasoning_known_requests, reported_total_known_requests, refresh_id, source_watermark, refreshed_at)
-SELECT request_date, customer_id, application_id, api_key_id, service_id, model, usage_source,
+(stat_date, cluster_name, deployment_environment, customer_id, provider_id, api_key_id, service_id, model, usage_source, request_count, started_request_count, usage_observed_request_count, usage_missing_request_count, eligible_usage_request_count, ineligible_usage_request_count, http_2xx_request_count, http_error_request_count, terminal_missing_request_count, input_tokens, output_tokens, total_tokens, cached_read_tokens, cached_write_tokens, reasoning_tokens, reported_total_tokens, cached_read_known_requests, cached_write_known_requests, reasoning_known_requests, reported_total_known_requests, refresh_id, source_watermark, refreshed_at)
+SELECT request_date, cluster_name, deployment_environment, customer_id, COALESCE(provider_id, ''), api_key_id, COALESCE(service_id, ''), model, usage_source,
        COUNT(*) AS request_count,
        SUM(CASE WHEN start_variants = 1 THEN 1 ELSE 0 END) AS started_request_count,
        SUM(CASE WHEN usage_variants = 1 THEN 1 ELSE 0 END) AS usage_observed_request_count,
@@ -36,8 +36,7 @@ SELECT request_date, customer_id, application_id, api_key_id, service_id, model,
        SUM(CASE WHEN usage_variants = 1 AND usage_eligible = 1 AND input_tokens IS NOT NULL AND output_tokens IS NOT NULL AND reported_total_tokens IS NOT NULL THEN 1 ELSE 0 END) AS reported_total_known_requests,
        '{{refresh_id}}', '{{source_watermark}}', NOW(3)
 FROM metering.request_statistics
-WHERE request_date = '{{stat_date}}' AND has_conflict = 0 AND identity_status = 'known'
+WHERE request_date = '{{stat_date}}' AND has_conflict = 0 AND identity_status = 'known' AND customer_mapping_status = 'mapped'
   AND customer_id IS NOT NULL AND customer_id <> ''
-  AND application_id IS NOT NULL AND application_id <> ''
-  AND api_key_id IS NOT NULL AND api_key_id <> '' AND service_id <> ''
-GROUP BY request_date, customer_id, application_id, api_key_id, service_id, model, usage_source;
+  AND api_key_id IS NOT NULL AND api_key_id <> ''
+GROUP BY request_date, cluster_name, deployment_environment, customer_id, provider_id, api_key_id, service_id, model, usage_source;

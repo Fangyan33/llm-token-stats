@@ -118,7 +118,7 @@ class CollectionContractsTest(unittest.TestCase):
         with self.assertRaises(contracts.ContractError):
             contracts.validate_event(self.event, b"another-id")
         event = copy.deepcopy(self.event)
-        event.update(customer_id=None, identity_status="invalid", usage_eligible=False, anomaly_codes=["identity_invalid"])
+        event.update(api_key_id=None, customer_id=None, customer_mapping_version=None, customer_mapping_status="lookup_not_implemented", identity_status="invalid", usage_eligible=False, anomaly_codes=["identity_invalid"])
         contracts.validate_event(event)
 
     def test_raw_usage_does_not_allow_body_or_strings(self):
@@ -218,6 +218,25 @@ class CollectionContractsTest(unittest.TestCase):
         config = copy.deepcopy(self.config)
         config["gateway_instance_id"] = "58c2a12d-5467-4eb5-bc56-29bd7e271dd0"
         contracts.validate_config(config, release=True)
+
+    def test_mapping_null_pairs_and_secret_rejection(self):
+        for field in ('api_key','application_id'):
+            self.assert_event_invalid(lambda e: e.update({field:'sentinel'}))
+        self.assert_event_invalid(lambda e: e.update(provider_id=None))
+        self.assert_event_invalid(lambda e: e.update(mapping_status='lookup_not_implemented'))
+        self.assert_event_invalid(lambda e: e.update(customer_mapping_status='lookup_not_implemented'))
+        self.assert_event_invalid(lambda e: e.update(request_host='UPPER.example.invalid'))
+        self.assert_event_invalid(lambda e: e.update(request_host='127.0.0.1'))
+        event=copy.deepcopy(self.event)
+        event.update(service_id=None,provider_id=None,mapping_version=None,mapping_status='lookup_not_implemented')
+        contracts.validate_event(event)
+        event.update(api_key_id=None,customer_id=None,customer_mapping_version=None,customer_mapping_status='lookup_not_implemented',identity_status='invalid',usage_eligible=False,anomaly_codes=['identity_invalid'])
+        contracts.validate_event(event)
+
+    def test_removed_gateway_identity_configuration_is_rejected(self):
+        self.assert_config_invalid(lambda c: c.update(identity_namespace='envoy.filters.http.ext_authz'))
+        self.assert_config_invalid(lambda c: c.update(identity_fields={}))
+        self.assert_config_invalid(lambda c: c['routes'][0].update(service_id='old'))
 
 if __name__ == "__main__":
     unittest.main()

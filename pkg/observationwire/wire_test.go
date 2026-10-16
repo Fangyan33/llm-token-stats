@@ -22,3 +22,16 @@ func TestStandardInterop(t *testing.T) {
 		}
 	}
 }
+
+func TestReservedIdentityAndCredentialWireLimits(t *testing.T) {
+	for _, field := range []int{5, 7, 8, 9, 10} {
+		if Validate(Frame(1, 10, String(nil, field, "old-identity")), "frame") == nil {
+			t.Fatal("reserved identity accepted")
+		}
+	}
+	for _, payload := range [][]byte{Bytes(nil, 17, make([]byte, 4097)), String(nil, 16, string(make([]byte, 513))), append(Bytes(nil, 17, []byte("first")), Bytes(nil, 17, []byte("second"))...)} {
+		if Validate(Frame(1, 10, payload), "frame") == nil {
+			t.Fatal("unbounded or repeated credential accepted")
+		}
+	}
+}

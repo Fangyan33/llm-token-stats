@@ -6,6 +6,8 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"github.com/Fangyan33/llm-token-stats/internal/config"
+	"github.com/Fangyan33/llm-token-stats/pkg/requesthost"
 	"github.com/Fangyan33/llm-token-stats/pkg/strictjson"
 	"math"
 	"sort"
@@ -25,7 +27,7 @@ func Canonical(e *Event) ([]byte, error) {
 	return b, nil
 }
 func IdentityHash(e *Event) string {
-	return Tuple([]any{e.ServiceID, e.ApiKeyID, e.CustomerID, e.ApplicationID, e.IdentityStatus, e.ConfigVersion, e.GatewayInstanceID, e.AdapterID, e.XRequestID})
+	return Tuple([]any{e.ServiceID, e.ProviderID, e.ApiKeyID, e.CustomerID, e.IdentityStatus, e.ConfigVersion, e.GatewayInstanceID, e.AdapterID, e.XRequestID, e.ClusterName, e.DeploymentEnvironment, e.MappingStatus, e.MappingVersion, e.CustomerMappingStatus, e.CustomerMappingVersion})
 }
 func Decode(b, key []byte, now time.Time) (*Event, error) {
 	if len(b) > MaxBytes {
@@ -63,7 +65,10 @@ func Decode(b, key []byte, now time.Time) (*Event, error) {
 			return nil, errors.New("event_time")
 		}
 	}
-	known := e.ApiKeyID != nil && e.CustomerID != nil && e.ApplicationID != nil
+	if !config.Environment(e.DeploymentEnvironment) || !mappingValid(&e) {
+		return nil, errors.New("event_mapping")
+	}
+	known := e.ApiKeyID != nil && e.CustomerID != nil && e.CustomerMappingStatus == "mapped"
 	if (e.IdentityStatus == "known") != known || !known && !Has(e.AnomalyCodes, "identity_invalid") {
 		return nil, errors.New("event_identity")
 	}
@@ -193,4 +198,28 @@ func RawValid(s string) error {
 		}
 	}
 	return nil
+}
+
+func mappingValid(e *Event) bool {
+	if e.RequestHost != nil && (*e.RequestHost == "" || requesthost.Normalize(*e.RequestHost) != *e.RequestHost) {
+		return false
+	}
+	if e.MappingStatus == "mapped" {
+		if e.RequestHost == nil || e.ServiceID == nil || e.ProviderID == nil || e.MappingVersion == nil {
+			return false
+		}
+	} else if e.ServiceID != nil || e.ProviderID != nil || e.MappingVersion != nil {
+		return false
+	}
+	if e.MappingStatus == "invalid_host" && e.RequestHost != nil || e.MappingStatus != "invalid_host" && e.RequestHost == nil {
+		return false
+	}
+	if e.CustomerMappingStatus == "mapped" {
+		if e.ApiKeyID == nil || e.CustomerID == nil || e.CustomerMappingVersion == nil {
+			return false
+		}
+	} else if e.ApiKeyID != nil || e.CustomerID != nil || e.CustomerMappingVersion != nil {
+		return false
+	}
+	return true
 }

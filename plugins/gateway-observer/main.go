@@ -2,6 +2,7 @@ package main
 
 import (
 	"container/heap"
+	"github.com/Fangyan33/llm-token-stats/pkg/credentials"
 	"github.com/Fangyan33/llm-token-stats/pkg/gatewayconfig"
 	w "github.com/Fangyan33/llm-token-stats/pkg/observationwire"
 	"github.com/Fangyan33/llm-token-stats/pkg/routeinfo"
@@ -187,6 +188,9 @@ func (r *root) send(s *state, kind int, b []byte, end bool) bool {
 		return false
 	}
 	encoded := w.Frame(s.seq+1, kind, b)
+	if kind == 10 {
+		defer clear(encoded)
+	}
 	n := int64(len(encoded) + 5)
 	maxB, maxM := r.cfg.StreamInflightBytes, r.cfg.StreamInflightMessages
 	if kind == 12 {
@@ -338,21 +342,19 @@ func (h *httpContext) OnHttpRequestHeaders(_ int, eos bool) types.Action {
 	b = w.String(b, 2, h.cfg.GatewayInstanceID)
 	b = w.String(b, 3, h.cfg.ConfigVersion)
 	b = w.String(b, 4, routeinfo.Name(actualRoute))
-	b = w.String(b, 5, rule.ServiceID)
 	b = w.String(b, 6, rule.AdapterID)
-	ids := []string{property("metadata", "filter_metadata", h.cfg.IdentityNamespace, "api_key_id"), property("metadata", "filter_metadata", h.cfg.IdentityNamespace, "customer_id"), property("metadata", "filter_metadata", h.cfg.IdentityNamespace, "application_id")}
-	known := true
-	for _, id := range ids {
-		known = known && idValid(id)
+	authority := header(":authority")
+	if len(authority) <= 512 && utf8.ValidString(authority) {
+		b = w.String(b, 16, authority)
 	}
-	identity := "invalid"
-	if known {
-		identity = "known"
-		for i, id := range ids {
-			b = w.String(b, 7+i, id)
-		}
+	// Unlike get_header_map_value, this property joins duplicate header values.
+	// A comma is rejected by Bearer; never fall back to the first header value.
+	authorization, _ := proxywasm.GetProperty([]string{"request", "headers", "authorization"})
+	apiKey := credentials.Bearer(authorization)
+	if len(apiKey) > 0 {
+		b = w.Bytes(b, 17, apiKey)
 	}
-	b = w.String(b, 10, identity)
+	clear(authorization)
 	b = w.String(b, 11, "POST")
 	b = w.String(b, 12, ct)
 	b = w.String(b, 13, enc)
@@ -368,6 +370,7 @@ func (h *httpContext) OnHttpRequestHeaders(_ int, eos bool) types.Action {
 		b = w.String(b, 15, x)
 	}
 	r.send(s, 10, b, false)
+	clear(b)
 	return action
 }
 

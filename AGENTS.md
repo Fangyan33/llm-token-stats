@@ -6,7 +6,7 @@
 - `plugins/gateway-observer/` 是独立 Go 模块；SDK 扩展位于 `third_party/proxy-wasm-go-sdk/`。
 - `api/` 定义 Protobuf 与事件 Schema，`gen/` 保存生成代码。
 - `tests/` 存放契约与集成测试，`testdata/collection/` 保存合成事件及规范编码、摘要样例。
-- `configs/`、`deploy/`、`migrations/` 分别管理配置、部署和数据库迁移；设计在 `docs/`，实现计划在 `spec/plan/`，构建产物在 `dist/`。空目录及 `web/portal/` 不代表功能已实现。
+- `configs/`、`deploy/`、`migrations/` 分别管理配置、部署和数据库迁移；设计在 `docs/`，实现计划在 `docs/spec/plan/`，构建产物在 `dist/`。空目录及 `web/portal/` 不代表功能已实现。
 
 ## 构建、测试与本地开发
 

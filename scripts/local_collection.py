@@ -2,6 +2,7 @@
 import argparse,hashlib,json,os,re,socket,subprocess,time,urllib.error,urllib.request
 from pathlib import Path
 from wasm_artifact import remote_source
+from render_doris_sql import database_name,render_sql
 ROOT=Path(__file__).resolve().parents[1]
 BASE=['docker','compose','-f',str(ROOT/'deploy/local/compose.yaml')]
 def run(*args,input=None,capture_output=False):
@@ -108,10 +109,16 @@ def infra_up():
    if 'Alive' in columns and any(row.split('\t')[columns.index('Alive')]=='true' for row in rows[1:]):break
   time.sleep(2)
  else:raise RuntimeError('Doris readiness timeout')
+ database=database_name(json.loads((ROOT/'deploy/local/consumer.json').read_text())['doris']['database'])
+ # Never silently apply this single new contract to tables from an old checkout.
+ guard="SELECT column_name FROM information_schema.columns WHERE table_schema='"+database+"' AND table_name='events_raw';"
+ columns=run('exec','-T','doris','mysql','-uroot','-h127.0.0.1','-P9030','-N','-e',guard,capture_output=True).stdout.splitlines()
+ if columns and ('application_id' in columns or not {'request_host','provider_id','customer_mapping_status'}<=set(columns)):
+  raise RuntimeError('Incompatible existing Doris schema; choose an isolated database, never overwrite shared tables')
  for name in ['001_init.sql','002_usage_summaries.sql','004_summary_coordination.sql','005_consumer_recovery.sql','006_optional_route_identity.sql']:
-  run('exec','-T','doris','mysql','-uroot','-h127.0.0.1','-P9030',input=(ROOT/'migrations/doris/metering'/name).read_text())
+  run('exec','-T','doris','mysql','-uroot','-h127.0.0.1','-P9030',input=render_sql((ROOT/'migrations/doris/metering'/name).read_text(),json.loads((ROOT/'deploy/local/consumer.json').read_text())['doris']['database']))
  for _ in range(45):
-  result=subprocess.run([*BASE,'exec','-T','kafka','/opt/kafka/bin/kafka-topics.sh','--bootstrap-server','kafka:9092','--create','--if-not-exists','--topic','llm-metering-events','--partitions','24','--replication-factor','1','--config','retention.ms=259200000','--config','cleanup.policy=delete'],capture_output=True)
+  result=subprocess.run([*BASE,'exec','-T','kafka','/opt/kafka/bin/kafka-topics.sh','--bootstrap-server','kafka:9092','--create','--if-not-exists','--topic',json.loads((ROOT/'deploy/local/observer.json').read_text())['kafka']['topic'],'--partitions','24','--replication-factor','1','--config','retention.ms=259200000','--config','cleanup.policy=delete'],capture_output=True)
   if result.returncode==0:break
   time.sleep(2)
  else:raise RuntimeError('Kafka readiness timeout')

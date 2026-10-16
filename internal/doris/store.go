@@ -9,7 +9,7 @@ import (
 	"fmt"
 	"github.com/Fangyan33/llm-token-stats/internal/config"
 	"github.com/Fangyan33/llm-token-stats/internal/consumer"
-	_ "github.com/go-sql-driver/mysql"
+	"github.com/go-sql-driver/mysql"
 	"io"
 	"net/http"
 	"net/url"
@@ -25,8 +25,15 @@ type Store struct {
 }
 
 func New(c config.Doris) (*Store, error) {
+	if !config.DatabaseName(c.Database) {
+		return nil, errors.New("doris_database")
+	}
 	dsn := os.Getenv(c.DSNEnv)
 	if dsn == "" {
+		return nil, errors.New("doris_dsn")
+	}
+	parsed, err := mysql.ParseDSN(dsn)
+	if err != nil || parsed.DBName != c.Database {
 		return nil, errors.New("doris_dsn")
 	}
 	db, err := sql.Open("mysql", dsn)
@@ -64,7 +71,7 @@ func quote(v any) string {
 var keys = map[string][]string{"events_raw": {"request_date", "logical_request_id", "event_id", "payload_hash"}, "ingest_rejections": {"kafka_record_date", "kafka_topic", "kafka_partition", "kafka_offset", "payload_hash"}, "request_conflict_ids": {"logical_request_id"}, "summary_dirty_notifications": {"stat_date", "notification_id"}, "consumer_batch_receipts": {"kafka_topic", "kafka_partition", "first_offset", "last_offset", "batch_id"}, "consumer_partition_origins": {"group_id", "kafka_topic", "kafka_partition", "origin_id"}, "consumer_partition_gaps": {"group_id", "kafka_topic", "kafka_partition", "gap_id"}}
 
 func (s *Store) visible(ctx context.Context, label string) (bool, error) {
-	rows, err := s.DB.QueryContext(ctx, "SHOW TRANSACTION FROM metering WHERE LABEL = "+quote(label))
+	rows, err := s.DB.QueryContext(ctx, "SHOW TRANSACTION FROM "+s.Database()+" WHERE LABEL = "+quote(label))
 	if err != nil {
 		return false, errors.New("transaction_unknown")
 	}
@@ -116,7 +123,7 @@ func (s *Store) verify(ctx context.Context, table string, rows []map[string]any)
 	for i := 0; i < len(wheres); i += 128 {
 		end := min(i+128, len(wheres))
 		var n int
-		if err := s.DB.QueryRowContext(ctx, "SELECT COUNT(*) FROM metering."+table+" WHERE "+strings.Join(wheres[i:end], " OR ")).Scan(&n); err != nil || n != end-i {
+		if err := s.DB.QueryRowContext(ctx, "SELECT COUNT(*) FROM "+s.Database()+"."+table+" WHERE "+strings.Join(wheres[i:end], " OR ")).Scan(&n); err != nil || n != end-i {
 			return errors.New("doris_visibility")
 		}
 	}
@@ -129,7 +136,7 @@ func (s *Store) Load(ctx context.Context, table, label string, body []byte, rows
 	if v, err := s.visible(ctx, label); err == nil && v {
 		return s.verify(ctx, table, rows)
 	}
-	u, err := url.Parse(strings.TrimRight(s.Cfg.FE, "/") + "/api/metering/" + table + "/_stream_load")
+	u, err := url.Parse(strings.TrimRight(s.Cfg.FE, "/") + "/api/" + s.Cfg.Database + "/" + table + "/_stream_load")
 	if err != nil || !s.allowed(u) {
 		return errors.New("doris_target")
 	}
@@ -191,10 +198,8 @@ func (s *Store) Evidence(ctx context.Context, ids []string) ([]consumer.Evidence
 		for _, id := range ids[start:end] {
 			qs = append(qs, quote(id))
 		}
-		// Derive the comparison key from typed columns for both old and new rows.
-		// Stored legacy identity_hash includes route_name; comparing hash versions
-		// directly would turn a harmless diagnostics change into a tenant conflict.
-		r, err := s.DB.QueryContext(ctx, "SELECT CAST(request_date AS STRING),logical_request_id,payload_hash,"+IdentityKeySQL+",request_started_at_ms,event_id FROM metering.events_raw WHERE logical_request_id IN ("+strings.Join(qs, ",")+")")
+		// Compare the single contract using typed identity columns.
+		r, err := s.DB.QueryContext(ctx, "SELECT CAST(request_date AS STRING),logical_request_id,payload_hash,"+IdentityKeySQL+",request_started_at_ms,event_id FROM "+s.Database()+".events_raw WHERE logical_request_id IN ("+strings.Join(qs, ",")+")")
 		if err != nil {
 			return nil, errors.New("doris_evidence")
 		}
@@ -221,4 +226,7 @@ func (s *Store) Evidence(ctx context.Context, ids []string) ([]consumer.Evidence
 
 // IdentityKeySQL keeps the field order aligned with events.IdentityHash and migration 006.
 // This JSON tuple is used only for equality within Doris, not as a payload hash.
-const IdentityKeySQL = "CAST(JSON_ARRAY(service_id, api_key_id, customer_id, application_id, identity_status, config_version, gateway_instance_id, adapter_id, x_request_id) AS STRING)"
+const IdentityKeySQL = "CAST(JSON_ARRAY(service_id, provider_id, api_key_id, customer_id, identity_status, config_version, gateway_instance_id, adapter_id, x_request_id, cluster_name, deployment_environment, mapping_status, mapping_version, customer_mapping_status, customer_mapping_version) AS STRING)"
+
+// Database is a validated SQL identifier; New rejects arbitrary SQL fragments.
+func (s *Store) Database() string { return "`" + s.Cfg.Database + "`" }

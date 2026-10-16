@@ -17,10 +17,17 @@
     "config_version",
     "adapter_id",
     "route_name",
+    "request_host",
+    "cluster_name",
+    "deployment_environment",
     "service_id",
+    "provider_id",
+    "mapping_version",
+    "mapping_status",
     "api_key_id",
     "customer_id",
-    "application_id",
+    "customer_mapping_version",
+    "customer_mapping_status",
     "identity_status",
     "request_started_at_ms",
     "observation_ended_at_ms",
@@ -100,10 +107,61 @@
       "maxLength": 128,
       "description": "Envoy 实际 HTTP 路由名，仅用于诊断；不可读时为 unknown，不参与身份一致性或服务接纳。历史事件中的 * 保留原值。"
     },
-    "service_id": {
+    "request_host": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "minLength": 1,
+      "maxLength": 253
+    },
+    "cluster_name": {
       "type": "string",
       "minLength": 1,
       "maxLength": 128
+    },
+    "deployment_environment": {
+      "enum": [
+        "production",
+        "test",
+        "development"
+      ]
+    },
+    "service_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "provider_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "mapping_version": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "mapping_status": {
+      "enum": [
+        "mapped",
+        "unknown_host",
+        "invalid_host",
+        "lookup_not_implemented",
+        "lookup_timeout",
+        "lookup_unavailable",
+        "lookup_invalid_response",
+        "lookup_overloaded",
+        "lookup_rate_limited"
+      ]
     },
     "api_key_id": {
       "type": [
@@ -121,13 +179,25 @@
       "minLength": 1,
       "maxLength": 128
     },
-    "application_id": {
+    "customer_mapping_version": {
       "type": [
         "string",
         "null"
       ],
-      "minLength": 1,
-      "maxLength": 128
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "customer_mapping_status": {
+      "enum": [
+        "mapped",
+        "unknown_api_key",
+        "invalid_api_key",
+        "lookup_not_implemented",
+        "lookup_timeout",
+        "lookup_unavailable",
+        "lookup_invalid_response",
+        "lookup_overloaded",
+        "lookup_rate_limited"
+      ]
     },
     "identity_status": {
       "enum": [

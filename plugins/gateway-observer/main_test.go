@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	pb "github.com/Fangyan33/llm-token-stats/gen/observation/v1"
 	w "github.com/Fangyan33/llm-token-stats/pkg/observationwire"
@@ -12,6 +13,56 @@ import (
 	"testing"
 	"time"
 )
+
+func TestBearerStartAndUnchangedAuthorization(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		authorization []string
+		want          []byte
+	}{
+		{"single", []string{"Bearer Synthetic-MixedCase.Key"}, []byte("Synthetic-MixedCase.Key")},
+		{"scheme_case", []string{"bEaReR  Synthetic-MixedCase.Key"}, []byte("Synthetic-MixedCase.Key")},
+		{"maximum", []string{"Bearer " + strings.Repeat("a", 4096)}, bytes.Repeat([]byte{'a'}, 4096)},
+		{"missing", nil, nil}, {"empty", []string{"Bearer "}, nil},
+		{"other_scheme", []string{"Basic secret"}, nil},
+		{"duplicate", []string{"Bearer first", "Bearer second"}, nil},
+		{"duplicate_same", []string{"Bearer first", "Bearer first"}, nil},
+		{"joined", []string{"Bearer first,Bearer second"}, nil},
+		{"too_long", []string{"Bearer " + strings.Repeat("a", 4097)}, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := testHost(t)
+			id := h.InitializeHttpContext()
+			headers := [][2]string{{":method", "POST"}, {":path", "/v1/chat/completions"}, {":authority", "MODEL.example.invalid:443"}, {"x-forwarded-host", "forged.invalid"}, {"forwarded", "host=forged.invalid"}, {"x-api-key", "must-be-ignored"}, {"customer_id", "forged"}}
+			for _, v := range tc.authorization {
+				headers = append(headers, [2]string{"authorization", v})
+			}
+			h.CallOnRequestHeaders(id, headers, false)
+			calls := proxytest.GrpcCalls()
+			if len(calls) != 1 || len(calls[0].Messages) != 1 {
+				t.Fatal("missing Start")
+			}
+			var f pb.ObservationFrame
+			if proto.Unmarshal(calls[0].Messages[0], &f) != nil || f.GetStart() == nil {
+				t.Fatal("invalid Start")
+			}
+			st := f.GetStart()
+			if !bytes.Equal(st.ApiKey, tc.want) || st.RequestAuthority != "MODEL.example.invalid:443" {
+				t.Fatal("wrong transient identity input")
+			}
+			got := h.GetCurrentRequestHeaders(id)
+			var authorizations []string
+			for _, pair := range got {
+				if pair[0] == "authorization" {
+					authorizations = append(authorizations, pair[1])
+				}
+			}
+			if strings.Join(authorizations, "\n") != strings.Join(tc.authorization, "\n") {
+				t.Fatal("business Authorization changed")
+			}
+		})
+	}
+}
 
 func testHost(t *testing.T) proxytest.HostEmulator {
 	return testHostWithRoute(t, "llm-chat")
@@ -60,7 +111,7 @@ func TestWildcardSelectsWithoutRouteMetadata(t *testing.T) {
 			if route == "" || route == "*" || len(route) > 128 || route == string([]byte{0xff}) {
 				want = "unknown"
 			}
-			if start == nil || start.RouteName != want || start.ServiceId != "model-service-a" {
+			if start == nil || start.RouteName != want {
 				t.Fatalf("Start must report actual route or unknown: %+v", start)
 			}
 		})

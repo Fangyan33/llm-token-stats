@@ -1,8 +1,8 @@
 # 网关采集设计闭环与验收清单
 
-修订日期：2026-10-15。插件、SDK 扩展、Observer、Consumer 已实现并完成公开旧版 Envoy/Kafka/Doris 本地联调；生产完整门槛未验收。实现结果与已确认的请求头 Continue 调整见[运行说明](collection-components.md)。本文与[开发实现方案](gateway-request-collection-implementation.md)共同构成采集子项的实施依据。
+修订日期：2026-10-19。插件、SDK 扩展、Observer、Consumer 已实现并完成公开旧版 Envoy/Kafka/Doris 本地联调；生产完整门槛未验收。实现结果与已确认的请求头 Continue 调整见[运行说明](collection-components.md)。本文与[开发实现方案](gateway-request-collection-implementation.md)共同构成采集子项的实施依据。
 
-归属接口及占位已实现，详见[实现计划](spec/plan/host-service-provider-implementation.md)。当前 Start 只携带 Host 与临时 Bearer token，Observer 固定集群/环境并调用两个未实现 resolver；合法输入归属未知，原始 usage 保留。application_id、身份元数据配置和静态服务上报已删除，真实 HTTP/第三方鉴权未实现。
+归属接口及占位已实现，详见[实现计划](spec/plan/host-service-provider-implementation.md)。当前 Start 只携带 Host 与临时 Bearer token，两个归属接口支持配置 HTTP/HTTPS POST JSON 调用及 x-remote-data 认证；URI 为空时使用未实现占位。Observer 固定 prd/stg/dev 环境，在有界异步任务中取得 ID 和名称快照；service_name、provider_name、customer_name 经 Kafka 写入 Doris 独立列及 event_json。占位或失败侧的 ID、名称和版本为 null，不回源补写历史；原始 usage 保留，业务 token 不进入事件、数据库或日志。
 
 ## 1. 交付物与变更规则
 

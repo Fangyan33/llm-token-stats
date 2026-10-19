@@ -7,7 +7,7 @@
 CREATE TABLE IF NOT EXISTS metering.usage_daily (
     stat_date DATE NOT NULL COMMENT '日统计或重算通知对应的 UTC 请求日期',
     cluster_name VARCHAR(128) NOT NULL COMMENT 'Observer 配置固定的集群名称，业务请求不能覆盖',
-    deployment_environment VARCHAR(16) NOT NULL COMMENT 'Observer 固定部署环境：production、test 或 development',
+    deployment_environment VARCHAR(16) NOT NULL COMMENT 'Observer 固定部署环境：prd、stg 或 dev',
     customer_id VARCHAR(128) NOT NULL COMMENT '已成功解析的客户统计维度；未知客户不进入客户汇总，不创建空客户桶',
     provider_id VARCHAR(128) NOT NULL COMMENT '供应商统计维度；空串仅代表未知汇总桶，不回写原始事件归属',
     api_key_id VARCHAR(128) NOT NULL COMMENT '已成功解析的稳定 API Key 统计维度，不是原始密钥，必须与客户归属一起已知',
@@ -50,7 +50,7 @@ PROPERTIES (
 CREATE TABLE IF NOT EXISTS metering.usage_monthly (
     stat_month DATE NOT NULL COMMENT '月统计对应的 UTC 自然月首日',
     cluster_name VARCHAR(128) NOT NULL COMMENT 'Observer 配置固定的集群名称，业务请求不能覆盖',
-    deployment_environment VARCHAR(16) NOT NULL COMMENT 'Observer 固定部署环境：production、test 或 development',
+    deployment_environment VARCHAR(16) NOT NULL COMMENT 'Observer 固定部署环境：prd、stg 或 dev',
     customer_id VARCHAR(128) NOT NULL COMMENT '已成功解析的客户统计维度；未知客户不进入客户汇总，不创建空客户桶',
     provider_id VARCHAR(128) NOT NULL COMMENT '供应商统计维度；空串仅代表未知汇总桶，不回写原始事件归属',
     api_key_id VARCHAR(128) NOT NULL COMMENT '已成功解析的稳定 API Key 统计维度，不是原始密钥，必须与客户归属一起已知',
@@ -101,16 +101,20 @@ CREATE VIEW IF NOT EXISTS metering.request_statistics (
     usage_variants COMMENT '该逻辑请求的结果事件内容变体数；0 表示未观察结果，大于 1 表示冲突',
     started_count COMMENT '该日期内同一逻辑请求的不同开始时间数量；大于 1 表示时间冲突',
     identity_count COMMENT '该日期内同一逻辑请求的不同十五项归属与部署快照数量；大于 1 表示冲突',
+    name_count COMMENT '同请求不同名称快照元组数量；大于 1 表示冲突',
     customer_id COMMENT '与 api_key_id 同次成功解析得到的客户 ID；未知为 NULL，不采信客户端自报 ID',
     provider_id COMMENT '服务接口返回的服务所属供应商 ID；未知为 NULL，不代表隐藏的实际执行方',
     api_key_id COMMENT '客户接口返回的稳定 API Key ID；未知为 NULL，绝不是原始 Bearer token',
     service_id COMMENT '服务接口返回的服务 ID；未实现或失败为 NULL，不使用默认服务补值',
+    service_name COMMENT '请求发生时的服务名称快照；解析未知时为 NULL，不用最新名称覆盖历史',
+    provider_name COMMENT '请求发生时的供应商名称快照；解析未知时为 NULL，不用最新名称覆盖历史',
+    customer_name COMMENT '请求发生时的客户名称快照；解析未知时为 NULL，不用最新名称覆盖历史',
     cluster_name COMMENT 'Observer 配置固定的集群名称，业务请求不能覆盖',
-    deployment_environment COMMENT 'Observer 固定部署环境：production、test 或 development',
+    deployment_environment COMMENT 'Observer 固定部署环境：prd、stg 或 dev',
     request_host COMMENT '规范入口 DNS 域名；转小写并去端口及末尾根点，非法输入为 NULL',
-    mapping_status COMMENT '服务解析状态：mapped、unknown_host、invalid_host、lookup_not_implemented、lookup_timeout、lookup_unavailable、lookup_invalid_response、lookup_overloaded、lookup_rate_limited；当前合法输入为未实现占位',
+    mapping_status COMMENT '服务解析状态：mapped、unknown_host、invalid_host、lookup_not_implemented、lookup_timeout、lookup_unavailable、lookup_invalid_response、lookup_overloaded、lookup_rate_limited；空 URI 为未实现占位，配置 HTTP/HTTPS 可解析',
     mapping_version COMMENT '成功服务解析快照的规范 SHA-256，绑定 Host、集群、环境及服务和供应商；未知为 NULL',
-    customer_mapping_status COMMENT '客户解析状态：mapped、unknown_api_key、invalid_api_key、lookup_not_implemented、lookup_timeout、lookup_unavailable、lookup_invalid_response、lookup_overloaded、lookup_rate_limited；当前合法输入为未实现占位',
+    customer_mapping_status COMMENT '客户解析状态：mapped、unknown_api_key、invalid_api_key、lookup_not_implemented、lookup_timeout、lookup_unavailable、lookup_invalid_response、lookup_overloaded、lookup_rate_limited；空 URI 为未实现占位，配置 HTTP/HTTPS 可解析',
     customer_mapping_version COMMENT '成功客户解析快照的规范 SHA-256，绑定部署上下文、API Key ID 和客户；未知为 NULL',
     identity_status COMMENT '客户归属状态：known 或 invalid；仅完整客户解析成功为 known，不表示鉴权判定',
     request_model COMMENT '请求正文中可靠提取的模型名或 ID；未取得或非法时为 NULL',
@@ -132,7 +136,7 @@ CREATE VIEW IF NOT EXISTS metering.request_statistics (
 ) AS
 SELECT a.*,
        CASE WHEN a.start_variants > 1 OR a.usage_variants > 1
-                 OR a.started_count > 1 OR a.identity_count > 1
+                 OR a.started_count > 1 OR a.identity_count > 1 OR a.name_count > 1
                  OR c.logical_request_id IS NOT NULL THEN 1 ELSE 0 END AS has_conflict,
        COALESCE(NULLIF(a.response_model, ''), NULLIF(a.request_model, ''), '') AS model,
        CASE WHEN a.usage_variants = 0 THEN 'missing'
@@ -147,8 +151,12 @@ FROM (
            SUM(CASE WHEN event_type = 'usage_observed' THEN 1 ELSE 0 END) AS usage_variants,
            COUNT(DISTINCT request_started_at_ms) AS started_count,
            COUNT(DISTINCT CAST(JSON_ARRAY(service_id, provider_id, api_key_id, customer_id, identity_status, config_version, gateway_instance_id, adapter_id, x_request_id, cluster_name, deployment_environment, mapping_status, mapping_version, customer_mapping_status, customer_mapping_version) AS STRING)) AS identity_count,
+           COUNT(DISTINCT CAST(JSON_ARRAY(service_name, provider_name, customer_name) AS STRING)) AS name_count,
            MAX(customer_id) AS customer_id, MAX(provider_id) AS provider_id,
            MAX(api_key_id) AS api_key_id, MAX(service_id) AS service_id,
+           CASE WHEN COUNT(DISTINCT CAST(JSON_ARRAY(service_name, provider_name, customer_name) AS STRING)) = 1 THEN MAX(service_name) END AS service_name,
+           CASE WHEN COUNT(DISTINCT CAST(JSON_ARRAY(service_name, provider_name, customer_name) AS STRING)) = 1 THEN MAX(provider_name) END AS provider_name,
+           CASE WHEN COUNT(DISTINCT CAST(JSON_ARRAY(service_name, provider_name, customer_name) AS STRING)) = 1 THEN MAX(customer_name) END AS customer_name,
            MAX(cluster_name) AS cluster_name, MAX(deployment_environment) AS deployment_environment, MAX(request_host) AS request_host, MAX(mapping_status) AS mapping_status, MAX(mapping_version) AS mapping_version, MAX(customer_mapping_status) AS customer_mapping_status, MAX(customer_mapping_version) AS customer_mapping_version,
            MAX(identity_status) AS identity_status,
            MAX(request_model) AS request_model,

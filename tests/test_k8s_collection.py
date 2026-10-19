@@ -98,7 +98,7 @@ class KubernetesCollectionTests(unittest.TestCase):
                 ['request', 'usage_observed', 'logical', 'unknown', 'NULL', 'NULL',
                  'complete', '0', 'gateway-uid', 'observer-pod-uid', 'test-topic', 'synthetic-model-route']]
         for row in rows:
-            row.extend(['NULL'] * 4 + ['lookup_not_implemented'] * 2 + ['kind','test','wasm-verify.local','NULL','NULL'])
+            row.extend(['NULL'] * 4 + ['lookup_not_implemented'] * 2 + ['kind','stg','wasm-verify.local','NULL','NULL'])
         k8s.validate_events(copy.deepcopy(results), rows, 'gateway-uid', {'observer-pod-uid'}, 'test-topic')
         missing = copy.deepcopy(rows)
         for row in missing:

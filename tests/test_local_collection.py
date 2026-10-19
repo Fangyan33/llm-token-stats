@@ -51,6 +51,27 @@ class LocalCollectionTests(unittest.TestCase):
                 local.infra_up()
         self.assertFalse(any(call.kwargs.get('input') for call in compose.call_args_list))
 
+    def test_partial_name_upgrade_preserves_existing_column_and_refreshes_views(self):
+        initial = 'request_host\nprovider_id\ncustomer_mapping_status\nservice_id\nservice_name\n'
+        queries = 0
+        def compose(*args, **kwargs):
+            nonlocal queries
+            if isinstance(args[-1], str) and 'information_schema.columns' in args[-1]:
+                queries += 1
+                return result(initial if queries == 1 else initial + 'provider_name\ncustomer_name\n')
+            return result()
+        with patch.object(local, 'external_host'), patch.object(local, 'migrate_storage'), \
+                patch.object(local, 'run', side_effect=compose) as commands, \
+                patch.object(local.subprocess, 'run', return_value=result('BackendId\tAlive\n1\ttrue\n')):
+            local.infra_up()
+        statements = [c.kwargs['input'] for c in commands.call_args_list if c.kwargs.get('input')]
+        additions = [s for s in statements if s.startswith('ALTER TABLE') and 'ADD COLUMN' in s]
+        self.assertEqual(len(additions), 2)
+        self.assertTrue(any('ADD COLUMN provider_name' in s for s in additions))
+        self.assertTrue(any('ADD COLUMN customer_name' in s for s in additions))
+        self.assertEqual(sum(s.startswith('CREATE OR REPLACE VIEW') for s in statements), 7)
+        self.assertTrue(all('DROP DATABASE' not in s and 'UPDATE ' not in s for s in statements))
+
     def test_gateway_render_replaces_local_source_and_refreshes_checksum(self):
         with tempfile.TemporaryDirectory() as temp, patch.object(local, 'ROOT', Path(temp)):
             source = Path(temp) / 'deploy/local/envoy.json'

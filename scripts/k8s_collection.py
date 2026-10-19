@@ -98,7 +98,7 @@ def local_configs(host, topic, group, database="metering_development"):
     consumer['kafka'] = copy.deepcopy(kafka)
     consumer['consumer'].update(group_id=group, flush_interval_ms=1000)
     consumer['doris']['database'] = database
-    observer['observer'].update(cluster_name='kind', deployment_environment='test')
+    observer['observer'].update(cluster_name='kind', deployment_environment='stg')
     # 本地 all-in-one 的 FE 重定向到容器内 127.0.0.1；使用已发布的 BE 直连。
     consumer['doris']['fe_url'] = 'http://' + host + ':18040'
     consumer['doris']['allowed_load_hosts'] = [host + ':18040']
@@ -121,7 +121,7 @@ def validate_events(results, rows, gateway_uid, producer_ids, topic):
                 and matches[0][11] in ('synthetic-model-route', 'unknown'),
                 '事件必须记录真实 HTTP 路由名或 unknown，且请求内保持不变')
         require(all(row[12:16] == ['NULL'] * 4 and row[16:18] == ['lookup_not_implemented'] * 2
-                    and row[19:21] == ['test', 'wasm-verify.local'] and row[21:23] == ['NULL'] * 2
+                    and row[19:21] == ['stg', 'wasm-verify.local'] and row[21:23] == ['NULL'] * 2
                     for row in matches), '占位归属、上下文或版本错误')
         usage = next(row for row in matches if row[1] == 'usage_observed')
         require(usage[6] == 'complete', '观察结果不完整')
@@ -567,7 +567,7 @@ class Harness:
             summary = {'status': 'passed', 'context': self.args.context, 'namespace': self.namespace,
                        'image_tag': self.image_tag, 'images': self.images,
                        'wasm_sha256': self.sha, 'kafka_topic': self.topic, 'doris_database': self.database,
-                       'cluster_name':self.args.kind_cluster,'deployment_environment':'test',
+                       'cluster_name':self.args.kind_cluster,'deployment_environment':'stg',
                        'lookup_implementation':'unimplemented','consumer': consumer,
                        'requests': results, 'ignored_requests': ignored, 'existing_gateway_unchanged': True}
             write_json(self.output / 'result.json', summary)

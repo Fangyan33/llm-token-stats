@@ -21,7 +21,7 @@ func TestDiagnosticRouteIdentityAndSnapshotConflicts(t *testing.T) {
 	s := localStore(t, "http://127.0.0.1:18040")
 	cl := kafka(t)
 	topic, group := batchingTopic(t, cl)
-	for _, mode := range []string{"diagnostic_route", "tenant_conflict", "provider_conflict", "environment_conflict"} {
+	for _, mode := range []string{"diagnostic_route", "tenant_conflict", "provider_conflict", "environment_conflict", "name_conflict"} {
 		t.Run(mode, func(t *testing.T) {
 			now := time.Now()
 			id := uuid(t)
@@ -50,8 +50,11 @@ func TestDiagnosticRouteIdentityAndSnapshotConflicts(t *testing.T) {
 					if mode == "provider_conflict" {
 						e.ProviderID = events.Ptr("different-provider")
 					}
+					if mode == "name_conflict" {
+						e.ServiceName = events.Ptr("不同名称")
+					}
 					if mode == "environment_conflict" {
-						e.DeploymentEnvironment = "production"
+						e.DeploymentEnvironment = "prd"
 					}
 				}
 				e.RouteName, e.RequestStartedAtMs, e.EventCreatedAtMs = route, now.UnixMilli(), now.UnixMilli()

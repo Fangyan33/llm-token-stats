@@ -2,7 +2,9 @@
 
 本文面向订阅计量事件的应用开发者，描述[网关请求采集开发实现方案](gateway-request-collection-implementation.md)对应的当前 **schema_version=1 契约**。采集、Kafka 和 Doris 已有真实本地链路验证，记录见[验证记录](spec/plan/gateway-collection-verification.md)；生产 Broker、认证权限及完整 G0–G5 尚需在实际环境验收。
 
-本页描述唯一有效事件模型：应用维度已删除，归属由 Observer 的服务/客户接口解析，目前均为未实现占位。合法输入的 ID 和版本为 null，mapping_status/customer_mapping_status 为 lookup_not_implemented，identity_status=invalid、usage_eligible=false，usage 可仍为 known。当前不发第三方请求，也不发送或接收原始 api_key 事件字段。
+本页描述唯一有效事件模型：应用维度已删除，归属由 Observer 的服务/客户接口解析。两个归属接口支持配置 HTTP/HTTPS POST JSON 调用及 x-remote-data 认证；URI 为空时使用未实现占位。Observer 固定 prd/stg/dev 环境，在有界异步任务中取得 ID 和名称快照；service_name、provider_name、customer_name 经 Kafka 写入 Doris 独立列及 event_json。占位或失败侧的 ID、名称和版本为 null，不回源补写历史；原始 usage 保留，业务 token 不进入事件、数据库或日志。
+
+观察取消、超时或 ACK 失败时，已接纳的归属查询继续到完成或原查询截止时间，保留成功侧的 ID、名称及版本，仅未返回侧标为 lookup_timeout。开始事件与结果事件共用冻结快照，迟到结果不回写；归属成功不恢复观察完整性或有效统计资格。该规则限于 Observer 正常运行期间，不保证事件必然投递到 Kafka。
 
 正式字段契约见 [事件 Schema](../api/events/v1/metering-event.schema.json)，合成事件见 [testdata/collection](../testdata/collection)。运行时还须执行 UTF-8 字节、状态关系、来源与 Kafka key 校验；[离线校验器](../scripts/validate_collection_contracts.py)提供可复现参考。Doris Consumer 的写入/冲突/dirty/提交恢复顺序见[闭环清单](gateway-collection-design-closure.md#5-consumer-提交与恢复屏障)。
 
@@ -12,13 +14,13 @@
 
 | 项目 | 约定 |
 | --- | --- |
-| Topic | `llm-metering-events` |
+| Topic | 由 Observer 和 Consumer 的 `kafka.topic` 配置决定；生产配置示例为 `llm-metering-events`，当前本地联调为 `llm-metering-development` |
 | Kafka key | `logical_request_id` 的 UTF-8 字节；同一请求的事件使用同一个 key |
 | Kafka value | UTF-8 JSON，固定字段集，`schema_version=1` |
 | 事件类型 | `request_started` 与 `usage_observed`；不存在独立的 `request_finished` |
 | 事件大小 | JSON 序列化后最多 32 KiB |
 | 保留时间 | 设计初值 72 小时；应用应监控消费延迟，超出保留期无法靠 Kafka 补齐 |
-| 消费组 | 每个下游应用使用自己的 group ID；不要复用 Doris Consumer 的 `llm-metering-doris-v1` |
+| 消费组 | 每个下游应用使用自己的 group ID；不要复用 Doris Consumer 的生产示例组 `llm-metering-doris-v1` 或本地组 `llm-metering-development` |
 | 权限与连接 | 申请 Topic 读取、消费组权限，以及实际集群的 Broker 地址和 TLS/SASL 配置；密钥通过环境或 Secret 注入 |
 
 一次符合采集条件的逻辑请求最多形成两种事件：
@@ -53,18 +55,21 @@ UUIDv4 不包含时间。`request_started_at_ms` 仍由网关观察并作为事�
 | `observation_scope` | 字符串 / 否 | 当前固定为 `gateway_response`，表示网关可见的一次逻辑响应，并非所有上游尝试。 |
 | `producer_id` | 字符串 / 否 | 生成事件的 Observer 实例标识。 |
 | `gateway_instance_id` | 字符串 / 否 | 观察该请求的网关实例标识。 |
-| `config_version` | 字符串 / 否 | 请求开始时固定的采集配置版本，用于解释当时的采集规则。固定为 `collection-v1` |
+| `config_version` | 字符串 / 否 | 请求开始时冻结的采集配置版本，用于解释当时的采集规则。非空合法 UTF-8，最多 128 字节，需在 Observer 和 Consumer 的 `accepted_config_versions` 中登记；当前配置示例使用 `collection-v1`。 |
 | `adapter_id` | 字符串 / 否 | 解析上游协议的适配器 ID；当前接入范围固定为 `chat_completions_v1`。 |
 | `route_name` | 字符串 / 否 | 真实 Envoy HTTP 路由名；不可读时为 `unknown`。仅用于诊断、审计，不参与身份一致性、准入或价格选择；不是 VirtualService 名称或后端 ID。字段保留非空字符串，业务上可缺失；当前网关不输出 `*`，Consumer 不按诊断值判断身份。事件不携带原始 URL 或 query。 |
 | `request_host` | 字符串 / 是 | 规范入口 DNS 域名；非法输入为 null，不保存 URL/query。 |
 | `cluster_name` | 字符串 / 否 | Observer 配置的固定集群名称，客户端不可覆盖。 |
-| `deployment_environment` | 字符串 / 否 | Observer 固定 production/test/development。 |
+| `deployment_environment` | 字符串 / 否 | Observer 固定 prd/stg/dev。 |
 | `provider_id` | 字符串 / 是 | 服务接口返回的供应商归属；未实现或失败为 null。 |
-| `mapping_status` / `customer_mapping_status` | 字符串 / 否 | 两类查询各自的固定状态，当前合法输入为 lookup_not_implemented，非法为 invalid_host/invalid_api_key。 |
+| `mapping_status` / `customer_mapping_status` | 字符串 / 否 | 两类查询各自的固定状态；成功为 mapped，空 URI 为 lookup_not_implemented，非法输入为 invalid_host/invalid_api_key，HTTP 故障按归属接口契约分类。 |
 | `mapping_version` / `customer_mapping_version` | 字符串 / 是 | 成功结果的规范 SHA-256 摘要；未知时为 null。 |
 | `service_id` | 字符串 / 是 | Observer 按 request_host + 固定集群/环境查询服务；占位或失败为 null，不填默认服务。 |
 | `api_key_id` | 字符串 / 是 | 客户查询接口返回的稳定 API Key ID，不是原始 token；未实现或失败时为 null。 |
 | `customer_id` | 字符串 / 是 | 与 api_key_id 同次查询得到的客户快照，二者成对成功；不从身份元数据补值。 |
+| `service_name` | 字符串 / 是 | 请求发生时的服务名称快照，非空合法 UTF-8、最多 512 字节；对应解析失败为 null。两类事件一致，重命名不覆盖历史。 |
+| `provider_name` | 字符串 / 是 | 请求发生时的供应商名称快照，非空合法 UTF-8、最多 512 字节；对应解析失败为 null。两类事件一致，重命名不覆盖历史。 |
+| `customer_name` | 字符串 / 是 | 请求发生时的客户名称快照，非空合法 UTF-8、最多 512 字节；对应解析失败为 null。两类事件一致，重命名不覆盖历史。 |
 | `identity_status` | 字符串 / 否 | 客户接口完整成功时 known，否则 invalid；不表示鉴权判定，invalid 不进入有效客户汇总。 |
 | `request_started_at_ms` | 整数 / 否 | 网关观察到请求头的开始时间，也是统计归属和 UTC `request_date` 的来源；与 UUIDv4 独立，同一请求的两种事件必须一致。 |
 | `observation_ended_at_ms` | 整数 / 是 | Observer 结束本次观察的时间；start 尚未结束时为 `null`。它不等于网关确认业务请求结束。 |
@@ -137,14 +142,14 @@ UUIDv4 不包含时间。`request_started_at_ms` 仍由网关观察并作为事�
   "route_name": "llm-chat",
   "request_host": "model.example.invalid",
   "cluster_name": "fixture-cluster",
-  "deployment_environment": "test",
+  "deployment_environment": "stg",
   "service_id": "model-service-a",
   "provider_id": "provider-a",
-  "mapping_version": "48a5034f65608f6895d3e529dafbb6f3c152e2058951074d7ce7ccaeaa6bc7da",
+  "mapping_version": "e475bfa24c9f16841c8cb11f66586faf008e144eddc1fa7ff3595bae6999905b",
   "mapping_status": "mapped",
   "api_key_id": "key-42",
   "customer_id": "customer-7",
-  "customer_mapping_version": "7cca1d652cd89a6f3257c9bfb4c9e8bf4d044af5513e0fa7ad7be5dd7cc861e1",
+  "customer_mapping_version": "1713a45606930ab59d794cd8ddd92eff6ce2df588201f4df1ec8bf5354748081",
   "customer_mapping_status": "mapped",
   "identity_status": "known",
   "request_started_at_ms": 1789862400000,
@@ -190,7 +195,10 @@ UUIDv4 不包含时间。`request_started_at_ms` 仍由网关观察并作为事�
   },
   "raw_usage_json": "{\"prompt_tokens\":1000,\"completion_tokens\":500,\"total_tokens\":1500,\"prompt_tokens_details\":{\"cached_tokens\":200,\"cache_write_tokens\":300},\"completion_tokens_details\":{\"reasoning_tokens\":100}}",
   "raw_usage_truncated": false,
-  "anomaly_codes": []
+  "anomaly_codes": [],
+  "service_name": "模型服务 A",
+  "provider_name": "供应商 A",
+  "customer_name": "客户 A"
 }
 ```
 
@@ -206,9 +214,17 @@ Kafka record 的 key 是上述 `logical_request_id`，不在 JSON 内另设 `kaf
 
 下面的 Go 和 Java 示例只演示连接、读取、关键字段解析及手动提交。示例中的打印处理应替换为应用自己的持久化与冲突检测；生产环境还需加入实际 TLS/SASL、完整 schema 校验、异常隔离和监控。
 
+两个示例都要求设置 `KAFKA_BROKERS` 和 `KAFKA_TOPIC`；`KAFKA_GROUP` 可选，默认 `my-app-metering-v1`。连接当前本地联调栈时可使用：
+
+```sh
+export KAFKA_BROKERS=127.0.0.1:29092
+export KAFKA_TOPIC=llm-metering-development
+export KAFKA_GROUP=my-app-metering-v1
+```
+
 ### 4.1 Go 示例
 
-依赖：`github.com/twmb/franz-go/pkg/kgo`（方案中使用 v1.18.1）。设置 `KAFKA_BROKERS` 后运行；`KAFKA_GROUP` 可选，默认 `my-app-metering-v1`。
+依赖：`github.com/twmb/franz-go/pkg/kgo`（方案中使用 v1.18.1）。设置上述连接参数后运行。
 
 ```go
 package main
@@ -283,6 +299,10 @@ func main() {
     if brokers == "" {
         log.Fatal("KAFKA_BROKERS is required")
     }
+    topic := os.Getenv("KAFKA_TOPIC")
+    if topic == "" {
+        log.Fatal("KAFKA_TOPIC is required")
+    }
     group := os.Getenv("KAFKA_GROUP")
     if group == "" {
         group = "my-app-metering-v1"
@@ -290,7 +310,7 @@ func main() {
     cl, err := kgo.NewClient(
         kgo.SeedBrokers(strings.Split(brokers, ",")...),
         kgo.ConsumerGroup(group),
-        kgo.ConsumeTopics("llm-metering-events"),
+        kgo.ConsumeTopics(topic),
         kgo.ConsumeResetOffset(kgo.NewOffset().AtStart()),
         kgo.DisableAutoCommit(),
     )
@@ -330,7 +350,7 @@ func main() {
 
 ### 4.2 Java 示例
 
-依赖：`org.apache.kafka:kafka-clients` 与 `com.fasterxml.jackson.core:jackson-databind`；示例使用 Java 17+。设置 `KAFKA_BROKERS` 后运行；`KAFKA_GROUP` 可选。
+依赖：`org.apache.kafka:kafka-clients` 与 `com.fasterxml.jackson.core:jackson-databind`；示例使用 Java 17+。设置上述连接参数后运行。
 
 ```java
 import com.fasterxml.jackson.databind.JsonNode;
@@ -387,6 +407,10 @@ public class MeteringConsumer {
         if (brokers == null || brokers.isBlank()) {
             throw new IllegalArgumentException("KAFKA_BROKERS is required");
         }
+        String topic = System.getenv("KAFKA_TOPIC");
+        if (topic == null || topic.isBlank()) {
+            throw new IllegalArgumentException("KAFKA_TOPIC is required");
+        }
         String group = System.getenv().getOrDefault("KAFKA_GROUP", "my-app-metering-v1");
         Properties props = new Properties();
         props.put("bootstrap.servers", brokers);
@@ -397,7 +421,7 @@ public class MeteringConsumer {
         props.put("value.deserializer", ByteArrayDeserializer.class.getName());
 
         try (KafkaConsumer<String, byte[]> consumer = new KafkaConsumer<>(props)) {
-            consumer.subscribe(List.of("llm-metering-events"));
+            consumer.subscribe(List.of(topic));
             while (true) {
                 ConsumerRecords<String, byte[]> records = consumer.poll(Duration.ofSeconds(1));
                 for (ConsumerRecord<String, byte[]> record : records) {

@@ -29,11 +29,14 @@ type Event struct {
 	ClusterName            string   `json:"cluster_name"`
 	DeploymentEnvironment  string   `json:"deployment_environment"`
 	ServiceID              *string  `json:"service_id"`
+	ServiceName            *string  `json:"service_name"`
 	ProviderID             *string  `json:"provider_id"`
+	ProviderName           *string  `json:"provider_name"`
 	MappingVersion         *string  `json:"mapping_version"`
 	MappingStatus          string   `json:"mapping_status"`
 	ApiKeyID               *string  `json:"api_key_id"`
 	CustomerID             *string  `json:"customer_id"`
+	CustomerName           *string  `json:"customer_name"`
 	CustomerMappingVersion *string  `json:"customer_mapping_version"`
 	CustomerMappingStatus  string   `json:"customer_mapping_status"`
 	IdentityStatus         string   `json:"identity_status"`

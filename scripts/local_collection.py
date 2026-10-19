@@ -115,7 +115,28 @@ def infra_up():
  columns=run('exec','-T','doris','mysql','-uroot','-h127.0.0.1','-P9030','-N','-e',guard,capture_output=True).stdout.splitlines()
  if columns and ('application_id' in columns or not {'request_host','provider_id','customer_mapping_status'}<=set(columns)):
   raise RuntimeError('Incompatible existing Doris schema; choose an isolated database, never overwrite shared tables')
- for name in ['001_init.sql','002_usage_summaries.sql','004_summary_coordination.sql','005_consumer_recovery.sql','006_optional_route_identity.sql','007_schema_comments.sql']:
+ if columns:
+  missing=not {'service_name','provider_name','customer_name'}<=set(columns)
+  if missing and database!='metering_development':raise RuntimeError('Only the current development database may be upgraded in place')
+  if database=='metering_development':
+   from doris_schema import statements
+   for statement in statements((ROOT/'migrations/doris/metering/008_name_snapshots.sql').read_text()):
+    if statement.startswith('ALTER TABLE'):
+     field=statement.split('ADD COLUMN ',1)[1].split()[0]
+     if field in columns:continue
+     run('exec','-T','doris','mysql','--default-character-set=utf8mb4','-uroot','-h127.0.0.1','-P9030',input=render_sql(statement+';',database))
+     for _ in range(60):
+      current=run('exec','-T','doris','mysql','-uroot','-h127.0.0.1','-P9030','-N','-e',guard,capture_output=True).stdout.splitlines()
+      if field in current:break
+      time.sleep(1)
+     else:raise RuntimeError('Doris name column schema change timeout')
+    else:
+     run('exec','-T','doris','mysql','--default-character-set=utf8mb4','-uroot','-h127.0.0.1','-P9030',input=render_sql(statement+';',database))
+ # Existing views retain their old stored SELECT * expansion. Rebuild them in
+ # dependency order with 008 before applying the comment-only 007 instead of validating new lists against old views.
+ initial=['001_init.sql','002_usage_summaries.sql','004_summary_coordination.sql','005_consumer_recovery.sql','006_optional_route_identity.sql','007_schema_comments.sql']
+ if columns:initial=['004_summary_coordination.sql','005_consumer_recovery.sql','007_schema_comments.sql']
+ for name in initial:
   run('exec','-T','doris','mysql','--default-character-set=utf8mb4','-uroot','-h127.0.0.1','-P9030',input=render_sql((ROOT/'migrations/doris/metering'/name).read_text(),json.loads((ROOT/'deploy/local/consumer.json').read_text())['doris']['database']))
  for _ in range(45):
   result=subprocess.run([*BASE,'exec','-T','kafka','/opt/kafka/bin/kafka-topics.sh','--bootstrap-server','kafka:9092','--create','--if-not-exists','--topic',json.loads((ROOT/'deploy/local/observer.json').read_text())['kafka']['topic'],'--partitions','24','--replication-factor','1','--config','retention.ms=259200000','--config','cleanup.policy=delete'],capture_output=True)
@@ -126,6 +147,7 @@ def up():
  for name in ['observer','consumer','fixture','gateway-observer-v1.wasm']:
   if not (ROOT/'dist'/name).is_file():raise RuntimeError('Run make build wasm first')
  expected=render_gateway()
+ run('stop','gateway','observer','consumer')
  infra_up()
  run('up','-d','fixture','observer','consumer')
  # Mounted executables/artifacts may change without a Compose configuration change.

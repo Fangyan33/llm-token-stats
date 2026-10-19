@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"github.com/Fangyan33/llm-token-stats/internal/config"
+	"github.com/Fangyan33/llm-token-stats/internal/identitylookup"
 	"github.com/Fangyan33/llm-token-stats/pkg/requesthost"
 	"github.com/Fangyan33/llm-token-stats/pkg/strictjson"
 	"math"
@@ -201,24 +202,29 @@ func RawValid(s string) error {
 }
 
 func mappingValid(e *Event) bool {
+	for _, n := range []*string{e.ServiceName, e.ProviderName, e.CustomerName} {
+		if n != nil && !identitylookup.ValidName(*n) {
+			return false
+		}
+	}
 	if e.RequestHost != nil && (*e.RequestHost == "" || requesthost.Normalize(*e.RequestHost) != *e.RequestHost) {
 		return false
 	}
 	if e.MappingStatus == "mapped" {
-		if e.RequestHost == nil || e.ServiceID == nil || e.ProviderID == nil || e.MappingVersion == nil {
+		if e.RequestHost == nil || e.ServiceID == nil || e.ProviderID == nil || e.MappingVersion == nil || e.ServiceName == nil || e.ProviderName == nil {
 			return false
 		}
-	} else if e.ServiceID != nil || e.ProviderID != nil || e.MappingVersion != nil {
+	} else if e.ServiceID != nil || e.ProviderID != nil || e.MappingVersion != nil || e.ServiceName != nil || e.ProviderName != nil {
 		return false
 	}
 	if e.MappingStatus == "invalid_host" && e.RequestHost != nil || e.MappingStatus != "invalid_host" && e.RequestHost == nil {
 		return false
 	}
 	if e.CustomerMappingStatus == "mapped" {
-		if e.ApiKeyID == nil || e.CustomerID == nil || e.CustomerMappingVersion == nil {
+		if e.ApiKeyID == nil || e.CustomerID == nil || e.CustomerMappingVersion == nil || e.CustomerName == nil {
 			return false
 		}
-	} else if e.ApiKeyID != nil || e.CustomerID != nil || e.CustomerMappingVersion != nil {
+	} else if e.ApiKeyID != nil || e.CustomerID != nil || e.CustomerMappingVersion != nil || e.CustomerName != nil {
 		return false
 	}
 	return true

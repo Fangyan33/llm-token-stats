@@ -21,6 +21,7 @@ import (
 	"google.golang.org/protobuf/proto"
 	"io"
 	"math"
+	"sync"
 	"sync/atomic"
 	"time"
 	"unicode/utf8"
@@ -49,6 +50,8 @@ type Server struct {
 	Random           io.Reader
 	ServiceResolver  identitylookup.ServiceResolver
 	CustomerResolver identitylookup.CustomerResolver
+	lookupOnce       sync.Once
+	lookupSlots      chan struct{}
 }
 
 func (s *Server) reserve(n int64) bool {
@@ -148,6 +151,9 @@ func (s *Server) Observe(stream pb.ObservationService_ObserveServer) error {
 	defer ticker.Stop()
 	var start *pb.Start
 	var e *events.Event
+	var lookup <-chan events.Event
+	var acceptedEnd *pb.End
+	finalized := false
 	p := chatcompletions.New()
 	var seq uint64
 	var bodySeq, offset [2]uint64
@@ -170,9 +176,38 @@ func (s *Server) Observe(stream pb.ObservationService_ObserveServer) error {
 			}
 		}
 	}
+	freezeLookup := func(snapshot events.Event) bool {
+		lookup = nil
+		if snapshot.ServiceID != nil && !config.AcceptsService(s.Cfg.AcceptedServices, *snapshot.ServiceID) {
+			s.Health.Count("lookup_service_unregistered")
+			e = nil
+			return false
+		}
+		e.ServiceID, e.ServiceName, e.ProviderID, e.ProviderName = snapshot.ServiceID, snapshot.ServiceName, snapshot.ProviderID, snapshot.ProviderName
+		e.ApiKeyID, e.CustomerID, e.CustomerName = snapshot.ApiKeyID, snapshot.CustomerID, snapshot.CustomerName
+		e.MappingStatus, e.MappingVersion = snapshot.MappingStatus, snapshot.MappingVersion
+		e.CustomerMappingStatus, e.CustomerMappingVersion, e.IdentityStatus = snapshot.CustomerMappingStatus, snapshot.CustomerMappingVersion, snapshot.IdentityStatus
+		if e.IdentityStatus != "known" {
+			e.AnomalyCodes = events.Add(e.AnomalyCodes, "identity_invalid")
+		}
+		copy := *e
+		s.Sink.Emit(&copy)
+		return true
+	}
 	final := func(reason string, end *pb.End) {
-		if e == nil {
+		if finalized || e == nil {
 			return
+		}
+		finalized = true
+		if end == nil {
+			end = acceptedEnd
+		}
+		if lookup != nil {
+			// The coordinator has its own deadline; stream cancellation must not
+			// discard one side's already completed attribution.
+			if !freezeLookup(<-lookup) {
+				return
+			}
 		}
 		for _, a := range e.AnomalyCodes {
 			p.Anomaly(a)
@@ -252,8 +287,19 @@ func (s *Server) Observe(stream pb.ObservationService_ObserveServer) error {
 		s.Sink.Emit(e)
 		s.Health.Count("observer_finalized")
 	}
+	defer func() {
+		reason := "transport_lost"
+		if ctx.Err() == context.DeadlineExceeded {
+			reason = "observation_timeout"
+		}
+		final(reason, acceptedEnd)
+	}()
 	for {
 		select {
+		case snapshot := <-lookup:
+			if !freezeLookup(snapshot) {
+				return status.Error(codes.InvalidArgument, "service_registration")
+			}
 		case <-ctx.Done():
 			reason := "transport_lost"
 			if ctx.Err() == context.DeadlineExceeded {
@@ -297,11 +343,8 @@ func (s *Server) Observe(stream pb.ObservationService_ObserveServer) error {
 				if err != nil {
 					return status.Error(codes.Unavailable, "random_source")
 				}
-				snapshot := s.resolve(ctx, st)
-				if snapshot.ServiceID != nil && !config.AcceptsService(s.Cfg.AcceptedServices, *snapshot.ServiceID) {
-					s.Health.Count("lookup_service_unregistered")
-					return status.Error(codes.InvalidArgument, "service_registration")
-				}
+				snapshot := s.emptySnapshot(st, "lookup_timeout")
+				lookup = s.beginResolve(ctx, st)
 				start = st
 				st.RouteName = routeinfo.Name(st.RouteName)
 				e = &snapshot
@@ -312,9 +355,6 @@ func (s *Server) Observe(stream pb.ObservationService_ObserveServer) error {
 				e.RequestStartedAtMs, e.EventCreatedAtMs = st.RequestStartedAtMs, time.Now().UnixMilli()
 				e.UsageStatus, e.RawUsageJSON = "not_applicable", "{}"
 				e.AnomalyCodes = []string{}
-				if e.IdentityStatus != "known" {
-					e.AnomalyCodes = events.Add(e.AnomalyCodes, "identity_invalid")
-				}
 				if st.RequestStartedAtMs < time.Now().UnixMilli()-300000 {
 					e.AnomalyCodes = events.Add(e.AnomalyCodes, "clock_anomaly")
 				}
@@ -322,8 +362,6 @@ func (s *Server) Observe(stream pb.ObservationService_ObserveServer) error {
 				p.Content(true, st.RequestContentType, st.RequestContentEncoding)
 				seq = f.FrameSeq
 				queue(&pb.ObservationAck{LogicalRequestId: id, AcceptedFrameSeq: seq, Reason: "accepted"})
-				copy := *e
-				s.Sink.Emit(&copy)
 				continue
 			}
 			if st := f.GetStart(); st != nil {
@@ -388,16 +426,18 @@ func (s *Server) Observe(stream pb.ObservationService_ObserveServer) error {
 				reason = "parse_limit"
 			}
 			if !valid {
+				id := e.LogicalRequestID
+				queue(&pb.ObservationAck{LogicalRequestId: e.LogicalRequestID, AcceptedFrameSeq: seq, Reason: "accepted"})
 				final(reason, nil)
-				queue(&pb.ObservationAck{LogicalRequestId: e.LogicalRequestID, AcceptedFrameSeq: seq, CloseStream: true, Reason: reason})
+				queue(&pb.ObservationAck{LogicalRequestId: id, AcceptedFrameSeq: seq, CloseStream: true, Reason: reason})
 				return status.Error(codes.InvalidArgument, reason)
 			}
 			seq = f.FrameSeq
 			latest = &pb.ObservationAck{LogicalRequestId: e.LogicalRequestID, AcceptedFrameSeq: seq, Reason: "accepted"}
 			if end != nil {
-				final("finalized", end)
+				acceptedEnd = end
 				done := make(chan error, 1)
-				a := ackWrite{a: &pb.ObservationAck{LogicalRequestId: e.LogicalRequestID, AcceptedFrameSeq: seq, CloseStream: true, Reason: "finalized"}, done: done}
+				a := ackWrite{a: &pb.ObservationAck{LogicalRequestId: e.LogicalRequestID, AcceptedFrameSeq: seq, Reason: "accepted"}, done: done}
 				select {
 				case <-acks:
 				default:
@@ -408,9 +448,35 @@ func (s *Server) Observe(stream pb.ObservationService_ObserveServer) error {
 					return ctx.Err()
 				}
 				select {
-				case <-done:
+				case err := <-done:
+					if err != nil {
+						final("transport_lost", end)
+						s.Health.Count("ack_write_failure")
+						return status.Error(codes.Unavailable, "ack_write_failure")
+					}
+					final("finalized", end)
+					if e != nil {
+						closed := make(chan error, 1)
+						select {
+						case acks <- ackWrite{a: &pb.ObservationAck{LogicalRequestId: e.LogicalRequestID, AcceptedFrameSeq: seq, CloseStream: true, Reason: "finalized"}, done: closed}:
+						case <-ctx.Done():
+							return nil
+						}
+						select {
+						case err := <-closed:
+							if err != nil {
+								s.Health.Count("ack_write_failure")
+							}
+						case <-ctx.Done():
+						case <-time.After(2 * time.Second):
+							s.Health.Count("ack_write_failure")
+						}
+					}
 					return nil
+				case <-ctx.Done():
+					return ctx.Err() // Deferred finalization preserves the valid End.
 				case <-time.After(2 * time.Second):
+					final("transport_lost", nil)
 					s.Health.Count("ack_write_failure")
 					return status.Error(codes.DeadlineExceeded, "ack_timeout")
 				}
@@ -441,45 +507,49 @@ func (s *Server) validStart(st *pb.Start) bool {
 	return true
 }
 
-func (s *Server) resolve(ctx context.Context, st *pb.Start) events.Event {
-	defer func() { clear(st.ApiKey); st.ApiKey = nil }()
+func (s *Server) emptySnapshot(st *pb.Start, reason string) events.Event {
 	e := events.Event{ClusterName: s.Cfg.ClusterName, DeploymentEnvironment: s.Cfg.DeploymentEnvironment, IdentityStatus: "invalid", MappingStatus: "invalid_host", CustomerMappingStatus: "invalid_api_key"}
-	host := requesthost.Normalize(st.RequestAuthority)
-	st.RequestAuthority = ""
-	if host != "" {
+	if host := requesthost.Normalize(st.RequestAuthority); host != "" {
 		e.RequestHost = events.Ptr(host)
-		resolver := s.ServiceResolver
-		if resolver == nil {
-			resolver = identitylookup.UnimplementedServiceResolver{}
-		}
-		result, err := resolver.Resolve(ctx, identitylookup.ServiceLookupRequest{RequestHost: host, ClusterName: s.Cfg.ClusterName, DeploymentEnvironment: s.Cfg.DeploymentEnvironment})
-		if err != nil {
-			e.MappingStatus = identitylookup.Failure(err)
-		} else if !identitylookup.ValidID(result.ServiceID) || !identitylookup.ValidID(result.ProviderID) {
-			e.MappingStatus = "lookup_invalid_response"
-		} else {
-			e.ServiceID, e.ProviderID = events.Ptr(result.ServiceID), events.Ptr(result.ProviderID)
-			e.MappingStatus = "mapped"
-			e.MappingVersion = events.Ptr(events.Tuple([]any{1, e.ClusterName, e.DeploymentEnvironment, host, result.ServiceID, result.ProviderID}))
-		}
+		e.MappingStatus = reason
 	}
 	if credentials.ValidToken(st.ApiKey) {
-		resolver := s.CustomerResolver
-		if resolver == nil {
-			resolver = identitylookup.UnimplementedCustomerResolver{}
-		}
-		result, err := resolver.Resolve(ctx, st.ApiKey)
-		if err != nil {
-			e.CustomerMappingStatus = identitylookup.Failure(err)
-		} else if !identitylookup.ValidID(result.APIKeyID) || !identitylookup.ValidID(result.CustomerID) {
-			e.CustomerMappingStatus = "lookup_invalid_response"
-		} else {
-			e.ApiKeyID, e.CustomerID = events.Ptr(result.APIKeyID), events.Ptr(result.CustomerID)
-			e.CustomerMappingStatus, e.IdentityStatus = "mapped", "known"
-			e.CustomerMappingVersion = events.Ptr(events.Tuple([]any{1, e.ClusterName, e.DeploymentEnvironment, result.APIKeyID, result.CustomerID}))
-		}
+		e.CustomerMappingStatus = reason
 	}
-	s.Health.Count("service_mapping_" + e.MappingStatus)
-	s.Health.Count("customer_mapping_" + e.CustomerMappingStatus)
 	return e
+}
+
+// No queue: at most LookupConcurrency transient credentials and HTTP tasks.
+// Only a small immutable attribution result crosses back into the receive loop.
+func (s *Server) beginResolve(ctx context.Context, st *pb.Start) <-chan events.Event {
+	s.lookupOnce.Do(func() {
+		n := s.Cfg.LookupConcurrency
+		if n == 0 {
+			n = 64
+		}
+		s.lookupSlots = make(chan struct{}, n)
+	})
+	result := make(chan events.Event, 1)
+	select {
+	case s.lookupSlots <- struct{}{}:
+		input := &pb.Start{RequestAuthority: st.RequestAuthority, ApiKey: st.ApiKey}
+		st.RequestAuthority = ""
+		st.ApiKey = nil
+		ms := s.Cfg.LookupTimeoutMS
+		if ms == 0 {
+			ms = 200
+		}
+		deadline, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Duration(ms)*time.Millisecond)
+		go func() {
+			defer cancel()
+			result <- s.resolveQueries(deadline, input, func() { <-s.lookupSlots })
+		}()
+	default:
+		result <- s.emptySnapshot(st, "lookup_overloaded")
+		clear(st.ApiKey)
+		st.ApiKey = nil
+		st.RequestAuthority = ""
+		s.Health.Count("lookup_overloaded")
+	}
+	return result
 }

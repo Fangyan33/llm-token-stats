@@ -10,12 +10,28 @@ import (
 	"github.com/Fangyan33/llm-token-stats/internal/health"
 	"github.com/Fangyan33/llm-token-stats/internal/identitylookup"
 	"testing"
+	"time"
 )
 
 type serviceFunc func(context.Context, identitylookup.ServiceLookupRequest) (identitylookup.ServiceIdentity, error)
 
 func (f serviceFunc) Resolve(c context.Context, r identitylookup.ServiceLookupRequest) (identitylookup.ServiceIdentity, error) {
 	return f(c, r)
+}
+
+func TestIndependentQueriesShareDeadline(t *testing.T) {
+	s := &Server{Cfg: config.Observer{ClusterName: "cluster", DeploymentEnvironment: "stg"}, Health: &health.State{}}
+	s.ServiceResolver = serviceFunc(func(ctx context.Context, _ identitylookup.ServiceLookupRequest) (identitylookup.ServiceIdentity, error) {
+		<-ctx.Done()
+		return identitylookup.ServiceIdentity{}, ctx.Err()
+	})
+	s.CustomerResolver = customerFake{}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	e := s.resolve(ctx, &pb.Start{RequestAuthority: "model.example.com", ApiKey: []byte("synthetic-private")})
+	if e.MappingStatus != "lookup_timeout" || e.CustomerMappingStatus != "mapped" || e.CustomerName == nil || e.IdentityStatus != "known" {
+		t.Fatal("failed service erased independently resolved customer")
+	}
 }
 
 type customerFunc func(context.Context, []byte) (identitylookup.CustomerIdentity, error)
@@ -27,14 +43,14 @@ func (f customerFunc) Resolve(c context.Context, b []byte) (identitylookup.Custo
 func TestIdentityLookupSnapshotsAndCredentialLifetime(t *testing.T) {
 	for _, mode := range []string{"unimplemented", "mapped", "service_failure", "customer_failure", "invalid_host", "invalid_key", "partial_service", "partial_customer"} {
 		t.Run(mode, func(t *testing.T) {
-			s := &Server{Cfg: config.Observer{ClusterName: "cluster-a", DeploymentEnvironment: "test"}, Health: &health.State{}}
+			s := &Server{Cfg: config.Observer{ClusterName: "cluster-a", DeploymentEnvironment: "stg"}, Health: &health.State{}}
 			st := &pb.Start{RequestAuthority: "MODEL.Example.invalid:443", ApiKey: []byte("synthetic-sentinel-key")}
 			var borrowed []byte
 			serviceCalls, customerCalls := 0, 0
 			if mode != "unimplemented" {
 				s.ServiceResolver = serviceFunc(func(_ context.Context, r identitylookup.ServiceLookupRequest) (identitylookup.ServiceIdentity, error) {
 					serviceCalls++
-					if r.RequestHost != "model.example.invalid" || r.ClusterName != "cluster-a" || r.DeploymentEnvironment != "test" {
+					if r.RequestHost != "model.example.invalid" || r.ClusterName != "cluster-a" || r.DeploymentEnvironment != "stg" {
 						t.Fatal("lookup context changed")
 					}
 					if mode == "service_failure" {
@@ -43,7 +59,7 @@ func TestIdentityLookupSnapshotsAndCredentialLifetime(t *testing.T) {
 					if mode == "partial_service" {
 						return identitylookup.ServiceIdentity{ServiceID: "service-a"}, nil
 					}
-					return identitylookup.ServiceIdentity{ServiceID: "service-a", ProviderID: "provider-a"}, nil
+					return identitylookup.ServiceIdentity{ServiceID: "service-a", ProviderID: "provider-a", ServiceName: "服务 A", ProviderName: "供应商 A"}, nil
 				})
 				s.CustomerResolver = customerFunc(func(_ context.Context, key []byte) (identitylookup.CustomerIdentity, error) {
 					customerCalls++
@@ -57,7 +73,7 @@ func TestIdentityLookupSnapshotsAndCredentialLifetime(t *testing.T) {
 					if mode == "partial_customer" {
 						return identitylookup.CustomerIdentity{APIKeyID: "key-a"}, nil
 					}
-					return identitylookup.CustomerIdentity{APIKeyID: "key-a", CustomerID: "customer-a"}, nil
+					return identitylookup.CustomerIdentity{APIKeyID: "key-a", CustomerID: "customer-a", CustomerName: "客户 A"}, nil
 				})
 			}
 			if mode == "invalid_host" {

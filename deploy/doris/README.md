@@ -2,6 +2,8 @@
 
 本目录使用 Apache Doris 4.1.3 官方 all-in-one 镜像，提供单 FE、单 BE 的开发/测试环境。生产环境应使用 Doris Operator 或独立 FE/BE 集群，按容量测试确定副本、分桶和资源配置。
 
+已有当前模型库新增名称字段时，先按实际缺失列执行 `008_name_snapshots.sql` 并重建视图，再执行 `007_schema_comments.sql` 更新注释；新库 001 已有名称列，不重复运行 008。旧数据名称保持 NULL。
+
 本页 SQL 初始化当前唯一契约，应用字段已删除，增加供应商、部署上下文及两类解析状态。使用 render_doris_sql.py --database 库名 SQL文件 渲染到隔离库，Consumer 的 doris.database 和 DSN 必须一致。旧结构共享库不能原样套用新 DDL；本地默认 metering_development，K8s 每次另建测试库。
 
 完整表职责、上下游关系及字段说明见[数据库表与字段文档](../../docs/doris-database-schema.md)。新建库的注释包含在初始化 SQL；已有当前模型库执行 007_schema_comments.sql 补注释，CREATE TABLE IF NOT EXISTS 本身不会更新已有注释。007 不升级旧字段，执行前确认目标库。

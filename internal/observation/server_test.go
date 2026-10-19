@@ -35,7 +35,7 @@ func TestObserveEOSAndOnceFinalization(t *testing.T) {
 			l := bufconn.Listen(1 << 20)
 			h := &health.State{}
 			k := &sink{}
-			srv := &Server{Cfg: config.Observer{ProducerID: "test", ClusterName: "test-cluster", DeploymentEnvironment: "test", MaxActive: 4, ParserBudget: 64 << 20, MaxObservationMS: 5000, AcceptedConfigs: []string{"v1"}, AcceptedAdapters: []string{"chat_completions_v1"}, AcceptedServices: []string{"a"}}, Sink: k, Health: h, ServiceResolver: serviceFake{}, CustomerResolver: customerFake{}}
+			srv := &Server{Cfg: config.Observer{ProducerID: "test", ClusterName: "test-cluster", DeploymentEnvironment: "stg", MaxActive: 4, ParserBudget: 64 << 20, MaxObservationMS: 5000, AcceptedConfigs: []string{"v1"}, AcceptedAdapters: []string{"chat_completions_v1"}, AcceptedServices: []string{"a"}}, Sink: k, Health: h, ServiceResolver: serviceFake{}, CustomerResolver: customerFake{}}
 			if mode == "unimplemented" {
 				srv.ServiceResolver = nil
 				srv.CustomerResolver = nil
@@ -129,11 +129,108 @@ func TestObserveEOSAndOnceFinalization(t *testing.T) {
 type serviceFake struct{}
 
 func (serviceFake) Resolve(context.Context, identitylookup.ServiceLookupRequest) (identitylookup.ServiceIdentity, error) {
-	return identitylookup.ServiceIdentity{ServiceID: "a", ProviderID: "p"}, nil
+	return identitylookup.ServiceIdentity{ServiceID: "a", ProviderID: "p", ServiceName: "服务", ProviderName: "供应商"}, nil
 }
 
 type customerFake struct{}
 
 func (customerFake) Resolve(context.Context, []byte) (identitylookup.CustomerIdentity, error) {
-	return identitylookup.CustomerIdentity{APIKeyID: "k", CustomerID: "c"}, nil
+	return identitylookup.CustomerIdentity{APIKeyID: "k", CustomerID: "c", CustomerName: "客户"}, nil
+}
+
+func TestLookupDoesNotDelayAcksAndHasNoQueue(t *testing.T) {
+	release := make(chan struct{})
+	defer func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+	}()
+	entered := make(chan struct{})
+	k := &sink{}
+	srv := &Server{Cfg: config.Observer{ProducerID: "test", ClusterName: "cluster", DeploymentEnvironment: "stg", MaxActive: 4, ParserBudget: 64 << 20, MaxObservationMS: 5000, LookupTimeoutMS: 1500, LookupConcurrency: 1, AcceptedConfigs: []string{"v1"}, AcceptedAdapters: []string{"chat_completions_v1"}, AcceptedServices: []string{"a"}}, Sink: k, Health: &health.State{}, CustomerResolver: customerFake{}}
+	srv.ServiceResolver = serviceFunc(func(ctx context.Context, _ identitylookup.ServiceLookupRequest) (identitylookup.ServiceIdentity, error) {
+		close(entered)
+		select {
+		case <-release:
+			return serviceFake{}.Resolve(ctx, identitylookup.ServiceLookupRequest{})
+		case <-ctx.Done():
+			return identitylookup.ServiceIdentity{}, ctx.Err()
+		}
+	})
+	l := bufconn.Listen(1 << 20)
+	g := grpc.NewServer(grpc.ForceServerCodec(Codec{}))
+	pb.RegisterObservationServiceServer(g, srv)
+	go g.Serve(l)
+	defer g.Stop()
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	defer cancel()
+	c, err := grpc.NewClient("passthrough:///async", grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) { return l.Dial() }), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	stream, err := pb.NewObservationServiceClient(c).Observe(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st := &pb.Start{RequestStartedAtMs: time.Now().UnixMilli(), GatewayInstanceId: "gateway", ConfigVersion: "v1", AdapterId: "chat_completions_v1", Method: "POST", RequestAuthority: "model.example.com", ApiKey: []byte("private"), RequestEndStream: true}
+	stream.Send(&pb.ObservationFrame{SchemaVersion: 1, FrameSeq: 1, Payload: &pb.ObservationFrame_Start{Start: st}})
+	ackWithinBudget := func(wantSeq uint64) {
+		t.Helper()
+		done := make(chan bool, 1)
+		go func() {
+			for {
+				a, err := stream.Recv()
+				if err != nil {
+					done <- false
+					return
+				}
+				if a.CloseStream {
+					done <- false
+					return
+				}
+				if a.AcceptedFrameSeq >= wantSeq {
+					done <- a.AcceptedFrameSeq >= 1
+					return
+				}
+			}
+		}()
+		select {
+		case ok := <-done:
+			if !ok {
+				t.Error("ACK failed")
+			}
+		case <-time.After(500 * time.Millisecond):
+			t.Fatal("ACK waited for lookup")
+		}
+	}
+	ackWithinBudget(1)
+	<-entered
+	extra := &pb.Start{RequestAuthority: "model.example.com", ApiKey: []byte("second-private")}
+	overload := <-srv.beginResolve(ctx, extra)
+	if overload.MappingStatus != "lookup_overloaded" || overload.CustomerMappingStatus != "lookup_overloaded" || extra.ApiKey != nil {
+		t.Fatal("unbounded lookup queue or retained credential")
+	}
+	k.mu.Lock()
+	n := len(k.es)
+	k.mu.Unlock()
+	if n != 0 {
+		t.Fatal("published unresolved identity")
+	}
+	stream.Send(&pb.ObservationFrame{SchemaVersion: 1, FrameSeq: 2, Payload: &pb.ObservationFrame_ResponseHeaders{ResponseHeaders: &pb.ResponseHeaders{HttpStatus: 200, EndStream: true}}})
+	stream.Send(&pb.ObservationFrame{SchemaVersion: 1, FrameSeq: 3, Payload: &pb.ObservationFrame_End{End: &pb.End{RequestFinishedAtMs: time.Now().UnixMilli(), RequestEndStreamSeen: true, ResponseEndStreamSeen: true}}})
+	ackWithinBudget(3)
+	close(release)
+	for {
+		if _, err := stream.Recv(); err != nil {
+			break
+		}
+	}
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	if len(k.es) != 2 || k.es[0].ServiceName == nil || k.es[1].ServiceName == nil || *k.es[0].ServiceName != *k.es[1].ServiceName {
+		t.Fatal("snapshot not frozen across events")
+	}
 }

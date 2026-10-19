@@ -44,8 +44,8 @@ class DorisSchemaTests(unittest.TestCase):
     def test_all_current_objects_and_columns_have_annotations(self):
         tables = [r for r in self.relations.values() if r['kind'] == 'TABLE']
         views = [r for r in self.relations.values() if r['kind'] == 'VIEW']
-        self.assertEqual((len(tables), sum(len(r['columns']) for r in tables)), (12, 211))
-        self.assertEqual((len(views), sum(len(r['columns']) for r in views)), (7, 299))
+        self.assertEqual((len(tables), sum(len(r['columns']) for r in tables)), (12, 214))
+        self.assertEqual((len(views), sum(len(r['columns']) for r in views)), (7, 318))
         for relation in self.relations.values():
             self.assertTrue(relation['purpose'].strip())
             self.assertTrue(all(col['comment'].strip() for col in relation['columns']))
@@ -54,7 +54,7 @@ class DorisSchemaTests(unittest.TestCase):
         actual = (schema.DDL / schema.COMMENT_MIGRATION).read_text()
         self.assertEqual(actual, schema.migration(self.relations))
         changes = list(schema.statements(actual))
-        self.assertEqual(len(changes), 12 + 211 + 7)
+        self.assertEqual(len(changes), 12 + 214 + 7)
         for change in changes:
             self.assertTrue(change.startswith(('ALTER TABLE metering.', 'ALTER VIEW metering.')))
             if change.startswith('ALTER TABLE'):
@@ -62,6 +62,19 @@ class DorisSchemaTests(unittest.TestCase):
             else:
                 name = change.split(' ', 3)[2].split('.', 1)[1]
                 self.assertEqual(change.split(') AS\n', 1)[1], self.relations[name]['query'])
+
+    def test_name_migration_preserves_records_and_rebuilds_current_projections(self):
+        source = (schema.DDL / '008_name_snapshots.sql').read_text()
+        self.assertEqual(source, schema.name_migration(self.relations))
+        changes = list(schema.statements(source))
+        self.assertEqual(len(changes), 10)
+        for change in changes[:3]:
+            self.assertRegex(change, r'^ALTER TABLE metering.events_raw ADD COLUMN \w+ VARCHAR\(512\) NULL COMMENT ')
+        for change in changes[3:]:
+            relation = schema.parse_relation(change, '008_name_snapshots.sql')
+            expected = self.relations[relation['name']]
+            self.assertEqual(relation['columns'], expected['columns'])
+            self.assertEqual(relation['query'], expected['query'])
 
     def test_document_inventory_meanings_and_table_types_match_ddl(self):
         document, live = self.document_metadata()

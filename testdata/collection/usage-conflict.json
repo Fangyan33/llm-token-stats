@@ -13,14 +13,14 @@
   "route_name": "llm-chat",
   "request_host": "model.example.invalid",
   "cluster_name": "fixture-cluster",
-  "deployment_environment": "test",
+  "deployment_environment": "stg",
   "service_id": "model-service-a",
   "provider_id": "provider-a",
-  "mapping_version": "48a5034f65608f6895d3e529dafbb6f3c152e2058951074d7ce7ccaeaa6bc7da",
+  "mapping_version": "e475bfa24c9f16841c8cb11f66586faf008e144eddc1fa7ff3595bae6999905b",
   "mapping_status": "mapped",
   "api_key_id": "key-42",
   "customer_id": "customer-7",
-  "customer_mapping_version": "7cca1d652cd89a6f3257c9bfb4c9e8bf4d044af5513e0fa7ad7be5dd7cc861e1",
+  "customer_mapping_version": "1713a45606930ab59d794cd8ddd92eff6ce2df588201f4df1ec8bf5354748081",
   "customer_mapping_status": "mapped",
   "identity_status": "known",
   "request_started_at_ms": 1789862400000,
@@ -68,5 +68,8 @@
   "raw_usage_truncated": false,
   "anomaly_codes": [
     "usage_conflict"
-  ]
+  ],
+  "service_name": "模型服务 A",
+  "provider_name": "供应商 A",
+  "customer_name": "客户 A"
 }

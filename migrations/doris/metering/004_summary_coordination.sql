@@ -31,7 +31,7 @@ CREATE TABLE IF NOT EXISTS metering.consumer_batch_receipts (
     next_offset BIGINT NOT NULL COMMENT '本批最后 offset 加 1；凭据确认可领先于 Kafka 提交，不能直接当连续已提交水位',
     notification_count BIGINT NOT NULL COMMENT '该批次实际登记并确认可见的日期通知集合大小，可以为 0',
     notification_digest CHAR(64) NOT NULL COMMENT '该批次已确认通知集合按日期和通知 ID 排序后的规范 SHA-256',
-    confirmed_at DATETIME(3) NOT NULL COMMENT '批次必要写入全部确认可见时的 UTC 时间；Kafka offset 可能尚未提交'
+    confirmed_at DATETIME(3) NOT NULL COMMENT '批次冻结时记录的 UTC 审计时间，重试沿用；不代表写入确认完成或 Kafka offset 提交的时间'
 )
 UNIQUE KEY(kafka_topic, kafka_partition, first_offset, last_offset, batch_id)
 COMMENT '消费批次处理凭据表；证明入库、冲突维护和通知登记已确认可见'

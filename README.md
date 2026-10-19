@@ -6,7 +6,7 @@ LLM Token Stats 在网关旁路观察大模型请求和响应，提取模型返�
 
 当前协议已移除 application_id。Wasm 仅从 Authorization: Bearer 提取临时 api_key，并发送入口 authority。Observer 使用配置的 cluster_name/deployment_environment，通过服务和客户查询接口解析归属。
 
-这两个接口目前尚未实现：合法输入返回 lookup_not_implemented，service_id/provider_id/api_key_id/customer_id 及映射版本均为 null，identity_status=invalid、usage_eligible=false，原始 usage 仍会保留。查询 URI 可以留空，填写后也不会发起 HTTP 请求。Observer 不访问 PG，也不从身份元数据补全归属；密钥不进入事件、数据库或日志。具体说明见[归属接口说明](docs/spec/plan/host-service-provider-implementation.md)。
+两个归属接口支持配置 HTTP/HTTPS POST JSON 调用及 x-remote-data 认证；URI 为空时使用未实现占位。Observer 固定 prd/stg/dev 环境，在有界异步任务中取得 ID 和名称快照；service_name、provider_name、customer_name 经 Kafka 写入 Doris 独立列及 event_json。占位或失败侧的 ID、名称和版本为 null，不回源补写历史；原始 usage 保留，业务 token 不进入事件、数据库或日志。具体说明见[归属接口说明](docs/spec/plan/host-service-provider-implementation.md)。
 
 ## 架构与组件职责
 
@@ -304,7 +304,7 @@ cp configs/gateway-observer.example.json "$DEPLOY_DIR/gateway-observer.json"
 
 | 配置 | 必须确认的内容 |
 | --- | --- |
-| Observer | Kafka Broker、CA 和认证环境变量名；`accepted_config_versions`、`accepted_adapter_ids`、`accepted_service_ids`；固定 `cluster_name`、`deployment_environment`（production/test/development）及两个查询 URI；资源预算；`wasm_download` 的镜像内路径与下载端口 |
+| Observer | Kafka Broker、CA 和认证环境变量名；`accepted_config_versions`、`accepted_adapter_ids`、`accepted_service_ids`；固定 `cluster_name`、`deployment_environment`（prd/stg/dev）及两个查询 URI；资源预算；`wasm_download` 的镜像内路径与下载端口 |
 | Consumer | 同一 Kafka topic、稳定的 `group_id`、历史配置版本及服务白名单；Doris `fe_url`、`allowed_load_hosts`；攒批大小与时间 |
 | Wasm | 规则 `route_name`（当前为 `*`，忽略路由名）、方法、精确路径、`adapter_id`、`config_version`、Observer cluster；保持默认关闭，通过渲染器显式启用 |
 
@@ -429,13 +429,13 @@ kubectl apply -f "$DEPLOY_DIR/envoyfilter.$GATEWAY_POD_UID.disabled.yaml"
 
 配置中的 `route_name: "*"` 只用于筛选请求。事件的 `route_name` 记录请求头阶段可读的真实 Envoy HTTP 路由名；路由名缺失、超过 128 UTF-8 字节或无效时，记录为 `unknown`，不使用通配值或计量 metadata 替代。该字段仅用于诊断和审计，不作为客户归属、服务接纳、身份一致性或价格依据，也不代表 VirtualService 名称或实际后端。
 
-`adapter_id` 取自命中规则；service_id/provider_id 由 Observer 服务接口解析，目前接口尚未实现，只能记录未知归属。配置仍支持精确路由名筛选，并按配置顺序选择第一个命中路由名的规则。
+`adapter_id` 取自命中规则；service_id/provider_id 及名称由 Observer 服务接口解析；配置 HTTP/HTTPS URI 和凭据后可返回已知归属，空 URI 为未知占位。配置仍支持精确路由名筛选，并按配置顺序选择第一个命中路由名的规则。
 
 Observer / Consumer 使用 accepted_service_ids 精确匹配并接纳已映射服务。未映射事件的 service_id/provider_id 均为 null，仍可保留用于质量诊断。配置已移除旧 accepted_routes、Wasm identity_namespace/identity_fields 和规则 service_id，传入这些字段会被拒绝。配置版本、适配器及事件状态一致性检查仍会执行。
 
 功能尚未上线，协议、代码、配置和新开发库统一使用当前格式，不接纳旧格式消息，也不双写旧表。001/002/004/005/006/007 共同初始化同一套新模型，006 不负责兼容旧数据。旧结构库无法通过 CREATE IF NOT EXISTS 直接升级，应保留旧数据，改用隔离库和独立 topic/group。
 
-Bearer 仅临时用于归属查询。由于查询接口尚未实现，客户归属仍为未知；即使用量为 known，身份也为 invalid，usage_eligible 始终为 false。使用以下命令检查实际代理配置：
+Bearer 仅临时用于归属查询。空 URI 占位或客户查询失败时归属未知；即使用量为 known，身份也为 invalid、usage_eligible=false。启用 HTTP/HTTPS 查询并成功解析后按冻结的客户归属和名称生成事件。使用以下命令检查实际代理配置：
 
 ```sh
 istioctl proxy-config all "$GATEWAY_POD" -n istio-system -o json \

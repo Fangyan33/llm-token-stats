@@ -199,13 +199,13 @@ func (s *Store) Evidence(ctx context.Context, ids []string) ([]consumer.Evidence
 			qs = append(qs, quote(id))
 		}
 		// Compare the single contract using typed identity columns.
-		r, err := s.DB.QueryContext(ctx, "SELECT CAST(request_date AS STRING),logical_request_id,payload_hash,"+IdentityKeySQL+",request_started_at_ms,event_id FROM "+s.Database()+".events_raw WHERE logical_request_id IN ("+strings.Join(qs, ",")+")")
+		r, err := s.DB.QueryContext(ctx, "SELECT CAST(request_date AS STRING),logical_request_id,payload_hash,"+IdentityKeySQL+","+NameKeySQL+",request_started_at_ms,event_id FROM "+s.Database()+".events_raw WHERE logical_request_id IN ("+strings.Join(qs, ",")+")")
 		if err != nil {
 			return nil, errors.New("doris_evidence")
 		}
 		for r.Next() {
 			var e consumer.Evidence
-			if r.Scan(&e.Date, &e.ID, &e.Hash, &e.Identity, &e.Started, &e.EventID) != nil {
+			if r.Scan(&e.Date, &e.ID, &e.Hash, &e.Identity, &e.Names, &e.Started, &e.EventID) != nil {
 				r.Close()
 				return nil, errors.New("doris_evidence")
 			}
@@ -227,6 +227,8 @@ func (s *Store) Evidence(ctx context.Context, ids []string) ([]consumer.Evidence
 // IdentityKeySQL keeps the field order aligned with events.IdentityHash and migration 006.
 // This JSON tuple is used only for equality within Doris, not as a payload hash.
 const IdentityKeySQL = "CAST(JSON_ARRAY(service_id, provider_id, api_key_id, customer_id, identity_status, config_version, gateway_instance_id, adapter_id, x_request_id, cluster_name, deployment_environment, mapping_status, mapping_version, customer_mapping_status, customer_mapping_version) AS STRING)"
+
+const NameKeySQL = "CAST(JSON_ARRAY(service_name, provider_name, customer_name) AS STRING)"
 
 // Database is a validated SQL identifier; New rejects arbitrary SQL fragments.
 func (s *Store) Database() string { return "`" + s.Cfg.Database + "`" }

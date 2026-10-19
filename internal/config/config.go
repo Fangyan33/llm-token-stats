@@ -22,7 +22,10 @@ type Kafka struct {
 	PasswordEnv string   `json:"password_env"`
 }
 type Lookup struct {
-	URI string `json:"uri"`
+	URI           string `json:"uri"`
+	CredentialEnv string `json:"credential_env"`
+	CAFile        string `json:"ca_file"`
+	MaxRPS        int    `json:"max_requests_per_second"`
 }
 
 type Observer struct {
@@ -30,6 +33,8 @@ type Observer struct {
 	DeploymentEnvironment string        `json:"deployment_environment"`
 	ServiceLookup         Lookup        `json:"service_lookup"`
 	CustomerLookup        Lookup        `json:"customer_lookup"`
+	LookupTimeoutMS       int           `json:"lookup_timeout_ms"`
+	LookupConcurrency     int           `json:"lookup_max_concurrency"`
 	WasmDownload          *WasmDownload `json:"wasm_download"`
 	Listen                string        `json:"listen"`
 	Health                string        `json:"health_listen"`
@@ -99,6 +104,23 @@ func Read(path string) (Config, error) {
 var kafkaTopicName = regexp.MustCompile(`^[A-Za-z0-9._-]{1,249}$`)
 
 func (c *Config) ObserverDefaults() error {
+	if c.Observer.LookupTimeoutMS == 0 {
+		c.Observer.LookupTimeoutMS = 200
+	}
+	if c.Observer.LookupConcurrency == 0 {
+		c.Observer.LookupConcurrency = 64
+	}
+	if c.Observer.LookupTimeoutMS < 1 || c.Observer.LookupTimeoutMS > 2000 || c.Observer.LookupConcurrency < 1 || c.Observer.LookupConcurrency > 256 {
+		return fmt.Errorf("config_lookup")
+	}
+	for _, lookup := range []Lookup{c.Observer.ServiceLookup, c.Observer.CustomerLookup} {
+		if lookup.MaxRPS < 0 || lookup.MaxRPS > 100000 {
+			return fmt.Errorf("config_lookup")
+		}
+		if lookup.URI != "" && (!regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`).MatchString(lookup.CredentialEnv) || lookup.CAFile != "" && !text(lookup.CAFile, 4096)) {
+			return fmt.Errorf("config_lookup")
+		}
+	}
 	if w := c.Observer.WasmDownload; w != nil {
 		if w.Listen == "" {
 			w.Listen = ":9093"
@@ -128,7 +150,7 @@ func (c *Config) ObserverDefaults() error {
 	if c.Observer.ProducerID == "" {
 		c.Observer.ProducerID = os.Getenv("POD_UID")
 	}
-	if !text(c.Observer.ClusterName, 128) || !Environment(c.Observer.DeploymentEnvironment) || !lookupURI(c.Observer.ServiceLookup.URI) || !lookupURI(c.Observer.CustomerLookup.URI) || !text(c.Observer.ProducerID, 128) || c.Observer.MaxActive < 1 || c.Observer.MaxActive > 4096 || c.Observer.ParserBudget < 3*32768 || c.Observer.ParserBudget > 256<<20 || c.Observer.MaxObservationMS < 1 || c.Observer.MaxObservationMS > 605000 || c.Observer.MaxConnections < 1 || c.Observer.MaxConnections > 128 || !registration(c.Observer.AcceptedConfigs, c.Observer.AcceptedServices) || len(c.Observer.AcceptedAdapters) != 1 || c.Observer.AcceptedAdapters[0] != "chat_completions_v1" || !codes(c.Observer.Flags) || !codes(c.Observer.Details) {
+	if !text(c.Observer.ClusterName, 128) || !Environment(c.Observer.DeploymentEnvironment) || !LookupURI(c.Observer.ServiceLookup.URI) || !LookupURI(c.Observer.CustomerLookup.URI) || !text(c.Observer.ProducerID, 128) || c.Observer.MaxActive < 1 || c.Observer.MaxActive > 4096 || c.Observer.ParserBudget < 3*32768 || c.Observer.ParserBudget > 256<<20 || c.Observer.MaxObservationMS < 1 || c.Observer.MaxObservationMS > 605000 || c.Observer.MaxConnections < 1 || c.Observer.MaxConnections > 128 || !registration(c.Observer.AcceptedConfigs, c.Observer.AcceptedServices) || len(c.Observer.AcceptedAdapters) != 1 || c.Observer.AcceptedAdapters[0] != "chat_completions_v1" || !codes(c.Observer.Flags) || !codes(c.Observer.Details) {
 		return fmt.Errorf("config_observer")
 	}
 	return nil
@@ -232,11 +254,13 @@ func Duration(ms int) time.Duration { return time.Duration(ms) * time.Millisecon
 var databaseName = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_]{0,63}$`)
 
 func DatabaseName(name string) bool { return databaseName.MatchString(name) }
-func Environment(s string) bool     { return s == "production" || s == "test" || s == "development" }
-func lookupURI(s string) bool {
+func Environment(s string) bool     { return s == "prd" || s == "stg" || s == "dev" }
+
+// LookupURI accepts an empty placeholder or an HTTP(S) endpoint without credentials or query data.
+func LookupURI(s string) bool {
 	if s == "" {
 		return true
 	}
 	u, err := url.Parse(s)
-	return err == nil && len(s) <= 2048 && (u.Scheme == "https" || u.Scheme == "http") && u.Hostname() != "" && u.User == nil && u.RawQuery == "" && u.Fragment == "" && u.Opaque == ""
+	return err == nil && len(s) <= 2048 && (u.Scheme == "http" || u.Scheme == "https") && u.Hostname() != "" && u.User == nil && u.RawQuery == "" && !u.ForceQuery && u.Fragment == "" && u.Opaque == ""
 }

@@ -2,13 +2,14 @@
 
 本文描述当前唯一采集模型，面向开发、运维和数据使用者。实体表的类型、键、说明来自仓库 DDL；视图类型及可空性经 Doris 4.1.3 元数据核对。整数显示宽度和 DECIMALV3 名称归一化为 SQL 类型。
 
-覆盖 12 张实体表、211 个实体字段，以及 7 个逻辑视图、299 个视图字段。当前本地 Consumer 写入 metering_development；旧 metering 及历史 Kubernetes 验证库不属于本次注释更新范围。
+覆盖 12 张实体表、214 个实体字段，以及 7 个逻辑视图、318 个视图字段。当前本地 Consumer 写入 metering_development；旧 metering 及历史 Kubernetes 验证库不属于本次注释更新范围。
 
 ## 使用口径
 
 - 一个逻辑请求最多包含 request_started、usage_observed 两类事件；查询调用量按 logical_request_id 统计，不能按事件行数统计。
 - 原始用量 NULL 表示未知，0 表示已知零。输入/输出及缓存、推理子项不能重复相加。usage_eligible 表示统计候选，不表示收费资格。
-- 合法 Host/Bearer 当前进入未实现查询占位，归属 ID 和版本为 NULL，身份 invalid、usage_eligible=0；保留已观察 usage，不伪造客户或供应商。
+- Observer 支持 HTTP/HTTPS 归属查询，环境仅接受 prd/stg/dev；ID 与服务、供应商和客户名称作为请求快照保存。空 URI 占位或查询失败侧为 NULL，不伪造归属。
+- 观察取消后保留已完成的单侧归属，未返回侧在原查询截止时间标为 lookup_timeout；快照冻结后不接受迟到回写。
 - 全部时间按 UTC。Unix 毫秒字段带 _ms；DATETIME(3) 是 UTC 审计时间。offset 仅在同一 topic/分区比较，first/last 包含，next 不包含。
 - Unique Key 是 Doris 幂等键。下述关系是应用逻辑关联，没有声明数据库外键。协调表不是数据库锁，也不使 Kafka/Doris 成为分布式事务。
 - usage-worker、统计 HTTP API 尚未实现。已有汇总 DDL 和合成 SQL 验证不代表生产发布状态、查询一致性或真实客户归属已经交付。
@@ -104,12 +105,15 @@ flowchart TD
 | route_name | VARCHAR(128) | 否 | 未声明 | — | 实际 Envoy HTTP 路由名，不可读时为 unknown；仅诊断，不代表 VirtualService 或归属 |
 | request_host | VARCHAR(253) | 是 | 未声明 | — | 规范入口 DNS 域名；转小写并去端口及末尾根点，非法输入为 NULL |
 | cluster_name | VARCHAR(128) | 否 | 未声明 | — | Observer 配置固定的集群名称，业务请求不能覆盖 |
-| deployment_environment | VARCHAR(16) | 否 | 未声明 | — | Observer 固定部署环境：production、test 或 development |
-| mapping_status | VARCHAR(32) | 否 | 未声明 | — | 服务解析状态：mapped、unknown_host、invalid_host、lookup_not_implemented、lookup_timeout、lookup_unavailable、lookup_invalid_response、lookup_overloaded、lookup_rate_limited；当前合法输入为未实现占位 |
+| deployment_environment | VARCHAR(16) | 否 | 未声明 | — | Observer 固定部署环境：prd、stg 或 dev |
+| mapping_status | VARCHAR(32) | 否 | 未声明 | — | 服务解析状态：mapped、unknown_host、invalid_host、lookup_not_implemented、lookup_timeout、lookup_unavailable、lookup_invalid_response、lookup_overloaded、lookup_rate_limited；空 URI 为未实现占位，配置 HTTP/HTTPS 可解析 |
 | mapping_version | CHAR(64) | 是 | 未声明 | — | 成功服务解析快照的规范 SHA-256，绑定 Host、集群、环境及服务和供应商；未知为 NULL |
-| customer_mapping_status | VARCHAR(32) | 否 | 未声明 | — | 客户解析状态：mapped、unknown_api_key、invalid_api_key、lookup_not_implemented、lookup_timeout、lookup_unavailable、lookup_invalid_response、lookup_overloaded、lookup_rate_limited；当前合法输入为未实现占位 |
+| customer_mapping_status | VARCHAR(32) | 否 | 未声明 | — | 客户解析状态：mapped、unknown_api_key、invalid_api_key、lookup_not_implemented、lookup_timeout、lookup_unavailable、lookup_invalid_response、lookup_overloaded、lookup_rate_limited；空 URI 为未实现占位，配置 HTTP/HTTPS 可解析 |
 | customer_mapping_version | CHAR(64) | 是 | 未声明 | — | 成功客户解析快照的规范 SHA-256，绑定部署上下文、API Key ID 和客户；未知为 NULL |
 | service_id | VARCHAR(128) | 是 | 未声明 | — | 服务接口返回的服务 ID；未实现或失败为 NULL，不使用默认服务补值 |
+| service_name | VARCHAR(512) | 是 | 未声明 | — | 请求发生时的服务名称快照；解析未知时为 NULL，不用最新名称覆盖历史 |
+| provider_name | VARCHAR(512) | 是 | 未声明 | — | 请求发生时的供应商名称快照；解析未知时为 NULL，不用最新名称覆盖历史 |
+| customer_name | VARCHAR(512) | 是 | 未声明 | — | 请求发生时的客户名称快照；解析未知时为 NULL，不用最新名称覆盖历史 |
 | api_key_id | VARCHAR(128) | 是 | 未声明 | — | 客户接口返回的稳定 API Key ID；未知为 NULL，绝不是原始 Bearer token |
 | customer_id | VARCHAR(128) | 是 | 未声明 | — | 与 api_key_id 同次成功解析得到的客户 ID；未知为 NULL，不采信客户端自报 ID |
 | provider_id | VARCHAR(128) | 是 | 未声明 | — | 服务接口返回的服务所属供应商 ID；未知为 NULL，不代表隐藏的实际执行方 |
@@ -222,7 +226,7 @@ flowchart TD
 | --- | --- | --- | --- | --- | --- |
 | stat_date | DATE | 否 | 未声明 | 唯一键 | 日统计或重算通知对应的 UTC 请求日期 |
 | cluster_name | VARCHAR(128) | 否 | 未声明 | 唯一键 | Observer 配置固定的集群名称，业务请求不能覆盖 |
-| deployment_environment | VARCHAR(16) | 否 | 未声明 | 唯一键 | Observer 固定部署环境：production、test 或 development |
+| deployment_environment | VARCHAR(16) | 否 | 未声明 | 唯一键 | Observer 固定部署环境：prd、stg 或 dev |
 | customer_id | VARCHAR(128) | 否 | 未声明 | 唯一键 | 已成功解析的客户统计维度；未知客户不进入客户汇总，不创建空客户桶 |
 | provider_id | VARCHAR(128) | 否 | 未声明 | 唯一键 | 供应商统计维度；空串仅代表未知汇总桶，不回写原始事件归属 |
 | api_key_id | VARCHAR(128) | 否 | 未声明 | 唯一键 | 已成功解析的稳定 API Key 统计维度，不是原始密钥，必须与客户归属一起已知 |
@@ -274,7 +278,7 @@ flowchart TD
 | --- | --- | --- | --- | --- | --- |
 | stat_month | DATE | 否 | 未声明 | 唯一键 | 月统计对应的 UTC 自然月首日 |
 | cluster_name | VARCHAR(128) | 否 | 未声明 | 唯一键 | Observer 配置固定的集群名称，业务请求不能覆盖 |
-| deployment_environment | VARCHAR(16) | 否 | 未声明 | 唯一键 | Observer 固定部署环境：production、test 或 development |
+| deployment_environment | VARCHAR(16) | 否 | 未声明 | 唯一键 | Observer 固定部署环境：prd、stg 或 dev |
 | customer_id | VARCHAR(128) | 否 | 未声明 | 唯一键 | 已成功解析的客户统计维度；未知客户不进入客户汇总，不创建空客户桶 |
 | provider_id | VARCHAR(128) | 否 | 未声明 | 唯一键 | 供应商统计维度；空串仅代表未知汇总桶，不回写原始事件归属 |
 | api_key_id | VARCHAR(128) | 否 | 未声明 | 唯一键 | 已成功解析的稳定 API Key 统计维度，不是原始密钥，必须与客户归属一起已知 |
@@ -362,7 +366,7 @@ flowchart TD
 | next_offset | BIGINT | 否 | 未声明 | — | 本批最后 offset 加 1；凭据确认可领先于 Kafka 提交，不能直接当连续已提交水位 |
 | notification_count | BIGINT | 否 | 未声明 | — | 该批次实际登记并确认可见的日期通知集合大小，可以为 0 |
 | notification_digest | CHAR(64) | 否 | 未声明 | — | 该批次已确认通知集合按日期和通知 ID 排序后的规范 SHA-256 |
-| confirmed_at | DATETIME(3) | 否 | 未声明 | — | 批次必要写入全部确认可见时的 UTC 时间；Kafka offset 可能尚未提交 |
+| confirmed_at | DATETIME(3) | 否 | 未声明 | — | 批次冻结时记录的 UTC 审计时间，重试沿用；不代表写入确认完成或 Kafka offset 提交的时间 |
 
 ## summary_refresh_inputs
 
@@ -555,12 +559,15 @@ flowchart TD
 | route_name | VARCHAR(128) | 否 | —（派生） | — | 实际 Envoy HTTP 路由名，不可读时为 unknown；仅诊断，不代表 VirtualService 或归属 |
 | request_host | VARCHAR(253) | 是 | —（派生） | — | 规范入口 DNS 域名；转小写并去端口及末尾根点，非法输入为 NULL |
 | cluster_name | VARCHAR(128) | 否 | —（派生） | — | Observer 配置固定的集群名称，业务请求不能覆盖 |
-| deployment_environment | VARCHAR(16) | 否 | —（派生） | — | Observer 固定部署环境：production、test 或 development |
-| mapping_status | VARCHAR(32) | 否 | —（派生） | — | 服务解析状态：mapped、unknown_host、invalid_host、lookup_not_implemented、lookup_timeout、lookup_unavailable、lookup_invalid_response、lookup_overloaded、lookup_rate_limited；当前合法输入为未实现占位 |
+| deployment_environment | VARCHAR(16) | 否 | —（派生） | — | Observer 固定部署环境：prd、stg 或 dev |
+| mapping_status | VARCHAR(32) | 否 | —（派生） | — | 服务解析状态：mapped、unknown_host、invalid_host、lookup_not_implemented、lookup_timeout、lookup_unavailable、lookup_invalid_response、lookup_overloaded、lookup_rate_limited；空 URI 为未实现占位，配置 HTTP/HTTPS 可解析 |
 | mapping_version | CHAR(64) | 是 | —（派生） | — | 成功服务解析快照的规范 SHA-256，绑定 Host、集群、环境及服务和供应商；未知为 NULL |
-| customer_mapping_status | VARCHAR(32) | 否 | —（派生） | — | 客户解析状态：mapped、unknown_api_key、invalid_api_key、lookup_not_implemented、lookup_timeout、lookup_unavailable、lookup_invalid_response、lookup_overloaded、lookup_rate_limited；当前合法输入为未实现占位 |
+| customer_mapping_status | VARCHAR(32) | 否 | —（派生） | — | 客户解析状态：mapped、unknown_api_key、invalid_api_key、lookup_not_implemented、lookup_timeout、lookup_unavailable、lookup_invalid_response、lookup_overloaded、lookup_rate_limited；空 URI 为未实现占位，配置 HTTP/HTTPS 可解析 |
 | customer_mapping_version | CHAR(64) | 是 | —（派生） | — | 成功客户解析快照的规范 SHA-256，绑定部署上下文、API Key ID 和客户；未知为 NULL |
 | service_id | VARCHAR(128) | 是 | —（派生） | — | 服务接口返回的服务 ID；未实现或失败为 NULL，不使用默认服务补值 |
+| service_name | VARCHAR(512) | 是 | —（派生） | — | 请求发生时的服务名称快照；解析未知时为 NULL，不用最新名称覆盖历史 |
+| provider_name | VARCHAR(512) | 是 | —（派生） | — | 请求发生时的供应商名称快照；解析未知时为 NULL，不用最新名称覆盖历史 |
+| customer_name | VARCHAR(512) | 是 | —（派生） | — | 请求发生时的客户名称快照；解析未知时为 NULL，不用最新名称覆盖历史 |
 | api_key_id | VARCHAR(128) | 是 | —（派生） | — | 客户接口返回的稳定 API Key ID；未知为 NULL，绝不是原始 Bearer token |
 | customer_id | VARCHAR(128) | 是 | —（派生） | — | 与 api_key_id 同次成功解析得到的客户 ID；未知为 NULL，不采信客户端自报 ID |
 | provider_id | VARCHAR(128) | 是 | —（派生） | — | 服务接口返回的服务所属供应商 ID；未知为 NULL，不代表隐藏的实际执行方 |
@@ -661,12 +668,15 @@ flowchart TD
 | route_name | VARCHAR(128) | 否 | —（派生） | — | 实际 Envoy HTTP 路由名，不可读时为 unknown；仅诊断，不代表 VirtualService 或归属 |
 | request_host | VARCHAR(253) | 是 | —（派生） | — | 规范入口 DNS 域名；转小写并去端口及末尾根点，非法输入为 NULL |
 | cluster_name | VARCHAR(128) | 否 | —（派生） | — | Observer 配置固定的集群名称，业务请求不能覆盖 |
-| deployment_environment | VARCHAR(16) | 否 | —（派生） | — | Observer 固定部署环境：production、test 或 development |
-| mapping_status | VARCHAR(32) | 否 | —（派生） | — | 服务解析状态：mapped、unknown_host、invalid_host、lookup_not_implemented、lookup_timeout、lookup_unavailable、lookup_invalid_response、lookup_overloaded、lookup_rate_limited；当前合法输入为未实现占位 |
+| deployment_environment | VARCHAR(16) | 否 | —（派生） | — | Observer 固定部署环境：prd、stg 或 dev |
+| mapping_status | VARCHAR(32) | 否 | —（派生） | — | 服务解析状态：mapped、unknown_host、invalid_host、lookup_not_implemented、lookup_timeout、lookup_unavailable、lookup_invalid_response、lookup_overloaded、lookup_rate_limited；空 URI 为未实现占位，配置 HTTP/HTTPS 可解析 |
 | mapping_version | CHAR(64) | 是 | —（派生） | — | 成功服务解析快照的规范 SHA-256，绑定 Host、集群、环境及服务和供应商；未知为 NULL |
-| customer_mapping_status | VARCHAR(32) | 否 | —（派生） | — | 客户解析状态：mapped、unknown_api_key、invalid_api_key、lookup_not_implemented、lookup_timeout、lookup_unavailable、lookup_invalid_response、lookup_overloaded、lookup_rate_limited；当前合法输入为未实现占位 |
+| customer_mapping_status | VARCHAR(32) | 否 | —（派生） | — | 客户解析状态：mapped、unknown_api_key、invalid_api_key、lookup_not_implemented、lookup_timeout、lookup_unavailable、lookup_invalid_response、lookup_overloaded、lookup_rate_limited；空 URI 为未实现占位，配置 HTTP/HTTPS 可解析 |
 | customer_mapping_version | CHAR(64) | 是 | —（派生） | — | 成功客户解析快照的规范 SHA-256，绑定部署上下文、API Key ID 和客户；未知为 NULL |
 | service_id | VARCHAR(128) | 是 | —（派生） | — | 服务接口返回的服务 ID；未实现或失败为 NULL，不使用默认服务补值 |
+| service_name | VARCHAR(512) | 是 | —（派生） | — | 请求发生时的服务名称快照；解析未知时为 NULL，不用最新名称覆盖历史 |
+| provider_name | VARCHAR(512) | 是 | —（派生） | — | 请求发生时的供应商名称快照；解析未知时为 NULL，不用最新名称覆盖历史 |
+| customer_name | VARCHAR(512) | 是 | —（派生） | — | 请求发生时的客户名称快照；解析未知时为 NULL，不用最新名称覆盖历史 |
 | api_key_id | VARCHAR(128) | 是 | —（派生） | — | 客户接口返回的稳定 API Key ID；未知为 NULL，绝不是原始 Bearer token |
 | customer_id | VARCHAR(128) | 是 | —（派生） | — | 与 api_key_id 同次成功解析得到的客户 ID；未知为 NULL，不采信客户端自报 ID |
 | provider_id | VARCHAR(128) | 是 | —（派生） | — | 服务接口返回的服务所属供应商 ID；未知为 NULL，不代表隐藏的实际执行方 |
@@ -743,12 +753,15 @@ flowchart TD
 | route_name | VARCHAR(128) | 否 | —（派生） | — | 实际 Envoy HTTP 路由名，不可读时为 unknown；仅诊断，不代表 VirtualService 或归属 |
 | request_host | VARCHAR(253) | 是 | —（派生） | — | 规范入口 DNS 域名；转小写并去端口及末尾根点，非法输入为 NULL |
 | cluster_name | VARCHAR(128) | 否 | —（派生） | — | Observer 配置固定的集群名称，业务请求不能覆盖 |
-| deployment_environment | VARCHAR(16) | 否 | —（派生） | — | Observer 固定部署环境：production、test 或 development |
-| mapping_status | VARCHAR(32) | 否 | —（派生） | — | 服务解析状态：mapped、unknown_host、invalid_host、lookup_not_implemented、lookup_timeout、lookup_unavailable、lookup_invalid_response、lookup_overloaded、lookup_rate_limited；当前合法输入为未实现占位 |
+| deployment_environment | VARCHAR(16) | 否 | —（派生） | — | Observer 固定部署环境：prd、stg 或 dev |
+| mapping_status | VARCHAR(32) | 否 | —（派生） | — | 服务解析状态：mapped、unknown_host、invalid_host、lookup_not_implemented、lookup_timeout、lookup_unavailable、lookup_invalid_response、lookup_overloaded、lookup_rate_limited；空 URI 为未实现占位，配置 HTTP/HTTPS 可解析 |
 | mapping_version | CHAR(64) | 是 | —（派生） | — | 成功服务解析快照的规范 SHA-256，绑定 Host、集群、环境及服务和供应商；未知为 NULL |
-| customer_mapping_status | VARCHAR(32) | 否 | —（派生） | — | 客户解析状态：mapped、unknown_api_key、invalid_api_key、lookup_not_implemented、lookup_timeout、lookup_unavailable、lookup_invalid_response、lookup_overloaded、lookup_rate_limited；当前合法输入为未实现占位 |
+| customer_mapping_status | VARCHAR(32) | 否 | —（派生） | — | 客户解析状态：mapped、unknown_api_key、invalid_api_key、lookup_not_implemented、lookup_timeout、lookup_unavailable、lookup_invalid_response、lookup_overloaded、lookup_rate_limited；空 URI 为未实现占位，配置 HTTP/HTTPS 可解析 |
 | customer_mapping_version | CHAR(64) | 是 | —（派生） | — | 成功客户解析快照的规范 SHA-256，绑定部署上下文、API Key ID 和客户；未知为 NULL |
 | service_id | VARCHAR(128) | 是 | —（派生） | — | 服务接口返回的服务 ID；未实现或失败为 NULL，不使用默认服务补值 |
+| service_name | VARCHAR(512) | 是 | —（派生） | — | 请求发生时的服务名称快照；解析未知时为 NULL，不用最新名称覆盖历史 |
+| provider_name | VARCHAR(512) | 是 | —（派生） | — | 请求发生时的供应商名称快照；解析未知时为 NULL，不用最新名称覆盖历史 |
+| customer_name | VARCHAR(512) | 是 | —（派生） | — | 请求发生时的客户名称快照；解析未知时为 NULL，不用最新名称覆盖历史 |
 | api_key_id | VARCHAR(128) | 是 | —（派生） | — | 客户接口返回的稳定 API Key ID；未知为 NULL，绝不是原始 Bearer token |
 | customer_id | VARCHAR(128) | 是 | —（派生） | — | 与 api_key_id 同次成功解析得到的客户 ID；未知为 NULL，不采信客户端自报 ID |
 | provider_id | VARCHAR(128) | 是 | —（派生） | — | 服务接口返回的服务所属供应商 ID；未知为 NULL，不代表隐藏的实际执行方 |
@@ -811,13 +824,16 @@ flowchart TD
 | x_request_id | VARCHAR(128) | 是 | —（派生） | — | 网关可见的 X-Request-Id，仅辅助关联；可空、可重复，不用于授权或去重 |
 | customer_id | VARCHAR(128) | 是 | —（派生） | — | 与 api_key_id 同次成功解析得到的客户 ID；未知为 NULL，不采信客户端自报 ID |
 | service_id | VARCHAR(128) | 是 | —（派生） | — | 服务接口返回的服务 ID；未实现或失败为 NULL，不使用默认服务补值 |
+| service_name | VARCHAR(512) | 是 | —（派生） | — | 请求发生时的服务名称快照；解析未知时为 NULL，不用最新名称覆盖历史 |
+| provider_name | VARCHAR(512) | 是 | —（派生） | — | 请求发生时的供应商名称快照；解析未知时为 NULL，不用最新名称覆盖历史 |
+| customer_name | VARCHAR(512) | 是 | —（派生） | — | 请求发生时的客户名称快照；解析未知时为 NULL，不用最新名称覆盖历史 |
 | provider_id | VARCHAR(128) | 是 | —（派生） | — | 服务接口返回的服务所属供应商 ID；未知为 NULL，不代表隐藏的实际执行方 |
 | cluster_name | VARCHAR(128) | 否 | —（派生） | — | Observer 配置固定的集群名称，业务请求不能覆盖 |
-| deployment_environment | VARCHAR(16) | 否 | —（派生） | — | Observer 固定部署环境：production、test 或 development |
+| deployment_environment | VARCHAR(16) | 否 | —（派生） | — | Observer 固定部署环境：prd、stg 或 dev |
 | request_host | VARCHAR(253) | 是 | —（派生） | — | 规范入口 DNS 域名；转小写并去端口及末尾根点，非法输入为 NULL |
-| mapping_status | VARCHAR(32) | 否 | —（派生） | — | 服务解析状态：mapped、unknown_host、invalid_host、lookup_not_implemented、lookup_timeout、lookup_unavailable、lookup_invalid_response、lookup_overloaded、lookup_rate_limited；当前合法输入为未实现占位 |
+| mapping_status | VARCHAR(32) | 否 | —（派生） | — | 服务解析状态：mapped、unknown_host、invalid_host、lookup_not_implemented、lookup_timeout、lookup_unavailable、lookup_invalid_response、lookup_overloaded、lookup_rate_limited；空 URI 为未实现占位，配置 HTTP/HTTPS 可解析 |
 | mapping_version | CHAR(64) | 是 | —（派生） | — | 成功服务解析快照的规范 SHA-256，绑定 Host、集群、环境及服务和供应商；未知为 NULL |
-| customer_mapping_status | VARCHAR(32) | 否 | —（派生） | — | 客户解析状态：mapped、unknown_api_key、invalid_api_key、lookup_not_implemented、lookup_timeout、lookup_unavailable、lookup_invalid_response、lookup_overloaded、lookup_rate_limited；当前合法输入为未实现占位 |
+| customer_mapping_status | VARCHAR(32) | 否 | —（派生） | — | 客户解析状态：mapped、unknown_api_key、invalid_api_key、lookup_not_implemented、lookup_timeout、lookup_unavailable、lookup_invalid_response、lookup_overloaded、lookup_rate_limited；空 URI 为未实现占位，配置 HTTP/HTTPS 可解析 |
 | customer_mapping_version | CHAR(64) | 是 | —（派生） | — | 成功客户解析快照的规范 SHA-256，绑定部署上下文、API Key ID 和客户；未知为 NULL |
 | response_model | VARCHAR(1024) | 是 | —（派生） | — | 响应上报的模型名或 ID，可能不同于请求模型；未取得或非法时为 NULL |
 | usage_status | STRING | 是 | —（派生） | — | 唯一结果事件的用量状态；无结果为 not_observed，多结果变体为 conflict |
@@ -864,12 +880,15 @@ flowchart TD
 | route_name | VARCHAR(128) | 否 | —（派生） | — | 实际 Envoy HTTP 路由名，不可读时为 unknown；仅诊断，不代表 VirtualService 或归属 |
 | request_host | VARCHAR(253) | 是 | —（派生） | — | 规范入口 DNS 域名；转小写并去端口及末尾根点，非法输入为 NULL |
 | cluster_name | VARCHAR(128) | 否 | —（派生） | — | Observer 配置固定的集群名称，业务请求不能覆盖 |
-| deployment_environment | VARCHAR(16) | 否 | —（派生） | — | Observer 固定部署环境：production、test 或 development |
-| mapping_status | VARCHAR(32) | 否 | —（派生） | — | 服务解析状态：mapped、unknown_host、invalid_host、lookup_not_implemented、lookup_timeout、lookup_unavailable、lookup_invalid_response、lookup_overloaded、lookup_rate_limited；当前合法输入为未实现占位 |
+| deployment_environment | VARCHAR(16) | 否 | —（派生） | — | Observer 固定部署环境：prd、stg 或 dev |
+| mapping_status | VARCHAR(32) | 否 | —（派生） | — | 服务解析状态：mapped、unknown_host、invalid_host、lookup_not_implemented、lookup_timeout、lookup_unavailable、lookup_invalid_response、lookup_overloaded、lookup_rate_limited；空 URI 为未实现占位，配置 HTTP/HTTPS 可解析 |
 | mapping_version | CHAR(64) | 是 | —（派生） | — | 成功服务解析快照的规范 SHA-256，绑定 Host、集群、环境及服务和供应商；未知为 NULL |
-| customer_mapping_status | VARCHAR(32) | 否 | —（派生） | — | 客户解析状态：mapped、unknown_api_key、invalid_api_key、lookup_not_implemented、lookup_timeout、lookup_unavailable、lookup_invalid_response、lookup_overloaded、lookup_rate_limited；当前合法输入为未实现占位 |
+| customer_mapping_status | VARCHAR(32) | 否 | —（派生） | — | 客户解析状态：mapped、unknown_api_key、invalid_api_key、lookup_not_implemented、lookup_timeout、lookup_unavailable、lookup_invalid_response、lookup_overloaded、lookup_rate_limited；空 URI 为未实现占位，配置 HTTP/HTTPS 可解析 |
 | customer_mapping_version | CHAR(64) | 是 | —（派生） | — | 成功客户解析快照的规范 SHA-256，绑定部署上下文、API Key ID 和客户；未知为 NULL |
 | service_id | VARCHAR(128) | 是 | —（派生） | — | 服务接口返回的服务 ID；未实现或失败为 NULL，不使用默认服务补值 |
+| service_name | VARCHAR(512) | 是 | —（派生） | — | 请求发生时的服务名称快照；解析未知时为 NULL，不用最新名称覆盖历史 |
+| provider_name | VARCHAR(512) | 是 | —（派生） | — | 请求发生时的供应商名称快照；解析未知时为 NULL，不用最新名称覆盖历史 |
+| customer_name | VARCHAR(512) | 是 | —（派生） | — | 请求发生时的客户名称快照；解析未知时为 NULL，不用最新名称覆盖历史 |
 | api_key_id | VARCHAR(128) | 是 | —（派生） | — | 客户接口返回的稳定 API Key ID；未知为 NULL，绝不是原始 Bearer token |
 | customer_id | VARCHAR(128) | 是 | —（派生） | — | 与 api_key_id 同次成功解析得到的客户 ID；未知为 NULL，不采信客户端自报 ID |
 | provider_id | VARCHAR(128) | 是 | —（派生） | — | 服务接口返回的服务所属供应商 ID；未知为 NULL，不代表隐藏的实际执行方 |
@@ -930,16 +949,20 @@ flowchart TD
 | usage_variants | BIGINT | 否 | —（派生） | — | 该逻辑请求的结果事件内容变体数；0 表示未观察结果，大于 1 表示冲突 |
 | started_count | BIGINT | 否 | —（派生） | — | 该日期内同一逻辑请求的不同开始时间数量；大于 1 表示时间冲突 |
 | identity_count | BIGINT | 否 | —（派生） | — | 该日期内同一逻辑请求的不同十五项归属与部署快照数量；大于 1 表示冲突 |
+| name_count | BIGINT | 否 | —（派生） | — | 同请求不同名称快照元组数量；大于 1 表示冲突 |
 | customer_id | VARCHAR(128) | 是 | —（派生） | — | 与 api_key_id 同次成功解析得到的客户 ID；未知为 NULL，不采信客户端自报 ID |
 | provider_id | VARCHAR(128) | 是 | —（派生） | — | 服务接口返回的服务所属供应商 ID；未知为 NULL，不代表隐藏的实际执行方 |
 | api_key_id | VARCHAR(128) | 是 | —（派生） | — | 客户接口返回的稳定 API Key ID；未知为 NULL，绝不是原始 Bearer token |
 | service_id | VARCHAR(128) | 是 | —（派生） | — | 服务接口返回的服务 ID；未实现或失败为 NULL，不使用默认服务补值 |
+| service_name | VARCHAR(512) | 是 | —（派生） | — | 请求发生时的服务名称快照；解析未知时为 NULL，不用最新名称覆盖历史 |
+| provider_name | VARCHAR(512) | 是 | —（派生） | — | 请求发生时的供应商名称快照；解析未知时为 NULL，不用最新名称覆盖历史 |
+| customer_name | VARCHAR(512) | 是 | —（派生） | — | 请求发生时的客户名称快照；解析未知时为 NULL，不用最新名称覆盖历史 |
 | cluster_name | VARCHAR(128) | 否 | —（派生） | — | Observer 配置固定的集群名称，业务请求不能覆盖 |
-| deployment_environment | VARCHAR(16) | 否 | —（派生） | — | Observer 固定部署环境：production、test 或 development |
+| deployment_environment | VARCHAR(16) | 否 | —（派生） | — | Observer 固定部署环境：prd、stg 或 dev |
 | request_host | VARCHAR(253) | 是 | —（派生） | — | 规范入口 DNS 域名；转小写并去端口及末尾根点，非法输入为 NULL |
-| mapping_status | VARCHAR(32) | 否 | —（派生） | — | 服务解析状态：mapped、unknown_host、invalid_host、lookup_not_implemented、lookup_timeout、lookup_unavailable、lookup_invalid_response、lookup_overloaded、lookup_rate_limited；当前合法输入为未实现占位 |
+| mapping_status | VARCHAR(32) | 否 | —（派生） | — | 服务解析状态：mapped、unknown_host、invalid_host、lookup_not_implemented、lookup_timeout、lookup_unavailable、lookup_invalid_response、lookup_overloaded、lookup_rate_limited；空 URI 为未实现占位，配置 HTTP/HTTPS 可解析 |
 | mapping_version | CHAR(64) | 是 | —（派生） | — | 成功服务解析快照的规范 SHA-256，绑定 Host、集群、环境及服务和供应商；未知为 NULL |
-| customer_mapping_status | VARCHAR(32) | 否 | —（派生） | — | 客户解析状态：mapped、unknown_api_key、invalid_api_key、lookup_not_implemented、lookup_timeout、lookup_unavailable、lookup_invalid_response、lookup_overloaded、lookup_rate_limited；当前合法输入为未实现占位 |
+| customer_mapping_status | VARCHAR(32) | 否 | —（派生） | — | 客户解析状态：mapped、unknown_api_key、invalid_api_key、lookup_not_implemented、lookup_timeout、lookup_unavailable、lookup_invalid_response、lookup_overloaded、lookup_rate_limited；空 URI 为未实现占位，配置 HTTP/HTTPS 可解析 |
 | customer_mapping_version | CHAR(64) | 是 | —（派生） | — | 成功客户解析快照的规范 SHA-256，绑定部署上下文、API Key ID 和客户；未知为 NULL |
 | identity_status | VARCHAR(16) | 否 | —（派生） | — | 客户归属状态：known 或 invalid；仅完整客户解析成功为 known，不表示鉴权判定 |
 | request_model | VARCHAR(1024) | 是 | —（派生） | — | 请求正文中可靠提取的模型名或 ID；未取得或非法时为 NULL |
@@ -961,7 +984,7 @@ flowchart TD
 
 ## 初始化、已有库更新与文档再生成
 
-新库按 001 → 002 → 004 → 005 → 006 → 007 初始化。007 只补当前模型注释，不升级旧表；执行前确认目标库确为当前结构。更新当前开发库：
+新库按 001 → 002 → 004 → 005 → 006 → 007 初始化。已有当前模型库先按 008_name_snapshots.sql 添加缺失名称列并重建视图，再执行 007 更新注释；新库 001 已含名称列，不重复执行 008。执行前确认目标库确为当前结构。更新当前开发库的注释与视图：
 
 ```sh
 set -o pipefail

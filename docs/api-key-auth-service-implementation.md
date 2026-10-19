@@ -6,7 +6,7 @@
 
 业务路径仍为调用方 → Istio/Envoy → 模型服务。已有 ext_authz 负责业务访问判定；Auth 的失败策略由网关鉴权配置管理，不能以采集 fail-open 放开未授权请求。Observer 不承担业务鉴权，也不串入业务请求路径。
 
-采集使用[归属接口](spec/plan/host-service-provider-implementation.md)：Host + Observer 固定集群/环境查询服务及供应商，Bearer token 查询客户及稳定 API Key ID。当前只交付两个类型明确的未实现占位，既不连接 PG，也不调用第三方 HTTP。占位返回未知归属，不表示鉴权通过或凭证无效。
+采集使用[归属接口](spec/plan/host-service-provider-implementation.md)：Host + Observer 固定集群/环境查询服务及供应商，Bearer token 查询客户及稳定 API Key ID。两个归属接口支持配置 HTTP/HTTPS POST JSON 调用及 x-remote-data 认证；URI 为空时使用未实现占位。Observer 固定 prd/stg/dev 环境，在有界异步任务中取得 ID 和名称快照；service_name、provider_name、customer_name 经 Kafka 写入 Doris 独立列及 event_json。占位或失败侧的 ID、名称和版本为 null，不回源补写历史；原始 usage 保留，业务 token 不进入事件、数据库或日志。占位返回未知归属，不表示鉴权通过或凭证无效。
 
 客户下属应用模型已删除；不建立应用表、API Key 应用外键、应用状态校验、应用 scope 或管理接口。
 

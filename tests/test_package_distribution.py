@@ -57,7 +57,7 @@ class DistributionTests(unittest.TestCase):
         self.assertEqual(observer['kafka'], consumer['kafka'])
         self.assertEqual(observer['kafka'], {'bootstrap_servers': ['kafka.isolated.svc.cluster.local:9092'],
                                             'topic': 'offline-events'})
-        self.assertEqual(observer['observer']['deployment_environment'], 'development')
+        self.assertEqual(observer['observer']['deployment_environment'], 'dev')
         self.assertEqual(consumer['doris']['database'], 'offline_data')
         self.assertEqual(consumer['doris']['fe_url'], 'http://doris.isolated.svc.cluster.local:8040')
         sql = objects['metering-doris-migrations']['data']

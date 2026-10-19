@@ -137,3 +137,38 @@ func TestLookupContextAndURI(t *testing.T) {
 		}
 	}
 }
+
+func TestLookupEnvironmentAndBounds(t *testing.T) {
+	for _, environment := range []string{"prd", "stg", "dev", "production", "test", "development", "PRD", ""} {
+		want := environment == "prd" || environment == "stg" || environment == "dev"
+		if Environment(environment) != want {
+			t.Fatal("environment alias accepted")
+		}
+	}
+	for _, change := range []func(*Observer){
+		func(o *Observer) { o.LookupConcurrency = 257 }, func(o *Observer) { o.LookupTimeoutMS = 2001 },
+		func(o *Observer) { o.ServiceLookup = Lookup{URI: "ftp://example.com/", CredentialEnv: "TOKEN"} },
+		func(o *Observer) { o.ServiceLookup = Lookup{URI: "https://example.com/"} },
+		func(o *Observer) { o.ServiceLookup.MaxRPS = -1 },
+	} {
+		c, err := Read("../../configs/observer.local.json")
+		if err != nil {
+			t.Fatal(err)
+		}
+		change(&c.Observer)
+		if c.ObserverDefaults() == nil {
+			t.Fatal("lookup configuration accepted")
+		}
+	}
+	for _, scheme := range []string{"http", "https"} {
+		c, err := Read("../../configs/observer.local.json")
+		if err != nil {
+			t.Fatal(err)
+		}
+		c.Observer.ServiceLookup = Lookup{URI: scheme + "://example.com/service", CredentialEnv: "TOKEN"}
+		c.Observer.CustomerLookup = Lookup{URI: scheme + "://example.com/customer", CredentialEnv: "TOKEN"}
+		if err := c.ObserverDefaults(); err != nil {
+			t.Fatalf("supported lookup scheme: %v", err)
+		}
+	}
+}

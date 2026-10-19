@@ -7,6 +7,7 @@ import (
 	pb "github.com/Fangyan33/llm-token-stats/gen/observation/v1"
 	"github.com/Fangyan33/llm-token-stats/internal/config"
 	"github.com/Fangyan33/llm-token-stats/internal/health"
+	"github.com/Fangyan33/llm-token-stats/internal/identitylookup"
 	"github.com/Fangyan33/llm-token-stats/internal/observation"
 	"github.com/Fangyan33/llm-token-stats/internal/producer"
 	"github.com/Fangyan33/llm-token-stats/internal/wasmdownload"
@@ -82,7 +83,15 @@ func main() {
 		log.Fatal("listen_failure")
 	}
 	server := grpc.NewServer(grpc.ForceServerCodec(observation.Codec{}), grpc.MaxRecvMsgSize(32768), grpc.MaxConcurrentStreams(128), grpc.InitialWindowSize(65535), grpc.InitialConnWindowSize(65535))
-	pb.RegisterObservationServiceServer(server, &observation.Server{Cfg: c.Observer, Sink: p, Health: h})
+	service, err := identitylookup.NewService(c.Observer.ServiceLookup)
+	if err != nil {
+		log.Fatal(err)
+	}
+	customer, err := identitylookup.NewCustomer(c.Observer.CustomerLookup)
+	if err != nil {
+		log.Fatal(err)
+	}
+	pb.RegisterObservationServiceServer(server, &observation.Server{Cfg: c.Observer, Sink: p, Health: h, ServiceResolver: service, CustomerResolver: customer})
 	h.Ready.Store(true)
 	go func() {
 		<-ctx.Done()

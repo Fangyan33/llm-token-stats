@@ -94,12 +94,15 @@ func TestMappingInvariantsAndSecretRejection(t *testing.T) {
 	}
 	unknown := *base
 	unknown.ServiceID, unknown.ProviderID, unknown.MappingVersion = nil, nil, nil
+	unknown.ServiceName, unknown.ProviderName = nil, nil
 	unknown.MappingStatus = "lookup_not_implemented"
 	b, _ := Canonical(&unknown)
 	if _, err = Decode(b, []byte(unknown.LogicalRequestID), time.Time{}); err != nil {
 		t.Fatal("known customer/unknown service rejected", err)
 	}
 	for _, change := range []func(*Event){
+		func(e *Event) { e.ServiceName = nil }, func(e *Event) { e.ProviderName = Ptr("") },
+		func(e *Event) { e.CustomerName = Ptr(strings.Repeat("中", 171)) },
 		func(e *Event) { e.ProviderID = nil }, func(e *Event) { e.MappingStatus = "lookup_not_implemented" },
 		func(e *Event) { e.RequestHost = Ptr("EXAMPLE.invalid") }, func(e *Event) { e.RequestHost = Ptr("127.0.0.1") },
 		func(e *Event) { e.CustomerID = nil }, func(e *Event) { e.CustomerMappingStatus = "lookup_not_implemented" },

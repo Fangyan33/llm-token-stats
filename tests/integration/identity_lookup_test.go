@@ -167,10 +167,12 @@ func TestSummarySQLWithSyntheticMappings(t *testing.T) {
 		e.RequestModel, e.ResponseModel = events.Ptr(mode), events.Ptr(mode)
 		if mode == "unknown_service" {
 			e.ServiceID, e.ProviderID, e.MappingVersion = nil, nil, nil
+			e.ServiceName, e.ProviderName = nil, nil
 			e.MappingStatus = "lookup_not_implemented"
 		}
 		if mode == "unknown_customer" {
 			e.CustomerID, e.ApiKeyID, e.CustomerMappingVersion = nil, nil, nil
+			e.CustomerName = nil
 			e.CustomerMappingStatus = "lookup_not_implemented"
 			e.IdentityStatus = "invalid"
 			e.UsageEligible = false

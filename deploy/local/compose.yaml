@@ -29,6 +29,9 @@ services:
   observer:
     image: alpine:latest
     command: [/app/observer, --config, /config/observer.json]
+    environment:
+      METERING_SERVICE_LOOKUP_TOKEN: '${METERING_SERVICE_LOOKUP_TOKEN:-}'
+      METERING_CUSTOMER_LOOKUP_TOKEN: '${METERING_CUSTOMER_LOOKUP_TOKEN:-}'
     volumes: ['../../dist:/app:ro', './observer.json:/config/observer.json:ro']
     ports: ['0.0.0.0:19090:9090', '0.0.0.0:19091:9091', '0.0.0.0:19093:9093']
   consumer:

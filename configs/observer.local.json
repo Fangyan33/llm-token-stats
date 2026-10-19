@@ -23,12 +23,20 @@
       "model-service-a"
     ],
     "cluster_name": "local-cluster",
-    "deployment_environment": "development",
+    "deployment_environment": "dev",
     "service_lookup": {
-      "uri": ""
+      "uri": "",
+      "credential_env": "METERING_SERVICE_LOOKUP_TOKEN",
+      "ca_file": "",
+      "max_requests_per_second": 1000
     },
     "customer_lookup": {
-      "uri": ""
-    }
+      "uri": "",
+      "credential_env": "METERING_CUSTOMER_LOOKUP_TOKEN",
+      "ca_file": "",
+      "max_requests_per_second": 1000
+    },
+    "lookup_timeout_ms": 200,
+    "lookup_max_concurrency": 64
   }
 }

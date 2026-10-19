@@ -149,7 +149,7 @@ def configurations(args):
     kafka = {'bootstrap_servers': [f'kafka.{ns}.svc.cluster.local:9092'], 'topic': args.topic}
     observer = json.loads((ROOT / 'configs/observer.production.example.json').read_text())
     observer['kafka'] = kafka
-    observer['observer'].update(cluster_name=args.cluster_name, deployment_environment='development')
+    observer['observer'].update(cluster_name=args.cluster_name, deployment_environment='dev')
     consumer = json.loads((ROOT / 'configs/consumer.production.example.json').read_text())
     consumer['kafka'] = copy.deepcopy(kafka)
     consumer['consumer']['group_id'] = args.group
@@ -168,6 +168,8 @@ def configurations(args):
     resources.append(resource('Secret', 'metering-consumer-credentials', ns, type='Opaque',
                               data={key: base64.b64encode(value.encode()).decode()
                                     for key, value in credentials.items()}))
+    # Empty until real HTTP/HTTPS endpoints are configured; never package a lookup token.
+    resources.append(resource('Secret', 'metering-observer-lookups', ns, type='Opaque', data={}))
     sql = {name: render_sql((ROOT / 'migrations/doris/metering' / name).read_text(), args.database)
            for name in MIGRATIONS}
     resources.append(resource('ConfigMap', 'metering-doris-migrations', ns, data=sql))
@@ -231,6 +233,7 @@ def applications(args, images):
                      'volumeMounts': [{'name': 'config', 'mountPath': '/config', 'readOnly': True}]}
         if name == 'observer':
             container['env'] = [{'name': 'POD_UID', 'valueFrom': {'fieldRef': {'fieldPath': 'metadata.uid'}}}]
+            container['envFrom'] = [{'secretRef': {'name': 'metering-observer-lookups', 'optional': True}}]
         else:
             container['envFrom'] = [{'secretRef': {'name': 'metering-consumer-credentials'}}]
         template = pod_spec([container], volumes=[{'name': 'config', 'configMap': {'name': app}}])

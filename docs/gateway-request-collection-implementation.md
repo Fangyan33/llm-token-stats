@@ -6,7 +6,7 @@
 
 设计闭环交付物、协议业务校验、请求改写衔接、Consumer 恢复屏障与 G0–G5 上线证据见[闭环与验收清单](gateway-collection-design-closure.md)。正式契约文件为实施依据，本文片段由离线脚本检查一致性。
 
-当前已删除 application_id。Wasm 只从 Authorization: Bearer 提取临时 api_key，并发送入口 authority；Observer 使用配置的 cluster_name/deployment_environment，分别通过服务和客户查询接口取得归属。两个接口目前只有未实现占位，合法输入产生 lookup_not_implemented，service_id/provider_id/api_key_id/customer_id 及映射版本为 null，identity_status=invalid、usage_eligible=false，原始 usage 保留。URI 可留空，填写也不会发起 HTTP；不访问 PG、不读身份元数据补值，密钥不进入事件、数据库或日志。 真实 HTTP 适配为后续工作。
+当前已删除 application_id。Wasm 只从 Authorization: Bearer 提取临时 api_key，并发送入口 authority；Observer 使用配置的 cluster_name/deployment_environment，分别通过服务和客户查询接口取得归属。两个归属接口支持配置 HTTP/HTTPS POST JSON 调用及 x-remote-data 认证；URI 为空时使用未实现占位。Observer 固定 prd/stg/dev 环境，在有界异步任务中取得 ID 和名称快照；service_name、provider_name、customer_name 经 Kafka 写入 Doris 独立列及 event_json。占位或失败侧的 ID、名称和版本为 null，不回源补写历史；原始 usage 保留，业务 token 不进入事件、数据库或日志。
 
 ## 1. 范围与技术决策
 
@@ -510,14 +510,14 @@ sequenceDiagram
   "route_name": "llm-chat",
   "request_host": "model.example.invalid",
   "cluster_name": "fixture-cluster",
-  "deployment_environment": "test",
+  "deployment_environment": "stg",
   "service_id": "model-service-a",
   "provider_id": "provider-a",
-  "mapping_version": "48a5034f65608f6895d3e529dafbb6f3c152e2058951074d7ce7ccaeaa6bc7da",
+  "mapping_version": "e475bfa24c9f16841c8cb11f66586faf008e144eddc1fa7ff3595bae6999905b",
   "mapping_status": "mapped",
   "api_key_id": "key-42",
   "customer_id": "customer-7",
-  "customer_mapping_version": "7cca1d652cd89a6f3257c9bfb4c9e8bf4d044af5513e0fa7ad7be5dd7cc861e1",
+  "customer_mapping_version": "1713a45606930ab59d794cd8ddd92eff6ce2df588201f4df1ec8bf5354748081",
   "customer_mapping_status": "mapped",
   "identity_status": "known",
   "request_started_at_ms": 1789862400000,
@@ -563,7 +563,10 @@ sequenceDiagram
   },
   "raw_usage_json": "{\"prompt_tokens\":1000,\"completion_tokens\":500,\"total_tokens\":1500,\"prompt_tokens_details\":{\"cached_tokens\":200,\"cache_write_tokens\":300},\"completion_tokens_details\":{\"reasoning_tokens\":100}}",
   "raw_usage_truncated": false,
-  "anomaly_codes": []
+  "anomaly_codes": [],
+  "service_name": "模型服务 A",
+  "provider_name": "供应商 A",
+  "customer_name": "客户 A"
 }
 ```
 

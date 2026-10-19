@@ -231,3 +231,54 @@ Kubernetes 运行 ID：`cb5990b85930`。镜像由当前工作区构建，tag 按
 | 清理 | 本次 metering_comments_verify_* 临时验证库已删除；开发数据及已有历史验证库保留 |
 
 注释覆盖与元数据/数据摘要记录在 `.tmp/doris-comments-verification/`。本次未改变采集事件、消费提交屏障、字段类型、唯一键、分区或视图查询口径；未重新执行完整 Kubernetes 部署或生产 G0–G5，本次实际数据库验证使用既有本地 Doris 4.1.3。
+
+## 2026-10-19：HTTPS 归属查询、环境枚举与名称快照
+
+本次实现 [归属接口计划](host-service-provider-implementation.md) 的 HTTP 与名称增量。配置非空 HTTPS URI 后，以 `x-remote-data` 独立凭据调用两个 POST JSON 接口；空 URI 保持 `lookup_not_implemented`。环境统一为 `prd/stg/dev`，不增加旧枚举别名。三个名称为 UTF-8、最多 512 字节，与 ID 一同冻结为请求快照；失败侧显式为 null。
+
+### 实现与故障边界
+
+- 两类解析并行共享截止时间，默认 200 ms；默认最多同时处理 64 个请求，不排队。每个接口默认独立限速 1000 次/秒，响应头和正文各限 8192 字节。禁用环境代理、重定向和自动重试，使用验证证书的 HTTPS；凭据只通过环境变量/Secret 注入。
+- Start 和 End 进度 ACK 不等待外部查询。End 先确认接收，归属冻结并输出事件后再发送 CloseStream ACK，避免网关提前取消查询。测试覆盖慢查询时 ACK 仍及时、并发满载立即降级、客户查询成功不被服务查询超时清除，以及 token 释放。
+- `service_name`、`provider_name`、`customer_name` 同时进入 Kafka 事件、Doris 独立列和 `event_json`。名称改变影响 `payload_hash`，不改变稳定 `identity_hash` 或两类映射版本；跨事件名称不一致通过独立名称元组比较被隔离。名称不加入日/月汇总分组。
+- 新库通过 001 等初始化定义取得名称列和视图；已有当前开发库由 008 添加缺失列并重建视图，再执行 007 更新注释。迁移可由 `scripts/doris_schema.py name-migration` 重现；本地脚本按实际缺失列执行，支持部分加列后重入，不删除或回填原始记录。
+
+### 验证结果
+
+| 验证 | 结果与边界 |
+| --- | --- |
+| `make test` | 71 项 Python 检查、契约/样例/摘要及 SQL/数据库字典检查、主模块和独立插件 Go 竞态测试通过 |
+| `make build wasm` | Observer、Consumer、fixture 构建及 Wasm ABI 检查通过；Wasm SHA-256 为 `c4b0ae3e6fd24f5db2a2b69771e6e5cbd2e095b573ab118347a50bc9d046f6bb` |
+| HTTP 适配测试 | 覆盖自签名证书拒绝、私有 CA 信任、认证请求头、原始 token 保真、404 错误体校验、401/403/5xx、429、歧义、畸形/超长/重复字段响应、超时、重定向禁止及本地限流不发送请求 |
+| `GOFLAGS='-count=1' make local-test` | 完整集成测试通过，356.729 秒；覆盖 JSON/SSE、未知用量、重放与冲突、位点屏障/恢复/重平衡、SQL 汇总、改写边界及 Wasm 下载故障恢复 |
+| 名称真实链路 | `TestHTTPNamesThroughKafkaToDoris` 使用合成 HTTPS 目录和真实 Observer gRPC → Kafka → 运行中 Consumer → Doris；逐字核对 Kafka 消息、独立列、event_json 及请求/用量视图中的中文名称；新请求保存新名称，旧请求仍返回旧名称 |
+| 名称冲突 | Doris 请求视图、Consumer 冲突标记和有效用量过滤均覆盖名称不一致；稳定身份相同也不能绕过名称快照一致性检查 |
+| 新库初始化 | 随机隔离库 `metering_names_init_f1087e22ce9f` 完整执行 001 → 002 → 004 → 005 → 006 → 007，名称列及全部依赖视图正常，检查后删除该测试库 |
+| 当前开发库 | `metering_development` 已更新；12 张表共 214 个字段、7 个视图共 318 个字段，名称列/投影合计 21 个；121 条旧事件的三个名称仍均为 NULL，未回填或重写旧 event_json。legacy metering 及既有历史 Kubernetes 库未做结构变更 |
+| `make k8s-test` | Kubernetes 1.22.17 / Istio 1.13.5 隔离验证通过，运行 ID `f2bafd6156ee`；JSON/SSE 用量 10/4，缺失用量保持 unknown/NULL，环境 stg；两个 Observer、独立 Consumer 及恢复场景通过，现有网关未修改 |
+| `make k8s-clean` | 删除本次 metering-wasm-verify 命名空间及专属 topic/group `llm-metering-k8s-f2bafd6156ee`，保留共享 Compose、数据卷和 Doris 验证记录 |
+| 文档与迁移 | 007/008 可由生成器重现，实际开发库元数据与数据库字典一致，`git diff --check` 通过 |
+
+Kubernetes 诊断保存在本地忽略目录 `.tmp/k8s-collection/kind-kind/metering-wasm-verify/f2bafd6156ee/`；结果为 passed。镜像 tag 为 `57094905bbc8`，Observer 镜像 ID 为 `sha256:bb1ded7da02b5d2af1710d69719cdef659f20cf0b15f8aa81326a95343715f38`，Consumer 为 `sha256:314ee7aea818588849500d22693aa4238d51cbeafb52ffe8f1c4d9c0ccc96d43`。
+
+本地正常配置的两个 URI 仍为空，保持未知归属；已知名称链路通过合成 HTTPS 目录验证。尚未提供真实第三方地址、凭据和生产配额；上述结果不代表真实目录数据、生产 TLS/权限/容量或完整 G0–G5 已验收。真实 Auth、usage-worker 和统计 HTTP API 仍不在本次交付范围。名称历史与 365 个 UTC 请求日期的明细共用保留期，日/月汇总不额外保存名称历史。
+
+## 2026-10-19：HTTP 兼容、运行镜像 CA 与取消收尾修复
+
+本次在既有实现上同时支持 HTTP 和 HTTPS。HTTP 不读取 ca_file；HTTPS 继续校验证书和主机名，并使用 Observer 运行镜像内的系统 CA bundle 及可选附加 CA。两种协议均保留 x-remote-data 认证、大小限制和独立限速，不使用环境代理、不跟随重定向、不自动重试或降级。
+
+已接纳查询从取得并发额度时开始使用独立共享截止时间，观察流取消或超时不重置该时间。协调器收集两侧独立结果，截止时保留已提交的成功侧，仅未返回侧为 lookup_timeout；迟到结果不改写冻结快照。底层任务退出后才释放并发额度，客户任务返回后清理其 token。退出路径只定稿一次；End ACK 失败或超时仍保留已校验的 End 和请求结束时间。
+
+| 验证 | 本次结果与边界 |
+| --- | --- |
+| `GOFLAGS=-count=1 make test` | 契约检查、71 项 Python 检查、主模块和独立插件 Go 竞态测试全部通过；HTTP/TLS 本地 socket 测试在获得权限后于沙箱外完成 |
+| 取消与资源回归 | bufconn 覆盖两种单侧成功、取消后双方成功、双方超时及观察截止早于查询截止；另验证已取消父上下文的 20 次竞争、迟到 resolver 不阻塞收尾、不提前释放额度、不改写快照，且 token 清理无竞态 |
+| ACK 回归 | End ACK 写入失败、取消和 ACK 超时均只定稿一次，保留有效 End 和相同名称快照；观察异常不会恢复为有效用量 |
+| HTTP/TLS 回归 | 两类 HTTP 查询及认证通过，HTTP 忽略不存在的 CA 文件；独立进程验证 ca_file 为空时的系统信任路径，并覆盖附加 CA、主机名不匹配、重定向禁止及响应正文超时分类 |
+| `make build wasm` | Observer、Consumer、fixture 构建及 Wasm ABI 检查通过 |
+| 实际运行镜像 | `metering-observer:lookup-fixes` 构建通过；以镜像默认非 root 用户、禁用网络运行 `TestSystemTrustHelper` 的 roots 模式，确认实际 CA bundle 可读且系统根证书池非空 |
+| `GOFLAGS=-count=1 make local-test` | 全量真实集成测试通过，392.385 秒；覆盖业务采集、消费恢复、冲突、位点屏障及 Wasm 下载故障恢复 |
+| 两种协议的名称链路 | `TestHTTPNamesThroughKafkaToDoris/http` 和 `/https` 均通过；分别验证 Observer gRPC → Kafka → 运行中 Consumer → Doris，核对事件、独立列、event_json 和视图中的名称，保持旧请求的历史名称 |
+| 数据库字典 | 刷新本地栈时保留数据卷，仅更新当前开发库注释和视图；只读核对 metering_development 元数据与生成的字典完全一致，结构仍为 12 表 / 214 列、7 视图 / 318 列 |
+
+上述查询收尾保证限于 Observer 正常运行期间。HTTP 的传输保护由部署链路提供；本次使用合成归属服务，未验收真实第三方、进程退出持久化或生产 G0–G5，不扩大 Kafka 投递和 Doris 可见性保证。

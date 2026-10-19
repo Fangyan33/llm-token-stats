@@ -2,7 +2,7 @@
 
 用例编号：**K8S-WASM-001**。固定环境为 **Kubernetes 1.22.17 + Istio 1.13.5**，通过真实控制面验证网关远程下载 Wasm、旁路采集和 Consumer 入库。脚本位于 [k8s_collection.py](../scripts/k8s_collection.py)，测试清单位于 [deploy/k8s-test](../deploy/k8s-test/fixtures.yaml)。这项本地合成测试不代表生产 G0–G5 验收。
 
-当前已删除 application_id。Wasm 只从 Authorization: Bearer 提取临时 api_key，并发送入口 authority；Observer 使用配置的 cluster_name/deployment_environment，分别通过服务和客户查询接口取得归属。两个接口目前只有未实现占位，合法输入产生 lookup_not_implemented，service_id/provider_id/api_key_id/customer_id 及映射版本为 null，identity_status=invalid、usage_eligible=false，原始 usage 保留。URI 可留空，填写也不会发起 HTTP；不访问 PG、不读身份元数据补值，密钥不进入事件、数据库或日志。 本页验收只覆盖占位链路；真实第三方对接尚未实施。
+当前已删除 application_id。Wasm 只从 Authorization: Bearer 提取临时 api_key，并发送入口 authority；Observer 使用配置的 cluster_name/deployment_environment，分别通过服务和客户查询接口取得归属。两个归属接口支持配置 HTTP/HTTPS POST JSON 调用及 x-remote-data 认证；URI 为空时使用未实现占位。Observer 固定 prd/stg/dev 环境，在有界异步任务中取得 ID 和名称快照；service_name、provider_name、customer_name 经 Kafka 写入 Doris 独立列及 event_json。占位或失败侧的 ID、名称和版本为 null，不回源补写历史；原始 usage 保留，业务 token 不进入事件、数据库或日志。 本页验收只覆盖占位链路；真实第三方对接尚未实施。
 
 ## 拓扑与前置条件
 

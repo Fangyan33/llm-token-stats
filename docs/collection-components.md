@@ -1,10 +1,10 @@
 # 网关采集组件运行说明
 
-更新日期：2026-10-15。[实现计划](spec/plan/gateway-collection-implementation.md)已落地到三个可构建组件。业务仍直接经过网关到模型服务；Wasm 旁路发送有界片段，Observer 解析后使用原生 Producer 写 Kafka，Consumer 确认 Doris 可见性后提交 offset。仅产生 `request_started`、`usage_observed`，未知值保留 null/unknown。
+更新日期：2026-10-19。[实现计划](spec/plan/gateway-collection-implementation.md)已落地到三个可构建组件。业务仍直接经过网关到模型服务；Wasm 旁路发送有界片段，Observer 解析后使用原生 Producer 写 Kafka，Consumer 确认 Doris 可见性后提交 offset。仅产生 `request_started`、`usage_observed`，未知值保留 null/unknown。
 
 本轮命令、故障处理及资源归零证据见[本地验证记录](spec/plan/gateway-collection-verification.md)，实际镜像 digest 见[镜像记录](../deploy/local/images.lock.json)。
 
-当前已删除 application_id。Wasm 只从 Authorization: Bearer 提取临时 api_key，并发送入口 authority；Observer 使用配置的 cluster_name/deployment_environment，分别通过服务和客户查询接口取得归属。两个接口目前只有未实现占位，合法输入产生 lookup_not_implemented，service_id/provider_id/api_key_id/customer_id 及映射版本为 null，identity_status=invalid、usage_eligible=false，原始 usage 保留。URI 可留空，填写也不会发起 HTTP；不访问 PG、不读身份元数据补值，密钥不进入事件、数据库或日志。 [归属接口实现计划](spec/plan/host-service-provider-implementation.md)定义后续真实 HTTP 对接边界。
+当前已删除 application_id。Wasm 只从 Authorization: Bearer 提取临时 api_key，并发送入口 authority；Observer 使用配置的 cluster_name/deployment_environment，分别通过服务和客户查询接口取得归属。两个归属接口支持配置 HTTP/HTTPS POST JSON 调用及 x-remote-data 认证；URI 为空时使用未实现占位。Observer 固定 prd/stg/dev 环境，在有界异步任务中取得 ID 和名称快照；service_name、provider_name、customer_name 经 Kafka 写入 Doris 独立列及 event_json。占位或失败侧的 ID、名称和版本为 null，不回源补写历史；原始 usage 保留，业务 token 不进入事件、数据库或日志。 [归属接口实现计划](spec/plan/host-service-provider-implementation.md)定义 HTTP 对接和名称保存边界。
 
 ## 构建与本地运行
 
@@ -61,6 +61,27 @@ curl http://127.0.0.1:19092/readyz
 
 fixture 只模拟 ext_authz 访问允许与模型 usage，不实现真实密钥鉴权或模型调用。集成测试写入合成事件及隔离的未知版本测试 topic/group；这些诊断事实保留在本地库，测试不会清理已有业务数据。all-in-one Doris 的 BE 注册地址是回环地址，因此本地 Consumer 直连 `doris:8040`；生产 FE→BE 重定向需登记全部实际 FE/BE 地址。
 
+## 归属 API 配置与名称查询
+
+Observer 环境仅接受 `prd`、`stg`、`dev`。分别设置 `observer.service_lookup.uri` 和 `observer.customer_lookup.uri` 为完整 HTTP/HTTPS 端点；每项通过 `credential_env` 指定提供 `x-remote-data` 值的环境变量，默认示例分别为 `METERING_SERVICE_LOOKUP_TOKEN`、`METERING_CUSTOMER_LOOKUP_TOKEN`。URI 为空时不要求凭据并继续占位；非空但凭据缺失时启动报固定配置错误。HTTPS 私有 CA 可通过各项 `ca_file` 指定挂载文件，证书验证始终启用。Kubernetes 模板可从可选 Secret `metering-observer-lookups` 注入同名环境变量，Compose 从启动环境传入，均不提交真实凭据。
+
+`lookup_timeout_ms` 默认 200 ms（最大 2000），两类查询并行共享截止时间，从取得并发额度时计时；`lookup_max_concurrency` 默认 64（最大 256），不排队；每项 `max_requests_per_second` 默认 1000，独立限速且不等待。响应正文和响应头各限 8192 字节，不跟随重定向、不使用环境代理、不自动重试、不缓存原始 token。进度 ACK 和正文处理不等待外部查询；两类事件在相同快照冻结后发送。
+
+HTTP 客户端总超时为 2 秒，拨号（含 DNS 解析）和 TLS 握手各有独立的 2 秒超时。查询截止后，尚在建立的连接仍受阶段超时约束，故障连接最终关闭并释放每主机连接额度；阶段超时归类为 `lookup_timeout`。
+
+HTTP 不读取 `ca_file`，传输保护由部署链路提供；HTTPS 使用镜像自带的系统根证书及可选附加 CA，持续校验证书和主机名，不自动降级为 HTTP。观察取消、超时或 ACK 失败时，已接纳查询继续到完成或原截止时间，保留成功侧的 ID 和名称，仅未返回侧标为 `lookup_timeout`。事件仅定稿一次，保留已校验的 End；迟到结果不改写快照。查询额度直到底层任务真正退出才释放，客户查询返回后清理 token。该行为不改变业务转发和 Kafka 投递边界，也不保证进程退出时查询完成。
+
+名称从接口返回值保存到 Kafka 必填键及 Doris `service_name`、`provider_name`、`customer_name` 可空列，单项非空 UTF-8、最多 512 字节。`requests`、`request_statistics`、`event_details` 和 `usage_effective` 可直接查询名称；同一请求名称不一致按冲突隔离。重命名保留历史快照，名称不参与稳定身份摘要或日/月汇总分组。明细保留期内可按请求 ID 查询：
+
+```sql
+SELECT logical_request_id, service_id, service_name,
+       provider_id, provider_name, customer_id, customer_name
+FROM metering_development.requests
+WHERE logical_request_id = '<logical_request_id>' AND has_conflict = 0;
+```
+
+新库初始化定义已包含名称；已有当前开发库先通过 `008_name_snapshots.sql` 添加缺失列并重建视图，再执行 `007_schema_comments.sql` 更新注释。本地脚本自动检查并补当前 `metering_development`，不修改 legacy `metering` 或历史 Kubernetes 库；旧行保持名称 NULL，不根据最新目录回填。不要把 CREATE TABLE IF NOT EXISTS 或仅更新 007 当作实体列已增加。
+
 ## 协议生成与版本
 
 Protobuf 工具：protoc 29.3、protoc-gen-go v1.36.5、protoc-gen-go-grpc v1.5.1。生成文件保存标准工具版本标记；运行时 protobuf v1.36.10、gRPC-Go v1.78.0、franz-go v1.18.1，最终版本以 go.mod/go.sum 为准。
@@ -80,7 +101,7 @@ make generate
 - 改写预算与观察预算独立；Observer 不可用仍可补充参数。超限、超时或 JSON 无效时恢复原文，响应正文一直 Continue。旧版真实慢上传 PoC 中，Root 异步 Resume 后尾片可能不再完整经过 Wasm 回调，因此超时恢复会在有界前缀后取消观察，结果保留 partial/unknown，不宣称完整用量。JSON 校验限制深度 64、元素 100000、单对象键 8192；超限取消解析/原文放行。这些额外保护可能使复杂合法 JSON 降级，不能宣称所有请求均能改写。
 - 当前 Wasm 配置资源整数还限制在有符号 32 位正值范围，防止 TinyGo wasm32 的长度转换溢出；给出的初值全部满足。预发布仍必须运行 Schema 与关系校验。
 - 当前默认规则为 `route_name: "*"`，忽略路由名，只采集 `POST /v1/chat/completions`；路由属性或 metadata 缺失也可命中。路径去掉查询串后精确匹配，其它方法、尾斜杠、子路径和不同路径均忽略。精确路由规则仍支持：先读取可信 `route_name`，缺失时读取 `route_metadata.filter_metadata.metering.route_name`，都不可读时该精确规则不命中。规则按配置顺序选择，不读取客户端提供的路由或身份头。
-服务及供应商由 Observer 的服务查询接口解析，客户/API Key ID 由客户接口解析，当前均为占位状态。route_name 仅诊断，不参与身份摘要；旧 accepted_routes、身份元数据配置及规则 service_id 已删除。同一事件不同内容仍冲突。
+服务及供应商由 Observer 的服务查询接口解析，客户/API Key ID 由客户接口解析；空 URI 为占位，启用 HTTP/HTTPS 适配后同时保存名称。route_name 仅诊断，不参与身份摘要；旧 accepted_routes、身份元数据配置及规则 service_id 已删除。同一事件不同内容仍冲突。
 - trailers 只产生零字节 EOS BodyChunk，不上传其内容。End 校验两个方向的片序、偏移、字节总数及 EOS；HTTP context 删除后只由 Root+token 处理迟到 ACK，不能延长业务生命周期。
 - 上游重复伪造的计量响应头先全部移除；Start ACK 已到才加入一个 Observer UUID。快响应允许头缺失；有头也不保证事件已入 Kafka/Doris。
 - 固定 franz-go 的 `RecordRetries(0)` 阻止首次发送，实际使用 1 表示仅一次尝试。发送超时/重试次数耗尽保守计为 uncertain，不补发。3 秒 watchdog 关闭超龄 Producer，额外 1 秒内不能释放则退出进程。

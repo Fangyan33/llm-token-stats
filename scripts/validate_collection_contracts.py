@@ -215,14 +215,14 @@ def validate_event(event, kafka_key=None, now_ms=None, input_size=None):
         except ValueError: pass
         else: raise ContractError('request_host_ip')
     service_mapped = event['mapping_status'] == 'mapped'
-    require(service_mapped == all(event[n] is not None for n in ('service_id','provider_id','mapping_version')), 'service_mapping')
+    require(service_mapped == all(event[n] is not None for n in ('service_id','provider_id','mapping_version','service_name','provider_name')), 'service_mapping')
     if not service_mapped:
-        require(all(event[n] is None for n in ('service_id','provider_id','mapping_version')), 'partial_service_mapping')
+        require(all(event[n] is None for n in ('service_id','provider_id','mapping_version','service_name','provider_name')), 'partial_service_mapping')
     require((event['mapping_status'] == 'invalid_host') == (host is None), 'host_mapping')
     customer_mapped = event['customer_mapping_status'] == 'mapped'
-    require(customer_mapped == all(event[n] is not None for n in ('api_key_id','customer_id','customer_mapping_version')), 'customer_mapping')
+    require(customer_mapped == all(event[n] is not None for n in ('api_key_id','customer_id','customer_mapping_version','customer_name')), 'customer_mapping')
     if not customer_mapped:
-        require(all(event[n] is None for n in ('api_key_id','customer_id','customer_mapping_version')), 'partial_customer_mapping')
+        require(all(event[n] is None for n in ('api_key_id','customer_id','customer_mapping_version','customer_name')), 'partial_customer_mapping')
     identity_known = all(event[n] is not None for n in ("api_key_id", "customer_id"))
     require((event["identity_status"] == "known") == identity_known, "identity_status_mismatch")
     if not identity_known:

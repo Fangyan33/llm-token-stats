@@ -8,9 +8,9 @@ import (
 )
 
 type Evidence struct {
-	Date, ID, Hash, Identity string
-	Started                  int64
-	EventID                  string
+	Date, ID, Hash, Identity, Names string
+	Started                         int64
+	EventID                         string
 }
 type Store interface {
 	Load(context.Context, string, string, []byte, []map[string]any) error
@@ -56,17 +56,19 @@ func (p *Processor) Process(ctx context.Context, b *Batch) error {
 	conflictDates := map[string][]string{}
 	for id, es := range groups {
 		starts, dates, identities := map[int64]bool{}, map[string]bool{}, map[string]bool{}
+		names := map[string]bool{}
 		variants := map[string]map[string]bool{}
 		for _, e := range es {
 			starts[e.Started] = true
 			dates[e.Date] = true
 			identities[e.Identity] = true
+			names[e.Names] = true
 			if variants[e.EventID] == nil {
 				variants[e.EventID] = map[string]bool{}
 			}
 			variants[e.EventID][e.Hash] = true
 		}
-		conflict := len(starts) > 1 || len(dates) > 1 || len(identities) > 1
+		conflict := len(starts) > 1 || len(dates) > 1 || len(identities) > 1 || len(names) > 1
 		for _, vs := range variants {
 			conflict = conflict || len(vs) > 1
 		}

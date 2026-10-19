@@ -118,7 +118,7 @@ class CollectionContractsTest(unittest.TestCase):
         with self.assertRaises(contracts.ContractError):
             contracts.validate_event(self.event, b"another-id")
         event = copy.deepcopy(self.event)
-        event.update(api_key_id=None, customer_id=None, customer_mapping_version=None, customer_mapping_status="lookup_not_implemented", identity_status="invalid", usage_eligible=False, anomaly_codes=["identity_invalid"])
+        event.update(api_key_id=None, customer_id=None, customer_name=None, customer_mapping_version=None, customer_mapping_status="lookup_not_implemented", identity_status="invalid", usage_eligible=False, anomaly_codes=["identity_invalid"])
         contracts.validate_event(event)
 
     def test_raw_usage_does_not_allow_body_or_strings(self):
@@ -228,9 +228,9 @@ class CollectionContractsTest(unittest.TestCase):
         self.assert_event_invalid(lambda e: e.update(request_host='UPPER.example.invalid'))
         self.assert_event_invalid(lambda e: e.update(request_host='127.0.0.1'))
         event=copy.deepcopy(self.event)
-        event.update(service_id=None,provider_id=None,mapping_version=None,mapping_status='lookup_not_implemented')
+        event.update(service_id=None,provider_id=None,service_name=None,provider_name=None,mapping_version=None,mapping_status='lookup_not_implemented')
         contracts.validate_event(event)
-        event.update(api_key_id=None,customer_id=None,customer_mapping_version=None,customer_mapping_status='lookup_not_implemented',identity_status='invalid',usage_eligible=False,anomaly_codes=['identity_invalid'])
+        event.update(api_key_id=None,customer_id=None,customer_name=None,customer_mapping_version=None,customer_mapping_status='lookup_not_implemented',identity_status='invalid',usage_eligible=False,anomaly_codes=['identity_invalid'])
         contracts.validate_event(event)
 
     def test_removed_gateway_identity_configuration_is_rejected(self):

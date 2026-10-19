@@ -1,8 +1,8 @@
 # 通过第三方 API 解析服务、供应商与客户归属的实现计划
 
-修订日期：2026-10-19。状态：2026-10-16 的 P0–P7 已实现并完成本地范围验收，真实第三方调用仍未实现。功能尚未上线，直接调整唯一有效的协议、代码及开发建表定义，不设计双版本或历史数据兼容。P0–P7 已交付内部查询接口、明确返回“未实现”的占位实现及相关代码、Schema、配置和 DDL；验证结果见本地验证记录。
+修订日期：2026-10-19。状态：P0–P7 的占位链路及本次 HTTP 查询、请求头认证、prd/stg/dev 环境枚举、名称快照持久化增量均已实现；本地验证结果见第 8 节和验证记录。功能尚未上线，生产第三方地址、凭据及完整 G0–G5 尚待真实环境验收。
 
-2026-10-19 增量定义第 4 节的两个 POST JSON 查询契约、`x-remote-data` 请求头认证、`prd/stg/dev` 目标环境枚举，以及 service_name、provider_name、customer_name 随 Kafka 事件写入 Doris 的后续实施要求。本次仅更新本文，不实现 HTTP 调用或名称持久化。当前代码、事件 Schema 和配置仍使用 `production/test/development`；新枚举须在后续实施中统一切换，本次文档定义不代表运行行为已改变。业务 api_key 仍固定来自 Authorization: Bearer。
+Observer 在配置非空 HTTP/HTTPS URI 后启用真实 POST JSON 查询，使用独立的 x-remote-data 凭据；空 URI 继续返回 lookup_not_implemented。service_name、provider_name、customer_name 与 ID 一起冻结，经 Kafka、Consumer 写入 Doris 独立列及 event_json。环境仅接受 prd/stg/dev，不接受旧值或别名；不回填既有事件。业务 api_key 仍固定来自 Authorization: Bearer。
 
 依据：[采集组件实现计划](gateway-collection-implementation.md)、[采集开发方案](../../gateway-request-collection-implementation.md)、[Kafka 事件接入说明](../../kafka-event-integration-guide.md)、[日/月汇总设计](../../daily-monthly-summary-design.md)。
 
@@ -13,9 +13,9 @@
 - 服务归属：`request_host + cluster_name + deployment_environment → service_id、service_name、provider_id、provider_name`。
 - 客户归属：`api_key → api_key_id、customer_id、customer_name`。api_key 固定取自 Authorization: Bearer 中的 token，api_key_id 是接口将来返回的稳定标识，两者不能混用。
 
-三个名称须保存为请求发生时的归属快照，经 Observer → Kafka → Consumer 写入 Doris 明细，供后续查询使用。当前尚未实现，检查结论和落库要求见第 6.4 节。
+三个名称须保存为请求发生时的归属快照，经 Observer → Kafka → Consumer 写入 Doris 明细，供后续查询使用。保存与查询规则见第 6.4 节。
 
-集群名称和部署环境由 Observer 配置固定，不能从业务请求或 Wasm 覆盖；两个 API 的 URI 配置项分别保留在 Observer 中，目前允许留空，填写 URI 也不会启用未实现的 HTTP 调用。目标部署环境仅接受 `prd`、`stg`、`dev`，分别对应生产、预发布、开发，不接受旧值或别名；当前实现与目标的切换边界见第 4.4 节。移除先前计划中的 PostgreSQL 查询、连接池、SQL/视图适配、完整目录刷新、PG Secret 和 PG fixture，不实现数据库回退路径。
+集群名称和部署环境由 Observer 配置固定，不能从业务请求或 Wasm 覆盖；两个 API 的 URI 配置项分别保留在 Observer 中，允许留空；非空时按第 4 节启用 HTTP 查询。部署环境仅接受 `prd`、`stg`、`dev`，分别对应生产、预发布、开发，不接受旧值或别名；当前实现与目标的切换边界见第 4.4 节。移除先前计划中的 PostgreSQL 查询、连接池、SQL/视图适配、完整目录刷新、PG Secret 和 PG fixture，不实现数据库回退路径。
 
 彻底删除客户下属应用维度 application_id，包括协议字段、代码类型、身份校验、配置、数据库列、汇总分组和 Auth 应用层级。Wasm 不再上报 api_key_id、customer_id 或完整身份状态；Observer 以客户 API 返回的两项 ID 为准，不使用客户端自报 ID 或残留鉴权元数据补值。
 
@@ -29,7 +29,7 @@
 - 只维护一套事件及配置契约，直接更新当前 schema、样例和摘要；开发验证使用新契约合成数据，不接入旧格式开发消息。
 - 同一契约下的事件重放去重、内容冲突检查和 Consumer 位点屏障继续有效。
 
-P0–P7 覆盖协议、采集组件、查询接口及占位实现、建表及汇总定义、部署与验证。本次文档增量补齐对外查询契约；真实 HTTP 适配、请求头认证接入、环境枚举切换、网络缓存及外部联调作为后续工作。真实 Auth 服务、汇总 Worker、统计查询 API、扣款和账单按各自工作包交付。
+P0–P7 覆盖采集组件和占位链路；本次增量实现 HTTP 适配、请求头认证、环境枚举切换及名称存储。当前不实现缓存或自动重试，真实第三方业务联调由实际部署环境完成。真实 Auth 服务、汇总 Worker、统计查询 API、扣款和账单按各自工作包交付。
 
 ## 2. 调整前后对照
 
@@ -51,17 +51,17 @@ flowchart LR
     C[调用方] --> G[Istio 网关] --> S[模型服务]
     G -. Wasm 有界旁路：authority、临时 api_key、观察帧 .-> O[Observer]
     F[Observer 固定配置：集群、环境、预留 API URI] --> O
-    O -. Host、集群、环境 .-> A[ServiceResolver 占位实现]
-    A -. lookup_not_implemented .-> O
-    O -. 临时 Bearer token .-> B[CustomerResolver 占位实现]
-    B -. lookup_not_implemented .-> O
-    O --> K[Kafka：仅稳定 ID 与解析结果] --> Q[Consumer] --> D[(Doris)]
+    O -. Host、集群、环境 .-> A[ServiceResolver：HTTP/HTTPS / 空 URI 占位]
+    A -. 服务 / 供应商 ID、名称、状态 .-> O
+    O -. 临时 Bearer token .-> B[CustomerResolver：HTTP/HTTPS / 空 URI 占位]
+    B -. API Key / 客户 ID、名称、状态 .-> O
+    O --> K[Kafka：稳定 ID、名称快照与解析状态] --> Q[Consumer] --> D[(Doris)]
 ```
 
 1. Wasm 仅在命中 method/path 后读取入口 authority，以及单个 Authorization: Bearer 的 token，通过受保护的 Observe 链路发送 Start；不调用第三方 API，不等待归属结果，不上报归属 ID。
-2. Observer 为有效 Start 生成一次逻辑请求 ID，将规范 Host 和固定集群/环境传给 ServiceResolver，将临时 api_key 传给 CustomerResolver。本次提供的两个占位实现立即返回 ErrLookupNotImplemented，不创建 HTTP 客户端、缓存刷新任务或等待队列。
+2. Observer 为有效 Start 生成一次逻辑请求 ID，将规范 Host 和固定集群/环境传给 ServiceResolver，将临时 api_key 传给 CustomerResolver。两个查询在有界异步任务中并行执行，使用共享截止时间；空 URI 对应的占位立即返回 ErrLookupNotImplemented，无缓存、重试或等待队列。
 3. 输入缺失/非法先固定为对应 invalid 状态；合法输入的占位查询结果为 lookup_not_implemented。Observer 固定小型服务/客户快照，释放临时密钥引用，再发送 request_started。不得将空返回值当成功，也不得制造默认归属。
-4. ACK、正文处理、超时和资源预算保持现有边界，占位查询不延迟业务或额外保留正文。未来真实网络调用必须在有界异步执行器中完成，不能把阻塞 HTTP 塞入 gRPC 接收/ACK 路径。
+4. ACK、正文处理、超时和资源预算保持现有边界，占位查询不延迟业务或额外保留正文。真实网络调用在有界异步执行器中完成；Start 和 End 的 accepted 进度 ACK 不等待查询，正文继续按既有预算解析。名称和归属定稿前暂缓事件发送，最多等待共享查询截止时间，不额外缓存完整正文。End 先回 accepted 进度 ACK，定稿后再回 CloseStream ACK，避免 Wasm 提前取消尚未完成的归属查询。
 5. request_started 与 usage_observed 共用冻结快照；占位部署后均为未知归属及 identity_status=invalid，保留原始观察用量，usage_eligible=false。成功路径只在测试中注入合成 resolver 验证，不能在正常配置下启用假数据。
 6. Consumer 只校验和持久化事件，不调用第三方 API，不用最新归属重写历史事件。
 
@@ -71,7 +71,7 @@ provider_id 表达 API 根据入口服务返回的归属，不能证明服务内
 
 ### 4.1 内部查询接口与占位实现
 
-当前已实现以下类型明确的内部业务接口及占位实现，不使用无类型的 Go interface{}。第 4.5–4.8 节定义未来 HTTP 适配器遵循的请求、响应和认证契约，不改变当前占位运行行为：
+当前已实现以下类型明确的内部业务接口、HTTP/HTTPS 适配器及空 URI 占位实现。第 4.5–4.8 节为适配器实际遵循的请求、响应和认证契约：
 
 ```go
 type ServiceLookupRequest struct {
@@ -81,13 +81,16 @@ type ServiceLookupRequest struct {
 }
 
 type ServiceIdentity struct {
-    ServiceID  string
-    ProviderID string
+    ServiceID    string
+    ServiceName  string
+    ProviderID   string
+    ProviderName string
 }
 
 type CustomerIdentity struct {
-    APIKeyID   string
-    CustomerID string
+    APIKeyID     string
+    CustomerID   string
+    CustomerName string
 }
 
 type ServiceResolver interface {
@@ -103,12 +106,12 @@ var ErrLookupNotImplemented = errors.New("lookup_not_implemented")
 
 接口位于 internal/identitylookup/。ServiceIdentity 不能缺少任一 ID，CustomerIdentity 也必须成对成功；ID 均要求非空、合法 UTF-8、最多 128 字节。对于同一部署上下文，一个 Host 对应一个服务，一个服务归属一个供应商；允许一个服务多个域名、多个密钥归属同一客户。
 
-上面的 Go 类型表示当前实现。后续名称持久化须为 ServiceIdentity 增加 ServiceName、ProviderName，为 CustomerIdentity 增加 CustomerName（均为 string），将 API 返回的名称连同 ID 交给 Observer 冻结；不能在 HTTP 适配器中丢弃名称。Wasm 和 Start 无需增加名称字段，名称来源仅为归属接口。
+ServiceIdentity 和 CustomerIdentity 保留接口返回的名称，Observer 校验后连同 ID 冻结。Wasm 和 Start 无需增加名称字段，名称来源仅为归属接口。
 
 - UnimplementedServiceResolver 和 UnimplementedCustomerResolver 始终返回空结果及 ErrLookupNotImplemented，不发网络请求、不猜测归属、不返回空值加 nil error。错误文本固定，不包含输入。
-- Observer 默认注入这两个占位实现；不要求提供真实 URI 或第三方凭据，不因接口未实现而启动失败，也不影响 Wasm 下载和采集健康检查。
+- 每个 URI 独立选择适配器：空 URI 注入占位，不要求凭据；非空 URI 必须为 HTTP 或 HTTPS，credential_env 必须指向非空且适合 HTTP 请求头的凭据，错误配置按固定原因拒绝启动。不探测第三方可用性，运行时查询故障不使业务请求依赖第三方。
 - 单元测试可注入纯内存 fake resolver，验证成功、失败和快照冻结；fake 只在测试中存在，不增加正常配置可启用的假服务/假客户模式。
-- 两个接口保留 context.Context，方便未来增加取消/超时；占位实现不创建异步任务、HTTP 连接、缓存或重试。接口不接收/保存整个 Start 或请求头集合。
+- 两个接口使用 context.Context 执行查询取消和超时；占位实现不创建异步任务、HTTP 连接、缓存或重试。接口不接收/保存整个 Start 或请求头集合。
 - 客户输入必须是 Bearer token 原文，不能以 api_key_id、普通哈希或残留元数据替代。占位方法不得保留传入的字节切片或将其格式化到错误中。
 
 ### 4.2 入口 Host 处理
@@ -131,9 +134,9 @@ api_key 来源已确认，固定为 `Authorization: Bearer <token>` 的 token；
 
 ### 4.4 Observer 配置与以后接入的边界
 
-固定配置位置为 observer.cluster_name、observer.deployment_environment、observer.service_lookup.uri 和 observer.customer_lookup.uri。集群名称非空、合法 UTF-8、最多 128 字节；目标环境枚举仅为 `prd`、`stg`、`dev`。集群/环境缺失或非法仍按固定错误拒绝启动，接口未实现不属于配置错误。
+固定配置位置为 observer.cluster_name、observer.deployment_environment、observer.service_lookup.uri 和 observer.customer_lookup.uri。集群名称非空、合法 UTF-8、最多 128 字节；环境枚举仅为 `prd`、`stg`、`dev`。集群/环境缺失或非法仍按固定错误拒绝启动，接口未实现不属于配置错误。
 
-目标配置片段（环境枚举切换后使用，不能直接用于当前二进制）：
+配置片段（空 URI 保持占位；启用时填写完整 HTTP/HTTPS URI 并通过环境变量提供凭据）：
 
 ```json
 {
@@ -146,22 +149,30 @@ api_key 来源已确认，固定为 `Authorization: Bearer <token>` 的 token；
 }
 ```
 
-当前代码、事件 Schema 和配置仍使用 `production/test/development`，本次仅修改本文。后续须统一调整配置与事件校验、相关 Schema、样例和摘要、测试、部署配置及相关文档，贯通 Observer → Kafka → Consumer → Doris 的同一环境值；不能仅在出站 HTTP 请求时转换，也不增加旧值兼容别名。历史验收记录仍代表当时的实现，不证明新枚举已可运行。
+配置、事件 Schema、样例及部署上下文现已统一使用 `prd/stg/dev`。旧值没有兼容别名；历史记录不重写，旧格式开发消息不接入新契约。
 
-两个 URI 允许为空；非空时当前仅验证配置地址的合法性，不发探测请求、不启用真实查询。未来适配器将 URI 作为完整 HTTPS 端点地址直接使用，不自动拼接路径，例如 `https://identity.example.com/v1/lookup/service` 和 `https://identity.example.com/v1/lookup/customer`。URI 不能包含密钥、用户密码或其他凭据，不进入 Kafka 事件。删除先前的 observer.postgresql、observer.service_catalog、observer.customer_catalog、METERING_PG_DSN 及拟议 credential_source，不接纳为兼容别名。业务 Bearer 来源固定；第三方调用认证采用第 4.5 节的独立请求头。
+每个 service_lookup/customer_lookup 支持 uri、credential_env、ca_file、max_requests_per_second。uri 为空时不调用第三方；非空时将完整 HTTP/HTTPS 端点直接使用，不拼接路径。URI 禁止 userinfo、query 和 fragment；地址、认证凭据不进入 Kafka 事件。credential_env 为环境变量名，ca_file 仅在 HTTPS 下用于补充私有 CA，HTTP 不读取该文件；HTTPS 不关闭证书或主机名校验。凭据轮换后重启 Observer 读取新值。
 
-以下属于后续接入工作，不在本次创建运行配置或默认凭据：
+执行与资源配置：
 
-- 按第 4.5–4.8 节实现专用 HTTP 适配器及错误映射，接入 `x-remote-data` 认证；实际 URI、凭据注入与轮换、调用配额及资源预算在真实接入时落实。第三方 API 访问凭据与业务 token 分开管理。
-- 实现经验证的 HTTPS、禁止密钥进入 URL/query、禁止跟随重定向泄漏凭据，并检查 HTTP/代理日志与追踪。本次验收只覆盖 Wasm → Observer 的 TLS，不宣称第三方 TLS 已验收。
-- 外部查询使用有界异步执行、共享解析截止时间、速率/并发/响应体限制及有限待定稿预算，保持 ACK 和正文接收不等待外部请求，不引入无界队列或整段正文缓存。
-- 有需要时实现按键缓存：服务键为 `[cluster_name, deployment_environment, request_host]`；客户键使用进程随机密钥的 HMAC-SHA-256(api_key)，不保留或输出原始密钥。TTL、负缓存及内存预算待调用配额和规模确认后确定，本次不实现缓存。
+| 字段 | 默认值 | 约束与行为 |
+| --- | --- | --- |
+| observer.lookup_timeout_ms | 200 | 1–2000 ms；两个查询并行使用同一请求级截止时间 |
+| observer.lookup_max_concurrency | 64 | 1–256；最多同时保留这些请求的临时 token，每请求最多两个 HTTP 调用；不排队，超出立即 lookup_overloaded |
+| observer.service_lookup.max_requests_per_second / customer_lookup.max_requests_per_second | 1000 | 每接口独立令牌桶，容量与每秒速率相同；0 表示使用默认值，上限 100000；不足时 lookup_overloaded，不等待 |
+| HTTP 响应正文 / 响应头上限 | 各 8192 字节 | 正文超限为 lookup_invalid_response；HTTP 连接、TLS、鉴权和服务错误按第 4.8 节分类 |
+
+HTTP 客户端总超时为 2 秒；拨号（含 DNS 解析）和 TLS 握手另各设独立的 2 秒超时。请求仍按查询截止时间返回；Transport 在请求结束后继续执行的连接建立流程受上述阶段超时约束，失败连接关闭后释放每主机连接额度。阶段超时归类为 lookup_timeout。
+
+查询取得并发额度时开始计时，查询上下文独立于观察流取消及观察截止时间。观察取消或超时后停止处理观察数据，已接纳查询继续到两侧完成或原查询截止时间；截止时先收取已提交结果，仅未返回侧为 lookup_timeout。成功侧的 ID、名称和版本保留，两事件共用冻结快照，迟到结果不回写。底层任务真正退出后才释放查询额度，客户任务返回后清理其借用的 token；收尾不无限等待不响应取消的 resolver。所有退出路径仅定稿一次，ACK 失败不丢弃已校验的 End。查询成功不恢复观察完整性或有效统计资格。
+
+HTTP 不读取 ca_file；其 x-remote-data 和业务 api_key 的传输保护由部署链路提供。HTTPS 使用至少 TLS 1.2、系统 CA 及可选附加 CA，Observer 运行镜像包含系统 CA bundle，证书和主机名验证始终启用。两种协议均不使用环境代理、不跟随重定向、不自动重试；HTTPS 失败不自动降级到 HTTP。不采集正文日志/追踪，不保存 token 用于刷新，当前不实现正负缓存。第三方实际调用配额需在部署时据实调整，采集失败继续 fail-open；本地合成服务验证不等于真实第三方或生产 TLS 已验收。上述收尾保证限于 Observer 正常运行期间，不扩大进程退出、Kafka 投递或 Doris 可见性保证。
 
 成功解析结果的版本摘要已加入唯一事件模型：mapping_version 为 `[规则版本, cluster_name, deployment_environment, request_host, service_id, provider_id]` 的规范 JSON SHA-256，customer_mapping_version 为 `[规则版本, cluster_name, deployment_environment, api_key_id, customer_id]` 的同类摘要。二者均为 64 字符小写十六进制，排除密钥原文及进程随机值；占位结果版本均为 null。测试成功结果可生成摘要，不能将其称为第三方目录发布版本。
 
 ### 4.5 HTTP 公共协议与请求头认证
 
-两个接口统一使用 HTTPS、POST 和 UTF-8 JSON，字段命名为 snake_case。每次查询返回唯一归属，不提供批量或分页。请求与响应的 JSON 根节点为对象；成功响应直接包含归属 ID 及对应名称，不增加 code、message、data 包装。请求头示例：
+两个接口统一使用 HTTP/HTTPS、POST 和 UTF-8 JSON，字段命名为 snake_case。每次查询返回唯一归属，不提供批量或分页。请求与响应的 JSON 根节点为对象；成功响应直接包含归属 ID 及对应名称，不增加 code、message、data 包装。请求头示例：
 
 ```http
 Content-Type: application/json
@@ -172,7 +183,7 @@ x-remote-data: <接口访问凭据>
 - `x-remote-data` 是两个接口均必填的单值请求头，直接传入凭据，不加 `Bearer` 前缀。请求头名称按 HTTP 规则大小写不敏感；凭据值不做大小写转换。
 - 该凭据认证 Observer 的接口调用身份，与客户查询正文中的业务 `api_key` 分开管理；不得使用业务 token 作为该请求头的值，也不得从业务请求透传同名头。
 - 缺少、为空、重复或无效的认证凭据返回 `401 + unauthenticated`；认证成功但无接口调用权限返回 `403 + forbidden`。这两个状态不表示待查询业务 api_key 无效或不存在。
-- 实际访问凭据通过环境变量或 Secret 提供，本文只使用占位值；具体注入配置在后续接入时实现，不把凭据硬编码到普通配置、文档或源码。
+- 实际访问凭据通过环境变量或 Secret 提供，本文只使用占位值；通过每个 lookup 的 credential_env 指定环境变量名，不把凭据硬编码到普通配置、文档或源码。
 - 请求头凭据和业务 api_key 均不得进入 URL/query、响应、日志、指标、追踪、异常文本、Kafka 或 Doris。请求体和认证头不得被 HTTP/代理日志及追踪完整采集；业务 api_key 仅临时进入客户查询 JSON 正文，不进入服务查询。
 - 响应使用 `Content-Type: application/json`；失败采用第 4.8 节的 HTTP 状态和固定错误体，不以 HTTP 200 包装业务失败，不跟随重定向传递凭据。
 
@@ -252,7 +263,7 @@ HTTP 200 响应：
 
 已停用、过期或吊销的密钥，只要仍能确定归属，就返回上述 HTTP 200 结果；该结果不表示允许业务访问，业务权限由独立鉴权决定。未登记的 token 返回 `404 + not_found`；存在多项冲突归属返回 `409 + ambiguous_mapping`；已登记但目录内部缺少必要关联或客户名称返回 `500 + internal_error`。查询不返回密钥状态、业务授权或部分归属，不承诺目录已删除记录的历史恢复能力。
 
-service_name、provider_name、customer_name 均为查询时的展示名称，可以随重命名变化；归属唯一性仍以稳定 ID 为准，名称不参与 mapping_version、customer_mapping_version 或事件身份摘要。后续必须扩展内部 Go 类型、Kafka 事件及 Doris 字段，将名称连同 ID 保存为请求快照，具体要求见第 5.2、5.3 和 6.4 节。名称按解码后的 UTF-8 字节数限制为 512 字节，以保持事件和冻结快照有界；超长不能截断后当成功。本次仅定义这些要求，代码后续实施。
+service_name、provider_name、customer_name 均为查询时的展示名称，可以随重命名变化；归属唯一性仍以稳定 ID 为准，名称不参与 mapping_version、customer_mapping_version 或事件身份摘要。内部 Go 类型、Kafka 事件及 Doris 字段已扩展，名称连同 ID 保存为请求快照，具体要求见第 5.2、5.3 和 6.4 节。名称按解码后的 UTF-8 字节数限制为 512 字节，以保持事件和冻结快照有界；超长不能截断后当成功。当前代码已实现上述校验和保存。
 
 ### 4.8 错误契约与 Observer 映射
 
@@ -266,7 +277,7 @@ service_name、provider_name、customer_name 均为查询时的展示名称，�
 }
 ```
 
-| HTTP 状态 | error.code | 语义 | 未来 Observer 状态 |
+| HTTP 状态 | error.code | 语义 | Observer 状态 |
 | --- | --- | --- | --- |
 | 400 | invalid_request | 必填字段缺失、空值、类型或格式不符合契约，包括非法环境值 | lookup_unavailable |
 | 401 | unauthenticated | x-remote-data 缺失、为空、重复或凭据无效 | lookup_unavailable |
@@ -277,14 +288,14 @@ service_name、provider_name、customer_name 均为查询时的展示名称，�
 | 500 | internal_error | 第三方内部错误或必要关联、名称缺失 | lookup_unavailable |
 | 503 | unavailable | 第三方暂不可用 | lookup_unavailable |
 
-未来适配器按以下规则分类；这些 HTTP 错误映射尚未在当前占位代码中实现：
+HTTP 适配器按以下规则分类；空 URI 占位仍直接返回 lookup_not_implemented：
 
 - 仅 HTTP 200 且成功响应完整有效时为 mapped。缺少任一必填 ID 或名称、空串/null、非法 UTF-8、非法类型、超长 ID/名称或非法 JSON 均为 lookup_invalid_response，不采纳部分结果，也不制造默认归属。
 - 只有符合契约的 `404 + not_found` 才表示 unknown_host/unknown_api_key；普通网关 404 页面、空响应或其他错误码均为 lookup_invalid_response，不能误认为不存在。
-- 超时或取消为 lookup_timeout；连接/TLS 故障、HTTP 401/403 和任意 HTTP 5xx 为 lookup_unavailable。上述故障按传输或 HTTP 状态分类，不依赖错误正文，且不得记录原始正文。
+- 查询自身超时或取消为 lookup_timeout；观察流取消仍按第 4.4 节等待原查询截止时间。连接/TLS 故障、HTTP 401/403 和任意 HTTP 5xx 为 lookup_unavailable。上述故障按传输或 HTTP 状态分类，不依赖错误正文，且不得记录原始正文。
 - 对其余已定义状态，校验 JSON 错误体及对应 code 后按表映射；状态与错误码不匹配、错误体畸形或其他未约定响应（包括其他 2xx、3xx）为 lookup_invalid_response。
 - HTTP 400 表示出站请求与第三方契约不一致，按 lookup_unavailable 处理；本地非法 Host/token 仍在调用前分别产生 invalid_host/invalid_api_key，不发送对应请求。
-- 本地执行预算不足为 lookup_overloaded，第三方 `429 + rate_limited` 为 lookup_rate_limited；本次契约不授权无界排队或自动重试，重试策略在后续资源预算设计中确定。
+- 本地执行预算不足为 lookup_overloaded，第三方 `429 + rate_limited` 为 lookup_rate_limited；当前实现不排队、不自动重试。
 - lookup_not_implemented 仅表示当前内部占位实现，不能由第三方 HTTP 501 推导；HTTP 501 按 5xx 故障处理。
 
 两类查询独立保留成功结果。失败侧的两项 ID 和版本均为 null；成功结果的 mapping_version/customer_mapping_version 仍由 Observer 计算，不要求第三方返回。两个事件共用同一冻结快照，不使用迟到查询结果重写历史事件。
@@ -303,7 +314,7 @@ service_name、provider_name、customer_name 均为查询时的展示名称，�
 
 ### 5.2 Kafka 事件字段
 
-下表 deployment_environment 列出目标枚举，代码、Schema 和运行配置尚待按第 4.4 节统一切换；三个名称字段为新增待实施项，其他字段沿用已实现模型。
+下表为当前唯一事件模型；三个名称字段为必填键，按对应解析结果取字符串或 null。
 
 | 字段 | 类型及规则 |
 | --- | --- |
@@ -311,24 +322,24 @@ service_name、provider_name、customer_name 均为查询时的展示名称，�
 | api_key | 不属于 Kafka 事件，不能输出、不允许接收 |
 | request_host | string 或 null，合法规范域名，作为解析输入和诊断维度 |
 | cluster_name | 非空 string，由 Observer 固定配置填写 |
-| deployment_environment | 目标仅为 prd、stg、dev 之一，由 Observer 固定配置填写；枚举切换待实施 |
+| deployment_environment | 仅为 prd、stg、dev 之一，由 Observer 固定配置填写 |
 | service_id / provider_id | string 或 null，只采用服务 API 的完整成功结果 |
-| service_name / provider_name | 待新增：string 或 null，服务 API 返回的名称快照；非空、合法 UTF-8、最多 512 字节；服务解析失败为 null |
+| service_name / provider_name | string 或 null，服务 API 返回的名称快照；非空、合法 UTF-8、最多 512 字节；服务解析失败为 null |
 | mapping_version | 64 字符小写十六进制或 null，成功服务解析结果的版本摘要 |
 | mapping_status | mapped、unknown_host、invalid_host、lookup_not_implemented、lookup_timeout、lookup_unavailable、lookup_invalid_response、lookup_overloaded、lookup_rate_limited 之一 |
 | api_key_id / customer_id | string 或 null，只采用客户 API 的完整成功结果 |
-| customer_name | 待新增：string 或 null，客户 API 返回的名称快照；非空、合法 UTF-8、最多 512 字节；客户解析失败为 null |
+| customer_name | string 或 null，客户 API 返回的名称快照；非空、合法 UTF-8、最多 512 字节；客户解析失败为 null |
 | customer_mapping_version | 64 字符小写十六进制或 null，成功客户解析结果的版本摘要 |
 | customer_mapping_status | mapped、unknown_api_key、invalid_api_key、lookup_not_implemented、lookup_timeout、lookup_unavailable、lookup_invalid_response、lookup_overloaded、lookup_rate_limited 之一 |
 | identity_status | 客户解析成功且两项 ID 有效时 known，否则 invalid；不代表鉴权决策 |
 
 服务 mapped 要求 request_host、service_id、provider_id、mapping_version 全部有效；其余服务状态两个 ID 和版本均为 null。客户 mapped 要求 api_key_id、customer_id、customer_mapping_version 全部有效；其余客户状态三者均为 null。不能保留非法/半成功响应中的 ID。
 
-名称接入后，mapped 还要求对应名称完整有效：服务的 service_name/provider_name 与 service_id/provider_id 同次成功，客户的 customer_name 与 api_key_id/customer_id 同次成功。失败侧名称与 ID 一起设为 null，不影响另一侧成功快照。三个名称键在 request_started 和 usage_observed 中均为必填键，可按解析状态取 null，不能省略、填空串、用 ID 代替名称或制造默认名称。Observer 对同一请求只冻结一次名称快照，两类事件携带完全一致的名称；旧占位代码尚不输出这三个键。
+mapped 还要求对应名称完整有效：服务的 service_name/provider_name 与 service_id/provider_id 同次成功，客户的 customer_name 与 api_key_id/customer_id 同次成功。失败侧名称与 ID 一起设为 null，不影响另一侧成功快照。三个名称键在 request_started 和 usage_observed 中均为必填键，可按解析状态取 null，不能省略、填空串、用 ID 代替名称或制造默认名称。Observer 对同一请求只冻结一次名称快照，两类事件携带完全一致的名称；当前占位路径也显式输出三个 null 键。
 
 正常占位路径中，合法输入产生 lookup_not_implemented，相关 ID 和版本均为 null；缺失/非法输入先产生 invalid_host 或 invalid_api_key，不能误报成未登记。两个查询的结果各自独立，占位错误不导致进程退出、网络等待或业务拒绝。
 
-其余查询状态在单一模型中保留定义，HTTP 状态码及错误体映射已在第 4.8 节约定，真实传输和映射代码仍待实施：仅符合契约的 `404 + not_found` 为 unknown_host/unknown_api_key；超时为 lookup_timeout，连接/TLS/接口认证/服务错误为 lookup_unavailable，非法响应为 lookup_invalid_response，预算不足和限流分别为 lookup_overloaded/lookup_rate_limited。不使用旧的 catalog_unavailable/catalog_stale 枚举。
+其余查询状态在单一模型中保留定义，HTTP 状态码及错误体映射已在第 4.8 节约定，HTTP 适配器已实现该映射：仅符合契约的 `404 + not_found` 为 unknown_host/unknown_api_key；超时为 lookup_timeout，连接/TLS/接口认证/服务错误为 lookup_unavailable，非法响应为 lookup_invalid_response，预算不足和限流分别为 lookup_overloaded/lookup_rate_limited。不使用旧的 catalog_unavailable/catalog_stale 枚举。
 
 服务归属失败不清除客户或已观察 usage，不改变客户 identity_status。客户失败保留已知服务/供应商和 usage，但 identity_status=invalid、identity_invalid 异常、usage_eligible=false，不进入客户汇总。usage_eligible 仍是统计候选，不等于供应商已知或可收费。
 
@@ -342,7 +353,7 @@ accepted_service_ids 对已映射服务继续精确检查。未映射服务可�
 - 同一 event_id 的不同规范内容仍为冲突，即使差异仅在诊断字段；同内容重放幂等。同请求两个事件的客户、服务、上下文或解析快照不一致时隔离。
 - API 归属变化不回写既有事件；迟到结果不得造成同请求 start/usage 归属不同，不新增第三类修正事件。
 
-名称持久化实施时，三个名称必须进入规范事件 JSON 和 payload_hash；只修改名称的同 event_id 消息仍属于内容冲突。名称不加入既有 identity_hash 或两类 mapping_version，但 Consumer 与请求视图须独立比较同请求的名称元组 `[service_name, provider_name, customer_name]`（保留 null），不一致时按请求快照冲突隔离，不能任取一个名称。不同请求可保存同一 ID 重命名前后的不同名称。同步更新事件 Schema、Go 类型及校验器、Python 契约校验、合成 JSON、规范编码和摘要金样。
+三个名称进入规范事件 JSON 和 payload_hash；只修改名称的同 event_id 消息仍属于内容冲突。名称不加入既有 identity_hash 或两类 mapping_version，但 Consumer 与请求视图须独立比较同请求的名称元组 `[service_name, provider_name, customer_name]`（保留 null），不一致时按请求快照冲突隔离，不能任取一个名称。不同请求可保存同一 ID 重命名前后的不同名称。同步更新事件 Schema、Go 类型及校验器、Python 契约校验、合成 JSON、规范编码和摘要金样。
 
 ## 6. 存储、汇总与开发数据准备
 
@@ -375,15 +386,11 @@ Auth 设计直接调整为客户 → API Key，删除应用表设计、applicati
 
 Observer 不依赖 PG 获取任何归属；Consumer 和汇总也不查询 PG 或第三方 API。第三方服务内部的数据来源由其负责，不进入本项目部署依赖。删除仅针对本项目原计划及新增实现，不删除其他系统数据库或已有数据。
 
-### 6.4 名称快照持久化与后续查询（待实施）
+### 6.4 名称快照持久化与后续查询
 
-2026-10-19 检查结果：
+实施前检查发现事件类型、Schema 和开发库均没有名称。现已扩展 internal/identitylookup/、internal/events/、事件 Schema、Consumer 写入和 Doris 表/视图；当前开发库 metering_development 已添加名称列，并保留既有行和原 event_json，历史名称保持 NULL。legacy metering 和历史 metering_k8s_* 不做结构更新。
 
-- 当前 internal/identitylookup/ 的内部结果和 internal/events/ 的事件类型仅有相关 ID，没有 service_name、provider_name、customer_name。Kafka 事件 Schema 未定义三个名称字段，且 additionalProperties=false；直接向现有契约消息追加名称会被拒收。本次检查的是事件定义和消费校验路径，未抽样读取 Kafka 历史消息。
-- 当前 Doris 建表定义、数据库字典和消费写入链路未包含三个名称字段。只读查询开发库 metering_development 的 information_schema.columns，覆盖其 19 个表/视图，未发现任一名称列；events_raw、requests 等对象仅包含相关 ID。本次未修改数据库，未检查其他数据库。
-- event_json 保存通过校验的规范事件 JSON；现有事件没有这些名称，也不能依靠 event_json 自动保留第三方响应中未进入事件契约的字段。
-
-后续实施要求：
+保存与查询行为：
 
 1. Observer 将归属接口返回的名称与 ID 冻结在同一请求快照中，写入 request_started 和 usage_observed。占位或失败侧名称为 null；即使先完成字段接入，真实归属接口尚未启用时也不能产生已知名称。
 2. Consumer 按新事件契约校验名称，将三个字段同时写入 Doris 独立列和 event_json，保证两者一致；仍在 Doris 可见后提交 Kafka offset。名称从 Kafka 原始快照读取，不在消费时回源查询或补充最新名称。
@@ -391,13 +398,13 @@ Observer 不依赖 PG 获取任何归属；Consumer 和汇总也不查询 PG 或
 4. 同步 event_variants、events_valid、event_details、usage_effective 的透传投影，以及 requests、request_statistics 的请求级投影；在名称一致性检查通过后输出冻结名称。更新初始化 SQL 和重复定义视图的 SQL，避免后续初始化步骤覆盖新增列。通过这些视图查询请求明细时，无需再次调用归属 API。
 5. 新名称与 events_raw 明细共用现有 365 个 UTC 请求日期保留策略；日/月汇总仍按稳定 ID 分组，不将名称加入分组或唯一键，防止重命名拆分统计。该工作包提供明细期内的历史名称查询，不承诺明细过期后仍可从日/月汇总恢复名称；更长期的名称历史需另行设计。
 6. 名称变更只影响后续请求，不能用最新目录名称覆盖历史事件。已有数据没有名称证据时保留未知，不按当前 ID 查询结果伪造历史名称，也不回填修改既有 event_json 或 payload_hash。
-7. 更新源 DDL、数据库注释及生成字典，使用 scripts/doris_schema.py 重新生成和校验相关产物；007_schema_comments.sql 仅更新注释，不能代替新增列和视图结构变更。已有开发库不得以 CREATE TABLE IF NOT EXISTS 已执行为由宣称新增列完成；后续在隔离开发库验证完整初始化及写入查询，再落实已有开发库结构变更。保留 legacy metering 和历史 metering_k8s_*，本次不执行任何 DDL。
+7. 新库通过 001 创建名称列；已有当前模型开发库通过 008_name_snapshots.sql 添加缺失的可空列并重建视图，再用 007 更新注释。local_collection.py 仅对 metering_development 自动补列，按实际列检查跳过已完成步骤；保留原始行、分区、键及摘要。007 本身不添加实体列。数据库字典由 scripts/doris_schema.py 基于源 DDL 和实际元数据生成。
 
-本工作包需同时交付类型/Schema、Observer 快照、Consumer 校验与写入、Doris 列及视图、样例与摘要、测试和相关文档。仅修改 HTTP 返回示例或建表 SQL，均不构成名称持久化完成。
+类型/Schema、Observer 快照、Consumer 校验与写入、Doris 列及视图、样例与摘要和测试均已接入，实际验证边界见第 8 节。
 
 ## 7. 实施工作包
 
-以下为 2026-10-16 已完成的 P0–P7 代码交付范围。2026-10-19 补充 HTTP 契约及名称持久化设计，不扩大这些工作包的已完成范围；第 6.4 节为独立待实施增量。
+以下为 2026-10-16 已完成的 P0–P7 代码交付范围。2026-10-19 另行实现 HTTP 契约、认证、资源边界、环境切换及名称持久化增量；不扩大原记录的验证范围。
 
 | 工作包 | 主要交付与完成条件 |
 | --- | --- |
@@ -410,7 +417,7 @@ Observer 不依赖 PG 获取任何归属；Consumer 和汇总也不查询 PG 或
 | P6：文档与 SQL 模板 | 同步 README、总体/采集/Auth、Kafka、组件运行、汇总/协调、部署示例及样例；明确 Bearer 来源、占位状态、未知身份及真实对接尚未完成 |
 | P7：当前范围验收 | 完成下节测试、隔离开发部署与清理，记录镜像/Wasm 和占位事件证据；不宣称完成真实第三方查询或客户/供应商归属验收 |
 
-后续真实对接按第 4 节契约实施 HTTP 适配、x-remote-data 凭据注入、错误映射、缓存/限流/超时、异步定稿与第三方测试，并统一切换 prd/stg/dev 环境枚举及相关校验、Schema、样例和文档。名称保存须按第 6.4 节贯通内部结果、两类事件、Consumer、Doris 独立列与查询视图。实际地址、凭据轮换、配额及资源预算仍需落实，不能以接口占位或契约文档交付替代真实接入。本次仅修改本文，不新增 OpenAPI、HTTP 客户端、运行配置或测试服务。
+本次增量已贯通第 4 节 HTTP 适配、x-remote-data 凭据注入、错误映射、有界异步定稿，以及第 6.4 节的名称存储和查询视图。未实现缓存或自动重试；真实第三方地址、生产凭据和实际配额仍须部署时提供，并在生产 G0–G5 中独立验收。
 
 重点调整 api/observation/v1/observation.proto、api/events/v1/、pkg/gatewayconfig/、pkg/observationwire/、internal/config/、采集运行模块、migrations/doris/metering/、scripts/validate_collection_contracts.py、scripts/render_gateway_filter.py、scripts/local_collection.py、scripts/k8s_collection.py、scripts/cleanup_k8s_collection.py、scripts/sql/、deploy/、tests/ 和 testdata/collection/。沿用现有事件目录，不为占位接口引入 PG 驱动或 HTTP 客户端依赖。
 
@@ -418,7 +425,7 @@ Observer 不依赖 PG 获取任何归属；Consumer 和汇总也不查询 PG 或
 
 2026-10-16 的 P0–P7 范围已完成：52 项 Python 测试、Go 竞态/契约/构建/ABI、真实 Compose 完整链路及 K8S-WASM-001 均通过，清理已完成。具体结果和边界见[2026-10-16 验证记录](gateway-collection-verification.md#2026-10-16-host--bearer-归属接口与唯一事件模型)。下面为该次验收断言，不表示真实第三方 HTTP 或新环境枚举已实现。
 
-| 场景 | 当前范围必须满足的断言 |
+| 场景 | 2026-10-16 占位验收断言（历史） |
 | --- | --- |
 | 占位查询 | 合法输入立即返回 ErrLookupNotImplemented；没有网络请求、重试、缓存、等待队列；URI 空/非空均不启用第三方调用，不能返回默认 ID 或空值加成功 |
 | Bearer 提取 | 单个 Authorization: Bearer 提取 token，不带方案名前缀、不改变 token；覆盖方案名大小写、空值、非 Bearer、重复/拼接、多凭证、空白及超长；不读取 x-api-key 或伪造身份元数据 |
@@ -439,7 +446,7 @@ Kubernetes 用例固定使用本地 Kubernetes 1.22.17 + Istio 1.13.5。网关�
 
 证据记录镜像版本、Wasm SHA-256、固定集群/环境、占位状态、请求/事件 ID、Consumer 位点、清理前后资源及“无第三方出站调用”的验证；不记录 token。镜像 tag 继续 Git tag 优先，否则使用 commit 短 hash。实际结果追加在本地验证记录，本地验证与生产 G0–G5 仍然区分。
 
-2026-10-19 文档增量的检查范围为 JSON 示例语法、字段表与错误映射一致性、目标环境值、占位/真实接入状态说明及 `git diff --check`，不重跑上述运行链路作为文档变更的验收。后续 HTTP 适配器至少应覆盖下列场景；此表为待实施测试要求，不是通过记录：
+2026-10-19 增量执行代码、Schema、SQL、文档一致性、HTTP 适配和真实本地链路验证；下表为验收要求，具体命令和结果另记于验证记录。合成归属服务不代表真实第三方目录已验收：
 
 | 场景 | 预期结果 |
 | --- | --- |
@@ -457,15 +464,19 @@ Kubernetes 用例固定使用本地 Kubernetes 1.22.17 + Istio 1.13.5。网关�
 
 ## 9. 开发初始化与部署
 
-以下步骤适用于已实现的占位链路，继续使用当前运行配置。第 4 节目标契约和 prd/stg/dev 示例不能在相应代码、Schema 和配置统一切换前直接用于部署。
+以下步骤描述本地占位验证；启用 HTTP 查询时，先配置两个 HTTP/HTTPS URI、credential_env 及环境变量/Secret，可按需要配置 ca_file 和实际配额。统一使用 prd/stg/dev；新增名称列及视图须先于新版 Consumer 生效。
 
 1. 核对 Bearer 提取、Host 行为、固定集群/环境及网格 TLS，按当前配置保留两个 URI，未知时留空；不等待第三方接口或申请其鉴权凭据。
 2. 停止本项目开发采集写入，创建全新隔离 Doris 库和 Kafka topic/group，不创建 PG、第三方 HTTP fixture 或假归属目录。
 3. 使用更新后的 SQL 初始化 Doris，构建同一提交的 Observer、Consumer、模型/Auth fixture 和 Wasm；模型请求携带合成 Authorization: Bearer token，Auth fixture 只模拟访问判定，不再提供采集归属 ID。
 4. 先部署 Consumer、Observer 和模型/Auth fixture，检查占位接口、固定配置、TLS 与 Wasm 下载，再启用 Wasm；按实际 Pod 渲染、等待 XDS 收敛并验证 JSON/SSE/快速结束与未知归属事件。
-5. 在单元测试注入合成 resolver 验证已知归属分支，在独立合成事件链路验证 Consumer/DDL/汇总；报告明确标注正常部署的 API 仍未实现，不调用第三方、不验证真实客户/供应商归属。
+5. 在单元测试注入合成 resolver 验证已知归属分支，在独立合成事件链路验证 Consumer/DDL/汇总；默认占位部署不调用第三方；HTTP 合成测试证明适配和保存链路，不代表真实第三方目录及客户/供应商数据已验收。
 6. 失败时关闭采集并保留脱敏诊断，修复后重新初始化隔离数据并统一部署；完成后运行清理脚本并记录资源核对，未来真实对接与正式灰度另行验收。
 
-已确认：api_key 固定来自 Authorization: Bearer；两个查询 API 采用第 4 节的 POST JSON 请求/响应、x-remote-data 认证及错误契约，目标环境仅接受 prd/stg/dev。当前运行仍为占位实现；URI 实际值、凭据注入与轮换、调用配额及资源预算留待真实接入落实，环境枚举统一切换也尚未实施。不能以占位通过或契约定义完成声称第三方集成或有效客户归属已经完成。
+已确认：api_key 固定来自 Authorization: Bearer；两个查询 API 采用第 4 节的 POST JSON 请求/响应、x-remote-data 认证及错误契约，目标环境仅接受 prd/stg/dev。默认 URI 为空时运行占位；配置实际 HTTP/HTTPS URI 和凭据后启用真实适配。环境枚举和名称保存已实现，实际地址、凭据及配额按部署环境提供。不能以占位通过或契约定义完成声称第三方集成或有效客户归属已经完成。
 
 2026-10-16 注释增量：当前模型初始化链增加 007_schema_comments.sql，为已有当前模型补数据库注释；完整对象职责与字段字典见[数据库表文档](../../doris-database-schema.md)。该增量不为旧模型提供升级或兼容。
+
+2026-10-19 实施增量：HTTP 适配、有界并行查询、环境枚举、名称快照存储及 008 结构更新均已实现并完成本地与 Kubernetes 隔离验证；详见[本次验证记录](gateway-collection-verification.md#2026-10-19https-归属查询环境枚举与名称快照)。真实第三方与生产 G0–G5 的验收边界保持独立。
+
+同日修复增量：HTTP/HTTPS 双协议、运行镜像系统 CA、独立查询截止时间、取消保留单侧结果及 End ACK 故障定稿均已实现。无缓存全量测试、镜像 CA 检查和完整本地链路已通过，详见[修复验证记录](gateway-collection-verification.md)。

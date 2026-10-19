@@ -1,5 +1,4 @@
-// Package identitylookup defines the integration boundary. No network adapter
-// is implemented; normal deployments must never manufacture an identity.
+// Package identitylookup resolves immutable request attribution snapshots.
 package identitylookup
 
 import (
@@ -11,19 +10,22 @@ import (
 var ErrLookupNotImplemented = errors.New("lookup_not_implemented")
 
 type ServiceLookupRequest struct {
-	RequestHost           string
-	ClusterName           string
-	DeploymentEnvironment string
+	RequestHost           string `json:"request_host"`
+	ClusterName           string `json:"cluster_name"`
+	DeploymentEnvironment string `json:"deployment_environment"`
 }
 
 type ServiceIdentity struct {
-	ServiceID  string
-	ProviderID string
+	ServiceID    string `json:"service_id"`
+	ServiceName  string `json:"service_name"`
+	ProviderID   string `json:"provider_id"`
+	ProviderName string `json:"provider_name"`
 }
 
 type CustomerIdentity struct {
-	APIKeyID   string
-	CustomerID string
+	APIKeyID     string `json:"api_key_id"`
+	CustomerID   string `json:"customer_id"`
+	CustomerName string `json:"customer_name"`
 }
 
 type ServiceResolver interface {
@@ -45,9 +47,19 @@ func (UnimplementedCustomerResolver) Resolve(context.Context, []byte) (CustomerI
 	return CustomerIdentity{}, ErrLookupNotImplemented
 }
 
-func ValidID(s string) bool { return s != "" && len(s) <= 128 && utf8.ValidString(s) }
+func ValidID(s string) bool   { return s != "" && len(s) <= 128 && utf8.ValidString(s) }
+func ValidName(s string) bool { return s != "" && len(s) <= 512 && utf8.ValidString(s) }
+
+type lookupError string
+
+func (e lookupError) Error() string { return string(e) }
+func failure(code string) error     { return lookupError(code) }
 
 func Failure(err error) string {
+	var e lookupError
+	if errors.As(err, &e) {
+		return string(e)
+	}
 	if errors.Is(err, ErrLookupNotImplemented) {
 		return "lookup_not_implemented"
 	}

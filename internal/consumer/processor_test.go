@@ -69,6 +69,31 @@ func TestCommitBarrier(t *testing.T) {
 		}
 	}
 }
+
+func TestNamesConflictWithoutChangingIdentity(t *testing.T) {
+	b := batch(t)
+	id := b.Events[0].LogicalRequestID
+	f := &fakeStore{evidence: []Evidence{{ID: id, Date: "2026-10-19", Started: 1, EventID: id + ":start", Hash: "a", Identity: "same", Names: "old"}, {ID: id, Date: "2026-10-19", Started: 1, EventID: id + ":usage", Hash: "b", Identity: "same", Names: "new"}}}
+	p := Processor{Store: f, Owns: func() bool { return true }}
+	if err := p.Process(context.Background(), b); err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, n := range f.notifications {
+		found = found || n["reason"] == "CONFLICT"
+	}
+	if !found {
+		t.Fatal("name-only snapshot mismatch was not isolated")
+	}
+	e := *b.Events[0]
+	identity := events.IdentityHash(&e)
+	before, _ := events.Canonical(&e)
+	e.ServiceName = events.Ptr("重命名服务")
+	after, _ := events.Canonical(&e)
+	if events.IdentityHash(&e) != identity || events.Hash(before) == events.Hash(after) {
+		t.Fatal("name must change payload only")
+	}
+}
 func TestFrozenLabelAndRevocation(t *testing.T) {
 	b := batch(t)
 	label := Label("events_raw", b, b.Loads["events_raw"])
@@ -127,6 +152,7 @@ func TestUnknownServiceWithEmptyAdmissionAndSensitiveRejections(t *testing.T) {
 		t.Fatal("fixture")
 	}
 	e.ServiceID, e.ProviderID, e.MappingVersion = nil, nil, nil
+	e.ServiceName, e.ProviderName = nil, nil
 	e.MappingStatus = "lookup_not_implemented"
 	payload, _ := events.Canonical(&e)
 	cfg := config.Consumer{Bytes: 4 << 20, AcceptedConfigs: []string{e.ConfigVersion}}

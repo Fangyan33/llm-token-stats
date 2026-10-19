@@ -1,10 +1,12 @@
 # LLM Token Stats
 
-大模型请求用量采集与统计项目。通过网关旁路观察请求和响应，提取模型返回的 token usage，经 Kafka 写入 Doris，保留请求明细、用量状态和消费恢复记录。目前支持 Chat Completions 的 JSON 与 SSE 响应。
+LLM Token Stats 在网关旁路观察大模型请求和响应，提取模型返回的 token usage，经 Kafka 写入 Doris，供用量统计和分析使用。系统保留请求明细、用量状态和消费恢复记录，目前支持 Chat Completions 的 JSON 与 SSE 响应。
 
-业务请求直接经过网关到模型服务；采集使用独立的有界通道，采集失败时放行业务。未知用量保留 `null/unknown`，不按零用量计算；请求和响应正文只在采集过程中临时处理，不写入 Kafka、数据库或日志。
+业务请求直接经过网关到模型服务，采集通过独立的有界通道进行，采集失败时放行业务。未知用量保留 `null/unknown`，不按零用量计算。请求和响应正文只在采集过程中临时处理，不写入 Kafka、数据库或日志。
 
-当前已删除 application_id。Wasm 只从 Authorization: Bearer 提取临时 api_key，并发送入口 authority；Observer 使用配置的 cluster_name/deployment_environment，分别通过服务和客户查询接口取得归属。两个接口目前只有未实现占位，合法输入产生 lookup_not_implemented，service_id/provider_id/api_key_id/customer_id 及映射版本为 null，identity_status=invalid、usage_eligible=false，原始 usage 保留。URI 可留空，填写也不会发起 HTTP；不访问 PG、不读身份元数据补值，密钥不进入事件、数据库或日志。 具体边界见[归属接口说明](docs/spec/plan/host-service-provider-implementation.md)。
+当前协议已移除 application_id。Wasm 仅从 Authorization: Bearer 提取临时 api_key，并发送入口 authority。Observer 使用配置的 cluster_name/deployment_environment，通过服务和客户查询接口解析归属。
+
+这两个接口目前尚未实现：合法输入返回 lookup_not_implemented，service_id/provider_id/api_key_id/customer_id 及映射版本均为 null，identity_status=invalid、usage_eligible=false，原始 usage 仍会保留。查询 URI 可以留空，填写后也不会发起 HTTP 请求。Observer 不访问 PG，也不从身份元数据补全归属；密钥不进入事件、数据库或日志。具体说明见[归属接口说明](docs/spec/plan/host-service-provider-implementation.md)。
 
 ## 架构与组件职责
 
@@ -24,23 +26,23 @@ flowchart LR
 | 组件 | 职责 | 运行方式与实现情况 |
 | --- | --- | --- |
 | Istio / Envoy 网关 | 执行鉴权、路由和业务转发，向 Wasm 提供入口 Host、路由和 Bearer 凭证 | 复用现有入口网关；本地使用 `istio/proxyv2:1.13.5` 中的 Envoy |
-| Gateway Observer Wasm | 当前按 POST 与精确路径白名单选择请求，`route_name: "*"` 忽略路由名；有界观察正文，必要时补充 `stream_options.include_usage`，旁路发送观察消息 | 已实现；加载在网关内，不是独立服务，也不直接连接 Kafka |
+| Gateway Observer Wasm | 按 POST 与精确路径白名单选择请求，`route_name: "*"` 忽略路由名；在资源限制内观察正文，必要时补充 `stream_options.include_usage`，旁路发送观察消息 | 已实现；在网关内加载和运行，不单独部署，也不直接连接 Kafka |
 | Observer | 接收观察流，分配请求 ID，解析 JSON / SSE usage，生成 `request_started`、`usage_observed` 事件，通过原生 Producer 发送 Kafka | 已实现；入口为 `cmd/observer/`，提供 gRPC、两类归属查询占位、健康检查、指标及独立 HTTP Wasm 下载端口 |
 | Kafka | 缓冲结构化事件，按分区保存消费位置，为 Consumer 重放提供数据 | 外部基础设施；本地由 Compose 启动 |
-| Consumer | 校验事件与摘要、去重并保留冲突证据；写入 Doris 明细、拒绝诊断、日期通知和批次凭据；全部可见后提交 offset | 已实现；入口为 `cmd/consumer/`，多个副本使用同一 consumer group 分摊分区 |
+| Consumer | 校验事件与摘要，去重并保留冲突证据；将明细、拒绝诊断、日期通知和批次凭据写入 Doris，确认全部可见后提交 offset | 已实现；入口为 `cmd/consumer/`，多个副本使用同一 consumer group 分摊分区 |
 | Doris | 保存事件、请求视图、冲突标记和消费协调状态，支持 SQL 查询 | 已提供迁移；本地使用单 FE / BE，生产使用独立集群 |
 | Fixture | 模拟 ext_authz 访问允许和模型 JSON / SSE 响应 | 已实现；仅用于开发和测试，不提供真实鉴权或模型调用 |
 | Auth、usage-worker、平台 API / 门户 | 分别承担密钥鉴权、日/月汇总刷新、查询与管理交互 | 仓库包含相关设计或目录，尚无可部署的完整实现；采集接入需复用已有鉴权能力 |
 
-采集范围是模型入口服务 A，不重复统计 A 调用内部 B / C 的请求。观察 ACK 或响应中的计量 ID 不代表事件已经写入 Kafka / Doris；完整性还需要结合独立网关请求指标、Consumer 水位和缺口记录判断。
+采集范围是模型入口服务 A，不重复统计 A 调用内部 B / C 的请求。观察 ACK 和响应中的计量 ID 都不能证明事件已写入 Kafka / Doris。判断采集是否完整，还需要核对独立网关请求指标、Consumer 水位和缺口记录。
 
 ## 编译与构建镜像
 
 ### 工具与版本
 
-在仓库根目录执行以下命令。主模块使用 Go **1.25.0**，插件使用 TinyGo **0.40.1** 和仓库内固定的 Proxy-Wasm SDK；Python 脚本需要 **3.10+**。`make test` 包含 Go 竞态测试，需要可用的 C 编译器。开发联调需要 Docker Engine 和 Docker Compose v2。
+主模块使用 Go 1.25.0，插件使用 TinyGo 0.40.1 和仓库内固定的 Proxy-Wasm SDK，Python 脚本需要 3.10+。`make test` 包含 Go 竞态测试，需要可用的 C 编译器；开发联调还需要 Docker Engine 和 Docker Compose v2。以下命令均在仓库根目录执行。
 
-本地网关、Kafka、Doris 版本分别为 Istio proxyv2 **1.13.5**、Kafka **3.9.2**、Doris **4.1.3**。替换网关或 SDK 版本时，需要重新验证 ABI、hostcall 和过滤器行为。
+本地网关使用 Istio proxyv2 1.13.5，Kafka 和 Doris 分别使用 3.9.2、4.1.3。替换网关或 SDK 版本后，需要重新验证 ABI、hostcall 和过滤器行为。
 
 ```sh
 make test       # 契约检查、Python 测试、主模块和独立插件模块的 Go 竞态测试
@@ -53,7 +55,11 @@ make manifest   # 生成 dist/collection-manifest.json，记录工具版本与�
 
 ### Observer 与 Consumer 镜像
 
-两个 Dockerfile 的 Go 服务二进制都从源码构建；Observer 镜像另外复制宿主机 `make wasm` 生成的插件，构建镜像前必须先生成该文件。镜像版本统一由 `scripts/image_tag.py` 生成：当前提交有 Git tag 时使用该 tag，没有时使用至少 12 位 commit 短 hash，例如 `observer:v1.2.3` 或 `observer:2d36b71036b8`。同一提交有多个 tag 时按 Git 版本排序取最高项；历史提交的 tag 不用于当前版本。Git tag 必须符合 Docker tag 字符与长度限制，不兼容时直接报错。以下以 `linux/amd64` 为例，镜像仓库请按实际发布环境设置：
+两个 Dockerfile 都从源码构建 Go 服务二进制。Observer 镜像还会复制宿主机上 `make wasm` 生成的插件，因此必须先生成 Wasm，再构建镜像。
+
+镜像版本由 `scripts/image_tag.py` 统一生成：当前提交有 Git tag 时使用该 tag，否则使用至少 12 位 commit 短 hash，例如 `observer:v1.2.3` 或 `observer:2d36b71036b8`。同一提交有多个 tag 时，按 Git 版本排序取最高项；历史提交的 tag 不用于当前版本。Git tag 不符合 Docker tag 的字符或长度限制时，脚本直接报错。
+
+以下以 `linux/amd64` 为例，镜像仓库请按实际发布环境设置：
 
 ```sh
 export IMAGE_REGISTRY=registry.example.com/llm-token-stats
@@ -77,11 +83,17 @@ make package PACKAGE_DIR=dist/offline-package \
   PACKAGE_ARGS='--context kind-kind --namespace metering --cluster-name kind --storage-class standard'
 ```
 
-`make package` 编译 Wasm、构建 Observer / Consumer 镜像，然后通过 `docker save` 将 **Observer、Consumer、Kafka 3.9.2、Doris 4.1.3、Istio proxyv2 1.13.5** 五个运行镜像保存到 `dist/package/images/images.tar`。缺少的依赖镜像会自动拉取；已存在的镜像会检查平台，默认 `linux/amd64`。构建沿用本仓库 Kubernetes 测试的 host 网络并转交代理环境变量，可用 `--build-network default` 切换。服务镜像沿用当前 Git tag / commit hash；Wasm 随 Observer 镜像分发。包内另有镜像 ID、Wasm 摘要和全包文件校验和。输出目录非空时拒绝覆盖，可通过 `PACKAGE_DIR` 指定新目录。
+`make package` 编译 Wasm、构建 Observer / Consumer 镜像，再通过 `docker save` 将 Observer、Consumer、Kafka 3.9.2、Doris 4.1.3、Istio proxyv2 1.13.5 这五个运行镜像保存到 `dist/package/images/images.tar`。缺少的依赖镜像会自动拉取，已有镜像会检查平台，默认使用 `linux/amd64`。
 
-包内 `k8s/` 是已渲染的完整 YAML：Namespace、持久化的单节点 Kafka / Doris、Observer / Consumer Deployment 与 Service、全部 ConfigMap / Secret、Kafka topic 初始化 Job、Doris `001/002/004/005/006/007` 迁移及初始化 Job。Kafka 默认 24 分区、单副本、保留 72 小时；存储默认使用集群 StorageClass，可通过 `--storage-class` 和 `--kafka-storage`、`--doris-fe-storage`、`--doris-be-storage` 调整。这个分发配置使用明文 Kafka、Doris root 空密码和 `development` 环境标识，适用于受控开发环境；生产部署仍按下文配置独立基础设施和认证。
+镜像构建使用本仓库 Kubernetes 测试所用的 host 网络，并传入代理环境变量；需要切换网络时可指定 `--build-network default`。服务镜像版本取自当前 Git tag / commit hash，Wasm 随 Observer 镜像分发。包内还包含镜像 ID、Wasm 摘要和全包文件校验和。输出目录非空时，打包脚本会拒绝覆盖，可通过 `PACKAGE_DIR` 指定新目录。
 
-Istio 和已有网关继续复用目标集群的服务。打包默认只读查询当前 kubectl context 中 `istio-system` 下标签为 `istio=ingressgateway` 的实际 Pod；使用 `--context`、`--gateway-namespace` 可指定目标。打包机器不能访问目标集群时，使用 `PACKAGE_ARGS='--gateway-pod 实际Pod名=实际PodUID'` 提供目标 Pod，多个 Pod 重复传参。每个 Pod 均生成 `gateway/disabled/`、`gateway/enabled/` 两种完整 EnvoyFilter；网关必须有 `istio=ingressgateway` 标签，Pod 重建或扩容后重新打包。输出 YAML 不含 `REPLACE_*` 或 `RENDER_*`，使用者无需再次替换或渲染。
+包内 `k8s/` 包含已渲染的完整 YAML：Namespace、持久化的单节点 Kafka / Doris、Observer / Consumer Deployment 与 Service、全部 ConfigMap / Secret、Kafka topic 初始化 Job，以及 Doris `001/002/004/005/006/007` 迁移和初始化 Job。
+
+Kafka 默认使用 24 分区、单副本，数据保留 72 小时。存储默认使用集群 StorageClass，可通过 `--storage-class` 和 `--kafka-storage`、`--doris-fe-storage`、`--doris-be-storage` 调整。分发配置使用明文 Kafka、Doris root 空密码和 `development` 环境标识，适用于受控开发环境。生产环境的独立基础设施和认证配置见下文。
+
+部署复用目标集群已有的 Istio 和网关。打包时，脚本默认只读查询当前 kubectl context 中 `istio-system` 下带 `istio=ingressgateway` 标签的实际 Pod；可通过 `--context`、`--gateway-namespace` 指定目标。打包机器无法访问目标集群时，使用 `PACKAGE_ARGS='--gateway-pod 实际Pod名=实际PodUID'` 提供目标 Pod，多个 Pod 需重复传参。
+
+脚本为每个 Pod 生成 `gateway/disabled/`、`gateway/enabled/` 两种完整 EnvoyFilter。网关必须带有 `istio=ingressgateway` 标签，Pod 重建或扩容后需要重新打包。输出 YAML 不含 `REPLACE_*` 或 `RENDER_*`，部署时无需再次替换或渲染。
 
 分发后进入包目录执行：
 
@@ -105,13 +117,13 @@ kubectl apply -f gateway/disabled/
 kubectl apply -f gateway/enabled/
 ```
 
-目标集群需事先安装 Istio 1.13.5 并已有业务路由、鉴权，以及足够的 PV / StorageClass。包内 `README.md` 按打包参数生成完整部署命令；不会自动部署到集群。打包成功和清单校验不代表生产 G0–G5 验收完成。
+目标集群需事先安装 Istio 1.13.5，配置好业务路由和鉴权，并准备足够的 PV / StorageClass。包内 `README.md` 会按打包参数生成完整部署命令，打包过程不会自动部署到集群。打包成功、清单校验通过后，仍需完成生产 G0 至 G5 验收。
 
 ### Wasm 打包、下载与摘要
 
 Observer 镜像将同一份 `dist/gateway-observer-v1.wasm` 放在 `/usr/share/metering/wasm/gateway-observer-v1.wasm`。根目录 `.dockerignore` 只放行这份 Wasm，不将其他构建产物送入镜像。网关复用已有 Istio 镜像，通过 Observer 下载插件；插件随 Observer 镜像发布，无需独立 Deployment。
 
-生产配置启用以下可选下载服务；省略 `wasm_download` 时保留原有行为：
+生产配置可启用以下下载服务；省略 `wasm_download` 时保留原有行为：
 
 ```json
 "wasm_download": {
@@ -120,7 +132,7 @@ Observer 镜像将同一份 `dist/gateway-observer-v1.wasm` 放在 `/usr/share/m
 }
 ```
 
-接口为 `GET/HEAD /wasm/gateway-observer-v1.wasm`，只提供这一文件。默认集群地址为 `http://metering-observer.metering.svc.cluster.local:9093/wasm/gateway-observer-v1.wasm`。下载服务不调用 Kafka，最多 8 个并发下载，超限返回 503；读头超时 3 秒、写超时 30 秒。启用时文件不可读、Wasm 文件头非法或端口绑定失败会阻止 Observer 启动。
+下载接口为 `GET/HEAD /wasm/gateway-observer-v1.wasm`，仅提供这一文件，默认集群地址为 `http://metering-observer.metering.svc.cluster.local:9093/wasm/gateway-observer-v1.wasm`。下载服务不调用 Kafka，最多允许 8 个并发下载，超限返回 503；读头超时为 3 秒，写超时为 30 秒。启用下载服务后，文件不可读、Wasm 文件头非法或端口绑定失败都会阻止 Observer 启动。
 
 启动本地栈后，下载并核对实际内容；生产可先在另一个终端执行 `kubectl -n metering port-forward service/metering-observer 19093:9093`，再使用相同命令：
 
@@ -130,7 +142,9 @@ curl --noproxy '*' --fail --output dist/gateway-observer.download.wasm \
 sha256sum dist/gateway-observer-v1.wasm dist/gateway-observer.download.wasm
 ```
 
-两份摘要必须相同。渲染器读取打包时的同一份 Wasm 计算 `code.remote.sha256`，配置 HTTP 下载集群及 5 秒下载超时，不额外重试。这里使用固定版本 Envoy 的原生远程加载；现有 EnvoyFilter 不依赖 Istio agent 重写成文件路径。下载只发生在插件加载时，不进入逐请求的业务转发流程，首次加载仍有下载等待。
+两份摘要必须相同。渲染器读取打包时使用的同一份 Wasm，计算 `code.remote.sha256`，并配置 HTTP 下载集群和 5 秒下载超时，不额外重试。
+
+Wasm 使用固定版本 Envoy 的原生远程加载，现有 EnvoyFilter 不依赖 Istio agent 将其重写为文件路径。下载只在插件加载时发生，首次加载需要等待下载完成，逐请求的业务转发不触发下载。
 
 推送完成后记录两个服务镜像的仓库 digest，部署时使用完整的 `仓库地址@sha256:摘要`：
 
@@ -149,9 +163,11 @@ Kafka、Doris 使用基础设施镜像；Fixture 由本地 Compose 挂载编译�
 make test build wasm local-up local-test
 ```
 
-该命令依次完成检查、编译和 Wasm ABI 验证，启动 Kafka、Doris、Fixture、Observer、Consumer、Envoy，然后执行真实链路集成测试。`make local-up` 会等待基础设施就绪，应用 `001/002/004/005/006/007` Doris 迁移，在独立 metering_development 库初始化新表，并创建 24 分区、72 小时保留的 llm-metering-development topic。它本身不编译代码，会重新渲染下载摘要，重启使用挂载产物的 Fixture、Observer、Consumer，校验下载文件后重建网关。网关只挂载生成的配置，不挂载 Wasm。配置与编排位于 [deploy/local/](deploy/local/compose.yaml)。
+该命令依次完成检查、编译和 Wasm ABI 验证，启动 Kafka、Doris、Fixture、Observer、Consumer、Envoy，最后执行真实链路集成测试。
 
-`make test` 不启动容器、不写 Doris；`make local-test` 验证实际 Envoy → Observer → Kafka → Consumer → Doris 链路，包括 JSON / SSE、未知用量、重放去重、冲突、未知 schema 暂停、写入确认丢失和超时边界。测试使用合成数据，也会留下诊断记录。
+`make local-up` 等待基础设施就绪后，应用 `001/002/004/005/006/007` Doris 迁移，在独立的 metering_development 库初始化新表，并创建 24 分区、保留 72 小时的 llm-metering-development topic。它不会编译代码，但会重新渲染下载摘要，重启使用挂载产物的 Fixture、Observer、Consumer，校验下载文件后重建网关。网关只挂载生成的配置，不挂载 Wasm。配置与编排见 [deploy/local/](deploy/local/compose.yaml)。
+
+`make test` 检查代码和契约，不启动容器，也不写 Doris。`make local-test` 验证实际 Envoy → Observer → Kafka → Consumer → Doris 链路，覆盖 JSON / SSE、未知用量、重放去重、冲突、未知 schema 暂停、写入确认丢失和超时边界。测试使用合成数据，并保留诊断记录。
 
 本地发布端口绑定 `0.0.0.0`，用于受控开发网络：
 
@@ -206,7 +222,7 @@ Kafka、Doris 数据保存在命名卷中；不要用 `down -v` 清理需要保�
 
 ## Kubernetes 生产部署
 
-部署顺序为：**网关与鉴权前置能力 → Kafka / Doris → 数据库迁移 → 配置与 Secret → Consumer → Observer → 网关 Wasm 灰度启用**。以下命令用于在实际集群中渲染和发布采集组件；地址、账号、镜像及容量均需替换为环境实际值。
+按以下顺序部署：网关与鉴权 → Kafka / Doris → 数据库迁移 → 配置与 Secret → Consumer → Observer → 网关 Wasm 灰度启用。下面的命令用于在实际集群中渲染和发布采集组件，执行前需将地址、账号、镜像及容量替换为实际环境的值。
 
 ### 1. 准备网关与基础设施
 
@@ -218,7 +234,9 @@ Kafka、Doris 数据保存在命名卷中；不要用 `down -v` 清理需要保�
 | Doris | 使用 Doris Operator 或独立 FE / BE 集群，配置持久卷、备份、副本、动态分区与独立账号；[doris.yaml](deploy/doris/doris.yaml) 是单节点开发样例 |
 | 网络与身份 | 网关访问 Observer gRPC（9090）和 Wasm HTTP 下载（9093）；Observer 仅生产指定 topic；Consumer 消费指定 topic/group，并访问 Doris SQL 和 Stream Load。通过 NetworkPolicy 与网格授权限制来源，放通必要 DNS 与基础设施流量 |
 
-本文服务模板固定在 `metering` 命名空间，网关过滤器固定在 `istio-system`。若环境使用其他名称，需要同步修改模板、服务 DNS、Wasm 的 `observer_cluster`，以及渲染参数 `--wasm-url`、`--wasm-cluster`。按现有 Istio 安装方式为 `metering` 配置 sidecar 注入和 mTLS；Observer 自身的 gRPC 和下载 HTTP 监听不提供 TLS，网关到 Observer 的认证与加密由网格承担。模板没有自动创建这些网格和网络策略。
+本文服务模板使用 `metering` 命名空间，网关过滤器使用 `istio-system`。如果环境使用其他名称，需要同步修改模板、服务 DNS、Wasm 的 `observer_cluster`，以及渲染参数 `--wasm-url`、`--wasm-cluster`。
+
+请按现有 Istio 安装方式为 `metering` 配置 sidecar 注入和 mTLS。Observer 自身的 gRPC 和下载 HTTP 监听不提供 TLS，网关到 Observer 的认证与加密由网格承担；这些网格和网络策略需要另行配置，模板不会自动创建。
 
 ### 2. 初始化 Kafka 与 Doris
 
@@ -239,7 +257,7 @@ kafka-topics.sh --bootstrap-server "$KAFKA_BOOTSTRAP" \
 
 上述副本配置需要至少 3 个可用 Broker；24 分区是容量验收初值。同一采集部署周期不在线调整分区数。为 Observer 配置 topic 生产权限，为 Consumer 配置 topic 消费和 group 权限；现有 topic 的参数要另行核对，`--if-not-exists` 不会更新已有配置。
 
-Doris 新库按 `001 → 002 → 004 → 005 → 006 → 007` 顺序执行迁移。仓库 SQL 的副本数为开发值 1，需先生成经过审查的生产副本；以下示例改为 3，要求实际 BE 数量和存储资源满足条件：
+Doris 新库按 `001 → 002 → 004 → 005 → 006 → 007` 的顺序执行迁移。仓库 SQL 使用开发环境的副本数 1，生产部署前需生成并审查生产用 SQL。以下示例将副本数改为 3，实际 BE 数量和存储资源必须满足要求：
 
 ```sh
 export DEPLOY_DIR="$PWD/.private/deploy"
@@ -267,9 +285,11 @@ mysql --defaults-extra-file=/run/secrets/doris/admin.cnf \
   -e 'SHOW BACKENDS; SHOW TABLES FROM metering; USE metering; SHOW DYNAMIC PARTITION TABLES;'
 ```
 
-上述直接执行初始化 metering；如使用其他库，先以 `python3 scripts/render_doris_sql.py --database 库名 SQL文件` 渲染全部迁移，并同步 doris.database 与 DSN 的数据库名。标识符只允许字母开头及字母/数字/下划线，最多 64 字符。确认每个迁移成功后再部署 Consumer。已有库的保留策略调整使用 [003 迁移](migrations/doris/metering/003_raw_retention_one_year.sql)，执行前停止冲突的归档或分区清理任务；`CREATE TABLE IF NOT EXISTS` 不修改已有表。所有 FE 的 `dynamic_partition_enable=true` 应持久化，并确认 BE Alive、当天及所需历史日期分区存在。副本和分桶等其他生产参数需单独审查，不能仅替换副本数就视为容量验收完成。
+直接执行上述命令会初始化 metering 库。如需使用其他库，先通过 `python3 scripts/render_doris_sql.py --database 库名 SQL文件` 渲染全部迁移，并同步修改 doris.database 与 DSN 中的数据库名。标识符必须以字母开头，只能包含字母、数字和下划线，最多 64 字符。确认所有迁移成功后，再部署 Consumer。
 
-明细按 UTC 请求日期保留 365 个日期。日 / 月汇总已定义表和 SQL 模板，但执行这些迁移不会启动汇总刷新任务。
+已有库调整保留策略时，使用 [003 迁移](migrations/doris/metering/003_raw_retention_one_year.sql)，执行前先停止与之冲突的归档或分区清理任务。`CREATE TABLE IF NOT EXISTS` 不会修改已有表。所有 FE 都应持久化 `dynamic_partition_enable=true`，并确认 BE 为 Alive、当天及所需历史日期的分区已存在。副本、分桶等生产参数需逐项审查；仅修改副本数不足以完成容量验收。
+
+明细按 UTC 请求日期保留 365 个日期。仓库已定义日 / 月汇总表和 SQL 模板，执行这些迁移不会启动汇总刷新任务。
 
 ### 3. 准备服务配置与 Secret
 
@@ -288,7 +308,9 @@ cp configs/gateway-observer.example.json "$DEPLOY_DIR/gateway-observer.json"
 | Consumer | 同一 Kafka topic、稳定的 `group_id`、历史配置版本及服务白名单；Doris `fe_url`、`allowed_load_hosts`；攒批大小与时间 |
 | Wasm | 规则 `route_name`（当前为 `*`，忽略路由名）、方法、精确路径、`adapter_id`、`config_version`、Observer cluster；保持默认关闭，通过渲染器显式启用 |
 
-`allowed_load_hosts` 必须覆盖实际 FE 和所有可能接收重定向的 BE 地址及端口，且 Consumer 可达这些地址。配置只向登记地址发送 Stream Load 凭据，并拒绝 HTTPS 降级。首次使用新 consumer group 会登记 Kafka earliest；接管缺少起点记录的旧组需要明确 `initial_offsets`，不能随意更换 group 或跳到 latest。
+`allowed_load_hosts` 必须包含实际 FE 和所有可能接收重定向的 BE 地址及端口，Consumer 也必须能访问这些地址。Consumer 只向登记的地址发送 Stream Load 凭据，并拒绝 HTTPS 降级。
+
+首次使用新 consumer group 时，系统会登记 Kafka earliest。接管缺少起点记录的旧组时，需要明确指定 `initial_offsets`；不要随意更换 group 或跳到 latest。
 
 由 Secret 管理系统在本地受保护目录准备以下文件，不把凭据填入 JSON 或提交仓库：
 
@@ -308,7 +330,7 @@ DORIS_USER=替换为StreamLoad用户名
 DORIS_PASSWORD=替换为StreamLoad密码
 ```
 
-Doris 使用独立最小权限账号，具备采集表所需的查询与写入权限，DSN 必须包含连接 / 读写超时与 UTC 会话设置。服务不负责运行迁移。Kafka 如需客户端证书，在配置中增加 `cert_file`、`key_file`，并将对应文件加入下述 TLS Secret。
+Doris 使用独立账号，仅授予采集表所需的查询与写入权限。DSN 必须包含连接、读写超时和 UTC 会话设置；迁移需单独执行，服务不会代为运行。Kafka 如需客户端证书，在配置中增加 `cert_file`、`key_file`，并将对应文件加入下述 TLS Secret。
 
 ```sh
 export SECRET_DIR="$PWD/.private/secrets"
@@ -362,11 +384,13 @@ kubectl -n metering rollout status deployment/metering-observer --timeout=5m
 kubectl -n metering get pods,svc
 ```
 
-模板默认 Observer 2 副本、Consumer 1 副本。扩容 Consumer 时保留同一 group，实际并行度受 topic 分区数限制；Observer 需同时检查 HTTP/2 长连接的负载分布。配置和 Secret 更新后，使用 `kubectl rollout restart deployment/对应名称 -n metering` 重启服务。升级配置版本时先让 Observer 接受新旧版本，再更新网关，Consumer 保留在线数据窗口内的历史注册。
+模板默认部署 2 个 Observer 副本和 1 个 Consumer 副本。扩容 Consumer 时保持同一 group，实际并行度受 topic 分区数限制；扩容 Observer 时，还需检查 HTTP/2 长连接的负载分布。
+
+配置或 Secret 更新后，使用 `kubectl rollout restart deployment/对应名称 -n metering` 重启服务。升级配置版本时，先让 Observer 同时接受新旧版本，再更新网关；Consumer 需保留在线数据窗口内的历史注册信息。
 
 ### 5. 核对下载服务并按 Pod 渲染 Wasm 配置
 
-先确认 Observer 所有副本已使用目标镜像且下载内容与发布产物摘要一致，再通过现有 Istio 发布配置准备独立灰度网关，保留已有网关镜像、服务、端口、路由、鉴权与网格设置。以下假设其 Deployment 名为 `istio-ingressgateway-canary`；若名称不同请替换：
+确认所有 Observer 副本都已使用目标镜像，且下载内容与发布产物的摘要一致后，再通过现有 Istio 发布配置准备独立灰度网关。保留已有网关的镜像、服务、端口、路由、鉴权与网格设置。以下假设灰度网关的 Deployment 名为 `istio-ingressgateway-canary`，请按实际名称替换：
 
 ```sh
 export GATEWAY_DEPLOYMENT=istio-ingressgateway-canary
@@ -389,7 +413,9 @@ python3 scripts/render_gateway_filter.py \
 kubectl apply -f "$DEPLOY_DIR/envoyfilter.$GATEWAY_POD_UID.disabled.yaml"
 ```
 
-渲染器会验证 Wasm 配置及产物文件头、计算文件 SHA-256、写入实际 Pod UID、生成唯一 EnvoyFilter 名称，通过代理启动时的 `metadata.NAME/NAMESPACE` 精确匹配该 Pod；`--gateway-pod-name` 必填，`--gateway-namespace` 默认为 `istio-system`。不要直接 apply [EnvoyFilter 模板](deploy/gateway/envoyfilter.yaml)，也不要给整个 Deployment 共用一个实例 ID。Istio 1.13 的代理标签取自启动快照，Pod 启动后补加 UID 标签不能可靠匹配 EnvoyFilter，因此无需再给 Pod 添加 `metering-instance` 标签。
+渲染器验证 Wasm 配置和产物文件头后，计算文件 SHA-256，写入实际 Pod UID，并生成唯一的 EnvoyFilter 名称。过滤器通过代理启动时的 `metadata.NAME/NAMESPACE` 精确匹配目标 Pod；`--gateway-pod-name` 必填，`--gateway-namespace` 默认为 `istio-system`。
+
+请先渲染 [EnvoyFilter 模板](deploy/gateway/envoyfilter.yaml) 再发布，不要直接 apply 模板，也不要让整个 Deployment 共用一个实例 ID。Istio 1.13 的代理标签取自启动快照，Pod 启动后补加 UID 标签无法可靠匹配 EnvoyFilter，无需再添加 `metering-instance` 标签。
 
 当前仅采集 `POST /v1/chat/completions`，不限制 VirtualService、HTTP 路由名或域名。入口使用以下规则，`route_name: "*"` 接受任意路由名及路由名不可读的情况，无需配置路由 metadata：
 
@@ -399,22 +425,24 @@ kubectl apply -f "$DEPLOY_DIR/envoyfilter.$GATEWAY_POD_UID.disabled.yaml"
 }
 ```
 
-方法必须为 `POST`；路径去掉查询串后精确匹配，不做额外 URL 解码或大小写转换。其它方法、路径、尾斜杠和子路径全部忽略，不读取正文、不建立观察流、不发送事件。`*` 只支持作为完整 `route_name`，不表示路径或其它字段支持通配。全局和规则开关仍必须开启。
+方法必须为 `POST`，路径去掉查询串后精确匹配，不做额外 URL 解码或大小写转换。其他方法和路径（包括尾斜杠、子路径）均会被忽略，不读取正文、不建立观察流，也不发送事件。`*` 只能作为完整的 `route_name` 值，不表示路径或其他字段也支持通配。采集时，全局和规则开关都必须开启。
 
-配置中的 `route_name: "*"` 仅控制筛选。事件的 `route_name` 单独记录请求头阶段可读的真实 Envoy HTTP 路由名；缺失、超过 128 UTF-8 字节或无效时记录 `unknown`，不使用通配值或计量 metadata 冒充真实路由。它仅用于诊断、审计，不作为客户归属、服务接纳、身份一致性或价格依据，也不代表 VirtualService 名称或实际后端。`adapter_id` 取自命中规则；service_id/provider_id 由 Observer 服务接口解析，当前占位只记录未知归属。精确路由名筛选仍兼容，规则按配置顺序选择首先命中路由名的规则。
+配置中的 `route_name: "*"` 只用于筛选请求。事件的 `route_name` 记录请求头阶段可读的真实 Envoy HTTP 路由名；路由名缺失、超过 128 UTF-8 字节或无效时，记录为 `unknown`，不使用通配值或计量 metadata 替代。该字段仅用于诊断和审计，不作为客户归属、服务接纳、身份一致性或价格依据，也不代表 VirtualService 名称或实际后端。
 
-Observer / Consumer 使用 accepted_service_ids 对已映射服务精确接纳；未映射事件的 service_id/provider_id 同时为 null，允许保留为质量诊断。旧 accepted_routes、Wasm identity_namespace/identity_fields 和规则 service_id 已删除，配置严格拒绝这些字段。配置版本、适配器及事件状态一致性检查继续保留。
+`adapter_id` 取自命中规则；service_id/provider_id 由 Observer 服务接口解析，目前接口尚未实现，只能记录未知归属。配置仍支持精确路由名筛选，并按配置顺序选择第一个命中路由名的规则。
 
-功能尚未上线，统一更新唯一协议、代码、配置和新开发库，不接纳旧格式消息，也不双写旧表。001/002/004/005/006/007 是同一新模型的初始化链，006 不承担旧数据兼容。已有旧结构库不能直接用 CREATE IF NOT EXISTS 升级；改用隔离库、独立 topic/group，保留旧数据。
+Observer / Consumer 使用 accepted_service_ids 精确匹配并接纳已映射服务。未映射事件的 service_id/provider_id 均为 null，仍可保留用于质量诊断。配置已移除旧 accepted_routes、Wasm identity_namespace/identity_fields 和规则 service_id，传入这些字段会被拒绝。配置版本、适配器及事件状态一致性检查仍会执行。
 
-Bearer 只作为短暂查询输入；接口占位不会产生已知客户，真实用量可为 known，但身份 invalid，usage_eligible 始终为 false。检查实际代理配置：
+功能尚未上线，协议、代码、配置和新开发库统一使用当前格式，不接纳旧格式消息，也不双写旧表。001/002/004/005/006/007 共同初始化同一套新模型，006 不负责兼容旧数据。旧结构库无法通过 CREATE IF NOT EXISTS 直接升级，应保留旧数据，改用隔离库和独立 topic/group。
+
+Bearer 仅临时用于归属查询。由于查询接口尚未实现，客户归属仍为未知；即使用量为 known，身份也为 invalid，usage_eligible 始终为 false。使用以下命令检查实际代理配置：
 
 ```sh
 istioctl proxy-config all "$GATEWAY_POD" -n istio-system -o json \
   > "$DEPLOY_DIR/gateway-config-dump.json"
 ```
 
-确认过滤器顺序为 **ext_authz → Wasm → router**，远程 Wasm 加载成功，HTTP 下载集群 `outbound|9093||metering-observer.metering.svc.cluster.local` 与 HTTP/2 采集集群 `outbound|9090||metering-observer.metering.svc.cluster.local` 均存在，网格 mTLS、网络策略与授权允许访问相应端口。集群名称依赖实际服务发现；Service 已创建或健康探针成功本身不足以证明下载和采集链路就绪。
+确认过滤器顺序为 ext_authz → Wasm → router，且远程 Wasm 已加载成功。检查 HTTP 下载集群 `outbound|9093||metering-observer.metering.svc.cluster.local` 和 HTTP/2 采集集群 `outbound|9090||metering-observer.metering.svc.cluster.local` 是否均存在，并确认网格 mTLS、网络策略和授权允许访问相应端口。集群名称以实际服务发现结果为准；仅凭 Service 已创建或健康探针成功，无法确认下载和采集链路已就绪。
 
 使用 Istio `outbound|端口||服务DNS` 集群时，插件自动将 gRPC authority 设置为 `服务DNS:端口`，保留路由集群与 mTLS/SNI。自定义 ext_authz 配置也应显式设置 `grpc_service.envoy_grpc.authority` 为有效服务 DNS，不能让带 `|` 的集群名作为 HTTP/2 authority。
 
@@ -435,11 +463,15 @@ python3 scripts/render_gateway_filter.py \
 kubectl apply -f "$DEPLOY_DIR/envoyfilter.$GATEWAY_POD_UID.enabled.yaml"
 ```
 
-通过灰度入口发送已授权的 JSON / SSE 测试请求，检查业务响应、Observer / Consumer 的 `/metrics`、Kafka group lag，以及 Doris 中对应的 `events_raw`、`requests` 和 `consumer_batch_receipts`。Observer 健康端口为 `9091`，Consumer 为 `9092`，均提供 `/livez`、`/readyz`、`/metrics`；可通过 `kubectl port-forward` 从受控终端访问。`readyz` 成功仍需结合真实请求入库验证。
+通过灰度入口发送已授权的 JSON / SSE 测试请求，检查业务响应、Observer / Consumer 的 `/metrics`、Kafka group lag，以及 Doris 中对应的 `events_raw`、`requests` 和 `consumer_batch_receipts`。
 
-Consumer 默认按分区最多 5000 条 / 4 MiB，或等待 15 秒后攒批写入。Doris 不可用时暂停相应分区并保留冻结批次；未知 schema 同样暂停，不跳过。恢复位置落后于 Kafka earliest 时记录缺口并暂停，需按[恢复说明](docs/collection-components.md#consumer-恢复与统计边界)处置，不能用 latest 掩盖丢失数据。
+Observer 健康端口为 `9091`，Consumer 为 `9092`，均提供 `/livez`、`/readyz`、`/metrics`，可从受控终端通过 `kubectl port-forward` 访问。`readyz` 成功后，还需确认真实请求已经入库。
 
-服务只提供当前镜像内的一个版本。升级先发布 Observer，等待所有副本下载摘要一致，再更新网关 URL／摘要配置；滚动期间旧摘要可能下载失败，允许暂时缺少采集。已加载插件可继续运行，旧网关重启不保证还能下载旧文件。恢复服务后需触发插件重新安装或重启网关，并按实际 Pod UID 重新渲染配置；原样重复 apply 同一配置不保证触发下载，不承诺自动恢复。版本回退须先恢复对应 Observer 镜像，再恢复对应网关配置。
+Consumer 按分区攒批，默认达到 5000 条、4 MiB 或等待 15 秒时写入。Doris 不可用时，Consumer 暂停相应分区并保留冻结批次；遇到未知 schema 时也会暂停，不会跳过。恢复位置落后于 Kafka earliest 时，系统会记录缺口并暂停，需按[恢复说明](docs/collection-components.md#consumer-恢复与统计边界)处理，不能跳到 latest 掩盖数据丢失。
+
+Observer 只提供当前镜像内的一个 Wasm 版本。升级时，先发布 Observer，等待所有副本的下载摘要一致，再更新网关的 URL 和摘要配置。滚动升级期间，按旧摘要下载可能失败，采集允许暂时缺失；已加载的插件可以继续运行，但旧网关重启后不保证还能下载到旧文件。
+
+下载服务恢复后，需要触发插件重新安装或重启网关，并按实际 Pod UID 重新渲染配置。原样重复 apply 同一配置不一定触发下载，不能依赖它自动恢复。版本回退时，先恢复对应的 Observer 镜像，再恢复对应的网关配置。
 
 需要立即停止采集时，先重新应用同一 Pod 的关闭配置；若模块加载或 ABI 错误导致配置无法生效，再移除该 Pod 专属过滤器：
 
@@ -449,13 +481,13 @@ kubectl apply -f "$DEPLOY_DIR/envoyfilter.$GATEWAY_POD_UID.disabled.yaml"
 kubectl -n istio-system delete envoyfilter "gateway-observer-$GATEWAY_POD_UID"
 ```
 
-**每个网关 Pod 都需要独立渲染；Pod 重建、扩容后要获取实际 Pod 名称及 UID，重新渲染并发布对应过滤器，同时清理旧 UID 的资源。** 当前仓库未提供自动执行此流程的控制器，需要纳入实际发布流程。关闭配置用于停止采集，`fail_open` 不能保证底层模块加载失败时网关一定成功启动。
+每个网关 Pod 都需要独立渲染配置。Pod 重建或扩容后，需获取实际 Pod 名称和 UID，重新渲染并发布对应过滤器，同时清理旧 UID 的资源。仓库尚未提供自动执行这些操作的控制器，需要将其纳入发布流程。关闭配置用于停止采集；底层模块加载失败时，即使配置了 `fail_open`，也不能保证网关成功启动。
 
-本地集成通过不代表生产发布验收完成。扩大灰度前执行真实环境的改写、解析与故障恢复验证，生产验收还需完成性能、数据质量和回退检查；完整 G0–G5 要求见[闭环与验收清单](docs/gateway-collection-design-closure.md)，已有本地证据见[验证记录](docs/spec/plan/gateway-collection-verification.md)。
+本地集成结果仅覆盖本地环境。扩大灰度前，需在真实环境验证改写、解析和故障恢复；生产验收还包括性能、数据质量和回退检查。完整 G0 至 G5 要求见[闭环与验收清单](docs/gateway-collection-design-closure.md)，已有本地证据见[验证记录](docs/spec/plan/gateway-collection-verification.md)。
 
 ## 本地 Kubernetes / Istio 部署验证
 
-已将 **Kubernetes 1.22.17 + Istio 1.13.5** 实际部署验证固化为用例 **K8S-WASM-001**。Observer 两副本、Consumer、独立测试网关和合成鉴权/模型 fixture 均部署到 Kubernetes；Kafka、Doris 复用本地 Compose。每次使用独立 Doris 库、Kafka topic 和消费组，不依赖 Compose Consumer。原 `istio-system` 网关不参与发布。
+项目已在 Kubernetes 1.22.17 + Istio 1.13.5 上完成实际部署验证，并整理为 K8S-WASM-001 用例。测试将 2 个 Observer 副本、Consumer、独立测试网关和合成鉴权 / 模型 fixture 部署到 Kubernetes，Kafka、Doris 复用本地 Compose。每次测试使用独立的 Doris 库、Kafka topic 和消费组，不依赖 Compose Consumer，也不发布到原 `istio-system` 网关。
 
 ```sh
 # 仅启动 Kafka / Doris 并初始化本地迁移；已就绪可跳过。
@@ -464,7 +496,9 @@ make local-infra-up
 make k8s-test
 ```
 
-默认 context 为 `kind-kind`，测试命名空间为 `metering-wasm-verify`。Observer、Consumer、fixture 镜像统一使用 Git tag 或 commit 短 hash 作为版本；随机 run-id 继续用于测试 topic、消费组及诊断目录。测试会保留资源与 `.tmp/k8s-collection/` 下的结果，重复执行会清理归属于本测试的旧环境。网关仍使用原始 `istio/proxyv2:1.13.5`，没有挂载或打包 Wasm。完整前置条件、断言与自定义参数见[测试用例](docs/kubernetes-collection-test.md)，实际结果见[验证记录](docs/spec/plan/gateway-collection-verification.md)。
+默认 context 为 `kind-kind`，测试命名空间为 `metering-wasm-verify`。Observer、Consumer、fixture 镜像统一使用 Git tag 或 commit 短 hash 作为版本，测试 topic、消费组和诊断目录则使用随机 run-id。
+
+测试结束后会保留资源和 `.tmp/k8s-collection/` 下的结果；再次执行时，会先清理归属于本测试的旧环境。网关使用原始 `istio/proxyv2:1.13.5`，不挂载或打包 Wasm。完整前置条件、断言和自定义参数见[测试用例](docs/kubernetes-collection-test.md)，实际结果见[验证记录](docs/spec/plan/gateway-collection-verification.md)。
 
 ```sh
 kubectl --context kind-kind -n metering-wasm-verify get deployment,pod,svc

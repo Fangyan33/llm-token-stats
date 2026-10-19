@@ -3,7 +3,8 @@ GOMODCACHE ?= /tmp/metering-mod
 GOPATH ?= /tmp/metering-go
 export GOCACHE GOMODCACHE GOPATH
 PROTOC ?= protoc
-.PHONY: build wasm test generate local-infra-up local-up local-test k8s-test k8s-clean manifest
+PACKAGE_DIR ?= dist/package
+.PHONY: build wasm test generate local-infra-up local-up local-test k8s-test k8s-clean manifest package
 build:
 	mkdir -p dist
 	CGO_ENABLED=0 go build -trimpath -o dist/observer ./cmd/observer
@@ -32,3 +33,5 @@ k8s-clean:
 	python3 scripts/cleanup_k8s_collection.py $(K8S_TEST_ARGS)
 manifest:
 	python3 scripts/collection_manifest.py
+package: wasm
+	python3 scripts/package_distribution.py --output "$(PACKAGE_DIR)" $(PACKAGE_ARGS)

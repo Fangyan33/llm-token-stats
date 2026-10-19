@@ -68,6 +68,45 @@ docker push "$OBSERVER_IMAGE"
 docker push "$CONSUMER_IMAGE"
 ```
 
+### 离线分发镜像与完整 Kubernetes 清单
+
+```sh
+make package
+# 指定目标集群、命名空间、StorageClass 和输出目录：
+make package PACKAGE_DIR=dist/offline-package \
+  PACKAGE_ARGS='--context kind-kind --namespace metering --cluster-name kind --storage-class standard'
+```
+
+`make package` 编译 Wasm、构建 Observer / Consumer 镜像，然后通过 `docker save` 将 **Observer、Consumer、Kafka 3.9.2、Doris 4.1.3、Istio proxyv2 1.13.5** 五个运行镜像保存到 `dist/package/images/images.tar`。缺少的依赖镜像会自动拉取；已存在的镜像会检查平台，默认 `linux/amd64`。构建沿用本仓库 Kubernetes 测试的 host 网络并转交代理环境变量，可用 `--build-network default` 切换。服务镜像沿用当前 Git tag / commit hash；Wasm 随 Observer 镜像分发。包内另有镜像 ID、Wasm 摘要和全包文件校验和。输出目录非空时拒绝覆盖，可通过 `PACKAGE_DIR` 指定新目录。
+
+包内 `k8s/` 是已渲染的完整 YAML：Namespace、持久化的单节点 Kafka / Doris、Observer / Consumer Deployment 与 Service、全部 ConfigMap / Secret、Kafka topic 初始化 Job、Doris `001/002/004/005/006/007` 迁移及初始化 Job。Kafka 默认 24 分区、单副本、保留 72 小时；存储默认使用集群 StorageClass，可通过 `--storage-class` 和 `--kafka-storage`、`--doris-fe-storage`、`--doris-be-storage` 调整。这个分发配置使用明文 Kafka、Doris root 空密码和 `development` 环境标识，适用于受控开发环境；生产部署仍按下文配置独立基础设施和认证。
+
+Istio 和已有网关继续复用目标集群的服务。打包默认只读查询当前 kubectl context 中 `istio-system` 下标签为 `istio=ingressgateway` 的实际 Pod；使用 `--context`、`--gateway-namespace` 可指定目标。打包机器不能访问目标集群时，使用 `PACKAGE_ARGS='--gateway-pod 实际Pod名=实际PodUID'` 提供目标 Pod，多个 Pod 重复传参。每个 Pod 均生成 `gateway/disabled/`、`gateway/enabled/` 两种完整 EnvoyFilter；网关必须有 `istio=ingressgateway` 标签，Pod 重建或扩容后重新打包。输出 YAML 不含 `REPLACE_*` 或 `RENDER_*`，使用者无需再次替换或渲染。
+
+分发后进入包目录执行：
+
+```sh
+cd dist/package
+sha256sum -c SHA256SUMS
+
+# 在所有可能调度相关 Pod 的节点上导入镜像，按运行时选择一条：
+docker load -i images/images.tar
+# sudo ctr -n k8s.io images import images/images.tar
+# kind load image-archive images/images.tar --name kind
+
+kubectl apply -f k8s/
+kubectl -n metering wait --for=condition=complete \
+  job/metering-kafka-init job/metering-doris-init --timeout=20m
+kubectl -n metering rollout status deployment/metering-consumer --timeout=5m
+kubectl -n metering rollout status deployment/metering-observer --timeout=5m
+
+# 确认 Wasm 下载摘要与过滤器顺序后启用；两种状态每次只 apply 一个目录。
+kubectl apply -f gateway/disabled/
+kubectl apply -f gateway/enabled/
+```
+
+目标集群需事先安装 Istio 1.13.5 并已有业务路由、鉴权，以及足够的 PV / StorageClass。包内 `README.md` 按打包参数生成完整部署命令；不会自动部署到集群。打包成功和清单校验不代表生产 G0–G5 验收完成。
+
 ### Wasm 打包、下载与摘要
 
 Observer 镜像将同一份 `dist/gateway-observer-v1.wasm` 放在 `/usr/share/metering/wasm/gateway-observer-v1.wasm`。根目录 `.dockerignore` 只放行这份 Wasm，不将其他构建产物送入镜像。网关复用已有 Istio 镜像，通过 Observer 下载插件；插件随 Observer 镜像发布，无需独立 Deployment。

@@ -25,6 +25,8 @@ python3 scripts/local_collection.py stop
 
 镜像版本使用 `python3 scripts/image_tag.py` 解析：当前 HEAD 有 Git tag 时取该 tag，无 tag 时取至少 12 位 commit 短 hash；多个 tag 按 Git 版本排序取最高项，历史 tag 不沿用，不兼容 Docker tag 的名称会报错。README 的服务镜像构建与 `make k8s-test` 使用同一规则；Kubernetes 测试的 topic / 消费组仍通过随机 run-id 隔离。
 
+`make package` 另构建 Observer / Consumer 镜像，并用 `docker save` 将这两个镜像及 Kafka、Doris、Istio proxyv2 保存到 `dist/package/images/images.tar`。分发包同时提供单节点 Kafka / Doris 的持久化部署、topic / 数据库初始化 Job、采集服务、全部 ConfigMap / Secret，以及针对实际网关 Pod 渲染的关闭态 / 启用态 EnvoyFilter；全部为可直接 `kubectl apply` 的 YAML。默认只读查询当前 context 的既有网关，也可通过 `PACKAGE_ARGS` 提供目标 context 或实际 Pod 名称 / UID。指定输出目录使用 `PACKAGE_DIR`，完整命令、离线导入和部署顺序见 [README 离线分发](../README.md#离线分发镜像与完整-kubernetes-清单)。该包采用开发环境的单节点、明文 Kafka 与 Doris root 空密码，生产仍使用下文的独立基础设施和认证配置。
+
 本地栈的已发布端口统一绑定 `0.0.0.0`，可使用服务器 IP 从远端访问：
 
 | 组件 | 宿主机端口 |

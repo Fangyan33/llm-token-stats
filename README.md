@@ -74,16 +74,21 @@ docker push "$OBSERVER_IMAGE"
 docker push "$CONSUMER_IMAGE"
 ```
 
-### 离线分发镜像与完整 Kubernetes 清单
+### 分发镜像与完整 Kubernetes 清单
 
 ```sh
 make package PACKAGE_ARGS="--accepted-request-host api.company.com --accepted-request-host '*.company.com'"
 # 指定目标集群、命名空间、StorageClass 和输出目录：
-make package PACKAGE_DIR=dist/offline-package \
+make package PACKAGE_DIR=dist/target-package \
   PACKAGE_ARGS='--accepted-request-host api.company.com --context kind-kind --namespace metering --cluster-name kind --storage-class standard'
+# 需要离线携带 Kafka、Doris、Istio proxyv2 镜像时显式开启：
+make package PACKAGE_DIR=dist/package-with-dependencies \
+  PACKAGE_ARGS='--accepted-request-host api.company.com --include-dependency-images'
 ```
 
-`make package` 编译 Wasm、构建 Observer / Consumer 镜像，再通过 `docker save` 将 Observer、Consumer、Kafka 3.9.2、Doris 4.1.3、Istio proxyv2 1.13.5 这五个运行镜像保存到 `dist/package/images/images.tar`。缺少的依赖镜像会自动拉取，已有镜像会检查平台，默认使用 `linux/amd64`。
+`make package` 编译 Wasm、构建 Observer / Consumer 镜像，再通过 `docker save` 将这两个应用镜像保存到 `dist/package/images/images.tar`，默认使用 `linux/amd64`。默认不拉取、不检查、不归档 Kafka、Doris 和 Istio proxyv2 镜像。指定 `--include-dependency-images` 后，额外归档 Kafka 3.9.2、Doris 4.1.3、Istio proxyv2 1.13.5；缺少的依赖镜像会自动拉取，已有镜像会检查平台。
+
+两种模式都保留 Kafka / Doris 的单节点部署 YAML、初始化 Job 和全部配置。默认包部署前，目标节点需能拉取 Kafka / Doris 镜像，或已预先导入对应镜像；Istio 继续复用已有网关。`manifest.json` 的 `images` 记录全部镜像引用，`archived_images` 记录实际归档内容，`external_images` 记录需要目标环境准备的镜像。
 
 打包必须至少提供一个 `--accepted-request-host`，多个域名或模式重复传参。参数完整替换示例中的名单，支持精确域名、`*.company.com`（任意层级子域名，不含根域名）和显式 `*`（全部合法 DNS Host）；通配符需加引号，避免被 Shell 展开。脚本在查询目标集群、构建或导出镜像前校验并规范化名单，拒绝非法项、重复项、超限及非 ASCII 字符。规范化后的名单写入每个 Pod 的关闭态/启用态 EnvoyFilter、`manifest.json` 和包内 README；不能直接沿用旧包中的示例名单。
 
@@ -120,6 +125,44 @@ kubectl apply -f gateway/enabled/
 ```
 
 目标集群需事先安装 Istio 1.13.5，配置好业务路由和鉴权，并准备足够的 PV / StorageClass。包内 `README.md` 会按打包参数生成完整部署命令，打包过程不会自动部署到集群。打包成功、清单校验通过后，仍需完成生产 G0 至 G5 验收。
+
+### GitHub Release 下载包
+
+[发布工作流](.github/workflows/release.yaml) 支持推送 `v*` tag 自动发布，以及在 Actions → release-package → Run workflow 手动发布。工作流检出指定 tag，运行 `make test` 和 `make package`，校验包内摘要，压缩后上传到该 tag 的 GitHub Release。当前发布平台为 `linux/amd64`，使用 Go 1.25.0 和 TinyGo 0.40.1；无需镜像仓库或额外 PAT，发布使用工作流自带的 `GITHUB_TOKEN` 和 `contents: write` 权限。
+
+Release 默认仅携带 Observer / Consumer 镜像和嵌入的 Wasm，保留 Kafka / Doris 部署 YAML，不携带 Kafka、Doris、Istio proxyv2 镜像。目标环境需能拉取或预先导入依赖镜像。
+
+GitHub Runner 无需访问目标 Kubernetes 集群，但必须提供目标网关的真实身份和业务域名。在仓库 Settings → Secrets and variables → Actions → Variables 配置以下 Repository variables：
+
+| Variable | 格式与用途 |
+| --- | --- |
+| `RELEASE_ACCEPTED_REQUEST_HOSTS` | 必填，业务 Host 的 JSON 字符串数组，如 `["api.company.com", "*.company.com"]` |
+| `RELEASE_GATEWAY_PODS` | 必填，实际 `NAME=UID` 的 JSON 字符串数组，覆盖需要安装插件的全部网关 Pod |
+| `RELEASE_NAMESPACE` | 可选，采集命名空间，默认 `metering` |
+| `RELEASE_GATEWAY_NAMESPACE` | 可选，网关命名空间，默认 `istio-system` |
+| `RELEASE_STORAGE_CLASS` | 可选，StorageClass 名称；未配置时使用目标集群默认值 |
+
+在能够访问目标集群的机器上获取网关身份，将输出的完整 JSON 数组保存为 `RELEASE_GATEWAY_PODS`：
+
+```sh
+kubectl -n istio-system get pods -l istio=ingressgateway -o json |
+  python3 -c 'import json,sys; print(json.dumps([p["metadata"]["name"]+"="+p["metadata"]["uid"] for p in json.load(sys.stdin)["items"] if not p["metadata"].get("deletionTimestamp")]))'
+```
+
+修改网关命名空间时同步调整查询命令和 Variable。网关 Pod 重建、扩容或更换目标集群后，更新 Variable 并用新 tag 重新发布；旧包仍只匹配原 Pod。
+
+将工作流和脚本提交到 GitHub 后，基于包含这些文件的提交创建并推送 tag：
+
+```sh
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+手动发布时，工作流须已进入默认分支；填写已存在的 `tag`，其余输入可覆盖同名 Variable 对应的值，留空时使用 Variable 或上表默认值。待打包 tag 也必须包含发布工作流和脚本。输入不是任意 Shell 参数，域名、Pod 身份和命名空间都按现有打包契约校验。
+
+成功后，在仓库 Releases 对应版本的 Assets 下载 `llm-token-stats-<tag>-linux-amd64.tgz`、`SHA256SUMS`、`manifest.json` 和 `DOWNLOAD.md`。GitHub Release 单个附件必须小于 2 GiB；压缩包超过 1900 MiB 时，工作流上传 `.tgz.part000`、`.tgz.part001` 等分卷。下载全部附件到同一空目录，按该 Release 的说明校验、合并和解压，再执行包内 `package/README.md` 中的部署命令。[附件大小限制](https://docs.github.com/en/repositories/releasing-projects-on-github/about-releases#storage-and-bandwidth-quotas)
+
+工作流先创建草稿并上传全部附件，上传成功才发布；含短横线的 tag（如 `v0.1.0-rc.1`）标记为预发布。已有 Release 时拒绝覆盖。上传失败可能留下草稿，删除该草稿后可以重跑；已发布版本的变更使用新 tag。构建失败时查看 Actions 日志，发布成功不代表生产部署验收完成。
 
 ### Wasm 打包、下载与摘要
 

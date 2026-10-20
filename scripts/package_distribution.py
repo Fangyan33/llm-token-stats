@@ -1,4 +1,4 @@
-"""构建单节点离线分发包：Docker 镜像、完整 Kubernetes YAML 与配置。"""
+"""构建单节点分发包：应用镜像、完整 Kubernetes YAML 与配置，可选携带依赖镜像。"""
 import argparse
 import base64
 import copy
@@ -350,18 +350,22 @@ def package(args):
     tag = resolve_image_tag()
     images = {'observer': 'metering-observer:' + tag, 'consumer': 'metering-consumer:' + tag,
               **RUNTIME_IMAGES}
+    archived_images = images if args.include_dependency_images else {
+        name: images[name] for name in ('observer', 'consumer')}
+    external_images = {name: image for name, image in images.items() if name not in archived_images}
     target.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix='.metering-package-', dir=target.parent) as directory:
         output = Path(directory) / 'package'
         output.mkdir(mode=0o700)
         render_manifests(args, images, pods, output)
         # 配置、Pod 身份、Wasm 校验全部通过后，才构建镜像并导出。
-        records = prepare_images(args, images)
+        records = prepare_images(args, archived_images)
         (output / 'images').mkdir()
-        print('导出全部运行镜像（包含单节点 Kafka / Doris 和网关依赖）：', flush=True)
+        print('导出镜像：' + ', '.join(archived_images.values()), flush=True)
         run(['docker', 'save', '--output', str(output / 'images/images.tar'),
-             *dict.fromkeys(images.values())], capture=False)
+             *dict.fromkeys(archived_images.values())], capture=False)
         manifest = {'image_tag': tag, 'platform': args.platform, 'images': images,
+                    'archived_images': archived_images, 'external_images': external_images,
                     'image_details': records, 'wasm_sha256': wasm_sha,
                     'namespace': args.namespace, 'gateway_namespace': args.gateway_namespace,
                     'accepted_request_hosts': gateway_config['accepted_request_hosts'],
@@ -377,6 +381,11 @@ def package(args):
 
 def package_readme(args, pods):
     hosts = gateway_configuration(args)['accepted_request_hosts']
+    image_note = ('镜像归档包含 Observer、Consumer、Kafka、Doris、Istio proxyv2。'
+                  if args.include_dependency_images else
+                  '镜像归档仅包含 Observer、Consumer；Kafka、Doris、Istio proxyv2 镜像不随包提供。\n'
+                  'Kafka / Doris 部署清单和初始化 Job 仍保留；部署前需保证节点能拉取这些依赖镜像，\n'
+                  '或在所有可能调度相关 Pod 的节点预先导入对应镜像。已有 Istio 网关继续复用。')
     return f'''# 单节点采集分发包
 
 运行平台：{args.platform}；采集命名空间：{args.namespace}。
@@ -384,7 +393,9 @@ Kafka 3.9.2（24 分区、单副本、保留 72 小时），Doris 4.1.3（单 FE
 本包使用明文 Kafka 和 Doris root 空密码，仅用于受控开发环境；不代表生产 G0–G5 验收。
 目标集群需已有 Istio 1.13.5、网关业务路由和鉴权，以及可用的 StorageClass / PV。
 本包不安装 Istio、不修改已有网关的 Deployment、路由和鉴权。
-镜像包括 Observer、Consumer、Kafka、Doris、Istio proxyv2；Wasm 已嵌入 Observer 镜像。
+{image_note}
+Wasm 已嵌入 Observer 镜像。manifest.json 的 images 记录全部镜像引用，
+archived_images 记录归档内镜像，external_images 记录需由目标环境准备的镜像。
 Wasm Host 白名单：{json.dumps(hosts, ensure_ascii=False)}，同时记录于 manifest.json 和每个 EnvoyFilter。
 该名单来自打包时显式提供的 --accepted-request-host；后缀通配匹配子域名，不含根域名。
 
@@ -447,6 +458,8 @@ def parser():
     p.add_argument('--topic', default='llm-metering-events')
     p.add_argument('--group', default='llm-metering-doris-v1')
     p.add_argument('--platform', choices=['linux/amd64', 'linux/arm64'], default='linux/amd64')
+    p.add_argument('--include-dependency-images', action='store_true',
+                   help='同时归档 Kafka、Doris、Istio proxyv2 镜像；默认仅归档 Observer、Consumer')
     p.add_argument('--build-network', default='host', help='Docker 构建网络，默认 host；可指定 default')
     p.add_argument('--storage-class', help='省略时使用目标集群默认 StorageClass；空串表示手工绑定 PV')
     p.add_argument('--kafka-storage', default='10Gi')

@@ -154,30 +154,37 @@ class DistributionTests(unittest.TestCase):
             self.assertFalse(args.output.exists())
             self.assertEqual(list(Path(directory).iterdir()), [])
 
-    def test_successful_package_saves_all_manifest_images_and_checksums(self):
+    def test_successful_package_saves_selected_images_and_checksums(self):
         def docker_save(command, **kwargs):
             self.assertEqual(command[:2], ['docker', 'save'])
             Path(command[command.index('--output') + 1]).write_bytes(b'synthetic archive')
 
-        with tempfile.TemporaryDirectory() as directory:
-            args = self.args('--output', str(Path(directory) / 'package'))
-            with patch.object(bundle, 'checksum', return_value='wasm-sha'), \
-                    patch.object(bundle, 'gateway_pods', return_value=[]), \
-                    patch.object(bundle, 'resolve_image_tag', return_value='version'), \
-                    patch.object(bundle, 'render_manifests'), \
-                    patch.object(bundle, 'prepare_images', return_value={}), \
-                    patch.object(bundle, 'run', side_effect=docker_save) as run:
-                bundle.package(args)
-            manifest = json.loads((args.output / 'manifest.json').read_text())
-            self.assertEqual(manifest['accepted_request_hosts'], ['model.example.invalid', '*.example.invalid'])
-            self.assertIn(json.dumps(manifest['accepted_request_hosts']), (args.output / 'README.md').read_text())
-            self.assertEqual(set(run.call_args.args[0][4:]), set(manifest['images'].values()))
-            sums = (args.output / 'SHA256SUMS').read_text()
-            self.assertIn(bundle.file_sha256(args.output / 'images/images.tar') + '  images/images.tar', sums)
-            with patch.object(bundle, 'prepare_images') as prepare:
-                with self.assertRaisesRegex(ValueError, '非空'):
+        for include_dependencies in (False, True):
+            with self.subTest(include_dependencies=include_dependencies), tempfile.TemporaryDirectory() as directory:
+                options = ['--include-dependency-images'] if include_dependencies else []
+                args = self.args('--output', str(Path(directory) / 'package'), *options)
+                with patch.object(bundle, 'checksum', return_value='wasm-sha'), \
+                        patch.object(bundle, 'gateway_pods', return_value=[]), \
+                        patch.object(bundle, 'resolve_image_tag', return_value='version'), \
+                        patch.object(bundle, 'render_manifests') as render, \
+                        patch.object(bundle, 'prepare_images', return_value={}) as prepare, \
+                        patch.object(bundle, 'run', side_effect=docker_save) as run:
                     bundle.package(args)
-            prepare.assert_not_called()
+                manifest = json.loads((args.output / 'manifest.json').read_text())
+                self.assertEqual(manifest['accepted_request_hosts'], ['model.example.invalid', '*.example.invalid'])
+                self.assertIn(json.dumps(manifest['accepted_request_hosts']), (args.output / 'README.md').read_text())
+                expected = {'observer', 'consumer'} | (set(bundle.RUNTIME_IMAGES) if include_dependencies else set())
+                self.assertEqual(set(manifest['archived_images']), expected)
+                self.assertEqual(set(prepare.call_args.args[1]), expected)
+                self.assertEqual(set(run.call_args.args[0][4:]), set(manifest['archived_images'].values()))
+                self.assertEqual(set(render.call_args.args[1]), {'observer', 'consumer', *bundle.RUNTIME_IMAGES})
+                self.assertEqual(set(manifest['external_images']), set(manifest['images']) - expected)
+                sums = (args.output / 'SHA256SUMS').read_text()
+                self.assertIn(bundle.file_sha256(args.output / 'images/images.tar') + '  images/images.tar', sums)
+                with patch.object(bundle, 'prepare_images') as prepare:
+                    with self.assertRaisesRegex(ValueError, '非空'):
+                        bundle.package(args)
+                prepare.assert_not_called()
 
     def test_mismatched_image_platform_is_rejected_before_save(self):
         info = [{'Os': 'linux', 'Architecture': 'arm64', 'Id': 'sha256:image'}]

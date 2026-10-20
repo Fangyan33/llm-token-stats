@@ -1,0 +1,107 @@
+name: release-package
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '已存在的 Git tag（须包含本工作流和发布脚本）'
+        required: true
+        type: string
+      accepted_request_hosts:
+        description: '业务 Host 的 JSON 数组；留空使用 RELEASE_ACCEPTED_REQUEST_HOSTS'
+        type: string
+      gateway_pods:
+        description: '实际 NAME=UID 的 JSON 数组；留空使用 RELEASE_GATEWAY_PODS'
+        type: string
+      namespace:
+        description: '采集命名空间；留空使用 RELEASE_NAMESPACE 或 metering'
+        type: string
+      gateway_namespace:
+        description: '网关命名空间；留空使用 RELEASE_GATEWAY_NAMESPACE 或 istio-system'
+        type: string
+      storage_class:
+        description: 'StorageClass；留空使用 RELEASE_STORAGE_CLASS 或目标集群默认值'
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-package-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      contents: write
+    env:
+      RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+      RELEASE_ACCEPTED_REQUEST_HOSTS: ${{ inputs.accepted_request_hosts || vars.RELEASE_ACCEPTED_REQUEST_HOSTS }}
+      RELEASE_GATEWAY_PODS: ${{ inputs.gateway_pods || vars.RELEASE_GATEWAY_PODS }}
+      RELEASE_NAMESPACE: ${{ inputs.namespace || vars.RELEASE_NAMESPACE || 'metering' }}
+      RELEASE_GATEWAY_NAMESPACE: ${{ inputs.gateway_namespace || vars.RELEASE_GATEWAY_NAMESPACE || 'istio-system' }}
+      RELEASE_STORAGE_CLASS: ${{ inputs.storage_class || vars.RELEASE_STORAGE_CLASS }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ env.RELEASE_TAG }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Validate target configuration and tag
+        run: python3 scripts/release_package.py validate --tag "$RELEASE_TAG"
+      - name: Check release does not already exist
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo '该 tag 已有 Release；请使用新版本，或先删除上次失败遗留的草稿。' >&2
+            exit 1
+          fi
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.0'
+          cache: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Test
+        run: make test
+      - name: Prepare TinyGo 0.40.1
+        run: |
+          mkdir -p "$RUNNER_TEMP/release-bin"
+          cat > "$RUNNER_TEMP/release-bin/tinygo" <<'SH'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          docker run --rm -v "$GITHUB_WORKSPACE:/src" \
+            -w /src/plugins/gateway-observer tinygo/tinygo:0.40.1 tinygo "$@"
+          SH
+          chmod +x "$RUNNER_TEMP/release-bin/tinygo"
+          echo "$RUNNER_TEMP/release-bin" >> "$GITHUB_PATH"
+      - name: Build package with make package
+        run: python3 scripts/release_package.py build --tag "$RELEASE_TAG"
+      - name: Free runner disk before compression
+        run: |
+          docker builder prune --all --force
+          docker image prune --all --force
+      - name: Create tgz and checksums
+        run: python3 scripts/release_package.py archive --tag "$RELEASE_TAG"
+      - name: Upload assets and publish Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          flags=()
+          if [[ "$RELEASE_TAG" == *-* ]]; then
+            flags+=(--prerelease)
+          fi
+          gh release create "$RELEASE_TAG" dist/release/* \
+            --repo "$GITHUB_REPOSITORY" --verify-tag --draft \
+            --title "$RELEASE_TAG" --notes-file dist/release-notes.md "${flags[@]}"
+          gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --draft=false
+          gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json url --jq .url >> "$GITHUB_STEP_SUMMARY"

@@ -63,7 +63,7 @@ func startBatchingConsumer(t *testing.T, topic, group string, rows, bytes int) *
 	c := config.Config{
 		Kafka: config.Kafka{Brokers: []string{"127.0.0.1:29092"}, Topic: topic},
 		Consumer: config.Consumer{Group: group, Rows: rows, Bytes: bytes, FlushMS: 500,
-			AcceptedConfigs: []string{"collection-v1"}, AcceptedServices: []string{"model-service-a"}},
+			AcceptedConfigs: []string{"collection-v1"}},
 		Doris: s.Cfg,
 	}
 	if err := c.ConsumerDefaults(); err != nil {

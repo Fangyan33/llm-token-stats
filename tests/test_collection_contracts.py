@@ -182,7 +182,8 @@ class CollectionContractsTest(unittest.TestCase):
                                     ('deploy/local/consumer.json', 'consumer'),
                                     ('configs/consumer.production.example.json', 'consumer')]:
             settings = contracts.load(ROOT / filename)[component]
-            self.assertEqual(settings['accepted_service_ids'], ['model-service-a'])
+            self.assertNotIn('accepted_request_hosts', settings)
+            self.assertNotIn('accepted_service_ids', settings)
             self.assertNotIn('accepted_routes', settings)
 
     def test_diagnostic_route_only_changes_payload_hash(self):
@@ -194,6 +195,27 @@ class CollectionContractsTest(unittest.TestCase):
             other_payload, other_identity = contracts.event_hashes(changed)
             self.assertNotEqual(payload, other_payload)
             self.assertEqual(identity, other_identity)
+
+    def test_wasm_host_allowlist_patterns(self):
+        for patterns in ([], ['*'], ['MODEL.Example.invalid.', '*.Example.invalid.']):
+            config = copy.deepcopy(self.config)
+            config['accepted_request_hosts'] = patterns
+            contracts.validate_config(config)
+        config = copy.deepcopy(self.config)
+        config.pop('accepted_request_hosts')
+        contracts.validate_config(config)
+        config['accepted_request_hosts'] = ['h' + str(i) + '.example.com' for i in range(1024)]
+        contracts.validate_config(config)
+        for patterns in (None, 'example.com', [''], ['example.com:443'], ['https://example.com'],
+                         ['127.0.0.1'], ['*.127.0.0.1'], ['model-*.example.com'],
+                         ['**.example.com'], ['?.example.com'], ['*.example.com..'],
+                         ['K.example.com'], ['a' * 64 + '.com'],
+                         ['example.com', 'EXAMPLE.COM.'], ['*.example.com', '*.EXAMPLE.COM.'],
+                         ['*'] * 1025):
+            with self.subTest(patterns=str(patterns)[:80]):
+                self.assert_config_invalid(lambda c: c.update(accepted_request_hosts=patterns))
+        patterns = ['h' + str(i) + '.' + 'a' * 63 + '.' + 'b' * 63 + '.example.com' for i in range(512)]
+        self.assert_config_invalid(lambda c: c.update(accepted_request_hosts=patterns))
 
     def test_config_resource_relationships(self):
         changes = [

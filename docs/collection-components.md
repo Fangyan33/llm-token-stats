@@ -1,6 +1,6 @@
 # 网关采集组件运行说明
 
-更新日期：2026-10-19。[实现计划](spec/plan/gateway-collection-implementation.md)已落地到三个可构建组件。业务仍直接经过网关到模型服务；Wasm 旁路发送有界片段，Observer 解析后使用原生 Producer 写 Kafka，Consumer 确认 Doris 可见性后提交 offset。仅产生 `request_started`、`usage_observed`，未知值保留 null/unknown。
+更新日期：2026-10-20。[实现计划](spec/plan/gateway-collection-implementation.md)已落地到三个可构建组件。业务仍直接经过网关到模型服务；Wasm 旁路发送有界片段，Observer 解析后使用原生 Producer 写 Kafka，Consumer 确认 Doris 可见性后提交 offset。仅产生 `request_started`、`usage_observed`，未知值保留 null/unknown。
 
 本轮命令、故障处理及资源归零证据见[本地验证记录](spec/plan/gateway-collection-verification.md)，实际镜像 digest 见[镜像记录](../deploy/local/images.lock.json)。
 
@@ -25,7 +25,7 @@ python3 scripts/local_collection.py stop
 
 镜像版本使用 `python3 scripts/image_tag.py` 解析：当前 HEAD 有 Git tag 时取该 tag，无 tag 时取至少 12 位 commit 短 hash；多个 tag 按 Git 版本排序取最高项，历史 tag 不沿用，不兼容 Docker tag 的名称会报错。README 的服务镜像构建与 `make k8s-test` 使用同一规则；Kubernetes 测试的 topic / 消费组仍通过随机 run-id 隔离。
 
-`make package` 另构建 Observer / Consumer 镜像，并用 `docker save` 将这两个镜像及 Kafka、Doris、Istio proxyv2 保存到 `dist/package/images/images.tar`。分发包同时提供单节点 Kafka / Doris 的持久化部署、topic / 数据库初始化 Job、采集服务、全部 ConfigMap / Secret，以及针对实际网关 Pod 渲染的关闭态 / 启用态 EnvoyFilter；全部为可直接 `kubectl apply` 的 YAML。默认只读查询当前 context 的既有网关，也可通过 `PACKAGE_ARGS` 提供目标 context 或实际 Pod 名称 / UID。指定输出目录使用 `PACKAGE_DIR`，完整命令、离线导入和部署顺序见 [README 离线分发](../README.md#离线分发镜像与完整-kubernetes-清单)。该包采用开发环境的单节点、明文 Kafka 与 Doris root 空密码，生产仍使用下文的独立基础设施和认证配置。
+`make package` 另构建 Observer / Consumer 镜像，并用 `docker save` 将这两个镜像及 Kafka、Doris、Istio proxyv2 保存到 `dist/package/images/images.tar`。分发包同时提供单节点 Kafka / Doris 的持久化部署、topic / 数据库初始化 Job、采集服务、全部 ConfigMap / Secret，以及针对实际网关 Pod 渲染的关闭态 / 启用态 EnvoyFilter；全部为可直接 `kubectl apply` 的 YAML。打包必须通过 `PACKAGE_ARGS` 至少提供一个 `--accepted-request-host`，可重复传入目标域名、后缀通配或显式 `*`；名单完整覆盖示例值，并写入两种状态的 EnvoyFilter、manifest 和包内说明。省略或非法名单在集群查询及镜像构建前失败。默认只读查询当前 context 的既有网关，也可通过 `PACKAGE_ARGS` 提供目标 context 或实际 Pod 名称 / UID。指定输出目录使用 `PACKAGE_DIR`，完整命令、离线导入和部署顺序见 [README 离线分发](../README.md#离线分发镜像与完整-kubernetes-清单)。该包采用开发环境的单节点、明文 Kafka 与 Doris root 空密码，生产仍使用下文的独立基础设施和认证配置。
 
 本地栈的已发布端口统一绑定 `0.0.0.0`，可使用服务器 IP 从远端访问：
 
@@ -95,12 +95,20 @@ make generate
 
 `observation.proto` 的 go_package 已固定到本项目。Wasm 使用有界手工编码与标准 Protobuf 互操作测试，禁止将 gRPC-Go 编入插件。基底 SDK 导出 ABI marker `proxy_abi_version_0_2_0`，实际正文回调名为 `proxy_on_request_body`；ABI 脚本检查这些真实符号、gRPC 回调/hostcall 及无 socket imports，保留基底 marker。
 
+## Wasm Host 白名单
+
+仅在 Wasm 配置顶层维护 `accepted_request_hosts`。支持精确 DNS 域名、`*.example.com` 和 `*`；后缀通配匹配任意层级子域名，不含根域名。请求从 `:authority` 规范化，先拒绝非 ASCII 字符，再转小写并去端口和末尾点，不读取转发头。规则最多 1024 项，且整体 Wasm 配置仍须满足 64 KiB 上限；加载时转小写、去末尾点；端口、URL、IP、其他通配符和规范化后重复项均为无效配置。缺省或空名单不采集；非法配置停用插件采集，继续放行业务。
+
+Host 无效或不匹配时，在提取凭据、建立观察流、缓存或改写正文之前直接透传，分别记录 `metering_requests_ignored_invalid_host_total`、`metering_requests_ignored_host_total`，无域名标签。Observer / Consumer 不维护服务或 Host 白名单，仍校验配置版本、协议和字段状态一致性；历史空 Host 诊断事件仍按原事件契约处理。
+
+升级时先构建新 Wasm、按新摘要渲染并启用含 Host 名单的 EnvoyFilter，再更新 Observer / Consumer 二进制和删除旧名单的配置。下游不接受 `accepted_service_ids` 或 `accepted_request_hosts` 字段。已有离线包必须重新生成；这些校验不代表生产验收。
+
 ## 已确认的旧版网关处理
 
 - 请求头 Continue；符合条件的正文在非 EOS 回调 Pause，EOS 时只修改 `stream_options.include_usage`。请求头可先到上游。这是用户在真实旧版 ext_authz PoC 后确认的调整：暂停头会延迟已缓冲正文回调直到改写超时。
 - 改写预算与观察预算独立；Observer 不可用仍可补充参数。超限、超时或 JSON 无效时恢复原文，响应正文一直 Continue。旧版真实慢上传 PoC 中，Root 异步 Resume 后尾片可能不再完整经过 Wasm 回调，因此超时恢复会在有界前缀后取消观察，结果保留 partial/unknown，不宣称完整用量。JSON 校验限制深度 64、元素 100000、单对象键 8192；超限取消解析/原文放行。这些额外保护可能使复杂合法 JSON 降级，不能宣称所有请求均能改写。
 - 当前 Wasm 配置资源整数还限制在有符号 32 位正值范围，防止 TinyGo wasm32 的长度转换溢出；给出的初值全部满足。预发布仍必须运行 Schema 与关系校验。
-- 当前默认规则为 `route_name: "*"`，忽略路由名，只采集 `POST /v1/chat/completions`；路由属性或 metadata 缺失也可命中。路径去掉查询串后精确匹配，其它方法、尾斜杠、子路径和不同路径均忽略。精确路由规则仍支持：先读取可信 `route_name`，缺失时读取 `route_metadata.filter_metadata.metering.route_name`，都不可读时该精确规则不命中。规则按配置顺序选择，不读取客户端提供的路由或身份头。
+- 当前默认规则为 `route_name: "*"`，忽略路由名，采集匹配顶层 `accepted_request_hosts` 的 `POST /v1/chat/completions`；路由属性或 metadata 缺失也可命中。路径去掉查询串后精确匹配，其它方法、尾斜杠、子路径和不同路径均忽略。精确路由规则仍支持：先读取可信 `route_name`，缺失时读取 `route_metadata.filter_metadata.metering.route_name`，都不可读时该精确规则不命中。规则按配置顺序选择，不读取客户端提供的路由或身份头。
 服务及供应商由 Observer 的服务查询接口解析，客户/API Key ID 由客户接口解析；空 URI 为占位，启用 HTTP/HTTPS 适配后同时保存名称。route_name 仅诊断，不参与身份摘要；旧 accepted_routes、身份元数据配置及规则 service_id 已删除。同一事件不同内容仍冲突。
 - trailers 只产生零字节 EOS BodyChunk，不上传其内容。End 校验两个方向的片序、偏移、字节总数及 EOS；HTTP context 删除后只由 Root+token 处理迟到 ACK，不能延长业务生命周期。
 - 上游重复伪造的计量响应头先全部移除；Start ACK 已到才加入一个 Observer UUID。快响应允许头缺失；有头也不保证事件已入 Kafka/Doris。
@@ -188,7 +196,7 @@ G0–G5 仍须独立完成：私有镜像/真实 Auth、HTTP2 慢上传与断开
 
 ## 归属配置与隔离库
 
-Observer 必填 cluster_name、deployment_environment，service_lookup/customer_lookup 各有可空 uri。当前不实现真实 HTTP、鉴权或网络缓存，不要求第三方 Secret。输入非法先记录 invalid_host/invalid_api_key，合法输入的两个占位记录 lookup_not_implemented。两事件复用快照，客户失败使 identity_status=invalid、usage_eligible=false，不清除原始已观察 usage。
+Observer 必填 cluster_name、deployment_environment，service_lookup/customer_lookup 各有可空 uri。非空 URI 使用 HTTP/HTTPS 和独立 x-remote-data 凭据，空 URI 使用 lookup_not_implemented 占位；未启用接口时不要求第三方 Secret。Wasm 先按 Host 筛选，非法 Host 不建立观察；invalid_host 仍为历史诊断契约保留。两事件复用快照，客户失败使 identity_status=invalid、usage_eligible=false，不清除原始已观察 usage。
 
 Consumer 的 doris.database、DSN、Stream Load 和证据/巡检 SQL 使用同一经过校验的库名。初始化使用 `python3 scripts/render_doris_sql.py --database 数据库 migrations/doris/metering/001_init.sql`，对其余初始化 SQL 同样渲染。本地默认 metering_development，新 Kubernetes 测试每次用 metering_k8s_<run-id>；不修改旧 metering 库及其消息，清理保留测试库作为证据。普通 Docker 联调使用合成 token 和隔离明文网络；生产/真实密钥只允许已验证的网格 mTLS/TLS。
 

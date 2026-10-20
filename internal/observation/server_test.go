@@ -29,16 +29,23 @@ func (s *sink) Emit(e *events.Event) {
 	s.es = append(s.es, &copy)
 }
 func TestObserveEOSAndOnceFinalization(t *testing.T) {
-	for _, mode := range []string{"trailers_eos", "bad_end", "resource_limit", "missing_route", "other_route", "legacy_wildcard", "overlong_route", "unimplemented"} {
+	for _, mode := range []string{"trailers_eos", "bad_end", "resource_limit", "missing_route", "other_route", "legacy_wildcard", "overlong_route", "unimplemented", "new_service", "legacy_invalid_host"} {
 		t.Run(mode, func(t *testing.T) {
 			badEnd, limited := mode == "bad_end", mode == "resource_limit"
 			l := bufconn.Listen(1 << 20)
 			h := &health.State{}
 			k := &sink{}
-			srv := &Server{Cfg: config.Observer{ProducerID: "test", ClusterName: "test-cluster", DeploymentEnvironment: "stg", MaxActive: 4, ParserBudget: 64 << 20, MaxObservationMS: 5000, AcceptedConfigs: []string{"v1"}, AcceptedAdapters: []string{"chat_completions_v1"}, AcceptedServices: []string{"a"}}, Sink: k, Health: h, ServiceResolver: serviceFake{}, CustomerResolver: customerFake{}}
+			srv := &Server{Cfg: config.Observer{ProducerID: "test", ClusterName: "test-cluster", DeploymentEnvironment: "stg", MaxActive: 4, ParserBudget: 64 << 20, MaxObservationMS: 5000, AcceptedConfigs: []string{"v1"}, AcceptedAdapters: []string{"chat_completions_v1"}}, Sink: k, Health: h, ServiceResolver: serviceFake{}, CustomerResolver: customerFake{}}
 			if mode == "unimplemented" {
 				srv.ServiceResolver = nil
 				srv.CustomerResolver = nil
+			}
+			if mode == "new_service" {
+				srv.ServiceResolver = serviceFunc(func(ctx context.Context, r identitylookup.ServiceLookupRequest) (identitylookup.ServiceIdentity, error) {
+					v, err := serviceFake{}.Resolve(ctx, r)
+					v.ServiceID = "new-service-without-registration"
+					return v, err
+				})
 			}
 			if limited {
 				srv.Cfg.ParserBudget = 3 * 32768
@@ -59,6 +66,9 @@ func TestObserveEOSAndOnceFinalization(t *testing.T) {
 				t.Fatal(err)
 			}
 			st := &pb.Start{RequestStartedAtMs: time.Now().UnixMilli(), GatewayInstanceId: "gateway", ConfigVersion: "v1", RouteName: "chat", AdapterId: "chat_completions_v1", RequestAuthority: "Model.Example.invalid:443", ApiKey: []byte("synthetic-key"), Method: "POST", RequestContentType: "application/json"}
+			if mode == "legacy_invalid_host" {
+				st.RequestAuthority = "127.0.0.1"
+			}
 			wantRoute := "chat"
 			switch mode {
 			case "missing_route":
@@ -103,6 +113,12 @@ func TestObserveEOSAndOnceFinalization(t *testing.T) {
 				t.Fatal("not exactly two", len(k.es))
 			}
 			e := k.es[1]
+			if mode == "new_service" && (e.ServiceID == nil || *e.ServiceID != "new-service-without-registration") {
+				t.Fatal("service ID still filtered")
+			}
+			if mode == "legacy_invalid_host" && (e.RequestHost != nil || e.MappingStatus != "invalid_host") {
+				t.Fatal("legacy diagnostic contract changed")
+			}
 			if k.es[0].RouteName != wantRoute || e.RouteName != wantRoute {
 				t.Fatalf("diagnostic route must be fixed across events: %q / %q", k.es[0].RouteName, e.RouteName)
 			}
@@ -149,7 +165,7 @@ func TestLookupDoesNotDelayAcksAndHasNoQueue(t *testing.T) {
 	}()
 	entered := make(chan struct{})
 	k := &sink{}
-	srv := &Server{Cfg: config.Observer{ProducerID: "test", ClusterName: "cluster", DeploymentEnvironment: "stg", MaxActive: 4, ParserBudget: 64 << 20, MaxObservationMS: 5000, LookupTimeoutMS: 1500, LookupConcurrency: 1, AcceptedConfigs: []string{"v1"}, AcceptedAdapters: []string{"chat_completions_v1"}, AcceptedServices: []string{"a"}}, Sink: k, Health: &health.State{}, CustomerResolver: customerFake{}}
+	srv := &Server{Cfg: config.Observer{ProducerID: "test", ClusterName: "cluster", DeploymentEnvironment: "stg", MaxActive: 4, ParserBudget: 64 << 20, MaxObservationMS: 5000, LookupTimeoutMS: 1500, LookupConcurrency: 1, AcceptedConfigs: []string{"v1"}, AcceptedAdapters: []string{"chat_completions_v1"}}, Sink: k, Health: &health.State{}, CustomerResolver: customerFake{}}
 	srv.ServiceResolver = serviceFunc(func(ctx context.Context, _ identitylookup.ServiceLookupRequest) (identitylookup.ServiceIdentity, error) {
 		close(entered)
 		select {

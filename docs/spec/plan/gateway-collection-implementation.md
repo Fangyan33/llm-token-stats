@@ -28,7 +28,7 @@
 ## 接口与故障约束
 
 - 协议服务名和 schema_version=1 保持不变；删除的 Start 字段号保留为 reserved，新增 authority=16/api_key=17；可选事件字段显式输出 null，固定 struct 编码和 SHA-256 摘要。
-- Wasm 在规则启用/POST/精确路径过滤后才读取 Host/Bearer 与正文、分配观察资源。当前 `route_name: "*"` 忽略实际路由名及其 metadata；精确路由规则仍兼容。事件记录真实 Envoy 路由名或 unknown，仅供诊断；Observer / Consumer 按 accepted_service_ids 接纳，旧 accepted_routes 已删除。身份一致性排除路由，006 初始化同一新模型视图；只接纳当前格式事件，同事件不同内容仍冲突。改写只编辑 include_usage，超时/超限恢复透传；正文前缀只观察一次。
+- Wasm 在规则启用/POST/精确路径过滤后才读取 Host/Bearer 与正文、分配观察资源。当前 `route_name: "*"` 忽略实际路由名及其 metadata；精确路由规则仍兼容。事件记录真实 Envoy 路由名或 unknown，仅供诊断；采集范围由 Wasm 顶层 accepted_request_hosts 筛选，Observer / Consumer 不维护服务或 Host 白名单，旧 accepted_routes 已删除。身份一致性排除路由，006 初始化同一新模型视图；只接纳当前格式事件，同事件不同内容仍冲突。改写只编辑 include_usage，超时/超限恢复透传；正文前缀只观察一次。
 - ACK 只确认已处理帧，不等待 Kafka；发送失败不补发，无正文持久化或恢复队列。
 - Consumer 未知 schema 暂停该分区；永久非法消息仅保存坐标/摘要/固定原因。事务未知须确认原 label，凭据只发送到允许的 FE/BE。
 - 新消费组先持久登记最早可用 offset；已有组缺少可信起点需显式接管配置。保留期缺口登记后暂停，显式恢复，不跳到最新。

@@ -149,6 +149,7 @@ func TestRemoteWasmFailureAndRecovery(t *testing.T) {
 				id := uuid(t)
 				body := []byte(`{"model":"fixture","messages":[{"role":"user","content":"synthetic download recovery"}]}`)
 				req, _ := http.NewRequest("POST", base+"/v1/chat/completions", bytes.NewReader(body))
+				req.Host = "model.example.invalid"
 				req.Header.Set("Content-Type", "application/json")
 				req.Header.Set("x-request-id", id)
 				res, err := client.Do(req)

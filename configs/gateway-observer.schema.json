@@ -67,7 +67,7 @@
         ],
         "properties": {
           "route_name": {
-            "description": "精确路由名；单独的 * 表示忽略路由名，仅按 method/path 筛选，包括路由名不可读的请求。事件单独记录实际 Envoy 路由名，不可读时为 unknown。规则按配置顺序选择，先命中的路由规则决定启用与路径匹配。",
+            "description": "精确路由名；单独的 * 表示忽略路由名，仍按 method/path 和顶层 Host 白名单筛选，包括路由名不可读的请求。事件单独记录实际 Envoy 路由名，不可读时为 unknown。规则按配置顺序选择，先命中的路由规则决定启用与路径匹配。",
             "type": "string",
             "minLength": 1,
             "maxLength": 128
@@ -199,6 +199,19 @@
       "type": "integer",
       "minimum": 1,
       "maximum": 1024
+    },
+    "accepted_request_hosts": {
+      "description": "采集 Host 白名单：精确 DNS 域名、*.example.com（任意层级子域名，不含根域名）或 *（所有合法 DNS Host）。缺省或空数组不采集；规则转小写并去末尾根点，拒绝端口、IP、其他通配符和规范化后的重复项。",
+      "type": "array",
+      "default": [],
+      "maxItems": 1024,
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 256,
+        "pattern": "(?:\\*|(?:\\*\\.)?[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?\\.?)"
+      }
     }
   }
 }

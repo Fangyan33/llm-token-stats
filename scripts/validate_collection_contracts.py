@@ -6,6 +6,7 @@ Errors contain field locations/reason codes, never input values or payloads.
 """
 import argparse
 import hashlib
+import ipaddress
 import json
 import math
 import re
@@ -277,13 +278,34 @@ def validate_event(event, kafka_key=None, now_ms=None, input_size=None):
         incomplete = {"missing_end", "protocol_error", "protocol_incomplete", "parse_limit", "transport_lost", "observation_timeout"}
         require(not incomplete.intersection(event["anomaly_codes"]), "complete_observation_anomaly")
 
+def normalize_request_host_pattern(pattern):
+    require(type(pattern) is str and pattern.isascii(), 'request_host_pattern_ascii')
+    if pattern == '*':
+        return pattern
+    wildcard = pattern.startswith('*.')
+    host = pattern[2:] if wildcard else pattern
+    host = host.removesuffix('.').lower()
+    require(0 < len(host) <= 253 and host.isascii(), 'request_host_pattern_length')
+    require(all(re.fullmatch(r'[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?', part)
+                for part in host.split('.')), 'request_host_pattern_dns')
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        pass
+    else:
+        raise ContractError('request_host_pattern_ip')
+    return '*.' + host if wildcard else host
+
 def validate_config(config, release=False):
     schema = load(ROOT / "configs/gateway-observer.schema.json")
     validate_schema(config, schema)
     check_strings(config)
+    require(len(go_json(config)) <= 65536, 'config_bytes')
     for name, field in schema["properties"].items():
-        if isinstance(config[name], str) and "maxLength" in field:
+        if isinstance(config.get(name), str) and "maxLength" in field:
             require(utf8_size(config[name]) <= field["maxLength"], name + ":utf8_bytes")
+    patterns = [normalize_request_host_pattern(p) for p in config.get('accepted_request_hosts', [])]
+    require(len(patterns) == len(set(patterns)), 'duplicate_request_host_pattern')
     names = []
     for rule in config["routes"]:
         names.append(rule["route_name"])

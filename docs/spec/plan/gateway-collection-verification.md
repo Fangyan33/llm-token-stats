@@ -282,3 +282,37 @@ Kubernetes 诊断保存在本地忽略目录 `.tmp/k8s-collection/kind-kind/mete
 | 数据库字典 | 刷新本地栈时保留数据卷，仅更新当前开发库注释和视图；只读核对 metering_development 元数据与生成的字典完全一致，结构仍为 12 表 / 214 列、7 视图 / 318 列 |
 
 上述查询收尾保证限于 Observer 正常运行期间。HTTP 的传输保护由部署链路提供；本次使用合成归属服务，未验收真实第三方、进程退出持久化或生产 G0–G5，不扩大 Kafka 投递和 Doris 可见性保证。
+
+## 2026-10-20：Wasm Host 白名单与下游准入简化
+
+采集范围统一由 Wasm 顶层 accepted_request_hosts 决定，支持精确 DNS 域名、*.example.com 与 *。后缀通配包含任意层级子域名，不含根域名；* 仅接纳合法 DNS Host。请求只读取 :authority，转小写并去端口与末尾点，不使用转发头。名单缺省或为空时不采集；最多 1024 项，且整体配置受 64 KiB 上限约束，Go 运行时和 Python 发布校验均验证边界、非法规则及规范化后的重复项。
+
+Host 无效或未匹配时，在提取凭据、分配正文改写资源及建立观察流之前直接透传。指标仅使用 requests_ignored_invalid_host 与 requests_ignored_host 固定原因，不增加域名标签。Observer / Consumer 已移除服务 ID 和 Host 白名单，保留配置版本、协议与字段状态一致性校验；历史空 Host/invalid_host 诊断契约继续有效。
+
+| 验证 | 本次结果与边界 |
+| --- | --- |
+| 无缓存全量单元检查 | GOFLAGS=-count=1 make test 通过：6 份事件契约样例、72 项 Python 测试、主模块及独立插件 Go 竞态测试全部通过；补充整体配置大小边界后，配置包竞态和全部 72 项 Python 测试再次通过 |
+| Wasm 入口回归 | 覆盖精确匹配、多级子域名、根域名和相似后缀排除、全量通配、空名单、缺失/无效 Host、非法配置及伪造转发头；未匹配请求头与正文不变，不建立观察流，观察和改写资源额度均为零 |
+| 下游回归 | 新服务 ID 无需登记即可接纳；符合契约的历史空 Host 诊断仍可入库；旧名单字段被严格配置解析拒绝，配置版本和敏感字段校验仍生效 |
+| 构建与 ABI | Observer、Consumer、fixture 构建完成；TinyGo 获得缓存写权限后构建通过，ABI/gRPC hostcall 检查通过，无 socket imports |
+| 本地完整集成 | GOFLAGS=-count=1 make local-test 执行 425.368 秒；仅新增 Host 用例因测试预期错误失败，其他场景全部通过，包括 JSON/SSE、未知用量、Stream Load 确认丢失、Kafka 黑洞、正文边界/超时、重平衡/重放、凭据保护、HTTP/HTTPS 名称入库、冲突隔离及 Wasm 下载故障恢复 |
+| Host 用例复测 | 修正测试预期后，go test -count=1 -tags=integration -v ./tests/integration -run '^TestWasmHostAllowlist$' 通过，48.554 秒；生产实现未因该测试失败而修改。未匹配的流式请求保留 fixture 原有 422 响应，普通 JSON 请求保留 200，二者正文摘要均不变；精确域名和多级子域名产生两类事件，未匹配及非法 Host 无采集事件 |
+| 渲染与分发 | 本地渲染配置已加载 Host 名单，Observer / Consumer 运行配置无名单字段；分发包和 Kubernetes 配置生成测试通过；Kubernetes 联调渲染登记 wasm-verify.local。本次未重新生成完整离线镜像包或部署生产 |
+
+本地 Wasm SHA-256：68348666ff79b37dbefc1e924eb86ee9041faf55a5543f66cceace74b4fa3ed2。联调保留原 Kafka/Doris 数据卷，使用 metering_development，不改 Kafka 事件或 Doris 表结构。历史验证段落中的服务白名单描述仅表示当时行为，当前以本节及组件运行说明为准；生产 G0–G5、容量和真实第三方仍未验收。
+
+## 2026-10-20：离线目标 Host 参数与非 ASCII 准入修复
+
+离线打包新增必填、可重复的 --accepted-request-host。参数完整替换示例 Host 名单，校验并规范化后写入每个目标 Pod 的关闭态与启用态 EnvoyFilter，同时保存到 manifest.json 和包内 README。省略、空值、非法/重复模式或超限均拒绝打包；校验在集群发现、镜像构建及导出之前执行。显式 * 仍受合法 DNS Host 限制。README 与组件说明已同步必填参数和 Shell 通配符引号示例。
+
+请求 authority 在共享 Normalize 中先验证 ASCII，再执行端口处理和小写转换，避免 Kelvin 符号 K 被折叠成 k 后通过准入。Python 模式规范化同样在小写转换前验证原始输入为 ASCII，避免打包 CLI 直接调用规范化函数时绕过校验。ASCII 大小写、合法端口、末尾根点及已编码 Punycode 的既有行为保留。
+
+| 验证 | 本次结果与边界 |
+| --- | --- |
+| 无缓存全量检查 | GOFLAGS=-count=1 make test 通过：74 项 Python 测试、事件契约检查、主模块和独立插件 Go 竞态测试均通过；需要临时 HTTP/TLS 端口的测试获得权限后完成 |
+| 打包配置回归 | 两个目标 Pod、关闭/启用共四份最终 EnvoyFilter 均包含规范化后的自定义域名和后缀模式，且无默认 .example.invalid 名单；manifest 与包内 README 保存同一名单；显式 * 可用；缺失/非法/重复及超限名单不触发集群发现或镜像构建/导出 |
+| 非 ASCII 回归 | 共享 Normalize 拒绝 Kelvin 符号、全角端口等非 ASCII 输入；插件模拟覆盖精确、后缀、全量名单，均不建立观察流，不改请求头或正文，观察/改写资源额度为零，记录固定 invalid_host 原因计数 |
+| 构建与 ABI | make build wasm 通过；Observer、Consumer、fixture 与 TinyGo Wasm 构建成功，ABI/gRPC hostcall 校验通过，无 socket imports |
+| 完整本地集成 | GOFLAGS=-count=1 make local-test 全部通过，437.568 秒；包含 JSON/SSE、未知用量、确认丢失、Kafka 黑洞、正文边界/超时、重平衡/重放、凭据保护、Host 筛选与透传、HTTP/HTTPS 名称快照、冲突隔离及 Wasm 下载故障恢复 |
+
+本次 Wasm SHA-256：033c8e48f5b13893124d02854b6f5d81262fb1fc3816c4c51ad218e2f9a8eec9。本地栈已加载该产物，保留已有 Kafka/Doris 数据卷。打包回归验证了清单实际渲染和包元数据逻辑，镜像导出阶段使用合成测试 archive；本次未重新导出完整离线镜像包，也未部署生产。需要按目标环境显式传入 Host 名单重新生成包；原有 G0–G5 生产验收边界不变。

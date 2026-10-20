@@ -86,30 +86,25 @@ func TestConsumerFlushConfiguration(t *testing.T) {
 	}
 }
 
-func TestServiceRegistration(t *testing.T) {
+func TestRejectRemovedAdmissionFields(t *testing.T) {
 	for _, component := range []string{"observer", "consumer"} {
-		for _, services := range [][]string{nil, {"model-service-a"}, {"model-service-a", "model-service-a"}} {
-			t.Setenv("POD_UID", "observer-test")
-			c, err := Read("../../configs/" + component + ".local.json")
+		for _, field := range []string{"accepted_service_ids", "accepted_request_hosts"} {
+			data, err := os.ReadFile("../../configs/" + component + ".local.json")
 			if err != nil {
 				t.Fatal(err)
 			}
-			if component == "observer" {
-				c.Observer.AcceptedServices = services
-				err = c.ObserverDefaults()
-			} else {
-				c.Consumer.AcceptedServices = services
-				err = c.ConsumerDefaults()
+			data = []byte(strings.Replace(string(data), `"accepted_config_versions":`, strconv.Quote(field)+`: ["example.com"], "accepted_config_versions":`, 1))
+			path := filepath.Join(t.TempDir(), "config.json")
+			if err := os.WriteFile(path, data, 0600); err != nil {
+				t.Fatal(err)
 			}
-			if (err == nil) != (len(services) < 2) {
-				t.Fatal("registration validation")
-			}
-			if AcceptsService(services, "other") {
-				t.Fatal("unregistered service")
+			if _, err := Read(path); err == nil {
+				t.Fatalf("%s accepted removed field %s", component, field)
 			}
 		}
 	}
 }
+
 func TestLookupContextAndURI(t *testing.T) {
 	for _, change := range []func(*Observer){
 		func(o *Observer) { o.ClusterName = "" }, func(o *Observer) { o.DeploymentEnvironment = "staging" },

@@ -1,6 +1,70 @@
 package gatewayconfig
 
-import "testing"
+import (
+	"encoding/json"
+	"os"
+	"reflect"
+	"strconv"
+	"strings"
+	"testing"
+)
+
+func TestRequestHostConfiguration(t *testing.T) {
+	data, err := os.ReadFile("../../configs/gateway-observer.example.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var maximum, oversized []string
+	for i := 0; i < 1024; i++ {
+		maximum = append(maximum, "h"+strconv.Itoa(i)+".example.com")
+		if i < 512 {
+			oversized = append(oversized, "h"+strconv.Itoa(i)+"."+strings.Repeat("a", 63)+"."+strings.Repeat("b", 63)+".example.com")
+		}
+	}
+	for _, tc := range []struct {
+		name          string
+		patterns      any
+		omit, invalid bool
+		want          []string
+	}{
+		{name: "missing", omit: true, want: []string{}},
+		{name: "empty", patterns: []string{}, want: []string{}},
+		{name: "all", patterns: []string{"*"}, want: []string{"*"}},
+		{name: "normalized", patterns: []string{"MODEL.Example.com.", "*.Example.INVALID."}, want: []string{"model.example.com", "*.example.invalid"}},
+		{name: "duplicate", patterns: []string{"example.com", "EXAMPLE.COM."}, invalid: true},
+		{name: "duplicate_wildcard", patterns: []string{"*.example.com", "*.EXAMPLE.COM."}, invalid: true},
+		{name: "null", invalid: true},
+		{name: "not_array", patterns: "example.com", invalid: true},
+		{name: "port", patterns: []string{"example.com:443"}, invalid: true},
+		{name: "ip", patterns: []string{"127.0.0.1"}, invalid: true},
+		{name: "glob", patterns: []string{"model-*.example.com"}, invalid: true},
+		{name: "unicode", patterns: []string{"K.example.com"}, invalid: true},
+		{name: "long_label", patterns: []string{strings.Repeat("a", 64) + ".com"}, invalid: true},
+		{name: "too_many", patterns: make([]string, 1025), invalid: true},
+		{name: "maximum", patterns: maximum, want: maximum},
+		{name: "document_bytes", patterns: oversized, invalid: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var c map[string]any
+			if err := json.Unmarshal(data, &c); err != nil {
+				t.Fatal(err)
+			}
+			if tc.omit {
+				delete(c, "accepted_request_hosts")
+			} else {
+				c["accepted_request_hosts"] = tc.patterns
+			}
+			b, _ := json.Marshal(c)
+			got, err := Decode(b)
+			if (err != nil) != tc.invalid {
+				t.Fatalf("Decode error=%v, want invalid=%v", err, tc.invalid)
+			}
+			if !tc.invalid && !reflect.DeepEqual(got.AcceptedRequestHosts, tc.want) {
+				t.Fatalf("patterns=%v, want %v", got.AcceptedRequestHosts, tc.want)
+			}
+		})
+	}
+}
 
 func TestWildcardRouteFiltersOnlyPostAndExactPath(t *testing.T) {
 	c := Config{Enabled: true, Routes: []Route{{RouteName: "*", Enabled: true, Methods: []string{"POST"}, Paths: []string{"/v1/chat/completions"}}}}

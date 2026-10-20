@@ -9,6 +9,7 @@ import (
 	"github.com/tetratelabs/proxy-wasm-go-sdk/proxywasm/types"
 	"google.golang.org/protobuf/proto"
 	"os"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -64,11 +65,94 @@ func TestBearerStartAndUnchangedAuthorization(t *testing.T) {
 	}
 }
 
+func TestHostAllowlistBeforeAllocation(t *testing.T) {
+	for _, tc := range []struct {
+		name, authority              string
+		patterns                     []string
+		want, omitted, invalidConfig bool
+	}{
+		{name: "exact", authority: "MODEL.Example.invalid.:443", patterns: []string{"Model.Example.invalid."}, want: true},
+		{name: "suffix", authority: "a.example.invalid", patterns: []string{"*.example.invalid"}, want: true},
+		{name: "nested", authority: "a.b.example.invalid", patterns: []string{"*.example.invalid"}, want: true},
+		{name: "root", authority: "example.invalid", patterns: []string{"*.example.invalid"}},
+		{name: "boundary", authority: "badexample.invalid", patterns: []string{"*.example.invalid"}},
+		{name: "trailing_domain", authority: "a.example.invalid.evil", patterns: []string{"*.example.invalid"}},
+		{name: "different", authority: "other.invalid", patterns: []string{"model.example.invalid"}},
+		{name: "all", authority: "any.valid", patterns: []string{"*"}, want: true},
+		{name: "empty", authority: "model.example.invalid", patterns: []string{}},
+		{name: "missing_list", authority: "model.example.invalid", omitted: true},
+		{name: "missing_host", patterns: []string{"*"}},
+		{name: "ip", authority: "127.0.0.1:80", patterns: []string{"*"}},
+		{name: "invalid", authority: "bad_host", patterns: []string{"*"}},
+		{name: "unicode_exact", authority: "K.example.invalid", patterns: []string{"k.example.invalid"}},
+		{name: "unicode_suffix", authority: "K.example.invalid.:443", patterns: []string{"*.example.invalid"}},
+		{name: "unicode_all", authority: "K.example.invalid", patterns: []string{"*"}},
+		{name: "invalid_config", authority: "model.example.invalid", patterns: []string{"model-*.example.invalid"}, invalidConfig: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := testHostWithConfig(t, "", func(c map[string]any) {
+				if tc.omitted {
+					delete(c, "accepted_request_hosts")
+				} else {
+					c["accepted_request_hosts"] = tc.patterns
+				}
+			})
+			id := h.InitializeHttpContext()
+			body := []byte(`{"stream":true,"messages":[]}`)
+			headers := [][2]string{{":method", "POST"}, {":path", "/v1/chat/completions"}, {":authority", tc.authority}, {"content-type", "application/json"}, {"content-length", "29"}, {"authorization", "Bearer synthetic-private"}, {"x-forwarded-host", "model.example.invalid"}, {"forwarded", "host=model.example.invalid"}}
+			if h.CallOnRequestHeaders(id, headers, false) != types.ActionContinue {
+				t.Fatal("headers paused")
+			}
+			if tc.want {
+				if len(proxytest.GrpcCalls()) != 1 {
+					t.Fatal("accepted host did not open observation")
+				}
+				h.CallOnRequestBody(id, body, true)
+				if !bytes.Contains(h.GetCurrentRequestBody(id), []byte(`"include_usage":true`)) {
+					t.Fatal("accepted host did not enter rewrite path")
+				}
+				return
+			}
+			if !reflect.DeepEqual(h.GetCurrentRequestHeaders(id), headers) {
+				t.Fatal("ignored request headers changed")
+			}
+			if h.CallOnRequestBody(id, body, false) != types.ActionContinue || !bytes.Equal(h.GetCurrentRequestBody(id), body) {
+				t.Fatal("ignored request paused or body changed")
+			}
+			h.CallOnResponseHeaders(id, [][2]string{{":status", "200"}}, false)
+			h.CallOnResponseBody(id, []byte("unchanged"), true)
+			h.CompleteHttpContext(id)
+			if len(proxytest.GrpcCalls()) != 0 {
+				t.Fatal("ignored host created observation")
+			}
+			for _, name := range []string{"active_streams", "inflight_bytes", "inflight_messages", "active_rewrites", "rewrite_reserved_bytes"} {
+				if n, err := h.GetGaugeMetric("metering_" + name); err != nil || n != 0 {
+					t.Fatalf("resource %s=%d: %v", name, n, err)
+				}
+			}
+			metric := "metering_requests_ignored_host_total"
+			if tc.authority == "" || tc.name == "ip" || tc.name == "invalid" || strings.HasPrefix(tc.name, "unicode_") {
+				metric = "metering_requests_ignored_invalid_host_total"
+			}
+			if tc.invalidConfig {
+				metric = "metering_config_invalid_total"
+			}
+			if n, err := h.GetCounterMetric(metric); err != nil || n != 1 {
+				t.Fatalf("missing fixed rejection counter %s: %d %v", metric, n, err)
+			}
+		})
+	}
+}
+
 func testHost(t *testing.T) proxytest.HostEmulator {
 	return testHostWithRoute(t, "llm-chat")
 }
 
 func testHostWithRoute(t *testing.T, route string) proxytest.HostEmulator {
+	return testHostWithConfig(t, route, nil)
+}
+
+func testHostWithConfig(t *testing.T, route string, change func(map[string]any)) proxytest.HostEmulator {
 	t.Helper()
 	proxytest.ResetGrpc()
 	b, err := os.ReadFile("../../configs/gateway-observer.example.json")
@@ -79,6 +163,9 @@ func testHostWithRoute(t *testing.T, route string) proxytest.HostEmulator {
 	json.Unmarshal(b, &c)
 	c["enabled"] = true
 	c["gateway_instance_id"] = "test-gateway"
+	if change != nil {
+		change(c)
+	}
 	b, _ = json.Marshal(c)
 	option := proxytest.NewEmulatorOption().WithVMContext(&vm{}).WithPluginConfiguration(b)
 	if route != "" {
@@ -97,7 +184,7 @@ func TestWildcardSelectsWithoutRouteMetadata(t *testing.T) {
 		t.Run(route, func(t *testing.T) {
 			h := testHostWithRoute(t, route)
 			id := h.InitializeHttpContext()
-			h.CallOnRequestHeaders(id, [][2]string{{":method", "POST"}, {":path", "/v1/chat/completions?x=y"}, {"content-type", "application/json"}}, false)
+			h.CallOnRequestHeaders(id, [][2]string{{":method", "POST"}, {":path", "/v1/chat/completions?x=y"}, {":authority", "model.example.invalid"}, {"content-type", "application/json"}}, false)
 			calls := proxytest.GrpcCalls()
 			if len(calls) != 1 || len(calls[0].Messages) != 1 {
 				t.Fatal("matching method/path did not send Start")
@@ -138,7 +225,7 @@ func TestGrpcUpstreamAuthority(t *testing.T) {
 func TestRewriteTimeoutResumesAndStopsAmbiguousObservation(t *testing.T) {
 	h := testHost(t)
 	id := h.InitializeHttpContext()
-	h.CallOnRequestHeaders(id, [][2]string{{":method", "POST"}, {":path", "/v1/chat/completions"}, {"content-type", "application/json"}}, false)
+	h.CallOnRequestHeaders(id, [][2]string{{":method", "POST"}, {":path", "/v1/chat/completions"}, {":authority", "model.example.invalid"}, {"content-type", "application/json"}}, false)
 	prefix := []byte(`{"stream":false,`)
 	calls := proxytest.GrpcCalls()
 	a := w.String(nil, 1, "7f6c2a90-4b13-4b68-9d21-67283e0c5f44")
@@ -174,7 +261,7 @@ func TestRewriteTimeoutResumesAndStopsAmbiguousObservation(t *testing.T) {
 func TestFullRequestBoundaryAndControlReserve(t *testing.T) {
 	h := testHost(t)
 	id := h.InitializeHttpContext()
-	h.CallOnRequestHeaders(id, [][2]string{{":method", "POST"}, {":path", "/v1/chat/completions"}, {"content-type", "application/json"}}, false)
+	h.CallOnRequestHeaders(id, [][2]string{{":method", "POST"}, {":path", "/v1/chat/completions"}, {":authority", "model.example.invalid"}, {"content-type", "application/json"}}, false)
 	prefix, suffix := `{"stream":false,"messages":[{"content":"`, `"}]}`
 	body := []byte(prefix + strings.Repeat("x", 262144-len(prefix)-len(suffix)) + suffix)
 	if h.CallOnRequestBody(id, body, true) != types.ActionContinue {
@@ -191,7 +278,7 @@ func TestFullRequestBoundaryAndControlReserve(t *testing.T) {
 	a = w.UInt(a, 2, 1)
 	a = w.String(a, 4, "accepted")
 	proxytest.EmitGrpcReceive(proxytest.PluginContextID, calls[0].Token, a)
-	h.CallOnResponseHeaders(id, [][2]string{{":status", "200"}, {"content-type", "application/json"}, {"x-metering-request-id", "forged"}, {"x-metering-request-id", "second"}}, true)
+	h.CallOnResponseHeaders(id, [][2]string{{":status", "200"}, {":authority", "model.example.invalid"}, {"content-type", "application/json"}, {"x-metering-request-id", "forged"}, {"x-metering-request-id", "second"}}, true)
 	var values []string
 	for _, p := range h.GetCurrentResponseHeaders(id) {
 		if p[0] == "x-metering-request-id" {
@@ -216,7 +303,7 @@ func TestIgnoreBeforeAllocation(t *testing.T) {
 		t.Run(tc.method+tc.path, func(t *testing.T) {
 			h := testHostWithRoute(t, "")
 			id := h.InitializeHttpContext()
-			h.CallOnRequestHeaders(id, [][2]string{{":method", tc.method}, {":path", tc.path}, {"content-type", "application/json"}}, false)
+			h.CallOnRequestHeaders(id, [][2]string{{":method", tc.method}, {":path", tc.path}, {":authority", "model.example.invalid"}, {"content-type", "application/json"}}, false)
 			h.CallOnRequestBody(id, []byte("invalid"), true)
 			h.CallOnResponseHeaders(id, [][2]string{{":status", "200"}}, false)
 			h.CallOnResponseBody(id, []byte("ignored"), true)
@@ -233,7 +320,7 @@ func TestIgnoreBeforeAllocation(t *testing.T) {
 func TestRewriteEOSAndLateACK(t *testing.T) {
 	h := testHost(t)
 	id := h.InitializeHttpContext()
-	if h.CallOnRequestHeaders(id, [][2]string{{":method", "POST"}, {":path", "/v1/chat/completions?x=y"}, {"content-type", "application/json"}, {"content-length", "1"}}, false) != types.ActionContinue {
+	if h.CallOnRequestHeaders(id, [][2]string{{":method", "POST"}, {":path", "/v1/chat/completions?x=y"}, {":authority", "model.example.invalid"}, {"content-type", "application/json"}, {"content-length", "1"}}, false) != types.ActionContinue {
 		t.Fatal("headers not continued")
 	}
 	h.CallOnRequestBody(id, []byte(`{"stream":true,"messages":[],"n":9007199254740993}`), true)

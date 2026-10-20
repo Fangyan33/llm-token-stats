@@ -94,7 +94,6 @@ func batchWorker(rows, bytes int) *Worker {
 	return &Worker{
 		Cfg: config.Config{Kafka: config.Kafka{Topic: "llm-metering-events"}, Consumer: config.Consumer{
 			Rows: rows, Bytes: bytes, FlushMS: 1000, AcceptedConfigs: []string{"collection-v1"},
-			AcceptedServices: []string{"model-service-a"},
 		}},
 		Health: &health.State{}, owned: map[int32]bool{0: true, 1: true}, ready: map[int32]bool{0: true, 1: true},
 		pending: map[int32]*consumer.Batch{}, buffered: map[int32]*recordBuffer{},

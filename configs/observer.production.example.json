@@ -25,9 +25,6 @@
     "accepted_adapter_ids": [
       "chat_completions_v1"
     ],
-    "accepted_service_ids": [
-      "model-service-a"
-    ],
     "cluster_name": "REPLACE_CLUSTER_NAME",
     "deployment_environment": "prd",
     "service_lookup": {

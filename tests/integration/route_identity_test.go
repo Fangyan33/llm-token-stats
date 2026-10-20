@@ -25,7 +25,7 @@ func TestDiagnosticRouteIdentityAndSnapshotConflicts(t *testing.T) {
 		t.Run(mode, func(t *testing.T) {
 			now := time.Now()
 			id := uuid(t)
-			c := config.Consumer{Bytes: 4 << 20, AcceptedConfigs: []string{"collection-v1"}, AcceptedServices: []string{"model-service-a"}}
+			c := config.Consumer{Bytes: 4 << 20, AcceptedConfigs: []string{"collection-v1"}}
 			ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 			defer cancel()
 			p := &consumer.Processor{Store: s, Owns: func() bool { return true }}

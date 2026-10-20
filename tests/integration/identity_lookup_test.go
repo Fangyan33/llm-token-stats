@@ -24,7 +24,7 @@ func TestBearerPrivacyAndInvalidInputs(t *testing.T) {
 	token := "synthetic-" + uuid(t)
 	type expected struct{ id, host, serviceStatus, customerStatus string }
 	var requests []expected
-	for _, mode := range []string{"valid", "duplicate", "joined", "missing", "other_scheme", "invalid_host"} {
+	for _, mode := range []string{"valid", "duplicate", "joined", "missing", "other_scheme"} {
 		id := uuid(t)
 		req, _ := http.NewRequest("POST", "http://127.0.0.1:18080/v1/chat/completions", strings.NewReader(`{"model":"fixture","stream":false}`))
 		req.Host = "MODEL.Example.invalid:443"
@@ -46,11 +46,6 @@ func TestBearerPrivacyAndInvalidInputs(t *testing.T) {
 		case "other_scheme":
 			req.Header.Set("Authorization", "Basic "+token)
 			customerStatus = "invalid_api_key"
-		case "invalid_host":
-			req.Host = "127.0.0.1"
-			host = "NULL"
-			serviceStatus = "invalid_host"
-			fallthrough
 		default:
 			req.Header.Set("Authorization", "Bearer "+token)
 		}
@@ -128,6 +123,76 @@ func TestBearerPrivacyAndInvalidInputs(t *testing.T) {
 		"--no-color", "observer", "consumer", "gateway", "fixture").Output()
 	if err != nil || bytes.Contains(logs, []byte(token)) {
 		t.Fatal("component log privacy check failed")
+	}
+}
+
+func TestWasmHostAllowlist(t *testing.T) {
+	db := database(t)
+	var ignored []string
+	for _, tc := range []struct {
+		host             string
+		accepted, stream bool
+	}{
+		{"MODEL.Example.invalid.:443", true, false},
+		{"a.b.example.invalid", true, false},
+		{"example.invalid", false, true},
+		{"badexample.invalid", false, false},
+		{"a.example.invalid.evil", false, true},
+		{"127.0.0.1", false, false},
+		{"bad_host", false, false},
+		{"model.example.invalid", true, false}, // Confirm collection still works after ignored hosts.
+	} {
+		id := uuid(t)
+		before := gatewaySelectedRequests(t)
+		body := []byte(`{"model":"fixture","stream":false}`)
+		wantStatus := http.StatusOK
+		if tc.stream {
+			body = []byte(`{"model":"fixture","stream":true}`)
+			// The fixture requires include_usage for SSE. An ignored request must
+			// preserve its original 422 response instead of being rewritten to 200.
+			wantStatus = http.StatusUnprocessableEntity
+		}
+		req, _ := http.NewRequest("POST", "http://127.0.0.1:18080/v1/chat/completions", bytes.NewReader(body))
+		req.Host = tc.host
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("x-request-id", id)
+		req.Header.Set("Authorization", "Bearer synthetic-host-filter")
+		req.Header.Set("x-forwarded-host", "model.example.invalid")
+		req.Header.Set("Forwarded", "host=model.example.invalid")
+		res, err := (&http.Client{Timeout: 10 * time.Second}).Do(req)
+		if err != nil {
+			t.Fatal("business request failed", err)
+		}
+		_, readErr := io.Copy(io.Discard, res.Body)
+		res.Body.Close()
+		if readErr != nil || res.StatusCode != wantStatus || res.Header.Get("x-test-body-sha256") != events.Hash(body) {
+			t.Fatalf("Host %q changed business response or body: status=%d want=%d err=%v", tc.host, res.StatusCode, wantStatus, readErr)
+		}
+		after := gatewaySelectedRequests(t)
+		if !tc.accepted {
+			if after != before {
+				t.Fatalf("rejected Host %q selected observation", tc.host)
+			}
+			ignored = append(ignored, id)
+			continue
+		}
+		if after != before+1 {
+			t.Fatalf("matching Host %q was not selected", tc.host)
+		}
+		eventually(t, func() bool {
+			var n int
+			return db.QueryRow("SELECT COUNT(*) FROM metering_development.events_raw WHERE x_request_id=?", id).Scan(&n) == nil && n == 2
+		})
+		var host string
+		if err := db.QueryRow("SELECT request_host FROM metering_development.events_raw WHERE x_request_id=? LIMIT 1", id).Scan(&host); err != nil || (tc.host == "a.b.example.invalid" && host != tc.host) || (tc.host != "a.b.example.invalid" && host != "model.example.invalid") {
+			t.Fatalf("canonical Host %q: %q %v", tc.host, host, err)
+		}
+	}
+	for _, id := range ignored {
+		var n int
+		if err := db.QueryRow("SELECT COUNT(*) FROM metering_development.events_raw WHERE x_request_id=?", id).Scan(&n); err != nil || n != 0 {
+			t.Fatalf("ignored Host produced %d events: %v", n, err)
+		}
 	}
 }
 

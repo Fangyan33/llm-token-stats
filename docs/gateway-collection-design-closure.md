@@ -25,7 +25,7 @@ Wasm 文件随 Observer 镜像发布，由独立 HTTP 下载服务提供单个�
 
 配置发布先让 Observer 接受新版本及仍存活的旧 Root 版本，再更新网关；回退同样先核查接纳清单。Consumer 保留所有在线窗口内历史 config_version/route/service 登记，不能因为网关移除路由或旧版本而拒收合法重放。白名单限制新采集与历史事件校验分别管理。
 
-当前入口 route_name=* 只按 POST 和精确路径筛选。事件记录实际路由名或 unknown，仅诊断；adapter_id 来自规则，service/provider 由 Observer 接口解析，当前为 null。Consumer/Observer 只对 mapped 服务执行 accepted_service_ids 精确登记检查；未知服务保留质量事件。006 初始化同一新模型的类型化身份投影，不维护旧格式或旧摘要兼容。
+当前入口 route_name=* 按 POST、精确路径和 Wasm 顶层 accepted_request_hosts 筛选。事件记录实际路由名或 unknown，仅诊断；adapter_id 来自规则，service/provider 由 Observer 接口解析，当前为 null。Consumer/Observer 已移除服务 ID 和 Host 白名单，仅保留配置版本、协议与字段状态一致性检查；未知服务仍可保留质量事件。006 初始化同一新模型的类型化身份投影，不维护旧格式或旧摘要兼容。
 
 ## 2. 本轮关闭的设计缺口
 
@@ -49,7 +49,7 @@ Wasm 文件随 Observer 镜像发布，由独立 HTTP 下载服务提供单个�
 | 消息 | 强制校验 |
 | --- | --- |
 | Start | frame_seq=1、每流一次、schema_version=1；时间为 [1,253402300799999] Unix 毫秒且不超前 5 分钟；method=POST；实例/配置各 ≤128 字节，adapter 固定 chat_completions_v1；route_name 不是准入条件，缺失/超长归一为 unknown；authority ≤512 字节、临时 api_key ≤4096 字节；Start 不含任何归属 ID，模型不在 Start，x_request_id 符合主方案 |
-| Start 接纳 | adapter/config_version 在 Observer 发布白名单中，服务 resolver 成功时其 service_id 在服务白名单中，未映射允许 null，route_name 可缺失；未接纳不分配 UUID、不产生事件；ID 随有效流只生成一次 |
+| Start 接纳 | Wasm 在资源分配前按 accepted_request_hosts 筛选；Observer 仅校验 adapter/config_version 和协议，不维护服务或 Host 白名单，未映射允许 null，route_name 可缺失；未接纳不分配 UUID、不产生事件；ID 随有效流只生成一次 |
 | Content-Type / Encoding | 只读取指定头，各 ≤128 字节；JSON 仅 application/json，SSE 仅 text/event-stream（忽略媒体类型大小写，允许参数）；无编码或 identity 支持，不尝试猜测或解压；未知类型产出固定异常码 |
 | ResponseHeaders | 一次最终响应，状态 200–599，1xx 不发送；必须在响应正文前；同一方向 EOS 后不得继续正文 |
 | BodyChunk | Direction 仅 REQUEST/RESPONSE；frame_seq 连续，每方向 body_seq 从1连续、offset 从0连续；加法检查溢出；零字节帧只允许首次宣告 EOS，不能无限空帧占 CPU |

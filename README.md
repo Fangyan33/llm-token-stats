@@ -77,21 +77,23 @@ docker push "$CONSUMER_IMAGE"
 ### 离线分发镜像与完整 Kubernetes 清单
 
 ```sh
-make package
+make package PACKAGE_ARGS="--accepted-request-host api.company.com --accepted-request-host '*.company.com'"
 # 指定目标集群、命名空间、StorageClass 和输出目录：
 make package PACKAGE_DIR=dist/offline-package \
-  PACKAGE_ARGS='--context kind-kind --namespace metering --cluster-name kind --storage-class standard'
+  PACKAGE_ARGS='--accepted-request-host api.company.com --context kind-kind --namespace metering --cluster-name kind --storage-class standard'
 ```
 
 `make package` 编译 Wasm、构建 Observer / Consumer 镜像，再通过 `docker save` 将 Observer、Consumer、Kafka 3.9.2、Doris 4.1.3、Istio proxyv2 1.13.5 这五个运行镜像保存到 `dist/package/images/images.tar`。缺少的依赖镜像会自动拉取，已有镜像会检查平台，默认使用 `linux/amd64`。
+
+打包必须至少提供一个 `--accepted-request-host`，多个域名或模式重复传参。参数完整替换示例中的名单，支持精确域名、`*.company.com`（任意层级子域名，不含根域名）和显式 `*`（全部合法 DNS Host）；通配符需加引号，避免被 Shell 展开。脚本在查询目标集群、构建或导出镜像前校验并规范化名单，拒绝非法项、重复项、超限及非 ASCII 字符。规范化后的名单写入每个 Pod 的关闭态/启用态 EnvoyFilter、`manifest.json` 和包内 README；不能直接沿用旧包中的示例名单。
 
 镜像构建使用本仓库 Kubernetes 测试所用的 host 网络，并传入代理环境变量；需要切换网络时可指定 `--build-network default`。服务镜像版本取自当前 Git tag / commit hash，Wasm 随 Observer 镜像分发。包内还包含镜像 ID、Wasm 摘要和全包文件校验和。输出目录非空时，打包脚本会拒绝覆盖，可通过 `PACKAGE_DIR` 指定新目录。
 
 包内 `k8s/` 包含已渲染的完整 YAML：Namespace、持久化的单节点 Kafka / Doris、Observer / Consumer Deployment 与 Service、全部 ConfigMap / Secret、Kafka topic 初始化 Job，以及 Doris `001/002/004/005/006/007` 迁移和初始化 Job。
 
-Kafka 默认使用 24 分区、单副本，数据保留 72 小时。存储默认使用集群 StorageClass，可通过 `--storage-class` 和 `--kafka-storage`、`--doris-fe-storage`、`--doris-be-storage` 调整。分发配置使用明文 Kafka、Doris root 空密码和 `development` 环境标识，适用于受控开发环境。生产环境的独立基础设施和认证配置见下文。
+Kafka 默认使用 24 分区、单副本，数据保留 72 小时。存储默认使用集群 StorageClass，可通过 `--storage-class` 和 `--kafka-storage`、`--doris-fe-storage`、`--doris-be-storage` 调整。分发配置使用明文 Kafka、Doris root 空密码和 `dev` 环境标识，适用于受控开发环境。生产环境的独立基础设施和认证配置见下文。
 
-部署复用目标集群已有的 Istio 和网关。打包时，脚本默认只读查询当前 kubectl context 中 `istio-system` 下带 `istio=ingressgateway` 标签的实际 Pod；可通过 `--context`、`--gateway-namespace` 指定目标。打包机器无法访问目标集群时，使用 `PACKAGE_ARGS='--gateway-pod 实际Pod名=实际PodUID'` 提供目标 Pod，多个 Pod 需重复传参。
+部署复用目标集群已有的 Istio 和网关。打包时，脚本默认只读查询当前 kubectl context 中 `istio-system` 下带 `istio=ingressgateway` 标签的实际 Pod；可通过 `--context`、`--gateway-namespace` 指定目标。打包机器无法访问目标集群时，使用 `PACKAGE_ARGS='--accepted-request-host api.company.com --gateway-pod 实际Pod名=实际PodUID'` 提供目标 Pod，多个 Pod 需重复传参。
 
 脚本为每个 Pod 生成 `gateway/disabled/`、`gateway/enabled/` 两种完整 EnvoyFilter。网关必须带有 `istio=ingressgateway` 标签，Pod 重建或扩容后需要重新打包。输出 YAML 不含 `REPLACE_*` 或 `RENDER_*`，部署时无需再次替换或渲染。
 
@@ -300,13 +302,13 @@ cp configs/consumer.production.example.json "$DEPLOY_DIR/consumer.json"
 cp configs/gateway-observer.example.json "$DEPLOY_DIR/gateway-observer.json"
 ```
 
-修改这三份配置，并保持注册信息一致：
+修改这三份配置，并保持采集配置版本一致：
 
 | 配置 | 必须确认的内容 |
 | --- | --- |
-| Observer | Kafka Broker、CA 和认证环境变量名；`accepted_config_versions`、`accepted_adapter_ids`、`accepted_service_ids`；固定 `cluster_name`、`deployment_environment`（prd/stg/dev）及两个查询 URI；资源预算；`wasm_download` 的镜像内路径与下载端口 |
-| Consumer | 同一 Kafka topic、稳定的 `group_id`、历史配置版本及服务白名单；Doris `fe_url`、`allowed_load_hosts`；攒批大小与时间 |
-| Wasm | 规则 `route_name`（当前为 `*`，忽略路由名）、方法、精确路径、`adapter_id`、`config_version`、Observer cluster；保持默认关闭，通过渲染器显式启用 |
+| Observer | Kafka Broker、CA 和认证环境变量名；`accepted_config_versions`、`accepted_adapter_ids`；固定 `cluster_name`、`deployment_environment`（prd/stg/dev）及两个查询 URI；资源预算；`wasm_download` 的镜像内路径与下载端口 |
+| Consumer | 同一 Kafka topic、稳定的 `group_id`、历史配置版本登记；Doris `fe_url`、`allowed_load_hosts`；攒批大小与时间 |
+| Wasm | `accepted_request_hosts`；规则 `route_name`（当前为 `*`，忽略路由名）、方法、精确路径、`adapter_id`、`config_version`、Observer cluster；保持默认关闭，通过渲染器显式启用 |
 
 `allowed_load_hosts` 必须包含实际 FE 和所有可能接收重定向的 BE 地址及端口，Consumer 也必须能访问这些地址。Consumer 只向登记的地址发送 Stream Load 凭据，并拒绝 HTTPS 降级。
 
@@ -431,7 +433,7 @@ kubectl apply -f "$DEPLOY_DIR/envoyfilter.$GATEWAY_POD_UID.disabled.yaml"
 
 `adapter_id` 取自命中规则；service_id/provider_id 及名称由 Observer 服务接口解析；配置 HTTP/HTTPS URI 和凭据后可返回已知归属，空 URI 为未知占位。配置仍支持精确路由名筛选，并按配置顺序选择第一个命中路由名的规则。
 
-Observer / Consumer 使用 accepted_service_ids 精确匹配并接纳已映射服务。未映射事件的 service_id/provider_id 均为 null，仍可保留用于质量诊断。配置已移除旧 accepted_routes、Wasm identity_namespace/identity_fields 和规则 service_id，传入这些字段会被拒绝。配置版本、适配器及事件状态一致性检查仍会执行。
+采集范围统一由 Wasm 顶层 `accepted_request_hosts` 决定，支持精确域名、`*.example.com` 和 `*`。后缀通配匹配任意层级子域名，不含根域名；`*` 仅匹配合法 DNS Host。请求 `:authority` 先拒绝非 ASCII 字符，再转小写并去端口和末尾点，不使用转发头。缺失、非法或不匹配的 Host 直接透传，不读取凭据、不建立观察流、不缓存或改写正文；名单缺省或为空时全部不采集。Observer / Consumer 不维护服务或 Host 白名单；旧 `accepted_service_ids`、`accepted_routes` 等字段会被严格配置解析拒绝，配置版本、适配器和事件状态一致性仍会校验。未映射事件仍可保留质量诊断。
 
 功能尚未上线，协议、代码、配置和新开发库统一使用当前格式，不接纳旧格式消息，也不双写旧表。001/002/004/005/006/007 共同初始化同一套新模型，006 不负责兼容旧数据。旧结构库无法通过 CREATE IF NOT EXISTS 直接升级，应保留旧数据，改用隔离库和独立 topic/group。
 

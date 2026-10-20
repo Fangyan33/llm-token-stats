@@ -19,7 +19,7 @@ import (
 )
 
 func lookupServer(k *sink) *Server {
-	return &Server{Cfg: config.Observer{ProducerID: "test", ClusterName: "cluster", DeploymentEnvironment: "dev", MaxActive: 4, ParserBudget: 64 << 20, MaxObservationMS: 5000, LookupTimeoutMS: 150, LookupConcurrency: 1, AcceptedConfigs: []string{"v1"}, AcceptedAdapters: []string{"chat_completions_v1"}, AcceptedServices: []string{"a"}}, Sink: k, Health: &health.State{}, ServiceResolver: serviceFake{}, CustomerResolver: customerFake{}}
+	return &Server{Cfg: config.Observer{ProducerID: "test", ClusterName: "cluster", DeploymentEnvironment: "dev", MaxActive: 4, ParserBudget: 64 << 20, MaxObservationMS: 5000, LookupTimeoutMS: 150, LookupConcurrency: 1, AcceptedConfigs: []string{"v1"}, AcceptedAdapters: []string{"chat_completions_v1"}}, Sink: k, Health: &health.State{}, ServiceResolver: serviceFake{}, CustomerResolver: customerFake{}}
 }
 
 func lookupStart() *pb.Start {

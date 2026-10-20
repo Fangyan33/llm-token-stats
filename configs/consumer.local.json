@@ -10,9 +10,6 @@
     "group_id": "llm-metering-development",
     "accepted_config_versions": [
       "collection-v1"
-    ],
-    "accepted_service_ids": [
-      "model-service-a"
     ]
   },
   "doris": {

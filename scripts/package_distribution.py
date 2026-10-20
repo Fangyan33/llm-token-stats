@@ -15,6 +15,7 @@ import uuid
 from image_tag import resolve_image_tag
 from render_doris_sql import database_name, render_sql
 from wasm_artifact import checksum
+from validate_collection_contracts import load, normalize_request_host_pattern, validate_config
 
 ROOT = Path(__file__).resolve().parents[1]
 MIGRATIONS = ('001_init.sql', '002_usage_summaries.sql', '004_summary_coordination.sql',
@@ -265,7 +266,19 @@ def gateway_pods(args):
     return pods
 
 
+def gateway_configuration(args):
+    if not args.accepted_request_host:
+        raise ValueError('至少提供一个 --accepted-request-host，不能使用示例名单代替目标业务域名')
+    config = load(ROOT / 'configs/gateway-observer.example.json')
+    config['accepted_request_hosts'] = [normalize_request_host_pattern(host)
+                                        for host in args.accepted_request_host]
+    config['observer_cluster'] = 'outbound|9090||metering-observer.' + args.namespace + '.svc.cluster.local'
+    validate_config(config)
+    return config
+
+
 def render_manifests(args, images, pods, output, wasm_file=None):
+    gateway_config = gateway_configuration(args)
     ns = args.namespace
     write_yaml(output / 'k8s/00-namespace.yaml', [{
         'apiVersion': 'v1', 'kind': 'Namespace',
@@ -275,9 +288,7 @@ def render_manifests(args, images, pods, output, wasm_file=None):
             ('20-config', configurations(args)), ('30-init', initialization(args, images)),
             ('40-applications', applications(args, images))):
         write_yaml(output / 'k8s' / (filename + '.yaml'), resources)
-    gateway_config = json.loads((ROOT / 'configs/gateway-observer.example.json').read_text())
     dns = f'metering-observer.{ns}.svc.cluster.local'
-    gateway_config['observer_cluster'] = 'outbound|9090||' + dns
     config_path = output / 'gateway-observer.json'
     config_path.write_text(json.dumps(gateway_config, indent=2) + '\n')
     for pod in pods:
@@ -333,6 +344,7 @@ def package(args):
     target = args.output.resolve()
     if target.exists() and (not target.is_dir() or any(target.iterdir())):
         raise ValueError('输出目录已存在且非空，请通过 PACKAGE_DIR 指定新目录：' + str(target))
+    gateway_config = gateway_configuration(args)
     wasm_sha = checksum(ROOT / 'dist/gateway-observer-v1.wasm')
     pods = gateway_pods(args)
     tag = resolve_image_tag()
@@ -352,6 +364,7 @@ def package(args):
         manifest = {'image_tag': tag, 'platform': args.platform, 'images': images,
                     'image_details': records, 'wasm_sha256': wasm_sha,
                     'namespace': args.namespace, 'gateway_namespace': args.gateway_namespace,
+                    'accepted_request_hosts': gateway_config['accepted_request_hosts'],
                     'gateway_pods': [{'name': pod['name'], 'uid': pod['uid']} for pod in pods]}
         (output / 'manifest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + '\n')
         (output / 'README.md').write_text(package_readme(args, pods), encoding='utf-8')
@@ -363,6 +376,7 @@ def package(args):
 
 
 def package_readme(args, pods):
+    hosts = gateway_configuration(args)['accepted_request_hosts']
     return f'''# 单节点采集分发包
 
 运行平台：{args.platform}；采集命名空间：{args.namespace}。
@@ -371,6 +385,8 @@ Kafka 3.9.2（24 分区、单副本、保留 72 小时），Doris 4.1.3（单 FE
 目标集群需已有 Istio 1.13.5、网关业务路由和鉴权，以及可用的 StorageClass / PV。
 本包不安装 Istio、不修改已有网关的 Deployment、路由和鉴权。
 镜像包括 Observer、Consumer、Kafka、Doris、Istio proxyv2；Wasm 已嵌入 Observer 镜像。
+Wasm Host 白名单：{json.dumps(hosts, ensure_ascii=False)}，同时记录于 manifest.json 和每个 EnvoyFilter。
+该名单来自打包时显式提供的 --accepted-request-host；后缀通配匹配子域名，不含根域名。
 
 在本目录校验：
 
@@ -421,6 +437,8 @@ def parser():
     p.add_argument('--output', type=Path, default=ROOT / 'dist/package')
     p.add_argument('--namespace', type=dns_name, default='metering')
     p.add_argument('--gateway-namespace', type=dns_name, default='istio-system')
+    p.add_argument('--accepted-request-host', action='append', required=True, metavar='HOST',
+                   help='目标业务 Host 白名单，可重复；支持精确域名、*.example.com 和 *，必须显式提供')
     p.add_argument('--gateway-pod', type=gateway_identity, action='append', default=[], metavar='NAME=UID',
                    help='目标网关实际 Pod，可重复；省略时只读查询目标集群 istio=ingressgateway 的 Pod')
     p.add_argument('--context', help='查询目标网关时使用的 kubectl context')

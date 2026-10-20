@@ -751,11 +751,17 @@ Consumer/Doris 故障可以依赖 Kafka 72 小时保留恢复，与禁止采集�
   "observation_max_ms": 600000,
   "tick_ms": 100,
   "metadata_max_bytes": 6144,
-  "ack_max_bytes": 1024
+  "ack_max_bytes": 1024,
+  "accepted_request_hosts": [
+    "model.example.invalid",
+    "*.example.invalid"
+  ]
 }
 ```
 
 `gateway_instance_id` 由发布渲染器从目标 Kubernetes Pod 的实际 UID 注入插件配置，生产不得给多个 Pod 写同一个常量。EnvoyFilter 使用代理启动元数据 `NAME/NAMESPACE` 精确匹配目标 Pod，不依赖启动后补加的 UID 标签；Pod 重建后获取新名称、UID 重新渲染。UID 不从 HTTP 请求头读取。
+
+顶层 `accepted_request_hosts` 是唯一采集 Host 白名单，支持精确域名、`*.example.com`（任意层级子域名，不含根域名）和 `*`（所有合法 DNS Host）；缺省或空名单不采集。规则最多 1024 项，且整体 Wasm 配置仍须满足 64 KiB 上限；转小写并去末尾点，拒绝 IP、端口、URL、其他通配符及规范化后的重复项。Wasm 读取 `:authority`，先拒绝非 ASCII 字符再规范化，不使用转发头；未匹配或无效 Host 在凭据提取、正文改写资源分配和建流之前直接透传，不产生事件。Observer / Consumer 不维护服务或 Host 白名单，保留配置版本、协议与字段一致性校验。升级先启用新 Wasm Host 筛选，再移除下游旧名单；需重新构建产物、更新摘要和渲染 EnvoyFilter。
 
 配置校验：规则 enabled 缺省为 false；空 routes 表示全部忽略。route_name 必须唯一，可使用完整值 `*` 忽略路由名；methods/paths 缺失、为空、重复、超限，路径不是以 / 开头、含查询串/片段标识或匹配模式，及非一期采集子项方法/适配器均为无效配置；不得把空列表解释为全匹配。遵循第 2.3 节的数量和长度上限。未知字段拒绝；ID、cluster、route 长度有界；每流额度必须小于等于 Root 额度；改写单次预留乘以并发上限不得大于 Root 改写预算；分片连同保守 256 字节 Protobuf 开销能装入 32 KiB gRPC 消息；最大完整改写请求必须连同全部分片开销和控制预留装入单流额度；改写预留至少覆盖原始请求上限的 4 倍。控制预留必须小于总额度。预发布严格校验失败即阻止发布；运行时语义配置无效时进入 disabled 并返回初始化成功，暴露 config_invalid 指标。模块无法加载、ABI 不兼容等底层错误仍可能 NACK/启动失败，fail_open 无法兜底。
 
@@ -793,17 +799,22 @@ Observer：
     "accepted_adapter_ids": [
       "chat_completions_v1"
     ],
-    "accepted_service_ids": [
-      "model-service-a"
-    ],
     "cluster_name": "REPLACE_CLUSTER_NAME",
-    "deployment_environment": "production",
+    "deployment_environment": "prd",
     "service_lookup": {
-      "uri": ""
+      "uri": "",
+      "credential_env": "METERING_SERVICE_LOOKUP_TOKEN",
+      "ca_file": "",
+      "max_requests_per_second": 1000
     },
     "customer_lookup": {
-      "uri": ""
-    }
+      "uri": "",
+      "credential_env": "METERING_CUSTOMER_LOOKUP_TOKEN",
+      "ca_file": "",
+      "max_requests_per_second": 1000
+    },
+    "lookup_timeout_ms": 200,
+    "lookup_max_concurrency": 64
   }
 }
 ```
@@ -829,9 +840,6 @@ Consumer：
     "flush_interval_ms": 15000,
     "accepted_config_versions": [
       "collection-v1"
-    ],
-    "accepted_service_ids": [
-      "model-service-a"
     ],
     "initial_offsets": [],
     "gap_resume_offsets": []
@@ -961,7 +969,7 @@ WASM 随 Observer 镜像打包到 `/usr/share/metering/wasm/gateway-observer-v1.
 | Consumer | consumed/inserted/rejected、insert_latency、commit_failures、lag_records、lag_age、conflict_requests |
 | 网关原有指标 | 同路由启用规则/方法/路径/同观察位置请求基数、业务错误率、首包/持续流式延迟、连接数和资源 |
 
-指标 label 禁止使用请求 ID、API Key、客户 ID、任意模型字符串；route/service 只允许配置白名单，原因码为固定枚举。Envoy 自定义 WASM 指标是否被 Istio stats matcher/prometheus 暴露属于接入检查项。
+指标 label 禁止使用请求 ID、API Key、客户 ID、任意模型字符串及请求 Host；当前固定指标不带动态路由或服务标签，原因码为固定枚举。Envoy 自定义 WASM 指标是否被 Istio stats matcher/prometheus 暴露属于接入检查项。
 
 完整率用独立网关同口径请求量与 requests 去重行数比较；分母必须与路由启用、方法、路径和观察位置一致，不能使用全网关流量或仅路由请求总数。插件 selected 指标用于诊断，不能替代独立基数；匹配不到可信分母时显示未知。已记录请求不等于 token 完整，分别展示 known/partial/unknown 和终态缺失。99.99% 是正常时段待验证目标，全日及故障时段不能隐去。
 

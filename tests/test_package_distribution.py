@@ -1,4 +1,6 @@
 import json
+import contextlib
+import io
 from pathlib import Path
 import subprocess
 import sys
@@ -13,7 +15,29 @@ import package_distribution as bundle
 
 class DistributionTests(unittest.TestCase):
     def args(self, *values):
+        if not any(v == '--accepted-request-host' or v.startswith('--accepted-request-host=') for v in values):
+            values = (*values, '--accepted-request-host', 'model.example.invalid',
+                      '--accepted-request-host', '*.example.invalid')
         return bundle.parser().parse_args(list(values))
+
+    def test_target_host_list_is_required_before_packaging(self):
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            bundle.parser().parse_args([])
+        for patterns in ([], [''], ['K.example.com'], ['api.example.com:443'],
+                         ['model-*.example.com'], ['api.example.com', 'API.EXAMPLE.COM.'],
+                         ['*'] * 1025):
+            with self.subTest(patterns=str(patterns)[:80]), tempfile.TemporaryDirectory() as directory:
+                args = self.args('--output', str(Path(directory) / 'package'))
+                args.accepted_request_host = patterns
+                with patch.object(bundle, 'gateway_pods') as pods, \
+                     patch.object(bundle, 'prepare_images') as images, \
+                     patch.object(bundle, 'run') as run:
+                    with self.assertRaises(ValueError):
+                        bundle.package(args)
+                    pods.assert_not_called()
+                    images.assert_not_called()
+                    run.assert_not_called()
+                self.assertFalse(args.output.exists())
 
     def images(self):
         return {'observer': 'metering-observer:test', 'consumer': 'metering-consumer:test',
@@ -58,6 +82,9 @@ class DistributionTests(unittest.TestCase):
         self.assertEqual(observer['kafka'], {'bootstrap_servers': ['kafka.isolated.svc.cluster.local:9092'],
                                             'topic': 'offline-events'})
         self.assertEqual(observer['observer']['deployment_environment'], 'dev')
+        for settings in (observer['observer'], consumer['consumer']):
+            self.assertNotIn('accepted_service_ids', settings)
+            self.assertNotIn('accepted_request_hosts', settings)
         self.assertEqual(consumer['doris']['database'], 'offline_data')
         self.assertEqual(consumer['doris']['fe_url'], 'http://doris.isolated.svc.cluster.local:8040')
         sql = objects['metering-doris-migrations']['data']
@@ -83,26 +110,35 @@ class DistributionTests(unittest.TestCase):
         self.assertIn('"enabled": false\n', text)
 
     def test_gateway_outputs_have_real_identity_exact_wasm_and_both_states(self):
-        args = self.args('--namespace', 'isolated')
-        pod = bundle.gateway_identity('ingressgateway-abc=7f6c2a90-4b13-4b68-9d21-67283e0c5f44')
+        args = self.args('--namespace', 'isolated', '--accepted-request-host', 'API.Corp.internal.',
+                         '--accepted-request-host', '*.Corp.internal.')
+        pods = [bundle.gateway_identity('ingressgateway-abc=7f6c2a90-4b13-4b68-9d21-67283e0c5f44'),
+                bundle.gateway_identity('ingressgateway-def=7f6c2a90-4b13-4b68-9d21-67283e0c5f45')]
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory)
             artifact = output / 'test.wasm'
             artifact.write_bytes(b'\x00asm\x01\x00\x00\x00synthetic')
-            bundle.render_manifests(args, self.images(), [pod], output, wasm_file=artifact)
-            for mode in ('disabled', 'enabled'):
-                text = (output / 'gateway' / mode / (pod['uid'] + '.yaml')).read_text()
-                self.assertNotIn('REPLACE_', text)
-                self.assertNotIn('RENDER_', text)
-                self.assertNotIn('Template only', text)
-                self.assertIn('NAME: "ingressgateway-abc"', text)
-                self.assertIn(bundle.checksum(artifact), text)
-                self.assertIn('metering-observer.isolated.svc.cluster.local', text)
-                line = next(row.strip() for row in text.splitlines() if row.strip().startswith('value: "'))
-                config = json.loads(json.loads(line[len('value: '):]))
-                self.assertEqual(config['enabled'], mode == 'enabled')
-                self.assertEqual(config['gateway_instance_id'], pod['uid'])
+            bundle.render_manifests(args, self.images(), pods, output, wasm_file=artifact)
+            for pod in pods:
+                for mode in ('disabled', 'enabled'):
+                    text = (output / 'gateway' / mode / (pod['uid'] + '.yaml')).read_text()
+                    self.assertNotIn('REPLACE_', text)
+                    self.assertNotIn('RENDER_', text)
+                    self.assertNotIn('Template only', text)
+                    self.assertIn('NAME: "' + pod['name'] + '"', text)
+                    self.assertIn(bundle.checksum(artifact), text)
+                    self.assertIn('metering-observer.isolated.svc.cluster.local', text)
+                    line = next(row.strip() for row in text.splitlines() if row.strip().startswith('value: "'))
+                    config = json.loads(json.loads(line[len('value: '):]))
+                    self.assertEqual(config['enabled'], mode == 'enabled')
+                    self.assertEqual(config['gateway_instance_id'], pod['uid'])
+                    self.assertEqual(config['accepted_request_hosts'], ['api.corp.internal', '*.corp.internal'])
+                    self.assertNotIn('.example.invalid', text)
             self.assertFalse((output / 'gateway-observer.json').exists())
+
+    def test_explicit_all_hosts_is_supported(self):
+        args = self.args('--accepted-request-host', '*')
+        self.assertEqual(bundle.gateway_configuration(args)['accepted_request_hosts'], ['*'])
 
     def test_failed_docker_save_does_not_publish_partial_package(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -133,6 +169,8 @@ class DistributionTests(unittest.TestCase):
                     patch.object(bundle, 'run', side_effect=docker_save) as run:
                 bundle.package(args)
             manifest = json.loads((args.output / 'manifest.json').read_text())
+            self.assertEqual(manifest['accepted_request_hosts'], ['model.example.invalid', '*.example.invalid'])
+            self.assertIn(json.dumps(manifest['accepted_request_hosts']), (args.output / 'README.md').read_text())
             self.assertEqual(set(run.call_args.args[0][4:]), set(manifest['images'].values()))
             sums = (args.output / 'SHA256SUMS').read_text()
             self.assertIn(bundle.file_sha256(args.output / 'images/images.tar') + '  images/images.tar', sums)

@@ -117,9 +117,9 @@ ServiceIdentity 和 CustomerIdentity 保留接口返回的名称，Observer 校�
 ### 4.2 入口 Host 处理
 
 - 读取网关用于入口路由的 authority，不使用 X-Forwarded-Host、客户端 service/provider 声明、DNS 反查或模型名称补值。
-- 原 authority 最多 512 UTF-8 字节，规范域名最多 253 ASCII 字节；校验并剥离端口、转小写、移除一个结尾根点，接受 ASCII DNS 域名和已编码 Punycode。IP 字面量、缺失、非法或超长输入为 invalid_host，不调用服务查询接口。
-- Wasm 对非法或超长输入发空值，不截断后尝试匹配，不把非法字符串放入 Protobuf string。Kafka 只保存合法规范域名或 null，不保存原始非法 authority、完整 URL 或 query。
-- Host 不解释通配符。实施前核对端口处理和 Host 重写，证明捕获的是入口路由所用 Host；若相同 Host/集群/环境仍区分多个服务，先补充映射键。
+- 原 authority 最多 512 UTF-8 字节，规范域名最多 253 ASCII 字节；在转小写之前拒绝原始输入中的非 ASCII 字符，再校验并剥离端口、转小写、移除一个结尾根点，接受 ASCII DNS 域名和已编码 Punycode。Wasm 对 IP 字面量、缺失、非法或超长输入直接放弃采集，不建立观察流；Observer 的 invalid_host 处理继续支持符合既有契约的直接观察或历史诊断。
+- Wasm 对非法或超长输入直接透传，不发送空 Host 的 Start，也不截断后尝试匹配。Kafka 只保存合法规范域名或 null，不保存原始非法 authority、完整 URL 或 query。
+- 请求 Host 本身不解释通配符；仅 Wasm 顶层 accepted_request_hosts 使用精确域名、后缀 *.example.com 或全量 * 规则。实施前核对端口处理和 Host 重写，证明捕获的是入口路由所用 Host；若相同 Host/集群/环境仍区分多个服务，先补充映射键。
 
 ### 4.3 Authorization: Bearer 与临时密钥
 
@@ -343,7 +343,7 @@ mapped 还要求对应名称完整有效：服务的 service_name/provider_name 
 
 服务归属失败不清除客户或已观察 usage，不改变客户 identity_status。客户失败保留已知服务/供应商和 usage，但 identity_status=invalid、identity_invalid 异常、usage_eligible=false，不进入客户汇总。usage_eligible 仍是统计候选，不等于供应商已知或可收费。
 
-accepted_service_ids 对已映射服务继续精确检查。未映射服务可用两个 ID 均为 null 入质量诊断；已映射但未登记的服务不能伪装未知绕过准入，Observer 拒绝该观察并计固定配置错误，业务继续。Consumer 只做事件一致性及登记校验，不调用 API。
+采集范围由 Wasm 顶层 accepted_request_hosts 决定：支持精确域名、*.example.com（任意层级子域名，不含根域名）与 *（全部合法 DNS Host）。在读取凭据、分配正文改写资源或建立观察流前匹配规范 Host；无效、不匹配、缺省或空名单均直接透传，不产生采集事件。Observer / Consumer 已移除 accepted_service_ids，不维护 Host 白名单；服务 ID 变化及未映射状态不再触发准入拒绝，配置版本与事件一致性仍校验。历史空 Host/invalid_host 诊断事件仍按既有契约处理；Consumer 不调用 API。
 
 ### 5.3 规范编码、摘要及冲突
 

@@ -83,6 +83,9 @@ class KubernetesCollectionTests(unittest.TestCase):
     def test_kubernetes_consumer_and_observer_share_isolated_topic(self):
         topic, group = k8s.isolated_names('0123456789ab')
         observer, consumer, credentials = k8s.local_configs('192.0.2.10', topic, group)
+        for settings in (observer['observer'], consumer['consumer']):
+            self.assertNotIn('accepted_service_ids', settings)
+            self.assertNotIn('accepted_request_hosts', settings)
         self.assertEqual(observer['kafka']['topic'], consumer['kafka']['topic'])
         self.assertNotEqual(topic, 'llm-metering-events')
         self.assertNotEqual(consumer['consumer']['group_id'], 'llm-metering-doris-v1')

@@ -301,6 +301,7 @@ class Harness:
         self.gateway = pods[0]
         self.gateway_uid = self.gateway['metadata']['uid']
         config = json.loads((ROOT / 'configs/gateway-observer.example.json').read_text())
+        config['accepted_request_hosts'] = ['wasm-verify.local']
         config['observer_cluster'] = 'outbound|9090||metering-observer.' + self.namespace + '.svc.cluster.local'
         path = self.output / 'gateway-observer.json'
         write_json(path, config)

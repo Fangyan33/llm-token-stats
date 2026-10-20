@@ -191,6 +191,7 @@ func TestCollectionEndToEnd(t *testing.T) {
 			id := uuid(t)
 			ids = append(ids, id)
 			req, _ := http.NewRequest(tc.method, "http://127.0.0.1:18080"+tc.path, strings.NewReader(`{"model":"fixture","stream":false}`))
+			req.Host = "model.example.invalid"
 			req.Header.Set("content-type", "application/json")
 			req.Header.Set("x-request-id", id)
 			res, err := (&http.Client{Timeout: 5 * time.Second}).Do(req)
@@ -316,7 +317,7 @@ func TestUnknownSchemaPausesPartition(t *testing.T) {
 		t.Fatalf("create local test topic: %v", err)
 	}
 	s := localStore(t, "http://127.0.0.1:18040")
-	c := config.Config{Kafka: config.Kafka{Brokers: []string{"127.0.0.1:29092"}, Topic: topic}, Consumer: config.Consumer{Group: group, AcceptedConfigs: []string{"collection-v1"}, AcceptedServices: []string{"model-service-a"}}, Doris: s.Cfg}
+	c := config.Config{Kafka: config.Kafka{Brokers: []string{"127.0.0.1:29092"}, Topic: topic}, Consumer: config.Consumer{Group: group, AcceptedConfigs: []string{"collection-v1"}}, Doris: s.Cfg}
 	if err = c.ConsumerDefaults(); err != nil {
 		t.Fatal(err)
 	}

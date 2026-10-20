@@ -10,6 +10,8 @@
 
 采集与汇总协调使用 Doris 保存日期通知、消费批次凭据和发布状态，无额外 PostgreSQL 依赖。Consumer 在原始/拒收记录、冲突标记、日期通知及批次凭据确认可见后提交 offset，不等待尚未实现的 Worker 发布汇总；发布状态由未来 Worker 负责，参见[Doris 协调设计](doris-summary-coordination.md)。这些内部处理元数据不加入 schema_version=1 Kafka value，也不要求其他订阅应用建设同样的状态表；各应用仍按自己的幂等处理结果提交进度。
 
+采集范围由 Wasm 配置 `accepted_request_hosts` 统一控制，支持精确域名、后缀通配和 `*`。无效或未匹配的 Host 不建立观察流、不发送事件，业务继续透传。Observer / Consumer 不维护服务或 Host 白名单；事件中的空 Host 与 invalid_host 状态为直接观察及历史诊断保留，不能据此认为当前 Wasm 会采集无效 Host。
+
 ## 1. 接入信息
 
 | 项目 | 约定 |

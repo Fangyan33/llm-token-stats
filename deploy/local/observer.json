@@ -19,9 +19,6 @@
     "accepted_adapter_ids": [
       "chat_completions_v1"
     ],
-    "accepted_service_ids": [
-      "model-service-a"
-    ],
     "cluster_name": "local-cluster",
     "deployment_environment": "dev",
     "service_lookup": {

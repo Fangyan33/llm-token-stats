@@ -176,13 +176,8 @@ func (s *Server) Observe(stream pb.ObservationService_ObserveServer) error {
 			}
 		}
 	}
-	freezeLookup := func(snapshot events.Event) bool {
+	freezeLookup := func(snapshot events.Event) {
 		lookup = nil
-		if snapshot.ServiceID != nil && !config.AcceptsService(s.Cfg.AcceptedServices, *snapshot.ServiceID) {
-			s.Health.Count("lookup_service_unregistered")
-			e = nil
-			return false
-		}
 		e.ServiceID, e.ServiceName, e.ProviderID, e.ProviderName = snapshot.ServiceID, snapshot.ServiceName, snapshot.ProviderID, snapshot.ProviderName
 		e.ApiKeyID, e.CustomerID, e.CustomerName = snapshot.ApiKeyID, snapshot.CustomerID, snapshot.CustomerName
 		e.MappingStatus, e.MappingVersion = snapshot.MappingStatus, snapshot.MappingVersion
@@ -192,7 +187,6 @@ func (s *Server) Observe(stream pb.ObservationService_ObserveServer) error {
 		}
 		copy := *e
 		s.Sink.Emit(&copy)
-		return true
 	}
 	final := func(reason string, end *pb.End) {
 		if finalized || e == nil {
@@ -205,9 +199,7 @@ func (s *Server) Observe(stream pb.ObservationService_ObserveServer) error {
 		if lookup != nil {
 			// The coordinator has its own deadline; stream cancellation must not
 			// discard one side's already completed attribution.
-			if !freezeLookup(<-lookup) {
-				return
-			}
+			freezeLookup(<-lookup)
 		}
 		for _, a := range e.AnomalyCodes {
 			p.Anomaly(a)
@@ -297,9 +289,7 @@ func (s *Server) Observe(stream pb.ObservationService_ObserveServer) error {
 	for {
 		select {
 		case snapshot := <-lookup:
-			if !freezeLookup(snapshot) {
-				return status.Error(codes.InvalidArgument, "service_registration")
-			}
+			freezeLookup(snapshot)
 		case <-ctx.Done():
 			reason := "transport_lost"
 			if ctx.Err() == context.DeadlineExceeded {

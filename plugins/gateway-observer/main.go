@@ -5,6 +5,7 @@ import (
 	"github.com/Fangyan33/llm-token-stats/pkg/credentials"
 	"github.com/Fangyan33/llm-token-stats/pkg/gatewayconfig"
 	w "github.com/Fangyan33/llm-token-stats/pkg/observationwire"
+	"github.com/Fangyan33/llm-token-stats/pkg/requesthost"
 	"github.com/Fangyan33/llm-token-stats/pkg/routeinfo"
 	"github.com/Fangyan33/llm-token-stats/pkg/strictjson"
 	"github.com/tetratelabs/proxy-wasm-go-sdk/proxywasm"
@@ -299,6 +300,17 @@ func (h *httpContext) OnHttpRequestHeaders(_ int, eos bool) types.Action {
 		r.count("requests_ignored_" + reason)
 		return types.ActionContinue
 	}
+	// Select before allocating rewrite/observation resources or reading credentials.
+	authority := header(":authority")
+	host := requesthost.Normalize(authority)
+	if host == "" {
+		r.count("requests_ignored_invalid_host")
+		return types.ActionContinue
+	}
+	if !requesthost.Match(r.cfg.AcceptedRequestHosts, host) {
+		r.count("requests_ignored_host")
+		return types.ActionContinue
+	}
 	h.selected = true
 	h.cfg = r.cfg
 	r.count("requests_selected")
@@ -343,7 +355,6 @@ func (h *httpContext) OnHttpRequestHeaders(_ int, eos bool) types.Action {
 	b = w.String(b, 3, h.cfg.ConfigVersion)
 	b = w.String(b, 4, routeinfo.Name(actualRoute))
 	b = w.String(b, 6, rule.AdapterID)
-	authority := header(":authority")
 	if len(authority) <= 512 && utf8.ValidString(authority) {
 		b = w.String(b, 16, authority)
 	}

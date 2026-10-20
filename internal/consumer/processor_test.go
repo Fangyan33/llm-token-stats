@@ -43,7 +43,7 @@ func batch(t *testing.T) *Batch {
 	if err != nil {
 		t.Fatal(err)
 	}
-	c := config.Consumer{Bytes: 4 << 20, AcceptedConfigs: []string{e.ConfigVersion}, AcceptedServices: []string{*e.ServiceID}}
+	c := config.Consumer{Bytes: 4 << 20, AcceptedConfigs: []string{e.ConfigVersion}}
 	result, err := Freeze([]*kgo.Record{{Topic: "llm-metering-events", Partition: 0, Offset: 10, Key: []byte(e.LogicalRequestID), Value: b, Timestamp: time.UnixMilli(e.EventCreatedAtMs)}}, c, time.UnixMilli(e.EventCreatedAtMs))
 	if err != nil {
 		t.Fatal(err)
@@ -125,24 +125,20 @@ func TestAdmissionIndependentOfDiagnosticRoute(t *testing.T) {
 			e := original
 			e.RouteName, e.ServiceID = route, events.Ptr(service)
 			payload, _ := events.Canonical(&e)
-			c := config.Consumer{Bytes: 4 << 20, AcceptedConfigs: []string{e.ConfigVersion}, AcceptedServices: []string{*original.ServiceID}}
+			c := config.Consumer{Bytes: 4 << 20, AcceptedConfigs: []string{e.ConfigVersion}}
 
 			b, err := Freeze([]*kgo.Record{{Topic: "llm-metering-events", Offset: 1, Key: []byte(e.LogicalRequestID), Value: payload, Timestamp: time.UnixMilli(e.EventCreatedAtMs)}}, c, time.UnixMilli(e.EventCreatedAtMs))
 			if err != nil {
 				t.Fatal(err)
 			}
-			if service != *original.ServiceID {
-				if len(b.Events) != 0 || len(b.Rejected) != 1 || b.Rejected[0]["reason"] != "event_registration" {
-					t.Fatal("unregistered service accepted")
-				}
-			} else if len(b.Events) != 1 || len(b.Rejected) != 0 || b.Events[0].RouteName != route || b.Raw[0]["route_name"] != route || b.Raw[0]["payload_hash"] != events.Hash(payload) {
+			if len(b.Events) != 1 || len(b.Rejected) != 0 || b.Events[0].RouteName != route || *b.Events[0].ServiceID != service || b.Raw[0]["route_name"] != route || b.Raw[0]["payload_hash"] != events.Hash(payload) {
 				t.Fatal("diagnostics blocked ingestion or historical payload changed")
 			}
 		}
 	}
 }
 
-func TestUnknownServiceWithEmptyAdmissionAndSensitiveRejections(t *testing.T) {
+func TestUnknownServiceAndSensitiveRejections(t *testing.T) {
 	data, err := os.ReadFile("../../testdata/collection/usage-known.json")
 	if err != nil {
 		t.Fatal(err)
@@ -175,6 +171,31 @@ func TestUnknownServiceWithEmptyAdmissionAndSensitiveRejections(t *testing.T) {
 			if bytes.Contains(load, []byte("synthetic-sensitive-sentinel")) {
 				t.Fatal("rejection retained sensitive input")
 			}
+		}
+	}
+}
+
+func TestLegacyNullHostAndConfigRegistration(t *testing.T) {
+	b := batch(t)
+	e := *b.Events[0]
+	e.RequestHost, e.ServiceID, e.ProviderID, e.MappingVersion = nil, nil, nil, nil
+	e.ServiceName, e.ProviderName = nil, nil
+	e.MappingStatus = "invalid_host"
+	payload, _ := events.Canonical(&e)
+	now := time.UnixMilli(e.EventCreatedAtMs)
+	r := &kgo.Record{Topic: "legacy-host", Offset: 1, Key: []byte(e.LogicalRequestID), Value: payload, Timestamp: now}
+	for _, version := range []string{e.ConfigVersion, "other-version"} {
+		cfg := config.Consumer{Bytes: 4 << 20, AcceptedConfigs: []string{version}}
+		got, err := Freeze([]*kgo.Record{r}, cfg, now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if version == e.ConfigVersion {
+			if len(got.Events) != 1 || got.Events[0].RequestHost != nil {
+				t.Fatal("legacy null Host rejected")
+			}
+		} else if len(got.Events) != 0 || len(got.Rejected) != 1 || got.Rejected[0]["reason"] != "event_registration" {
+			t.Fatal("configuration registration bypassed")
 		}
 	}
 }

@@ -17,9 +17,6 @@
     "accepted_config_versions": [
       "collection-v1"
     ],
-    "accepted_service_ids": [
-      "model-service-a"
-    ],
     "initial_offsets": [],
     "gap_resume_offsets": []
   },

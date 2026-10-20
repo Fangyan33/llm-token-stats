@@ -36,5 +36,9 @@
   "observation_max_ms": 600000,
   "tick_ms": 100,
   "metadata_max_bytes": 6144,
-  "ack_max_bytes": 1024
+  "ack_max_bytes": 1024,
+  "accepted_request_hosts": [
+    "model.example.invalid",
+    "*.example.invalid"
+  ]
 }

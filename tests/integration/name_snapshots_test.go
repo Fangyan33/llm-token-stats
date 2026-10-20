@@ -99,7 +99,7 @@ func testNamesThroughKafkaToDoris(t *testing.T, secure bool) {
 	defer sink.Close()
 	listener := bufconn.Listen(1 << 20)
 	server := grpc.NewServer(grpc.ForceServerCodec(observation.Codec{}))
-	pb.RegisterObservationServiceServer(server, &observation.Server{Cfg: config.Observer{ClusterName: "name-tests", DeploymentEnvironment: "dev", ProducerID: "name-tests", MaxActive: 4, ParserBudget: 64 << 20, MaxObservationMS: 5000, LookupTimeoutMS: 1000, LookupConcurrency: 2, AcceptedConfigs: []string{"collection-v1"}, AcceptedAdapters: []string{"chat_completions_v1"}, AcceptedServices: []string{"model-service-a"}}, Sink: sink, Health: h, ServiceResolver: service, CustomerResolver: customer})
+	pb.RegisterObservationServiceServer(server, &observation.Server{Cfg: config.Observer{ClusterName: "name-tests", DeploymentEnvironment: "dev", ProducerID: "name-tests", MaxActive: 4, ParserBudget: 64 << 20, MaxObservationMS: 5000, LookupTimeoutMS: 1000, LookupConcurrency: 2, AcceptedConfigs: []string{"collection-v1"}, AcceptedAdapters: []string{"chat_completions_v1"}}, Sink: sink, Health: h, ServiceResolver: service, CustomerResolver: customer})
 	go server.Serve(listener)
 	defer server.Stop()
 	conn, err := grpc.NewClient("passthrough:///names", grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) { return listener.Dial() }), grpc.WithTransportCredentials(insecure.NewCredentials()))

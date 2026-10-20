@@ -79,7 +79,8 @@ jobs:
           cat > "$RUNNER_TEMP/release-bin/tinygo" <<'SH'
           #!/usr/bin/env bash
           set -euo pipefail
-          docker run --rm -v "$GITHUB_WORKSPACE:/src" \
+          docker run --rm --user "$(id -u):$(id -g)" --env HOME=/tmp \
+            -v "$GITHUB_WORKSPACE:/src" \
             -w /src/plugins/gateway-observer tinygo/tinygo:0.40.1 tinygo "$@"
           SH
           chmod +x "$RUNNER_TEMP/release-bin/tinygo"

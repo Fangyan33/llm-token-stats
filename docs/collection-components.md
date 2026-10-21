@@ -21,13 +21,13 @@ make manifest
 python3 scripts/local_collection.py stop
 ```
 
-产物在 `dist/`：`observer`、`consumer`、`fixture`、`gateway-observer-v1.wasm` 和摘要清单。CI 运行契约检查、Go 竞态测试、服务构建及固定 TinyGo 镜像构建/ABI 检查；真实集成测试需单独启动 Docker 栈。
+产物在 `dist/`：`observer`、`consumer`、`fixture`、`gateway-observer-v1.wasm` 和摘要清单。构建与发布工作流仅在推送 `v*` tag 时触发，普通分支推送与 PR 不触发，也不配置手动启动入口。CI 运行契约检查、Go 竞态测试、服务构建及固定 TinyGo 镜像构建/ABI 检查；真实集成测试需单独启动 Docker 栈。
 
-CI 中的 TinyGo 容器使用 Runner 的 UID/GID，并将容器内的 HOME 设置为 `/tmp`，使 Git 能读取同一用户拥有的检出目录，构建缓存和 Wasm 输出也可写。`collection` 与 Release 工作流采用相同设置；若出现 `error obtaining VCS status: exit status 128`，可先检查容器与挂载仓库的用户身份是否一致。修复后需推送新提交触发构建；重跑旧工作流会继续使用旧提交中的配置。
+CI 中的 TinyGo 容器使用 Runner 的 UID/GID，并将容器内的 HOME 设置为 `/tmp`，使 Git 能读取同一用户拥有的检出目录，构建缓存和 Wasm 输出也可写。`collection` 与 Release 工作流采用相同设置；若出现 `error obtaining VCS status: exit status 128`，可先检查容器与挂载仓库的用户身份是否一致。修复后需推送包含新提交的 `v*` tag 触发构建；重跑旧工作流会继续使用旧提交中的配置。
 
 镜像版本使用 `python3 scripts/image_tag.py` 解析：当前 HEAD 有 Git tag 时取该 tag，无 tag 时取至少 12 位 commit 短 hash；多个 tag 按 Git 版本排序取最高项，历史 tag 不沿用，不兼容 Docker tag 的名称会报错。README 的服务镜像构建与 `make k8s-test` 使用同一规则；Kubernetes 测试的 topic / 消费组仍通过随机 run-id 隔离。
 
-`make package` 另构建 Observer / Consumer 镜像，并默认仅将这两个镜像保存到 `dist/package/images/images.tar`。指定 `--include-dependency-images` 后才额外归档 Kafka、Doris、Istio proxyv2；默认部署前需保证目标节点能拉取或已导入依赖镜像。分发包始终提供单节点 Kafka / Doris 的持久化部署、topic / 数据库初始化 Job、采集服务、全部 ConfigMap / Secret，以及针对实际网关 Pod 渲染的关闭态 / 启用态 EnvoyFilter；全部为可直接 `kubectl apply` 的 YAML。`manifest.json` 分别记录全部镜像引用、归档镜像和需外部准备的镜像。打包必须通过 `PACKAGE_ARGS` 至少提供一个 `--accepted-request-host`，可重复传入目标域名、后缀通配或显式 `*`；名单完整覆盖示例值，并写入两种状态的 EnvoyFilter、manifest 和包内说明。省略或非法名单在集群查询及镜像构建前失败。默认只读查询当前 context 的既有网关，也可通过 `PACKAGE_ARGS` 提供目标 context 或实际 Pod 名称 / UID。指定输出目录使用 `PACKAGE_DIR`，完整命令、镜像导入和部署顺序见 [README 分发说明](../README.md#分发镜像与完整-kubernetes-清单)。该包采用开发环境的单节点、明文 Kafka 与 Doris root 空密码，生产仍使用下文的独立基础设施和认证配置。
+`make package` 另构建 Observer / Consumer 镜像，并默认仅将这两个镜像保存到 `dist/package/images/images.tar`。指定 `--include-dependency-images` 后才额外归档 Kafka、Doris、Istio proxyv2；默认部署前需保证目标节点能拉取或已导入依赖镜像。分发包始终提供单节点 Kafka / Doris 的持久化部署、topic / 数据库初始化 Job、采集服务、全部 ConfigMap / Secret，以及针对实际网关 Pod 渲染的关闭态 / 启用态 EnvoyFilter；全部为可直接 `kubectl apply` 的 YAML。包根目录的 `envoyfilter.yaml` 汇总全部目标 Pod 的关闭态配置，`gateway/disabled/` 与 `gateway/enabled/` 按 Pod 保留两种状态；Observer 就绪后再单独应用 EnvoyFilter。`manifest.json` 分别记录全部镜像引用、归档镜像和需外部准备的镜像。省略 `--accepted-request-host` 时，打包写入 `["*"]`，匹配全部合法 DNS Host；显式提供时完整覆盖默认值，可重复传入目标域名、后缀通配或 `*`，并写入两种状态的 EnvoyFilter、manifest 和包内说明。显式空名单或非法名单在集群查询及镜像构建前失败。默认只读查询当前 context 的既有网关，也可通过 `PACKAGE_ARGS` 提供目标 context 或实际 Pod 名称 / UID。指定输出目录使用 `PACKAGE_DIR`，完整命令、镜像导入和部署顺序见 [README 分发说明](../README.md#分发镜像与完整-kubernetes-清单)。该包采用开发环境的单节点、明文 Kafka 与 Doris root 空密码，生产仍使用下文的独立基础设施和认证配置。
 
 本地栈的已发布端口统一绑定 `0.0.0.0`，可使用服务器 IP 从远端访问：
 
@@ -100,6 +100,8 @@ make generate
 ## Wasm Host 白名单
 
 仅在 Wasm 配置顶层维护 `accepted_request_hosts`。支持精确 DNS 域名、`*.example.com` 和 `*`；后缀通配匹配任意层级子域名，不含根域名。请求从 `:authority` 规范化，先拒绝非 ASCII 字符，再转小写并去端口和末尾点，不读取转发头。规则最多 1024 项，且整体 Wasm 配置仍须满足 64 KiB 上限；加载时转小写、去末尾点；端口、URL、IP、其他通配符和规范化后重复项均为无效配置。缺省或空名单不采集；非法配置停用插件采集，继续放行业务。
+
+`make package` 和 Release 发布脚本会在省略 Host 参数时显式写入 `["*"]`；生成的配置因此匹配全部合法 DNS Host。直接提供给 Wasm 的配置仍按上述缺省、空名单规则处理。
 
 Host 无效或不匹配时，在提取凭据、建立观察流、缓存或改写正文之前直接透传，分别记录 `metering_requests_ignored_invalid_host_total`、`metering_requests_ignored_host_total`，无域名标签。Observer / Consumer 不维护服务或 Host 白名单，仍校验配置版本、协议和字段状态一致性；历史空 Host 诊断事件仍按原事件契约处理。
 

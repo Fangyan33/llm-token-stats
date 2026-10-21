@@ -267,11 +267,12 @@ def gateway_pods(args):
 
 
 def gateway_configuration(args):
-    if not args.accepted_request_host:
-        raise ValueError('至少提供一个 --accepted-request-host，不能使用示例名单代替目标业务域名')
+    hosts = ['*'] if args.accepted_request_host is None else args.accepted_request_host
+    if not hosts:
+        raise ValueError('Host 白名单不能为空')
     config = load(ROOT / 'configs/gateway-observer.example.json')
     config['accepted_request_hosts'] = [normalize_request_host_pattern(host)
-                                        for host in args.accepted_request_host]
+                                        for host in hosts]
     config['observer_cluster'] = 'outbound|9090||metering-observer.' + args.namespace + '.svc.cluster.local'
     validate_config(config)
     return config
@@ -291,6 +292,7 @@ def render_manifests(args, images, pods, output, wasm_file=None):
     dns = f'metering-observer.{ns}.svc.cluster.local'
     config_path = output / 'gateway-observer.json'
     config_path.write_text(json.dumps(gateway_config, indent=2) + '\n')
+    disabled_filters = []
     for pod in pods:
         for mode in ('disabled', 'enabled'):
             target = output / 'gateway' / mode / (pod['uid'] + '.yaml')
@@ -307,6 +309,11 @@ def render_manifests(args, images, pods, output, wasm_file=None):
             text = text.replace('# Template only: the JSON is default-disabled and must be rendered/validated.',
                                 '# 已按目标网关 Pod 渲染，可直接 kubectl apply。')
             target.write_text(text)
+            if mode == 'disabled':
+                disabled_filters.append(text.rstrip() + '\n')
+    if not disabled_filters:
+        raise ValueError('没有生成目标网关的 EnvoyFilter')
+    (output / 'envoyfilter.yaml').write_text('---\n'.join(disabled_filters), encoding='utf-8')
     # 原始配置只作为渲染输入，不向使用者分发含 RENDER_FROM_POD_UID 的文件。
     config_path.unlink()
 
@@ -397,7 +404,10 @@ Kafka 3.9.2（24 分区、单副本、保留 72 小时），Doris 4.1.3（单 FE
 Wasm 已嵌入 Observer 镜像。manifest.json 的 images 记录全部镜像引用，
 archived_images 记录归档内镜像，external_images 记录需由目标环境准备的镜像。
 Wasm Host 白名单：{json.dumps(hosts, ensure_ascii=False)}，同时记录于 manifest.json 和每个 EnvoyFilter。
-该名单来自打包时显式提供的 --accepted-request-host；后缀通配匹配子域名，不含根域名。
+省略 --accepted-request-host 时默认 ["*"]，匹配全部合法 DNS Host；显式传参完整覆盖默认值。
+后缀通配匹配子域名，不含根域名。
+包根目录 envoyfilter.yaml 汇总全部目标 Pod 的关闭态 EnvoyFilter；
+gateway/disabled/ 和 gateway/enabled/ 按 Pod 分别提供关闭态与启用态配置。
 
 在本目录校验：
 
@@ -422,20 +432,21 @@ kubectl -n {args.namespace} get pods,svc,pvc
 ```
 
 确认 Wasm 下载内容与 manifest.json 的 wasm_sha256 一致、过滤器顺序为 ext_authz → Wasm → router 后，
-对已存在的网关应用插件。关闭态和启用态是同一资源的两种状态，每次只应用一个目录：
+对已存在的网关应用插件。先应用包根目录汇总的关闭态配置，再按验证结果启用采集：
 
 ```sh
-kubectl apply -f gateway/disabled/
+kubectl apply -f envoyfilter.yaml
 # 完成加载与顺序检查后启用采集
 kubectl apply -f gateway/enabled/
 # 需要关闭采集时
-kubectl apply -f gateway/disabled/
+kubectl apply -f envoyfilter.yaml
 ```
 
 网关命名空间：{args.gateway_namespace}；本包仅匹配以下实际 Pod：
 
 ''' + ''.join(f"- `{pod['name']}`，UID `{pod['uid']}`\n" for pod in pods) + '''
 网关 Pod 重建、扩容或更换目标集群后，必须使用新的 Pod 名称和 UID 重新打包。
+envoyfilter.yaml 与 gateway/disabled/ 内容相同，选择其中一个入口即可。
 gateway 目录中全部为最终 YAML，不含待替换字段；不要递归同时 apply disabled 和 enabled。
 初始化 Job 只处理本包的单节点 Kafka / Doris；已有旧事件表会拒绝初始化，请使用隔离命名空间 / 数据卷。
 PVC 数据在删除 StatefulSet 后仍保留；本包不自动删除 PVC、既有数据或网关资源。
@@ -448,8 +459,8 @@ def parser():
     p.add_argument('--output', type=Path, default=ROOT / 'dist/package')
     p.add_argument('--namespace', type=dns_name, default='metering')
     p.add_argument('--gateway-namespace', type=dns_name, default='istio-system')
-    p.add_argument('--accepted-request-host', action='append', required=True, metavar='HOST',
-                   help='目标业务 Host 白名单，可重复；支持精确域名、*.example.com 和 *，必须显式提供')
+    p.add_argument('--accepted-request-host', action='append', metavar='HOST',
+                   help='目标业务 Host 白名单，可重复；省略时默认 *，显式传参完整覆盖默认值')
     p.add_argument('--gateway-pod', type=gateway_identity, action='append', default=[], metavar='NAME=UID',
                    help='目标网关实际 Pod，可重复；省略时只读查询目标集群 istio=ingressgateway 的 Pod')
     p.add_argument('--context', help='查询目标网关时使用的 kubectl context')

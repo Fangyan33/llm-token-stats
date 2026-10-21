@@ -1,5 +1,7 @@
 name: collection
-on: [push, pull_request]
+on:
+  push:
+    tags: ['v*']
 jobs:
   unit:
     runs-on: ubuntu-latest

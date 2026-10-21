@@ -38,7 +38,8 @@ def string_array(environment, name):
 
 def package_options(environment):
     # 先按现有契约校验所有输入，再将受限字符集的值交给 Make，避免二次展开注入。
-    hosts = string_array(environment, 'RELEASE_ACCEPTED_REQUEST_HOSTS')
+    hosts = (string_array(environment, 'RELEASE_ACCEPTED_REQUEST_HOSTS')
+             if environment.get('RELEASE_ACCEPTED_REQUEST_HOSTS', '').strip() else ['*'])
     pods = string_array(environment, 'RELEASE_GATEWAY_PODS')
     namespace = bundle.dns_name(environment.get('RELEASE_NAMESPACE') or 'metering')
     gateway_namespace = bundle.dns_name(environment.get('RELEASE_GATEWAY_NAMESPACE') or 'istio-system')
@@ -90,6 +91,8 @@ def archive_package(tag, package_dir, output, max_bytes=ASSET_BYTES):
         raise ValueError('无效发布 tag')
     if output.exists() and (not output.is_dir() or any(output.iterdir())):
         raise ValueError('发布附件目录已存在且非空')
+    if not (package_dir / 'envoyfilter.yaml').is_file():
+        raise ValueError('分发包缺少 envoyfilter.yaml，请使用当前版本 make package 重新打包')
     subprocess.run(['sha256sum', '-c', 'SHA256SUMS'], cwd=package_dir, check=True)
     manifest = json.loads((package_dir / 'manifest.json').read_text(encoding='utf-8'))
     if manifest['platform'] != 'linux/amd64':
@@ -116,6 +119,8 @@ def archive_package(tag, package_dir, output, max_bytes=ASSET_BYTES):
 请下载本 Release 的全部附件到同一空目录。运行平台为 linux/amd64。
 包含已渲染的 Kubernetes 清单。{image_note}
 Wasm 已嵌入 Observer 镜像；目标网关 Pod 和业务域名见 manifest.json。
+Host 参数省略时默认匹配全部合法 DNS Host；可通过显式名单限制域名。
+包根目录 package/envoyfilter.yaml 汇总关闭态 EnvoyFilter，启用态位于 package/gateway/enabled/。
 本包绑定打包时的实际网关 Pod，Pod 重建、扩容或更换集群后须重新打包。
 单节点基础设施采用开发配置；生产部署仍需完成 G0–G5 验收。
 

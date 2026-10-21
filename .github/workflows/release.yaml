@@ -3,33 +3,12 @@ name: release-package
 on:
   push:
     tags: ['v*']
-  workflow_dispatch:
-    inputs:
-      tag:
-        description: '已存在的 Git tag（须包含本工作流和发布脚本）'
-        required: true
-        type: string
-      accepted_request_hosts:
-        description: '业务 Host 的 JSON 数组；留空使用 RELEASE_ACCEPTED_REQUEST_HOSTS'
-        type: string
-      gateway_pods:
-        description: '实际 NAME=UID 的 JSON 数组；留空使用 RELEASE_GATEWAY_PODS'
-        type: string
-      namespace:
-        description: '采集命名空间；留空使用 RELEASE_NAMESPACE 或 metering'
-        type: string
-      gateway_namespace:
-        description: '网关命名空间；留空使用 RELEASE_GATEWAY_NAMESPACE 或 istio-system'
-        type: string
-      storage_class:
-        description: 'StorageClass；留空使用 RELEASE_STORAGE_CLASS 或目标集群默认值'
-        type: string
 
 permissions:
   contents: read
 
 concurrency:
-  group: release-package-${{ inputs.tag || github.ref_name }}
+  group: release-package-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -39,12 +18,12 @@ jobs:
     permissions:
       contents: write
     env:
-      RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
-      RELEASE_ACCEPTED_REQUEST_HOSTS: ${{ inputs.accepted_request_hosts || vars.RELEASE_ACCEPTED_REQUEST_HOSTS }}
-      RELEASE_GATEWAY_PODS: ${{ inputs.gateway_pods || vars.RELEASE_GATEWAY_PODS }}
-      RELEASE_NAMESPACE: ${{ inputs.namespace || vars.RELEASE_NAMESPACE || 'metering' }}
-      RELEASE_GATEWAY_NAMESPACE: ${{ inputs.gateway_namespace || vars.RELEASE_GATEWAY_NAMESPACE || 'istio-system' }}
-      RELEASE_STORAGE_CLASS: ${{ inputs.storage_class || vars.RELEASE_STORAGE_CLASS }}
+      RELEASE_TAG: ${{ github.ref_name }}
+      RELEASE_ACCEPTED_REQUEST_HOSTS: ${{ vars.RELEASE_ACCEPTED_REQUEST_HOSTS || '["*"]' }}
+      RELEASE_GATEWAY_PODS: ${{ vars.RELEASE_GATEWAY_PODS }}
+      RELEASE_NAMESPACE: ${{ vars.RELEASE_NAMESPACE || 'metering' }}
+      RELEASE_GATEWAY_NAMESPACE: ${{ vars.RELEASE_GATEWAY_NAMESPACE || 'istio-system' }}
+      RELEASE_STORAGE_CLASS: ${{ vars.RELEASE_STORAGE_CLASS }}
     defaults:
       run:
         shell: bash

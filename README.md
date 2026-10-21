@@ -77,6 +77,8 @@ docker push "$CONSUMER_IMAGE"
 ### 分发镜像与完整 Kubernetes 清单
 
 ```sh
+make package # Host 默认匹配全部合法 DNS 域名
+# 只采集指定域名：
 make package PACKAGE_ARGS="--accepted-request-host api.company.com --accepted-request-host '*.company.com'"
 # 指定目标集群、命名空间、StorageClass 和输出目录：
 make package PACKAGE_DIR=dist/target-package \
@@ -90,7 +92,7 @@ make package PACKAGE_DIR=dist/package-with-dependencies \
 
 两种模式都保留 Kafka / Doris 的单节点部署 YAML、初始化 Job 和全部配置。默认包部署前，目标节点需能拉取 Kafka / Doris 镜像，或已预先导入对应镜像；Istio 继续复用已有网关。`manifest.json` 的 `images` 记录全部镜像引用，`archived_images` 记录实际归档内容，`external_images` 记录需要目标环境准备的镜像。
 
-打包必须至少提供一个 `--accepted-request-host`，多个域名或模式重复传参。参数完整替换示例中的名单，支持精确域名、`*.company.com`（任意层级子域名，不含根域名）和显式 `*`（全部合法 DNS Host）；通配符需加引号，避免被 Shell 展开。脚本在查询目标集群、构建或导出镜像前校验并规范化名单，拒绝非法项、重复项、超限及非 ASCII 字符。规范化后的名单写入每个 Pod 的关闭态/启用态 EnvoyFilter、`manifest.json` 和包内 README；不能直接沿用旧包中的示例名单。
+省略 `--accepted-request-host` 时，打包默认写入 `accepted_request_hosts: ["*"]`，匹配全部合法 DNS Host。显式提供参数时完整覆盖默认值，多个域名或模式重复传参，支持精确域名、`*.company.com`（任意层级子域名，不含根域名）和 `*`；通配符需加引号，避免被 Shell 展开。脚本在查询目标集群、构建或导出镜像前校验并规范化名单，拒绝显式空名单、非法项、重复项、超限及非 ASCII 字符。规范化后的名单写入每个 Pod 的关闭态/启用态 EnvoyFilter、`manifest.json` 和包内 README。
 
 镜像构建使用本仓库 Kubernetes 测试所用的 host 网络，并传入代理环境变量；需要切换网络时可指定 `--build-network default`。服务镜像版本取自当前 Git tag / commit hash，Wasm 随 Observer 镜像分发。包内还包含镜像 ID、Wasm 摘要和全包文件校验和。输出目录非空时，打包脚本会拒绝覆盖，可通过 `PACKAGE_DIR` 指定新目录。
 
@@ -100,7 +102,7 @@ Kafka 默认使用 24 分区、单副本，数据保留 72 小时。存储默认
 
 部署复用目标集群已有的 Istio 和网关。打包时，脚本默认只读查询当前 kubectl context 中 `istio-system` 下带 `istio=ingressgateway` 标签的实际 Pod；可通过 `--context`、`--gateway-namespace` 指定目标。打包机器无法访问目标集群时，使用 `PACKAGE_ARGS='--accepted-request-host api.company.com --gateway-pod 实际Pod名=实际PodUID'` 提供目标 Pod，多个 Pod 需重复传参。
 
-脚本为每个 Pod 生成 `gateway/disabled/`、`gateway/enabled/` 两种完整 EnvoyFilter。网关必须带有 `istio=ingressgateway` 标签，Pod 重建或扩容后需要重新打包。输出 YAML 不含 `REPLACE_*` 或 `RENDER_*`，部署时无需再次替换或渲染。
+包根目录的 `envoyfilter.yaml` 汇总全部目标 Pod 的关闭态 EnvoyFilter；`gateway/disabled/`、`gateway/enabled/` 继续按 Pod 提供关闭态、启用态的完整清单。汇总文件与 `gateway/disabled/` 内容相同，选择一个入口即可。先部署 `k8s/` 中的采集组件，等待 Observer 就绪后，再单独应用 EnvoyFilter。网关必须带有 `istio=ingressgateway` 标签，Pod 重建或扩容后需要重新打包。输出 YAML 不含 `REPLACE_*` 或 `RENDER_*`，部署时无需再次替换或渲染。
 
 分发后进入包目录执行：
 
@@ -119,8 +121,8 @@ kubectl -n metering wait --for=condition=complete \
 kubectl -n metering rollout status deployment/metering-consumer --timeout=5m
 kubectl -n metering rollout status deployment/metering-observer --timeout=5m
 
-# 确认 Wasm 下载摘要与过滤器顺序后启用；两种状态每次只 apply 一个目录。
-kubectl apply -f gateway/disabled/
+# 先应用汇总的关闭态 EnvoyFilter，确认 Wasm 下载摘要与过滤器顺序后启用。
+kubectl apply -f envoyfilter.yaml
 kubectl apply -f gateway/enabled/
 ```
 
@@ -128,15 +130,15 @@ kubectl apply -f gateway/enabled/
 
 ### GitHub Release 下载包
 
-[发布工作流](.github/workflows/release.yaml) 支持推送 `v*` tag 自动发布，以及在 Actions → release-package → Run workflow 手动发布。工作流检出指定 tag，运行 `make test` 和 `make package`，校验包内摘要，压缩后上传到该 tag 的 GitHub Release。当前发布平台为 `linux/amd64`，使用 Go 1.25.0 和 TinyGo 0.40.1；无需镜像仓库或额外 PAT，发布使用工作流自带的 `GITHUB_TOKEN` 和 `contents: write` 权限。
+[构建检查](.github/workflows/collection.yaml)和[发布工作流](.github/workflows/release.yaml)仅在推送 `v*` tag 时触发。普通分支推送与 PR 不触发，也不配置手动启动入口。发布工作流检出该 tag，运行 `make test` 和 `make package`，校验包内摘要，压缩后上传到该 tag 的 GitHub Release。当前发布平台为 `linux/amd64`，使用 Go 1.25.0 和 TinyGo 0.40.1；无需镜像仓库或额外 PAT，发布使用工作流自带的 `GITHUB_TOKEN` 和 `contents: write` 权限。
 
 Release 默认仅携带 Observer / Consumer 镜像和嵌入的 Wasm，保留 Kafka / Doris 部署 YAML，不携带 Kafka、Doris、Istio proxyv2 镜像。目标环境需能拉取或预先导入依赖镜像。
 
-GitHub Runner 无需访问目标 Kubernetes 集群，但必须提供目标网关的真实身份和业务域名。在仓库 Settings → Secrets and variables → Actions → Variables 配置以下 Repository variables：
+GitHub Runner 无需访问目标 Kubernetes 集群，但必须提供目标网关的真实身份；业务域名参数可按需限定，省略时匹配全部合法 DNS Host。在仓库 Settings → Secrets and variables → Actions → Variables 配置以下 Repository variables：
 
 | Variable | 格式与用途 |
 | --- | --- |
-| `RELEASE_ACCEPTED_REQUEST_HOSTS` | 必填，业务 Host 的 JSON 字符串数组，如 `["api.company.com", "*.company.com"]` |
+| `RELEASE_ACCEPTED_REQUEST_HOSTS` | 可选，业务 Host 的 JSON 字符串数组，如 `["api.company.com", "*.company.com"]`；未配置时默认 `["*"]` |
 | `RELEASE_GATEWAY_PODS` | 必填，实际 `NAME=UID` 的 JSON 字符串数组，覆盖需要安装插件的全部网关 Pod |
 | `RELEASE_NAMESPACE` | 可选，采集命名空间，默认 `metering` |
 | `RELEASE_GATEWAY_NAMESPACE` | 可选，网关命名空间，默认 `istio-system` |
@@ -158,9 +160,11 @@ git tag v0.1.0
 git push origin v0.1.0
 ```
 
-手动发布时，工作流须已进入默认分支；填写已存在的 `tag`，其余输入可覆盖同名 Variable 对应的值，留空时使用 Variable 或上表默认值。待打包 tag 也必须包含发布工作流和脚本。输入不是任意 Shell 参数，域名、Pod 身份和命名空间都按现有打包契约校验。
+待发布 tag 必须包含发布工作流和脚本。发布参数从上述 Repository variables 读取，未设置的可选参数使用表中默认值；域名、Pod 身份和命名空间都按现有打包契约校验。
 
-成功后，在仓库 Releases 对应版本的 Assets 下载 `llm-token-stats-<tag>-linux-amd64.tgz`、`SHA256SUMS`、`manifest.json` 和 `DOWNLOAD.md`。GitHub Release 单个附件必须小于 2 GiB；压缩包超过 1900 MiB 时，工作流上传 `.tgz.part000`、`.tgz.part001` 等分卷。下载全部附件到同一空目录，按该 Release 的说明校验、合并和解压，再执行包内 `package/README.md` 中的部署命令。[附件大小限制](https://docs.github.com/en/repositories/releasing-projects-on-github/about-releases#storage-and-bandwidth-quotas)
+成功后，在仓库 Releases 对应版本的 Assets 下载 `llm-token-stats-<tag>-linux-amd64.tgz`、`SHA256SUMS`、`manifest.json` 和 `DOWNLOAD.md`。解压后，关闭态 EnvoyFilter 汇总文件位于 `package/envoyfilter.yaml`，启用态清单位于 `package/gateway/enabled/`。GitHub Release 单个附件必须小于 2 GiB；压缩包超过 1900 MiB 时，工作流上传 `.tgz.part000`、`.tgz.part001` 等分卷。下载全部附件到同一空目录，按该 Release 的说明校验、合并和解压，再执行包内 `package/README.md` 中的部署命令。[附件大小限制](https://docs.github.com/en/repositories/releasing-projects-on-github/about-releases#storage-and-bandwidth-quotas)
+
+发布脚本会拒绝缺少 `envoyfilter.yaml` 的分发包；旧版产物需用当前版本重新打包。
 
 工作流先创建草稿并上传全部附件，上传成功才发布；含短横线的 tag（如 `v0.1.0-rc.1`）标记为预发布。已有 Release 时拒绝覆盖。上传失败可能留下草稿，删除该草稿后可以重跑；已发布版本的变更使用新 tag。构建失败时查看 Actions 日志，发布成功不代表生产部署验收完成。
 

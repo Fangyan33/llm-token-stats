@@ -33,9 +33,23 @@ class ReleasePackageTests(unittest.TestCase):
         self.assertEqual(args.platform, 'linux/amd64')
         self.assertFalse(args.include_dependency_images)
 
+    def test_missing_or_blank_host_input_defaults_to_all_hosts(self):
+        for host_input in (None, '', '   '):
+            with self.subTest(host_input=host_input):
+                environment = self.environment()
+                if host_input is None:
+                    del environment['RELEASE_ACCEPTED_REQUEST_HOSTS']
+                else:
+                    environment['RELEASE_ACCEPTED_REQUEST_HOSTS'] = host_input
+                with patch.object(release.bundle, 'run') as run:
+                    options = release.package_options(environment)
+                run.assert_not_called()
+                args = release.bundle.parser().parse_args(options)
+                self.assertEqual(release.bundle.gateway_configuration(args)['accepted_request_hosts'], ['*'])
+
     def test_invalid_and_shell_make_injection_inputs_are_rejected(self):
         cases = [
-            ('RELEASE_ACCEPTED_REQUEST_HOSTS', ''),
+            ('RELEASE_ACCEPTED_REQUEST_HOSTS', 'not-json'),
             ('RELEASE_ACCEPTED_REQUEST_HOSTS', '[]'),
             ('RELEASE_ACCEPTED_REQUEST_HOSTS', '{}'),
             ('RELEASE_ACCEPTED_REQUEST_HOSTS', '[1]'),
@@ -69,6 +83,8 @@ class ReleasePackageTests(unittest.TestCase):
         package.mkdir()
         (package / 'images').mkdir()
         (package / 'images/images.tar').write_bytes(os.urandom(4096))
+        (package / 'envoyfilter.yaml').write_text(
+            'apiVersion: networking.istio.io/v1alpha3\nkind: EnvoyFilter\nmetadata:\n  name: synthetic-test\n')
         images = {'observer': 'metering-observer:test', 'consumer': 'metering-consumer:test'}
         manifest = {'platform': 'linux/amd64', 'images': {**images, **release.bundle.RUNTIME_IMAGES},
                     'archived_images': images, 'external_images': release.bundle.RUNTIME_IMAGES}
@@ -121,6 +137,18 @@ class ReleasePackageTests(unittest.TestCase):
             package = self.package(root)
             (package / 'images/images.tar').write_bytes(b'corrupted')
             with self.assertRaises(subprocess.CalledProcessError):
+                release.archive_package('v1.0.0', package, root / 'release')
+            self.assertFalse((root / 'release').exists())
+
+    def test_missing_envoyfilter_rejects_legacy_package_before_archiving(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            package = self.package(root)
+            (package / 'envoyfilter.yaml').unlink()
+            checksums = package / 'SHA256SUMS'
+            checksums.write_text(''.join(line for line in checksums.read_text().splitlines(keepends=True)
+                                         if not line.endswith('  envoyfilter.yaml\n')))
+            with self.assertRaisesRegex(ValueError, '缺少 envoyfilter.yaml'):
                 release.archive_package('v1.0.0', package, root / 'release')
             self.assertFalse((root / 'release').exists())
 

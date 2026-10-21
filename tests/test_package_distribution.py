@@ -1,9 +1,8 @@
 import json
-import contextlib
-import io
 from pathlib import Path
 import subprocess
 import sys
+import tarfile
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -20,9 +19,7 @@ class DistributionTests(unittest.TestCase):
                       '--accepted-request-host', '*.example.invalid')
         return bundle.parser().parse_args(list(values))
 
-    def test_target_host_list_is_required_before_packaging(self):
-        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
-            bundle.parser().parse_args([])
+    def test_invalid_explicit_host_list_is_rejected_before_packaging(self):
         for patterns in ([], [''], ['K.example.com'], ['api.example.com:443'],
                          ['model-*.example.com'], ['api.example.com', 'API.EXAMPLE.COM.'],
                          ['*'] * 1025):
@@ -134,7 +131,66 @@ class DistributionTests(unittest.TestCase):
                     self.assertEqual(config['gateway_instance_id'], pod['uid'])
                     self.assertEqual(config['accepted_request_hosts'], ['api.corp.internal', '*.corp.internal'])
                     self.assertNotIn('.example.invalid', text)
+            combined = (output / 'envoyfilter.yaml').read_text()
+            configs = [json.loads(json.loads(line.strip()[len('value: '):]))
+                       for line in combined.splitlines() if line.strip().startswith('value: "')]
+            self.assertEqual(combined.count('kind: EnvoyFilter'), len(pods))
+            self.assertEqual({config['gateway_instance_id'] for config in configs}, {pod['uid'] for pod in pods})
+            self.assertTrue(all(config['enabled'] is False for config in configs))
+            self.assertTrue(all(config['accepted_request_hosts'] == ['api.corp.internal', '*.corp.internal']
+                                for config in configs))
+            self.assertNotIn('REPLACE_', combined)
+            self.assertNotIn('RENDER_', combined)
             self.assertFalse((output / 'gateway-observer.json').exists())
+
+    def test_omitted_hosts_default_all_and_explicit_hosts_replace_default(self):
+        args = bundle.parser().parse_args([])
+        self.assertEqual(bundle.gateway_configuration(args)['accepted_request_hosts'], ['*'])
+        args = bundle.parser().parse_args(['--accepted-request-host', 'API.Corp.internal.'])
+        self.assertEqual(bundle.gateway_configuration(args)['accepted_request_hosts'], ['api.corp.internal'])
+
+    def test_default_host_and_envoyfilter_survive_packaging_and_tgz(self):
+        import release_package as release
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            wasm_file = root / 'test.wasm'
+            wasm_file.write_bytes(b'\x00asm\x01\x00\x00\x00synthetic')
+            args = bundle.parser().parse_args([
+                '--output', str(root / 'package'),
+                '--gateway-pod', 'gateway-abc=7f6c2a90-4b13-4b68-9d21-67283e0c5f44'])
+            original_run = bundle.run
+            original_render = bundle.render_manifests
+
+            def run(command, **kwargs):
+                if command[:2] == ['docker', 'save']:
+                    Path(command[command.index('--output') + 1]).write_bytes(b'synthetic archive')
+                    return
+                return original_run(command, **kwargs)
+
+            def render(args, images, pods, output):
+                original_render(args, images, pods, output, wasm_file=wasm_file)
+
+            with patch.object(bundle, 'checksum', return_value=bundle.file_sha256(wasm_file)), \
+                    patch.object(bundle, 'resolve_image_tag', return_value='version'), \
+                    patch.object(bundle, 'prepare_images', return_value={}), \
+                    patch.object(bundle, 'render_manifests', side_effect=render), \
+                    patch.object(bundle, 'run', side_effect=run):
+                bundle.package(args)
+            manifest = json.loads((args.output / 'manifest.json').read_text())
+            self.assertEqual(manifest['accepted_request_hosts'], ['*'])
+            text = (args.output / 'envoyfilter.yaml').read_text()
+            config_line = next(line.strip() for line in text.splitlines() if line.strip().startswith('value: "'))
+            config = json.loads(json.loads(config_line[len('value: '):]))
+            self.assertEqual(config['accepted_request_hosts'], ['*'])
+            self.assertIs(config['enabled'], False)
+            self.assertIn(bundle.file_sha256(args.output / 'envoyfilter.yaml') + '  envoyfilter.yaml',
+                          (args.output / 'SHA256SUMS').read_text())
+            parts = release.archive_package('v1.0.0', args.output, root / 'release')
+            with tarfile.open(parts[0], 'r:gz') as archive:
+                self.assertEqual(archive.extractfile('package/envoyfilter.yaml').read().decode(), text)
+                for mode in ('disabled', 'enabled'):
+                    self.assertIn('package/gateway/' + mode + '/7f6c2a90-4b13-4b68-9d21-67283e0c5f44.yaml',
+                                  archive.getnames())
 
     def test_explicit_all_hosts_is_supported(self):
         args = self.args('--accepted-request-host', '*')

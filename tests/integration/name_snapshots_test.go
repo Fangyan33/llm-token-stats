@@ -45,7 +45,8 @@ func testNamesThroughKafkaToDoris(t *testing.T, secure bool) {
 	remote := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != "POST" || r.Header.Get("x-remote-data") != credential {
 			t.Error("remote authentication")
-			w.WriteHeader(401)
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]any{"responseCode": "unauthenticated", "responseMsg": "接口认证失败", "success": false, "data": nil})
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
@@ -58,13 +59,13 @@ func testNamesThroughKafkaToDoris(t *testing.T, secure bool) {
 			if json.NewDecoder(r.Body).Decode(&request) != nil || request.RequestHost != "names.example.com" || request.DeploymentEnvironment != "dev" {
 				t.Error("service request")
 			}
-			json.NewEncoder(w).Encode(identitylookup.ServiceIdentity{ServiceID: "model-service-a", ProviderID: "provider-names", ServiceName: "服务" + suffix, ProviderName: "供应商" + suffix})
+			json.NewEncoder(w).Encode(map[string]any{"responseCode": "000000", "responseMsg": "服务归属查询成功", "success": true, "data": identitylookup.ServiceIdentity{ServiceID: "model-service-a", ProviderID: "provider-names", ServiceName: "服务" + suffix, ProviderName: "供应商" + suffix}})
 		} else {
 			var request map[string]string
 			if json.NewDecoder(r.Body).Decode(&request) != nil || request["api_key"] != token {
 				t.Error("customer request")
 			}
-			json.NewEncoder(w).Encode(identitylookup.CustomerIdentity{APIKeyID: "key-names", CustomerID: "customer-names", CustomerName: "客户" + suffix})
+			json.NewEncoder(w).Encode(map[string]any{"responseCode": "000000", "responseMsg": "客户归属查询成功", "success": true, "data": identitylookup.CustomerIdentity{APIKeyID: "key-names", CustomerID: "customer-names", CustomerName: "客户" + suffix}})
 		}
 	}))
 	if secure {
@@ -166,6 +167,11 @@ func testNamesThroughKafkaToDoris(t *testing.T, secure bool) {
 			var event events.Event
 			if json.Unmarshal([]byte(raw), &event) != nil || a != "服务"+want || b != "供应商"+want || c != "客户"+want || event.ServiceName == nil || *event.ServiceName != a || *event.ProviderName != b || *event.CustomerName != c || strings.Contains(raw, token) || strings.Contains(raw, credential) {
 				t.Fatal("name snapshot persistence")
+			}
+			for _, field := range []string{"responseCode", "responseMsg", "服务归属查询成功", "客户归属查询成功"} {
+				if strings.Contains(raw, field) {
+					t.Fatal("remote response envelope persisted in event")
+				}
 			}
 			reader, err := kgo.NewClient(kgo.SeedBrokers("127.0.0.1:29092"), kgo.ConsumePartitions(map[string]map[int32]kgo.Offset{"llm-metering-development": {part: kgo.NewOffset().At(offset)}}))
 			if err != nil {

@@ -60,6 +60,7 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 	h := &health.State{}
+	h.GaugeFunc("lookup_logs_dropped_total", identitylookup.DroppedResponseLogs)
 	health.Start(ctx, c.Observer.Health, h)
 	var downloads *wasmdownload.Server
 	if c.Observer.WasmDownload != nil {

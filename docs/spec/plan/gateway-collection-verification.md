@@ -316,3 +316,36 @@ Host 无效或未匹配时，在提取凭据、分配正文改写资源及建立
 | 完整本地集成 | GOFLAGS=-count=1 make local-test 全部通过，437.568 秒；包含 JSON/SSE、未知用量、确认丢失、Kafka 黑洞、正文边界/超时、重平衡/重放、凭据保护、Host 筛选与透传、HTTP/HTTPS 名称快照、冲突隔离及 Wasm 下载故障恢复 |
 
 本次 Wasm SHA-256：033c8e48f5b13893124d02854b6f5d81262fb1fc3816c4c51ad218e2f9a8eec9。本地栈已加载该产物，保留已有 Kafka/Doris 数据卷。打包回归验证了清单实际渲染和包元数据逻辑，镜像导出阶段使用合成测试 archive；本次未重新导出完整离线镜像包，也未部署生产。需要按目标环境显式传入 Host 名单重新生成包；原有 G0–G5 生产验收边界不变。
+
+## 2026-10-21：归属 API 响应包装、业务错误码与消息日志
+
+两个归属接口的 HTTP 200 响应统一使用 responseCode、responseMsg、success、data。成功为字符串 "000000" 与 success=true，data 内沿用既有 ID/名称；unauthenticated、forbidden、not_found、ambiguous_mapping 使用 HTTP 200、success=false，data 可以为 null 或缺省。HTTP 400、429、5xx 保留原处理，不兼容旧扁平成功响应。Kafka 事件、名称快照和 Doris 结构未变。
+
+每次 HTTP 适配器查询在完成归属字段校验后输出一条 identity_lookup_response 日志；成功 INFO、失败 WARN，记录查询类型、HTTP 状态、业务码、远端成功标志、responseMsg 和最终分类。消息不参与归属判断；当前凭据与客户 token 先脱敏，再按 UTF-8 边界限制为 1024 字节并转义控制字符。无有效包装时仅记录固定诊断，不打印原始异常、URL、请求体、data 或完整响应。
+
+| 验证 | 本次结果与边界 |
+| --- | --- |
+| 无缓存全量检查 | GOFLAGS=-count=1 make test 通过：85 项 Python 测试、6 份事件契约样例、主模块和独立插件 Go 竞态测试均通过；HTTP/TLS 临时端口测试获得权限后完成 |
+| 两接口响应边界 | 服务、客户均覆盖四类业务错误与 data 为 null/缺省，控制字段缺失/错类型/矛盾、非法 data、ID/名称长度边界、重复键、未知字段、非法编码、整包超限及旧扁平响应拒绝；补充旧 HTTP 404 + not_found 拒绝用例后再次通过归属包竞态测试 |
+| 单侧失败与日志 | 真实 HTTP 合成接口验证四类业务错误不会清除另一侧的 ID/名称/版本；日志覆盖成功/失败级别、单次记录、缺省消息、重叠凭据脱敏、换行及控制字符转义、中文和跨截断边界的密钥处理；畸形响应和网络错误不回显原始内容 |
+| 构建与文档 | make build wasm 通过；Observer、Consumer、fixture 与 Wasm ABI/gRPC hostcall 校验通过；归属接口文档的 6 份请求/响应 JSON 示例可解析，契约及 git diff --check 通过 |
+| 首次本地全量运行 | 原消费组已有 Kafka 提交位点，但 metering_development 中缺少该组的可信起点及处理凭据，Consumer 报 watermark_untrusted 并暂停分区；JSON/SSE/未知用量等待入库超时后终止该次运行（156.378 秒），未重置位点或补造恢复事实 |
+| 临时组完整本地集成 | 临时独立组就绪后，以 GOFLAGS=-count=1 make local-test 执行全量测试，451.185 秒全部通过；覆盖 JSON/SSE、重放与冲突、未知 Schema、Kafka 黑洞、正文边界/超时、批处理/重平衡/停机重放、凭据保护、Host 筛选、汇总 SQL、名称快照及 Wasm 下载恢复 |
+| 新包装名称入库 | TestHTTPNamesThroughKafkaToDoris/http 与 /https 均通过，共 64.21 秒；三个名称在 Kafka、Doris 独立列、event_json 及查询视图一致，旧请求保留旧名称，responseCode/responseMsg 包装及合成凭据未进入事件；实际日志包含两类查询的成功 responseMsg |
+| 验证收尾 | 监督脚本已停止临时 Consumer；只读核对临时组产生 24 个起点，原组仍无起点记录，未重置原组位点。原组恢复问题仍未解决，默认配置的完整联调不能据此宣称恢复 |
+
+本次成功验证使用临时独立消费组 identity-envelope-validation-20261021，从 Kafka 当前保留起点消费到同一当前开发库；配置、日志与监督脚本仅写入 /tmp，未修改仓库内运行配置，原消费组位点保持不变。原组的恢复元数据问题独立于本次 API 契约，未在本次工作中修复；既有 Kafka/Doris 数据卷保留。真实第三方目录及生产 G0–G5 未验收。
+
+## 2026-10-21：日志背压与归属查询解耦
+
+归属日志改为进程级有界队列：两个接口共享 256 条待写容量和单个后台写入协程。resolver 仅完成脱敏、截断、序列化及非阻塞入队，不等待 stderr；队列满时丢弃新日志，Observer /metrics 的 metering_lookup_logs_dropped_total 累计队列满丢失数。后台只持有已处理日志文本和输出目标，不持有原始响应、token 或查询对象。进程退出不等待日志排空；正常成功和失败日志格式保持不变。
+
+| 验证 | 本次结果与边界 |
+| --- | --- |
+| 阻塞 writer 与并发 | 归属包使用不监听端口的合成 Transport 和持续阻塞 writer，验证 HTTP 已成功后 resolver 不等待日志；64 次并发服务/客户查询在队列饱和时仍成功，仅一个写入协程进入 writer，测试缩小队列至 2 条并精确核对 62 次丢失；排队内容已脱敏，解除背压后同一协程恢复写入 |
+| token 与查询额度 | Observer 使用真实 HTTP 合成目录、阻塞默认日志 writer、单一查询额度连续完成 300 次双侧归属；每次均保留 mapped 及名称，清理 token 并释放额度，队列满丢失数增加且可通过指标读取，不产生 lookup_timeout/lookup_overloaded |
+| 无缓存全量检查 | GOFLAGS=-count=1 make test 通过：85 项 Python 检查、6 份事件契约样例、主模块及独立插件 Go 竞态测试全部通过；相关 HTTP/TLS socket 用例获得权限后完成，未因沙箱限制跳过 |
+| 构建与 ABI | make build wasm 通过，Observer/Consumer/fixture 构建与 Wasm ABI/gRPC hostcall 检查通过 |
+| HTTP/HTTPS 名称链路 | go test -count=1 -tags=integration -v ./tests/integration -run '^TestHTTPNamesThroughKafkaToDoris$' 通过，64.894 秒；两种协议均验证异步日志、三个名称的 Kafka/Doris/视图快照、重命名历史及包装字段不入库 |
+
+本次定向入库回归复用上一节临时独立消费组，结束后已停止临时 Consumer；原消费组的恢复元数据和位点未修改。未重新执行上一节 451.185 秒的完整本地集成套件，也未部署生产；当前修复的全量单元/竞态、构建/ABI、阻塞故障及 HTTP/HTTPS 名称入库结果以上述记录为准。

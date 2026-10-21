@@ -29,9 +29,9 @@ func TestHTTPQueriesIgnoreCAFile(t *testing.T) {
 			if json.NewDecoder(r.Body).Decode(&body) != nil || body["api_key"] != "synthetic-business" {
 				t.Error("HTTP customer input")
 			}
-			w.Write([]byte(`{"api_key_id":"k","customer_id":"c","customer_name":"客户"}`))
+			w.Write([]byte(lookupSuccessJSON(`{"api_key_id":"k","customer_id":"c","customer_name":"客户"}`)))
 		} else {
-			w.Write([]byte(`{"service_id":"s","service_name":"服务","provider_id":"p","provider_name":"供应商"}`))
+			w.Write([]byte(lookupSuccessJSON(`{"service_id":"s","service_name":"服务","provider_id":"p","provider_name":"供应商"}`)))
 		}
 	}))
 	defer srv.Close()
@@ -82,7 +82,7 @@ func TestSystemTrustHelper(t *testing.T) {
 func TestHTTPSSystemTrustAndPrivateCA(t *testing.T) {
 	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(`{"service_id":"s","service_name":"S","provider_id":"p","provider_name":"P"}`))
+		w.Write([]byte(lookupSuccessJSON(`{"service_id":"s","service_name":"S","provider_id":"p","provider_name":"P"}`)))
 	}))
 	defer srv.Close()
 	dir := t.TempDir()

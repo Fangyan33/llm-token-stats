@@ -19,8 +19,9 @@ func TestHTTPSContractAndFailures(t *testing.T) {
 		status           int
 		body, kind, want string
 	}{
-		{"mapped", 200, `{"service_id":"s","service_name":"模型服务","provider_id":"p","provider_name":"供应商"}`, "application/json", ""},
-		{"not_found", 404, `{"error":{"code":"not_found"}}`, "application/json", "unknown_host"},
+		{"mapped", 200, lookupSuccessJSON(`{"service_id":"s","service_name":"模型服务","provider_id":"p","provider_name":"供应商"}`), "application/json", ""},
+		{"not_found", 200, `{"responseCode":"not_found","responseMsg":"未登记","success":false,"data":null}`, "application/json", "unknown_host"},
+		{"old_not_found", 404, `{"error":{"code":"not_found"}}`, "application/json", "lookup_invalid_response"},
 		{"bad_404", 404, `<html>not found</html>`, "text/html", "lookup_invalid_response"},
 		{"bad_error", 404, `{"error":{"code":"other"}}`, "application/json", "lookup_invalid_response"},
 		{"auth", 401, `secret`, "text/plain", "lookup_unavailable"},
@@ -71,7 +72,7 @@ func TestRemoteRateLimitAndConstruction(t *testing.T) {
 	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls.Add(1)
 		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(`{"service_id":"s","service_name":"S","provider_id":"p","provider_name":"P"}`))
+		w.Write([]byte(lookupSuccessJSON(`{"service_id":"s","service_name":"S","provider_id":"p","provider_name":"P"}`)))
 	}))
 	defer srv.Close()
 	r := serviceRemote{&remote{uri: srv.URL, credential: "synthetic", client: srv.Client(), tokens: 1, last: time.Now(), maxRPS: 1}}
@@ -104,7 +105,7 @@ func TestCustomerTokenAndNames(t *testing.T) {
 			t.Error("token changed or used as auth")
 		}
 		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(`{"api_key_id":"k","customer_id":"c","customer_name":"客户 A"}`))
+		w.Write([]byte(lookupSuccessJSON(`{"api_key_id":"k","customer_id":"c","customer_name":"客户 A"}`)))
 	}))
 	defer srv.Close()
 	resolver := customerRemote{&remote{uri: srv.URL, credential: "independent-credential", client: srv.Client()}}

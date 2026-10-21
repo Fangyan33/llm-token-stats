@@ -1,6 +1,6 @@
 # 通过第三方 API 解析服务、供应商与客户归属的实现计划
 
-修订日期：2026-10-19。状态：P0–P7 的占位链路及本次 HTTP 查询、请求头认证、prd/stg/dev 环境枚举、名称快照持久化增量均已实现；本地验证结果见第 8 节和验证记录。功能尚未上线，生产第三方地址、凭据及完整 G0–G5 尚待真实环境验收。
+修订日期：2026-10-21。状态：P0–P7 的占位链路、HTTP 查询、请求头认证、prd/stg/dev 环境枚举、名称快照持久化，以及响应包装与 responseMsg 脱敏日志均已实现；本地验证结果见第 8 节和验证记录。功能尚未上线，生产第三方地址、凭据及完整 G0–G5 尚待真实环境验收。
 
 Observer 在配置非空 HTTP/HTTPS URI 后启用真实 POST JSON 查询，使用独立的 x-remote-data 凭据；空 URI 继续返回 lookup_not_implemented。service_name、provider_name、customer_name 与 ID 一起冻结，经 Kafka、Consumer 写入 Doris 独立列及 event_json。环境仅接受 prd/stg/dev，不接受旧值或别名；不回填既有事件。业务 api_key 仍固定来自 Authorization: Bearer。
 
@@ -166,13 +166,13 @@ HTTP 客户端总超时为 2 秒；拨号（含 DNS 解析）和 TLS 握手另�
 
 查询取得并发额度时开始计时，查询上下文独立于观察流取消及观察截止时间。观察取消或超时后停止处理观察数据，已接纳查询继续到两侧完成或原查询截止时间；截止时先收取已提交结果，仅未返回侧为 lookup_timeout。成功侧的 ID、名称和版本保留，两事件共用冻结快照，迟到结果不回写。底层任务真正退出后才释放查询额度，客户任务返回后清理其借用的 token；收尾不无限等待不响应取消的 resolver。所有退出路径仅定稿一次，ACK 失败不丢弃已校验的 End。查询成功不恢复观察完整性或有效统计资格。
 
-HTTP 不读取 ca_file；其 x-remote-data 和业务 api_key 的传输保护由部署链路提供。HTTPS 使用至少 TLS 1.2、系统 CA 及可选附加 CA，Observer 运行镜像包含系统 CA bundle，证书和主机名验证始终启用。两种协议均不使用环境代理、不跟随重定向、不自动重试；HTTPS 失败不自动降级到 HTTP。不采集正文日志/追踪，不保存 token 用于刷新，当前不实现正负缓存。第三方实际调用配额需在部署时据实调整，采集失败继续 fail-open；本地合成服务验证不等于真实第三方或生产 TLS 已验收。上述收尾保证限于 Observer 正常运行期间，不扩大进程退出、Kafka 投递或 Doris 可见性保证。
+HTTP 不读取 ca_file；其 x-remote-data 和业务 api_key 的传输保护由部署链路提供。HTTPS 使用至少 TLS 1.2、系统 CA 及可选附加 CA，Observer 运行镜像包含系统 CA bundle，证书和主机名验证始终启用。两种协议均不使用环境代理、不跟随重定向、不自动重试；HTTPS 失败不自动降级到 HTTP。不记录完整请求/响应正文或凭据，responseMsg 仅按第 4.9 节脱敏记录；不保存 token 用于刷新，当前不实现正负缓存。第三方实际调用配额需在部署时据实调整，采集失败继续 fail-open；本地合成服务验证不等于真实第三方或生产 TLS 已验收。上述收尾保证限于 Observer 正常运行期间，不扩大进程退出、Kafka 投递或 Doris 可见性保证。
 
 成功解析结果的版本摘要已加入唯一事件模型：mapping_version 为 `[规则版本, cluster_name, deployment_environment, request_host, service_id, provider_id]` 的规范 JSON SHA-256，customer_mapping_version 为 `[规则版本, cluster_name, deployment_environment, api_key_id, customer_id]` 的同类摘要。二者均为 64 字符小写十六进制，排除密钥原文及进程随机值；占位结果版本均为 null。测试成功结果可生成摘要，不能将其称为第三方目录发布版本。
 
 ### 4.5 HTTP 公共协议与请求头认证
 
-两个接口统一使用 HTTP/HTTPS、POST 和 UTF-8 JSON，字段命名为 snake_case。每次查询返回唯一归属，不提供批量或分页。请求与响应的 JSON 根节点为对象；成功响应直接包含归属 ID 及对应名称，不增加 code、message、data 包装。请求头示例：
+两个接口统一使用 HTTP/HTTPS、POST 和 UTF-8 JSON。请求与 data 内的归属字段使用 snake_case，响应外层固定使用 responseCode、responseMsg、success、data。每次查询返回唯一归属，不提供批量或分页；JSON 根节点为对象。成功要求 HTTP 200、responseCode="000000"、success=true，原有归属 ID 与名称放入 data 对象。请求头示例：
 
 ```http
 Content-Type: application/json
@@ -182,10 +182,19 @@ x-remote-data: <接口访问凭据>
 
 - `x-remote-data` 是两个接口均必填的单值请求头，直接传入凭据，不加 `Bearer` 前缀。请求头名称按 HTTP 规则大小写不敏感；凭据值不做大小写转换。
 - 该凭据认证 Observer 的接口调用身份，与客户查询正文中的业务 `api_key` 分开管理；不得使用业务 token 作为该请求头的值，也不得从业务请求透传同名头。
-- 缺少、为空、重复或无效的认证凭据返回 `401 + unauthenticated`；认证成功但无接口调用权限返回 `403 + forbidden`。这两个状态不表示待查询业务 api_key 无效或不存在。
+- 缺少、为空、重复或无效的认证凭据返回 HTTP 200、responseCode="unauthenticated"；认证成功但无接口调用权限返回 HTTP 200、responseCode="forbidden"。两者 success=false，data 为 null 或缺省，不表示待查询业务 api_key 无效或不存在。
 - 实际访问凭据通过环境变量或 Secret 提供，本文只使用占位值；通过每个 lookup 的 credential_env 指定环境变量名，不把凭据硬编码到普通配置、文档或源码。
 - 请求头凭据和业务 api_key 均不得进入 URL/query、响应、日志、指标、追踪、异常文本、Kafka 或 Doris。请求体和认证头不得被 HTTP/代理日志及追踪完整采集；业务 api_key 仅临时进入客户查询 JSON 正文，不进入服务查询。
-- 响应使用 `Content-Type: application/json`；失败采用第 4.8 节的 HTTP 状态和固定错误体，不以 HTTP 200 包装业务失败，不跟随重定向传递凭据。
+- 响应使用 `Content-Type: application/json`。原 401、403、404、409 类业务错误改用 HTTP 200 与 responseCode 表达；400、429、5xx 保留原 HTTP 状态和错误体。详见第 4.8 节；不跟随重定向传递凭据。
+
+外层响应契约：
+
+| 字段 | 类型 | 必填 | 规则 |
+| --- | --- | --- | --- |
+| responseCode | string | 是 | 成功为 "000000"；四类业务错误使用第 4.8 节列出的原有错误名字符串，不使用 "401"、"403"、"404"、"409" |
+| responseMsg | string | 否 | 可省略或为空串；存在时不接受 null 或其他类型，不参与归属判断；按第 4.9 节记录日志 |
+| success | boolean | 是 | 成功为 true，业务失败为 false；不能缺省或为 null |
+| data | object 或 null | 成功时是 | 成功时必须为完整归属对象；业务失败时只能为 null 或缺省 |
 
 ### 4.6 服务归属查询
 
@@ -211,21 +220,26 @@ HTTP 200 响应：
 
 ```json
 {
-  "service_id": "service-a",
-  "service_name": "模型服务 A",
-  "provider_id": "provider-a",
-  "provider_name": "供应商 A"
+  "responseCode": "000000",
+  "responseMsg": "请求处理成功",
+  "success": true,
+  "data": {
+    "service_id": "service-a",
+    "service_name": "模型服务 A",
+    "provider_id": "provider-a",
+    "provider_name": "供应商 A"
+  }
 }
 ```
 
-| 响应字段 | 类型 | 必填 | 约束 |
+| data 字段 | 类型 | 必填 | 约束 |
 | --- | --- | --- | --- |
 | service_id | string | 是 | 稳定服务 ID，非空、合法 UTF-8，最多 128 字节 |
 | service_name | string | 是 | 服务展示名称，非空、合法 UTF-8，最多 512 字节 |
 | provider_id | string | 是 | 该服务所属供应商的稳定 ID，非空、合法 UTF-8，最多 128 字节 |
 | provider_name | string | 是 | 供应商展示名称，非空、合法 UTF-8，最多 512 字节 |
 
-请求和成功响应的上述字段均不接受 null、数字或数组；两项 ID 及两项名称必须同时有效。相同 `[cluster_name, deployment_environment, request_host]` 必须解析出唯一服务和供应商，不能从多条冲突映射中任取一条；允许多个 Host 对应同一服务。无登记映射返回 `404 + not_found`，存在歧义返回 `409 + ambiguous_mapping`，目录内部缺失必要关联或名称返回 `500 + internal_error`，不返回半成功结果。provider_id 仅表达服务所属供应商，不推断隐藏后端或重试的实际执行方。
+请求和成功响应的上述字段均不接受 null、数字或数组；两项 ID 及两项名称必须同时有效。相同 `[cluster_name, deployment_environment, request_host]` 必须解析出唯一服务和供应商，不能从多条冲突映射中任取一条；允许多个 Host 对应同一服务。无登记映射返回 HTTP 200、responseCode="not_found"，存在歧义返回 HTTP 200、responseCode="ambiguous_mapping"；两者 success=false，data 为 null 或缺省。目录内部缺失必要关联或名称返回 `500 + internal_error`，不返回半成功结果。provider_id 仅表达服务所属供应商，不推断隐藏后端或重试的实际执行方。
 
 ### 4.7 客户归属查询
 
@@ -247,13 +261,18 @@ HTTP 200 响应：
 
 ```json
 {
-  "api_key_id": "key-a",
-  "customer_id": "customer-a",
-  "customer_name": "客户 A"
+  "responseCode": "000000",
+  "responseMsg": "请求处理成功",
+  "success": true,
+  "data": {
+    "api_key_id": "key-a",
+    "customer_id": "customer-a",
+    "customer_name": "客户 A"
+  }
 }
 ```
 
-| 响应字段 | 类型 | 必填 | 约束 |
+| data 字段 | 类型 | 必填 | 约束 |
 | --- | --- | --- | --- |
 | api_key_id | string | 是 | 稳定 API Key ID，非空、合法 UTF-8，最多 128 字节；不是原始 token 或其普通哈希 |
 | customer_id | string | 是 | 所属客户的稳定 ID，非空、合法 UTF-8，最多 128 字节 |
@@ -261,44 +280,67 @@ HTTP 200 响应：
 
 请求和成功响应的上述字段均不接受 null、数字或数组；两项 ID 及客户名称必须同时有效。JSON 字符串按正常规则转义，长度和字符限制针对解码后的 token，不能截断、修剪或改变原文。Observer 不得以 api_key_id、摘要或残留身份元数据代替查询输入。
 
-已停用、过期或吊销的密钥，只要仍能确定归属，就返回上述 HTTP 200 结果；该结果不表示允许业务访问，业务权限由独立鉴权决定。未登记的 token 返回 `404 + not_found`；存在多项冲突归属返回 `409 + ambiguous_mapping`；已登记但目录内部缺少必要关联或客户名称返回 `500 + internal_error`。查询不返回密钥状态、业务授权或部分归属，不承诺目录已删除记录的历史恢复能力。
+已停用、过期或吊销的密钥，只要仍能确定归属，就返回上述 HTTP 200 结果；该结果不表示允许业务访问，业务权限由独立鉴权决定。未登记的 token 返回 HTTP 200、responseCode="not_found"；存在多项冲突归属返回 HTTP 200、responseCode="ambiguous_mapping"；两者 success=false，data 为 null 或缺省；已登记但目录内部缺少必要关联或客户名称返回 `500 + internal_error`。查询不返回密钥状态、业务授权或部分归属，不承诺目录已删除记录的历史恢复能力。
 
 service_name、provider_name、customer_name 均为查询时的展示名称，可以随重命名变化；归属唯一性仍以稳定 ID 为准，名称不参与 mapping_version、customer_mapping_version 或事件身份摘要。内部 Go 类型、Kafka 事件及 Doris 字段已扩展，名称连同 ID 保存为请求快照，具体要求见第 5.2、5.3 和 6.4 节。名称按解码后的 UTF-8 字节数限制为 512 字节，以保持事件和冻结快照有界；超长不能截断后当成功。当前代码已实现上述校验和保存。
 
 ### 4.8 错误契约与 Observer 映射
 
-失败统一返回固定错误码，不返回输入回显、凭据、动态异常文本或部分归属 ID/名称。以 HTTP 404 为例：
+原 401、403、404、409 类业务错误统一使用 HTTP 200。responseCode 使用原有错误名，success=false，data 为 null 或缺省；例如未登记归属：
+
+```json
+{
+  "responseCode": "not_found",
+  "responseMsg": "未查询到归属信息",
+  "success": false,
+  "data": null
+}
+```
+
+其余 HTTP 状态和错误体保持不变，例如 HTTP 429：
 
 ```json
 {
   "error": {
-    "code": "not_found"
+    "code": "rate_limited"
   }
 }
 ```
 
-| HTTP 状态 | error.code | 语义 | Observer 状态 |
+| HTTP 状态 | 错误码位置和值 | 语义 | Observer 状态 |
 | --- | --- | --- | --- |
-| 400 | invalid_request | 必填字段缺失、空值、类型或格式不符合契约，包括非法环境值 | lookup_unavailable |
-| 401 | unauthenticated | x-remote-data 缺失、为空、重复或凭据无效 | lookup_unavailable |
-| 403 | forbidden | 接口调用身份认证成功但无调用权限 | lookup_unavailable |
-| 404 | not_found | 服务映射未登记或业务 token 未登记 | 服务为 unknown_host，客户为 unknown_api_key |
-| 409 | ambiguous_mapping | 无法唯一确定服务/供应商或密钥/客户归属 | lookup_invalid_response |
-| 429 | rate_limited | 第三方接口限流 | lookup_rate_limited |
-| 500 | internal_error | 第三方内部错误或必要关联、名称缺失 | lookup_unavailable |
-| 503 | unavailable | 第三方暂不可用 | lookup_unavailable |
+| 200 | responseCode=unauthenticated | x-remote-data 缺失、为空、重复或凭据无效 | lookup_unavailable |
+| 200 | responseCode=forbidden | 接口调用身份认证成功但无调用权限 | lookup_unavailable |
+| 200 | responseCode=not_found | 服务映射未登记或业务 token 未登记 | 服务为 unknown_host，客户为 unknown_api_key |
+| 200 | responseCode=ambiguous_mapping | 无法唯一确定服务/供应商或密钥/客户归属 | lookup_invalid_response |
+| 400 | error.code=invalid_request | 必填字段缺失、空值、类型或格式错误，包括非法环境值 | lookup_unavailable |
+| 429 | error.code=rate_limited | 第三方接口限流 | lookup_rate_limited |
+| 500 | error.code=internal_error | 第三方内部错误或必要关联、名称缺失 | lookup_unavailable |
+| 503 | error.code=unavailable | 第三方暂不可用 | lookup_unavailable |
 
 HTTP 适配器按以下规则分类；空 URI 占位仍直接返回 lookup_not_implemented：
 
-- 仅 HTTP 200 且成功响应完整有效时为 mapped。缺少任一必填 ID 或名称、空串/null、非法 UTF-8、非法类型、超长 ID/名称或非法 JSON 均为 lookup_invalid_response，不采纳部分结果，也不制造默认归属。
-- 只有符合契约的 `404 + not_found` 才表示 unknown_host/unknown_api_key；普通网关 404 页面、空响应或其他错误码均为 lookup_invalid_response，不能误认为不存在。
-- 查询自身超时或取消为 lookup_timeout；观察流取消仍按第 4.4 节等待原查询截止时间。连接/TLS 故障、HTTP 401/403 和任意 HTTP 5xx 为 lookup_unavailable。上述故障按传输或 HTTP 状态分类，不依赖错误正文，且不得记录原始正文。
-- 对其余已定义状态，校验 JSON 错误体及对应 code 后按表映射；状态与错误码不匹配、错误体畸形或其他未约定响应（包括其他 2xx、3xx）为 lookup_invalid_response。
-- HTTP 400 表示出站请求与第三方契约不一致，按 lookup_unavailable 处理；本地非法 Host/token 仍在调用前分别产生 invalid_host/invalid_api_key，不发送对应请求。
-- 本地执行预算不足为 lookup_overloaded，第三方 `429 + rate_limited` 为 lookup_rate_limited；当前实现不排队、不自动重试。
-- lookup_not_implemented 仅表示当前内部占位实现，不能由第三方 HTTP 501 推导；HTTP 501 按 5xx 故障处理。
+- 仅 HTTP 200、responseCode="000000"、success=true 且 data 内的归属完整有效时为 mapped。不兼容旧扁平成功响应；不增加切换开关。
+- 外层控制字段缺失或类型错误、未知业务码、成功码搭配 success=false、失败码搭配 success=true、成功 data 缺失/null/无效、失败 data 非 null，均为 lookup_invalid_response。归属 ID/名称的既有类型、非空、UTF-8 和长度检查继续生效，不采纳部分结果。
+- 整个响应含外层包装共用 8192 字节正文上限；重复键、未知字段、非法编码、非法 JSON 均拒绝。responseMsg 不参与状态判断，但存在时必须是字符串。
+- 只有 HTTP 200、responseCode="not_found"、success=false 且 data 为 null 或缺省才表示 unknown_host/unknown_api_key。旧 HTTP 404 + not_found、普通 404 页面和旧 HTTP 409 均为 lookup_invalid_response。
+- 查询自身超时或取消为 lookup_timeout；观察流取消仍按第 4.4 节等待原查询截止时间。连接/TLS 故障、实际 HTTP 401/403 和任意 HTTP 5xx 为 lookup_unavailable，不依赖其错误正文。
+- HTTP 400 + invalid_request、429 + rate_limited 保留原错误体匹配规则。其余状态与错误体不匹配、错误体畸形或其他未约定响应（包括其他 2xx、3xx）为 lookup_invalid_response。
+- HTTP 400 表示出站请求与第三方契约不一致；本地非法 Host/token 仍在调用前分别产生 invalid_host/invalid_api_key，不发送对应请求。
+- 本地预算不足为 lookup_overloaded；当前实现不排队、不自动重试。lookup_not_implemented 仅表示内部占位，HTTP 501 按 5xx 故障处理。
 
-两类查询独立保留成功结果。失败侧的两项 ID 和版本均为 null；成功结果的 mapping_version/customer_mapping_version 仍由 Observer 计算，不要求第三方返回。两个事件共用同一冻结快照，不使用迟到查询结果重写历史事件。
+两类查询独立保留成功结果。失败侧的 ID、名称和版本均为 null；成功结果的 mapping_version/customer_mapping_version 仍由 Observer 计算。两个事件共用冻结快照，不使用迟到结果重写历史事件。
+
+### 4.9 responseMsg 日志
+
+HTTP 适配器在每次查询及归属字段校验结束后，尝试将一条已脱敏、截断并序列化的日志非阻塞入队，由单个后台写入协程通过 Observer 现有标准错误日志输出带默认时间前缀的 JSON 记录：event=identity_lookup_response、level、lookup_type（service/customer）、http_status、responseCode、success、responseMsg、status。成功为 INFO/mapped，失败为 WARN 及固定映射状态；HTTP 尚无响应时省略 http_status。没有取得有效外层字段时仅记录固定诊断字段，不打印原始错误或正文。success 保留远端标志，status 表示本地最终分类；外层有效而 data 无效时，仍记录脱敏后的消息，最终状态为 lookup_invalid_response。
+
+- 成功与业务失败均尝试记录 responseMsg；消息省略或为空时省略该日志字段，不影响归属结果。占位 resolver 不调用 HTTP 适配器，不产生此日志。
+- 两类查询共用进程级队列，最多保留 256 条待写日志和 1 条正在写入的日志，只启动 1 个后台写入协程。stderr 或日志管道阻塞不阻塞 resolver 返回、token 清理或查询额度释放；队列满时直接丢弃新日志，通过 Observer /metrics 的 metering_lookup_logs_dropped_total 累计队列满丢失数，不向同一日志管道报告丢失。
+- 日志尽力交付，不重试、不按请求创建写入协程；进程退出不等待队列排空，未写日志可能丢失。队列仅保存处理后的日志文本及输出目标，不保留请求、响应对象、凭据、token 或捕获这些值的闭包。
+- responseMsg 与日志中的 responseCode 先替换当前调用的 x-remote-data 凭据和客户查询业务 token，替换标记为 [REDACTED]；重叠凭据优先匹配较长值，再按 UTF-8 边界截断到 1024 字节，最后转义换行及控制字符。转义后的日志文本长度可增加。
+- 日志不打印 URL、请求体、认证头、data 或完整响应，也不回显网络异常文本。消息只用于排障，不参与归属或业务授权。
+- responseCode、responseMsg、success、data 包装不进入 Kafka、Doris、映射版本或摘要；仅 data 内校验通过的 ID 和名称进入既有请求快照。
 
 ## 5. 协议、事件与语义
 
@@ -339,7 +381,7 @@ mapped 还要求对应名称完整有效：服务的 service_name/provider_name 
 
 正常占位路径中，合法输入产生 lookup_not_implemented，相关 ID 和版本均为 null；缺失/非法输入先产生 invalid_host 或 invalid_api_key，不能误报成未登记。两个查询的结果各自独立，占位错误不导致进程退出、网络等待或业务拒绝。
 
-其余查询状态在单一模型中保留定义，HTTP 状态码及错误体映射已在第 4.8 节约定，HTTP 适配器已实现该映射：仅符合契约的 `404 + not_found` 为 unknown_host/unknown_api_key；超时为 lookup_timeout，连接/TLS/接口认证/服务错误为 lookup_unavailable，非法响应为 lookup_invalid_response，预算不足和限流分别为 lookup_overloaded/lookup_rate_limited。不使用旧的 catalog_unavailable/catalog_stale 枚举。
+其余查询状态在单一模型中保留定义，HTTP 状态码及错误体映射已在第 4.8 节约定，HTTP 适配器已实现该映射：仅符合契约的 HTTP 200、responseCode="not_found"、success=false、data 为 null 或缺省时为 unknown_host/unknown_api_key；超时为 lookup_timeout，连接/TLS/接口认证/服务错误为 lookup_unavailable，非法响应为 lookup_invalid_response，预算不足和限流分别为 lookup_overloaded/lookup_rate_limited。不使用旧的 catalog_unavailable/catalog_stale 枚举。
 
 服务归属失败不清除客户或已观察 usage，不改变客户 identity_status。客户失败保留已知服务/供应商和 usage，但 identity_status=invalid、identity_invalid 异常、usage_eligible=false，不进入客户汇总。usage_eligible 仍是统计候选，不等于供应商已知或可收费。
 
@@ -450,17 +492,17 @@ Kubernetes 用例固定使用本地 Kubernetes 1.22.17 + Istio 1.13.5。网关�
 
 | 场景 | 预期结果 |
 | --- | --- |
-| 两接口成功与字段边界 | 服务返回双 ID 及 service_name/provider_name，客户返回双 ID 及 customer_name；验证 ID 的 128 UTF-8 字节上限、名称非空且为合法 UTF-8、Host/集群限制及 token 的 1–4096 字节和字符限制；缺失必填 ID/名称、半成功、空值、错类型、非法 JSON 为 lookup_invalid_response |
+| 两接口成功与字段边界 | HTTP 200 + responseCode=000000 + success=true，data 中服务返回双 ID 及 service_name/provider_name，客户返回双 ID 及 customer_name；验证 ID 的 128 UTF-8 字节上限、名称非空且为合法 UTF-8、Host/集群限制及 token 的 1–4096 字节和字符限制；缺失必填 ID/名称、半成功、空值、错类型、非法 JSON 为 lookup_invalid_response |
 | 名称持久化 | 注入含中文名称的合成 resolver，核对 start/usage Kafka 事件、Doris 独立列、event_json 及请求视图的三个名称逐字一致；覆盖 512 UTF-8 字节边界、超长和两侧独立失败；未启用真实 API 时仅证明合成链路 |
 | 名称变更 | 同一请求冻结名称；重命名后的新请求保存新名称，旧请求仍可查到旧名称；不改变稳定 ID 或两类映射版本、事件身份摘要；名称不拆分日/月统计 |
 | 名称重放与冲突 | 同内容重放幂等；同 event_id 仅名称不同仍触发内容冲突；同请求 start/usage 名称不一致触发快照冲突，不能静默选取其一 |
 | 名称未知与数据库结构 | 占位/失败侧的名称键显式为 null；原有无名称数据不回填最新名称；验证新库初始化、视图和注释，确认列真实存在，保留无关数据库 |
-| 请求头认证 | 缺少、空值、重复或无效 x-remote-data 返回 401；无权限返回 403，均为 lookup_unavailable；业务 token 不作为接口访问凭据 |
+| 请求头认证 | HTTP 200 + responseCode=unauthenticated/forbidden，success=false 且 data 为 null 或缺省，均为 lookup_unavailable；实际 HTTP 401/403 仍作为访问故障；业务 token 不作为接口访问凭据 |
 | 环境值 | prd/stg/dev 贯通配置、事件和出站请求；旧值、别名和大小写变体拒绝，不仅在 HTTP 出站时转换 |
-| 未找到与歧义 | 仅 404 + not_found 映射 unknown；普通 404 页面为 lookup_invalid_response；409 + ambiguous_mapping 不选择任意归属 |
+| 未找到与歧义 | HTTP 200 + responseCode=not_found/ambiguous_mapping，success=false 且 data 为 null 或缺省；前者映射 unknown，后者 lookup_invalid_response；旧 HTTP 404/409 不作为有效业务响应 |
 | 停用密钥 | 停用、过期或吊销但仍能确定归属时返回双 ID，不作为业务访问授权 |
 | 限流与故障 | 429 + rate_limited、超时/取消、连接/TLS、5xx 分别映射约定状态；501 不映射 lookup_not_implemented；状态/错误码不匹配按第 4.8 节处理 |
-| 敏感数据与快照 | 认证头和业务 token 不回显、不落日志/事件/数据库、不跟随重定向；两类查询独立，两个事件共享冻结快照 |
+| 敏感数据与快照 | responseMsg 在成功和失败时均记录，敏感值先脱敏再截断和转义；不打印完整请求/响应，包装不入 Kafka/Doris；认证头和业务 token 不落日志/事件/数据库；两类查询独立，两个事件共享冻结快照 |
 
 ## 9. 开发初始化与部署
 
@@ -480,3 +522,5 @@ Kubernetes 用例固定使用本地 Kubernetes 1.22.17 + Istio 1.13.5。网关�
 2026-10-19 实施增量：HTTP 适配、有界并行查询、环境枚举、名称快照存储及 008 结构更新均已实现并完成本地与 Kubernetes 隔离验证；详见[本次验证记录](gateway-collection-verification.md#2026-10-19https-归属查询环境枚举与名称快照)。真实第三方与生产 G0–G5 的验收边界保持独立。
 
 同日修复增量：HTTP/HTTPS 双协议、运行镜像系统 CA、独立查询截止时间、取消保留单侧结果及 End ACK 故障定稿均已实现。无缓存全量测试、镜像 CA 检查和完整本地链路已通过，详见[修复验证记录](gateway-collection-verification.md)。
+
+2026-10-21 契约增量：第 4.5–4.9 节已按第三方实际响应增加 data 包装、HTTP 200 业务错误码及 responseMsg 脱敏日志。85 项 Python 检查、Go 竞态、构建/ABI 通过；本地完整集成在临时独立消费组下通过（451.185 秒），原组恢复元数据缺失问题未修改，详见[验证记录](gateway-collection-verification.md)。不改 Kafka 事件或 Doris 结构，不扩大真实第三方与生产验收结论。

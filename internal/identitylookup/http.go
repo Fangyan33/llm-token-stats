@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log"
 	"mime"
 	"net"
 	"net/http"
@@ -37,6 +38,8 @@ type remote struct {
 	tokens          float64
 	last            time.Time
 	maxRPS          int
+	logger          *log.Logger
+	logQueue        *responseLogQueue
 }
 type serviceRemote struct{ *remote }
 type customerRemote struct{ *remote }
@@ -107,7 +110,7 @@ func NewCustomer(c config.Lookup) (CustomerResolver, error) {
 	return customerRemote{r}, nil
 }
 
-func (r *remote) post(ctx context.Context, input, output any, notFound string) error {
+func (r *remote) post(ctx context.Context, input, output any, notFound string, record *responseRecord) error {
 	if !r.allow() {
 		return failure("lookup_overloaded")
 	}
@@ -137,6 +140,7 @@ func (r *remote) post(ctx context.Context, input, output any, notFound string) e
 		return failure("lookup_unavailable")
 	}
 	defer res.Body.Close()
+	record.HTTPStatus = res.StatusCode
 	if res.StatusCode == 401 || res.StatusCode == 403 || res.StatusCode >= 500 {
 		return failure("lookup_unavailable")
 	}
@@ -157,10 +161,40 @@ func (r *remote) post(ctx context.Context, input, output any, notFound string) e
 		return failure("lookup_invalid_response")
 	}
 	if res.StatusCode == 200 {
-		if strictjson.Decode(raw, output) != nil {
+		var envelope struct {
+			ResponseCode string          `json:"responseCode"`
+			ResponseMsg  json.RawMessage `json:"responseMsg"`
+			Success      *bool           `json:"success"`
+			Data         json.RawMessage `json:"data"`
+		}
+		if strictjson.Decode(raw, &envelope) != nil {
 			return failure("lookup_invalid_response")
 		}
-		return nil
+		var message string
+		if len(envelope.ResponseMsg) != 0 && (envelope.ResponseMsg[0] != '"' || strictjson.Decode(envelope.ResponseMsg, &message) != nil) {
+			return failure("lookup_invalid_response")
+		}
+		if envelope.ResponseCode == "" || envelope.Success == nil {
+			return failure("lookup_invalid_response")
+		}
+		record.ResponseCode, record.ResponseMsg, record.Success = envelope.ResponseCode, message, envelope.Success
+		if envelope.ResponseCode == "000000" {
+			if !*envelope.Success || len(envelope.Data) == 0 || bytes.Equal(envelope.Data, []byte("null")) || strictjson.Decode(envelope.Data, output) != nil {
+				return failure("lookup_invalid_response")
+			}
+			return nil
+		}
+		if *envelope.Success || (len(envelope.Data) != 0 && !bytes.Equal(envelope.Data, []byte("null"))) {
+			return failure("lookup_invalid_response")
+		}
+		switch envelope.ResponseCode {
+		case "unauthenticated", "forbidden":
+			return failure("lookup_unavailable")
+		case "not_found":
+			return failure(notFound)
+		default: // Includes ambiguous_mapping and unknown business codes.
+			return failure("lookup_invalid_response")
+		}
 	}
 	var result struct {
 		Error struct {
@@ -173,10 +207,6 @@ func (r *remote) post(ctx context.Context, input, output any, notFound string) e
 	switch {
 	case res.StatusCode == 400 && result.Error.Code == "invalid_request":
 		return failure("lookup_unavailable")
-	case res.StatusCode == 404 && result.Error.Code == "not_found":
-		return failure(notFound)
-	case res.StatusCode == 409 && result.Error.Code == "ambiguous_mapping":
-		return failure("lookup_invalid_response")
 	case res.StatusCode == 429 && result.Error.Code == "rate_limited":
 		return failure("lookup_rate_limited")
 	default:
@@ -201,9 +231,10 @@ func (r *remote) allow() bool {
 	return true
 }
 
-func (r serviceRemote) Resolve(ctx context.Context, request ServiceLookupRequest) (ServiceIdentity, error) {
-	var result ServiceIdentity
-	err := r.post(ctx, request, &result, "unknown_host")
+func (r serviceRemote) Resolve(ctx context.Context, request ServiceLookupRequest) (result ServiceIdentity, err error) {
+	var record responseRecord
+	defer func() { r.logResponse("service", record, err) }()
+	err = r.post(ctx, request, &result, "unknown_host", &record)
 	if err == nil && (!ValidID(result.ServiceID) || !ValidID(result.ProviderID) || !ValidName(result.ServiceName) || !ValidName(result.ProviderName)) {
 		err = failure("lookup_invalid_response")
 	}
@@ -212,11 +243,13 @@ func (r serviceRemote) Resolve(ctx context.Context, request ServiceLookupRequest
 	}
 	return result, nil
 }
-func (r customerRemote) Resolve(ctx context.Context, token []byte) (CustomerIdentity, error) {
-	var result CustomerIdentity
-	err := r.post(ctx, struct {
+func (r customerRemote) Resolve(ctx context.Context, token []byte) (result CustomerIdentity, err error) {
+	var record responseRecord
+	key := string(token)
+	defer func() { r.logResponse("customer", record, err, key) }()
+	err = r.post(ctx, struct {
 		APIKey string `json:"api_key"`
-	}{string(token)}, &result, "unknown_api_key")
+	}{key}, &result, "unknown_api_key", &record)
 	if err == nil && (!ValidID(result.APIKeyID) || !ValidID(result.CustomerID) || !ValidName(result.CustomerName)) {
 		err = failure("lookup_invalid_response")
 	}

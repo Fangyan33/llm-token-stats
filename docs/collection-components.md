@@ -1,6 +1,6 @@
 # 网关采集组件运行说明
 
-更新日期：2026-10-20。[实现计划](spec/plan/gateway-collection-implementation.md)已落地到三个可构建组件。业务仍直接经过网关到模型服务；Wasm 旁路发送有界片段，Observer 解析后使用原生 Producer 写 Kafka，Consumer 确认 Doris 可见性后提交 offset。仅产生 `request_started`、`usage_observed`，未知值保留 null/unknown。
+更新日期：2026-10-21。[实现计划](spec/plan/gateway-collection-implementation.md)已落地到三个可构建组件。业务仍直接经过网关到模型服务；Wasm 旁路发送有界片段，Observer 解析后使用原生 Producer 写 Kafka，Consumer 确认 Doris 可见性后提交 offset。仅产生 `request_started`、`usage_observed`，未知值保留 null/unknown。
 
 本轮命令、故障处理及资源归零证据见[本地验证记录](spec/plan/gateway-collection-verification.md)，实际镜像 digest 见[镜像记录](../deploy/local/images.lock.json)。
 
@@ -66,6 +66,10 @@ fixture 只模拟 ext_authz 访问允许与模型 usage，不实现真实密钥�
 ## 归属 API 配置与名称查询
 
 Observer 环境仅接受 `prd`、`stg`、`dev`。分别设置 `observer.service_lookup.uri` 和 `observer.customer_lookup.uri` 为完整 HTTP/HTTPS 端点；每项通过 `credential_env` 指定提供 `x-remote-data` 值的环境变量，默认示例分别为 `METERING_SERVICE_LOOKUP_TOKEN`、`METERING_CUSTOMER_LOOKUP_TOKEN`。URI 为空时不要求凭据并继续占位；非空但凭据缺失时启动报固定配置错误。HTTPS 私有 CA 可通过各项 `ca_file` 指定挂载文件，证书验证始终启用。Kubernetes 模板可从可选 Secret `metering-observer-lookups` 注入同名环境变量，Compose 从启动环境传入，均不提交真实凭据。
+
+两个接口的 HTTP 200 响应使用 `responseCode`、`responseMsg`、`success`、`data` 包装。成功要求 `responseCode="000000"`、`success=true`，原有 ID 与名称位于 `data`。认证失败、无权限、未找到和歧义分别使用 `unauthenticated`、`forbidden`、`not_found`、`ambiguous_mapping`，HTTP 均为 200，`success=false`，`data` 为 null 或缺省；HTTP 400、429、5xx 保持原处理。不接受旧扁平成功响应，详细映射见[归属接口契约](spec/plan/host-service-provider-implementation.md#48-错误契约与-observer-映射)。
+
+每次 HTTP 查询完成后，Observer 将一条 `event=identity_lookup_response` 的 JSON 记录非阻塞交付给共享日志队列，含查询类型、HTTP 状态、业务码、成功标志、`responseMsg` 和最终状态；成功 INFO、失败 WARN。消息不参与判断，可省略或为空；写日志前先替换当前凭据及客户 token，再按 UTF-8 边界限制为 1024 字节，转义换行和控制字符。未取得有效外层字段时仅记录固定诊断，不打印原始正文；不记录 URL、请求体、认证头或 data。响应包装不进入 Kafka/Doris，ID 与名称仍按原快照保存。 两类查询共用 256 条待写日志的进程级队列和单个后台写入协程；日志输出阻塞不影响归属结果返回、token 清理和查询额度释放。队列满时丢弃新日志，`/metrics` 中的 `metering_lookup_logs_dropped_total` 累计队列满丢失数。仅已脱敏的日志文本进入队列，不重试，进程退出不等待日志排空。
 
 `lookup_timeout_ms` 默认 200 ms（最大 2000），两类查询并行共享截止时间，从取得并发额度时计时；`lookup_max_concurrency` 默认 64（最大 256），不排队；每项 `max_requests_per_second` 默认 1000，独立限速且不等待。响应正文和响应头各限 8192 字节，不跟随重定向、不使用环境代理、不自动重试、不缓存原始 token。进度 ACK 和正文处理不等待外部查询；两类事件在相同快照冻结后发送。
 

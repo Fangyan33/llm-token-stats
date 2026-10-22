@@ -110,7 +110,7 @@ func NewCustomer(c config.Lookup) (CustomerResolver, error) {
 	return customerRemote{r}, nil
 }
 
-func (r *remote) post(ctx context.Context, input, output any, notFound string, record *responseRecord) error {
+func (r *remote) post(ctx context.Context, input, output any, record *responseRecord) error {
 	if !r.allow() {
 		return failure("lookup_overloaded")
 	}
@@ -141,11 +141,24 @@ func (r *remote) post(ctx context.Context, input, output any, notFound string, r
 	}
 	defer res.Body.Close()
 	record.HTTPStatus = res.StatusCode
-	if res.StatusCode == 401 || res.StatusCode == 403 || res.StatusCode >= 500 {
+	if res.StatusCode == 403 || res.StatusCode >= 500 {
 		return failure("lookup_unavailable")
 	}
 	raw, err := io.ReadAll(io.LimitReader(res.Body, maxResponseBytes+1))
 	defer clear(raw)
+	kind, _, mediaErr := mime.ParseMediaType(res.Header.Get("Content-Type"))
+	if res.StatusCode == http.StatusUnauthorized {
+		// The HTTP status establishes authentication failure even when an
+		// intermediary returns a malformed body. Only log valid contract fields.
+		if err == nil && mediaErr == nil && kind == "application/json" && len(raw) <= maxResponseBytes {
+			candidate := responseRecord{HTTPStatus: res.StatusCode}
+			data, decodeErr := decodeResponseEnvelope(raw, &candidate)
+			if decodeErr == nil && candidate.ResponseCode == "401" && !*candidate.Success && emptyResponseData(data) {
+				*record = candidate
+			}
+		}
+		return failure("lookup_unavailable")
+	}
 	if err != nil {
 		if ctx.Err() != nil {
 			return failure("lookup_timeout")
@@ -156,43 +169,31 @@ func (r *remote) post(ctx context.Context, input, output any, notFound string, r
 		}
 		return failure("lookup_unavailable")
 	}
-	kind, _, mediaErr := mime.ParseMediaType(res.Header.Get("Content-Type"))
 	if mediaErr != nil || kind != "application/json" || len(raw) > maxResponseBytes {
 		return failure("lookup_invalid_response")
 	}
 	if res.StatusCode == 200 {
-		var envelope struct {
-			ResponseCode string          `json:"responseCode"`
-			ResponseMsg  json.RawMessage `json:"responseMsg"`
-			Success      *bool           `json:"success"`
-			Data         json.RawMessage `json:"data"`
-		}
-		if strictjson.Decode(raw, &envelope) != nil {
+		data, err := decodeResponseEnvelope(raw, record)
+		if err != nil {
 			return failure("lookup_invalid_response")
 		}
-		var message string
-		if len(envelope.ResponseMsg) != 0 && (envelope.ResponseMsg[0] != '"' || strictjson.Decode(envelope.ResponseMsg, &message) != nil) {
-			return failure("lookup_invalid_response")
-		}
-		if envelope.ResponseCode == "" || envelope.Success == nil {
-			return failure("lookup_invalid_response")
-		}
-		record.ResponseCode, record.ResponseMsg, record.Success = envelope.ResponseCode, message, envelope.Success
-		if envelope.ResponseCode == "000000" {
-			if !*envelope.Success || len(envelope.Data) == 0 || bytes.Equal(envelope.Data, []byte("null")) || strictjson.Decode(envelope.Data, output) != nil {
+		if record.ResponseCode == "000000" {
+			if !*record.Success || emptyResponseData(data) || strictjson.Decode(data, output) != nil {
 				return failure("lookup_invalid_response")
 			}
 			return nil
 		}
-		if *envelope.Success || (len(envelope.Data) != 0 && !bytes.Equal(envelope.Data, []byte("null"))) {
+		if *record.Success || !emptyResponseData(data) {
 			return failure("lookup_invalid_response")
 		}
-		switch envelope.ResponseCode {
-		case "unauthenticated", "forbidden":
+		switch record.ResponseCode {
+		case "100001":
 			return failure("lookup_unavailable")
-		case "not_found":
-			return failure(notFound)
-		default: // Includes ambiguous_mapping and unknown business codes.
+		case "650013":
+			// This code covers both zero and multiple matches; it cannot prove
+			// absence and must never produce unknown_host/unknown_api_key.
+			return failure("lookup_invalid_response")
+		default:
 			return failure("lookup_invalid_response")
 		}
 	}
@@ -212,6 +213,28 @@ func (r *remote) post(ctx context.Context, input, output any, notFound string, r
 	default:
 		return failure("lookup_invalid_response")
 	}
+}
+
+func emptyResponseData(data json.RawMessage) bool {
+	return len(data) == 0 || bytes.Equal(bytes.TrimSpace(data), []byte("null"))
+}
+
+func decodeResponseEnvelope(raw []byte, record *responseRecord) (json.RawMessage, error) {
+	var envelope struct {
+		ResponseCode string          `json:"responseCode"`
+		ResponseMsg  json.RawMessage `json:"responseMsg"`
+		Success      *bool           `json:"success"`
+		Data         json.RawMessage `json:"data"`
+	}
+	if strictjson.Decode(raw, &envelope) != nil || envelope.ResponseCode == "" || envelope.Success == nil {
+		return nil, failure("lookup_invalid_response")
+	}
+	var message string
+	if len(envelope.ResponseMsg) != 0 && (envelope.ResponseMsg[0] != '"' || strictjson.Decode(envelope.ResponseMsg, &message) != nil) {
+		return nil, failure("lookup_invalid_response")
+	}
+	record.ResponseCode, record.ResponseMsg, record.Success = envelope.ResponseCode, message, envelope.Success
+	return envelope.Data, nil
 }
 
 // Independent per-endpoint token buckets; never wait for capacity or retain a token.
@@ -234,7 +257,7 @@ func (r *remote) allow() bool {
 func (r serviceRemote) Resolve(ctx context.Context, request ServiceLookupRequest) (result ServiceIdentity, err error) {
 	var record responseRecord
 	defer func() { r.logResponse("service", record, err) }()
-	err = r.post(ctx, request, &result, "unknown_host", &record)
+	err = r.post(ctx, request, &result, &record)
 	if err == nil && (!ValidID(result.ServiceID) || !ValidID(result.ProviderID) || !ValidName(result.ServiceName) || !ValidName(result.ProviderName)) {
 		err = failure("lookup_invalid_response")
 	}
@@ -249,7 +272,7 @@ func (r customerRemote) Resolve(ctx context.Context, token []byte) (result Custo
 	defer func() { r.logResponse("customer", record, err, key) }()
 	err = r.post(ctx, struct {
 		APIKey string `json:"api_key"`
-	}{key}, &result, "unknown_api_key", &record)
+	}{key}, &result, &record)
 	if err == nil && (!ValidID(result.APIKeyID) || !ValidID(result.CustomerID) || !ValidName(result.CustomerName)) {
 		err = failure("lookup_invalid_response")
 	}

@@ -1,6 +1,6 @@
 # 通过第三方 API 解析服务、供应商与客户归属的实现计划
 
-修订日期：2026-10-21。状态：P0–P7 的占位链路、HTTP 查询、请求头认证、prd/stg/dev 环境枚举、名称快照持久化，以及响应包装与 responseMsg 脱敏日志均已实现；本地验证结果见第 8 节和验证记录。功能尚未上线，生产第三方地址、凭据及完整 G0–G5 尚待真实环境验收。
+修订日期：2026-10-21。状态：P0–P7 的占位链路、HTTP 查询、请求头认证、prd/stg/dev 环境枚举、名称快照持久化，以及响应包装、数值字符串错误码与 responseMsg 脱敏日志均已实现；本地验证结果见第 8 节和验证记录。功能尚未上线，生产第三方地址、凭据及完整 G0–G5 尚待真实环境验收。
 
 Observer 在配置非空 HTTP/HTTPS URI 后启用真实 POST JSON 查询，使用独立的 x-remote-data 凭据；空 URI 继续返回 lookup_not_implemented。service_name、provider_name、customer_name 与 ID 一起冻结，经 Kafka、Consumer 写入 Doris 独立列及 event_json。环境仅接受 prd/stg/dev，不接受旧值或别名；不回填既有事件。业务 api_key 仍固定来自 Authorization: Bearer。
 
@@ -182,16 +182,16 @@ x-remote-data: <接口访问凭据>
 
 - `x-remote-data` 是两个接口均必填的单值请求头，直接传入凭据，不加 `Bearer` 前缀。请求头名称按 HTTP 规则大小写不敏感；凭据值不做大小写转换。
 - 该凭据认证 Observer 的接口调用身份，与客户查询正文中的业务 `api_key` 分开管理；不得使用业务 token 作为该请求头的值，也不得从业务请求透传同名头。
-- 缺少、为空、重复或无效的认证凭据返回 HTTP 200、responseCode="unauthenticated"；认证成功但无接口调用权限返回 HTTP 200、responseCode="forbidden"。两者 success=false，data 为 null 或缺省，不表示待查询业务 api_key 无效或不存在。
+- 缺少、为空或传输错误的认证凭据返回 HTTP 401、responseCode="401"、responseMsg="Unauthorized"、success=false，data 缺省或为 null。这表示 Observer 的接口访问认证失败，不表示待查询业务 api_key 无效或不存在。
 - 实际访问凭据通过环境变量或 Secret 提供，本文只使用占位值；通过每个 lookup 的 credential_env 指定环境变量名，不把凭据硬编码到普通配置、文档或源码。
 - 请求头凭据和业务 api_key 均不得进入 URL/query、响应、日志、指标、追踪、异常文本、Kafka 或 Doris。请求体和认证头不得被 HTTP/代理日志及追踪完整采集；业务 api_key 仅临时进入客户查询 JSON 正文，不进入服务查询。
-- 响应使用 `Content-Type: application/json`。原 401、403、404、409 类业务错误改用 HTTP 200 与 responseCode 表达；400、429、5xx 保留原 HTTP 状态和错误体。详见第 4.8 节；不跟随重定向传递凭据。
+- 响应使用 `Content-Type: application/json`。成功、归属无法唯一确定、入参校验失败均使用 HTTP 200，以 responseCode 区分；认证失败使用 HTTP 401。HTTP 400、429、5xx 保留原故障处理，详见第 4.8 节；不跟随重定向传递凭据。
 
 外层响应契约：
 
 | 字段 | 类型 | 必填 | 规则 |
 | --- | --- | --- | --- |
-| responseCode | string | 是 | 成功为 "000000"；四类业务错误使用第 4.8 节列出的原有错误名字符串，不使用 "401"、"403"、"404"、"409" |
+| responseCode | string | 是 | HTTP 200 使用 "000000"、"650013"、"100001"；HTTP 401 使用 "401"。必须为字符串，不接受 JSON 数字；不兼容旧英文业务码 |
 | responseMsg | string | 否 | 可省略或为空串；存在时不接受 null 或其他类型，不参与归属判断；按第 4.9 节记录日志 |
 | success | boolean | 是 | 成功为 true，业务失败为 false；不能缺省或为 null |
 | data | object 或 null | 成功时是 | 成功时必须为完整归属对象；业务失败时只能为 null 或缺省 |
@@ -224,10 +224,10 @@ HTTP 200 响应：
   "responseMsg": "请求处理成功",
   "success": true,
   "data": {
-    "service_id": "service-a",
-    "service_name": "模型服务 A",
-    "provider_id": "provider-a",
-    "provider_name": "供应商 A"
+    "service_id": "721d8ecf-b9fa-48e0-8413-e06f59ec3d18",
+    "service_name": "sfe-platform-ibc5t0ui",
+    "provider_name": "SFE-PLATFORM",
+    "provider_id": "PROJECT_D2EF1F14393B409E8F5675DC6DDE0EFC"
   }
 }
 ```
@@ -239,7 +239,7 @@ HTTP 200 响应：
 | provider_id | string | 是 | 该服务所属供应商的稳定 ID，非空、合法 UTF-8，最多 128 字节 |
 | provider_name | string | 是 | 供应商展示名称，非空、合法 UTF-8，最多 512 字节 |
 
-请求和成功响应的上述字段均不接受 null、数字或数组；两项 ID 及两项名称必须同时有效。相同 `[cluster_name, deployment_environment, request_host]` 必须解析出唯一服务和供应商，不能从多条冲突映射中任取一条；允许多个 Host 对应同一服务。无登记映射返回 HTTP 200、responseCode="not_found"，存在歧义返回 HTTP 200、responseCode="ambiguous_mapping"；两者 success=false，data 为 null 或缺省。目录内部缺失必要关联或名称返回 `500 + internal_error`，不返回半成功结果。provider_id 仅表达服务所属供应商，不推断隐藏后端或重试的实际执行方。
+请求和成功响应的上述字段均不接受 null、数字或数组；两项 ID 及两项名称必须同时有效。相同 `[cluster_name, deployment_environment, request_host]` 必须解析出唯一服务和供应商，不能从多条冲突映射中任取一条；允许多个 Host 对应同一服务。无登记映射或查询出多条映射均返回 HTTP 200、responseCode="650013"、success=false，data 缺省或为 null。第三方入参检查失败，包括参数 ID/Host 为空或 Host 无法解析出 service_name，返回 HTTP 200、responseCode="100001"、success=false；其他内部故障仍按 HTTP 5xx 处理，不返回半成功结果。provider_id 仅表达服务所属供应商，不推断隐藏后端或重试的实际执行方。
 
 ### 4.7 客户归属查询
 
@@ -280,56 +280,67 @@ HTTP 200 响应：
 
 请求和成功响应的上述字段均不接受 null、数字或数组；两项 ID 及客户名称必须同时有效。JSON 字符串按正常规则转义，长度和字符限制针对解码后的 token，不能截断、修剪或改变原文。Observer 不得以 api_key_id、摘要或残留身份元数据代替查询输入。
 
-已停用、过期或吊销的密钥，只要仍能确定归属，就返回上述 HTTP 200 结果；该结果不表示允许业务访问，业务权限由独立鉴权决定。未登记的 token 返回 HTTP 200、responseCode="not_found"；存在多项冲突归属返回 HTTP 200、responseCode="ambiguous_mapping"；两者 success=false，data 为 null 或缺省；已登记但目录内部缺少必要关联或客户名称返回 `500 + internal_error`。查询不返回密钥状态、业务授权或部分归属，不承诺目录已删除记录的历史恢复能力。
+已停用、过期或吊销的密钥，只要仍能确定归属，就返回上述 HTTP 200 结果；该结果不表示允许业务访问，业务权限由独立鉴权决定。未查询到客户归属或查询出多条归属均返回 HTTP 200、responseCode="650013"、success=false，data 缺省或为 null；第三方入参校验失败返回 HTTP 200、responseCode="100001"、success=false。其他内部故障仍按 HTTP 5xx 处理。查询不返回密钥状态、业务授权或部分归属，不承诺目录已删除记录的历史恢复能力。
 
 service_name、provider_name、customer_name 均为查询时的展示名称，可以随重命名变化；归属唯一性仍以稳定 ID 为准，名称不参与 mapping_version、customer_mapping_version 或事件身份摘要。内部 Go 类型、Kafka 事件及 Doris 字段已扩展，名称连同 ID 保存为请求快照，具体要求见第 5.2、5.3 和 6.4 节。名称按解码后的 UTF-8 字节数限制为 512 字节，以保持事件和冻结快照有界；超长不能截断后当成功。当前代码已实现上述校验和保存。
 
 ### 4.8 错误契约与 Observer 映射
 
-原 401、403、404、409 类业务错误统一使用 HTTP 200。responseCode 使用原有错误名，success=false，data 为 null 或缺省；例如未登记归属：
+服务和客户接口使用相同的数值字符串错误码。未查询到数据或查询出多条数据都使用 HTTP 200、responseCode="650013"；不再区分未登记与歧义，失败的 data 可以缺省或为 null：
 
 ```json
 {
-  "responseCode": "not_found",
-  "responseMsg": "未查询到归属信息",
+  "responseCode": "650013",
+  "responseMsg": "无法唯一确定服务/供应商或密钥/客户归属",
+  "success": false
+}
+```
+
+入参校验失败，包括参数 ID 为空、request_host 为空或 request_host 无法解析出 service_name，使用 HTTP 200：
+
+```json
+{
+  "responseCode": "100001",
+  "responseMsg": "无效的参数！",
+  "success": false
+}
+```
+
+x-remote-data 为空、凭据无效或传输错误导致认证失败时，使用 HTTP 401：
+
+```json
+{
   "success": false,
-  "data": null
+  "responseCode": "401",
+  "responseMsg": "Unauthorized"
 }
 ```
 
-其余 HTTP 状态和错误体保持不变，例如 HTTP 429：
-
-```json
-{
-  "error": {
-    "code": "rate_limited"
-  }
-}
-```
+其余 HTTP 状态保留原故障处理，例如 HTTP 429 仍使用 `{"error":{"code":"rate_limited"}}`。
 
 | HTTP 状态 | 错误码位置和值 | 语义 | Observer 状态 |
 | --- | --- | --- | --- |
-| 200 | responseCode=unauthenticated | x-remote-data 缺失、为空、重复或凭据无效 | lookup_unavailable |
-| 200 | responseCode=forbidden | 接口调用身份认证成功但无调用权限 | lookup_unavailable |
-| 200 | responseCode=not_found | 服务映射未登记或业务 token 未登记 | 服务为 unknown_host，客户为 unknown_api_key |
-| 200 | responseCode=ambiguous_mapping | 无法唯一确定服务/供应商或密钥/客户归属 | lookup_invalid_response |
-| 400 | error.code=invalid_request | 必填字段缺失、空值、类型或格式错误，包括非法环境值 | lookup_unavailable |
+| 200 | responseCode="000000"，success=true | data 中完整、唯一的服务/供应商或密钥/客户归属 | mapped |
+| 200 | responseCode="650013"，success=false | 未查询到数据或查询出多条数据，无法唯一确定归属 | lookup_invalid_response |
+| 200 | responseCode="100001"，success=false | 第三方入参检查不合法，包括 ID/Host 为空或 Host 无法解析 service_name | lookup_unavailable |
+| 401 | responseCode="401"，success=false | x-remote-data 为空、无效或传输错误，接口认证失败 | lookup_unavailable |
+| 400 | error.code=invalid_request | 出站请求与第三方原故障契约不一致 | lookup_unavailable |
 | 429 | error.code=rate_limited | 第三方接口限流 | lookup_rate_limited |
-| 500 | error.code=internal_error | 第三方内部错误或必要关联、名称缺失 | lookup_unavailable |
-| 503 | error.code=unavailable | 第三方暂不可用 | lookup_unavailable |
+| 500 / 503 等 5xx | 不依赖正文 | 第三方内部错误或暂不可用 | lookup_unavailable |
 
 HTTP 适配器按以下规则分类；空 URI 占位仍直接返回 lookup_not_implemented：
 
-- 仅 HTTP 200、responseCode="000000"、success=true 且 data 内的归属完整有效时为 mapped。不兼容旧扁平成功响应；不增加切换开关。
-- 外层控制字段缺失或类型错误、未知业务码、成功码搭配 success=false、失败码搭配 success=true、成功 data 缺失/null/无效、失败 data 非 null，均为 lookup_invalid_response。归属 ID/名称的既有类型、非空、UTF-8 和长度检查继续生效，不采纳部分结果。
+- 仅 HTTP 200、responseCode="000000"、success=true 且 data 内的归属完整有效时为 mapped。不兼容旧扁平成功响应，不增加切换开关。
+- HTTP 200 的外层控制字段缺失或类型错误、未知或旧英文业务码、成功码搭配 success=false、失败码搭配 success=true、成功 data 缺失/null/无效、失败 data 非 null，均为 lookup_invalid_response。归属 ID/名称的既有类型、非空、UTF-8 和长度检查继续生效，不采纳部分结果。
+- responseCode 必须为 JSON 字符串，数值 650013、100001 等不转换为字符串。HTTP 200 + responseCode="401" 也是未约定响应，不作为认证失败兼容格式。
 - 整个响应含外层包装共用 8192 字节正文上限；重复键、未知字段、非法编码、非法 JSON 均拒绝。responseMsg 不参与状态判断，但存在时必须是字符串。
-- 只有 HTTP 200、responseCode="not_found"、success=false 且 data 为 null 或缺省才表示 unknown_host/unknown_api_key。旧 HTTP 404 + not_found、普通 404 页面和旧 HTTP 409 均为 lookup_invalid_response。
-- 查询自身超时或取消为 lookup_timeout；观察流取消仍按第 4.4 节等待原查询截止时间。连接/TLS 故障、实际 HTTP 401/403 和任意 HTTP 5xx 为 lookup_unavailable，不依赖其错误正文。
-- HTTP 400 + invalid_request、429 + rate_limited 保留原错误体匹配规则。其余状态与错误体不匹配、错误体畸形或其他未约定响应（包括其他 2xx、3xx）为 lookup_invalid_response。
-- HTTP 400 表示出站请求与第三方契约不一致；本地非法 Host/token 仍在调用前分别产生 invalid_host/invalid_api_key，不发送对应请求。
+- 650013 同时表示零条和多条结果，不能根据该码或 responseMsg 推断“未登记”；统一为 lookup_invalid_response，不产生 unknown_host/unknown_api_key，也不任取一项归属。100001 是第三方返回的入参校验失败，按 lookup_unavailable 处理；本地非法 Host/token 仍在调用前分别产生 invalid_host/invalid_api_key，不发送对应请求。
+- HTTP 401 按访问故障处理。正文满足 application/json、大小和严格 JSON 校验，responseCode="401"、success=false 且 data 为 null 或缺省时，将其 responseMsg 按第 4.9 节记录；正文不符、读取失败或超限不改变 HTTP 401 的 lookup_unavailable 分类，不记录其中的动态字段。
+- 查询自身超时或取消为 lookup_timeout；观察流取消仍按第 4.4 节等待原查询截止时间。连接/TLS 故障、实际 HTTP 403 和任意 HTTP 5xx 为 lookup_unavailable，不依赖其错误正文。
+- HTTP 400 + invalid_request、429 + rate_limited 保留原错误体匹配规则。旧 HTTP 404/409、普通 404 页面、其余状态与错误体不匹配或其他未约定响应（包括其他 2xx、3xx）为 lookup_invalid_response。
 - 本地预算不足为 lookup_overloaded；当前实现不排队、不自动重试。lookup_not_implemented 仅表示内部占位，HTTP 501 按 5xx 故障处理。
 
-两类查询独立保留成功结果。失败侧的 ID、名称和版本均为 null；成功结果的 mapping_version/customer_mapping_version 仍由 Observer 计算。两个事件共用冻结快照，不使用迟到结果重写历史事件。
+两类查询独立保留成功结果。失败侧的 ID、名称和版本均为 null；成功结果的 mapping_version/customer_mapping_version 仍由 Observer 计算。两个事件共用冻结快照，不使用迟到结果重写历史事件。Kafka/Doris 保留原事件状态枚举，历史 unknown_host/unknown_api_key 仍可读取，但当前远端适配器不再根据错误码生成这两个状态。
 
 ### 4.9 responseMsg 日志
 
@@ -381,7 +392,7 @@ mapped 还要求对应名称完整有效：服务的 service_name/provider_name 
 
 正常占位路径中，合法输入产生 lookup_not_implemented，相关 ID 和版本均为 null；缺失/非法输入先产生 invalid_host 或 invalid_api_key，不能误报成未登记。两个查询的结果各自独立，占位错误不导致进程退出、网络等待或业务拒绝。
 
-其余查询状态在单一模型中保留定义，HTTP 状态码及错误体映射已在第 4.8 节约定，HTTP 适配器已实现该映射：仅符合契约的 HTTP 200、responseCode="not_found"、success=false、data 为 null 或缺省时为 unknown_host/unknown_api_key；超时为 lookup_timeout，连接/TLS/接口认证/服务错误为 lookup_unavailable，非法响应为 lookup_invalid_response，预算不足和限流分别为 lookup_overloaded/lookup_rate_limited。不使用旧的 catalog_unavailable/catalog_stale 枚举。
+其余查询状态在单一模型中保留定义，HTTP 状态码及错误体映射已在第 4.8 节约定，HTTP 适配器已实现该映射：HTTP 200 + responseCode="650013" 统一为 lookup_invalid_response，HTTP 200 + responseCode="100001" 为 lookup_unavailable；当前远端适配器不再生成 unknown_host/unknown_api_key，历史枚举继续保留；超时为 lookup_timeout，连接/TLS/接口认证/服务错误为 lookup_unavailable，非法响应为 lookup_invalid_response，预算不足和限流分别为 lookup_overloaded/lookup_rate_limited。不使用旧的 catalog_unavailable/catalog_stale 枚举。
 
 服务归属失败不清除客户或已观察 usage，不改变客户 identity_status。客户失败保留已知服务/供应商和 usage，但 identity_status=invalid、identity_invalid 异常、usage_eligible=false，不进入客户汇总。usage_eligible 仍是统计候选，不等于供应商已知或可收费。
 
@@ -497,9 +508,10 @@ Kubernetes 用例固定使用本地 Kubernetes 1.22.17 + Istio 1.13.5。网关�
 | 名称变更 | 同一请求冻结名称；重命名后的新请求保存新名称，旧请求仍可查到旧名称；不改变稳定 ID 或两类映射版本、事件身份摘要；名称不拆分日/月统计 |
 | 名称重放与冲突 | 同内容重放幂等；同 event_id 仅名称不同仍触发内容冲突；同请求 start/usage 名称不一致触发快照冲突，不能静默选取其一 |
 | 名称未知与数据库结构 | 占位/失败侧的名称键显式为 null；原有无名称数据不回填最新名称；验证新库初始化、视图和注释，确认列真实存在，保留无关数据库 |
-| 请求头认证 | HTTP 200 + responseCode=unauthenticated/forbidden，success=false 且 data 为 null 或缺省，均为 lookup_unavailable；实际 HTTP 401/403 仍作为访问故障；业务 token 不作为接口访问凭据 |
+| 请求头认证 | HTTP 401 + responseCode="401" + success=false 为 lookup_unavailable，合法响应的 Unauthorized 消息进入脱敏异步日志；非法错误正文仍为访问故障且不记录动态内容；业务 token 不作为接口访问凭据 |
 | 环境值 | prd/stg/dev 贯通配置、事件和出站请求；旧值、别名和大小写变体拒绝，不仅在 HTTP 出站时转换 |
-| 未找到与歧义 | HTTP 200 + responseCode=not_found/ambiguous_mapping，success=false 且 data 为 null 或缺省；前者映射 unknown，后者 lookup_invalid_response；旧 HTTP 404/409 不作为有效业务响应 |
+| 未找到与歧义 | HTTP 200 + responseCode="650013"，success=false，data 缺省或为 null，零条和多条统一为 lookup_invalid_response；不能推断 unknown；旧英文业务码和旧 HTTP 404/409 不作为有效业务响应 |
+| 第三方参数错误 | HTTP 200 + responseCode="100001" + success=false 为 lookup_unavailable；data 缺省或为 null，另一侧成功结果继续保存；JSON 数字错误码、矛盾成功标志和非空失败数据拒绝 |
 | 停用密钥 | 停用、过期或吊销但仍能确定归属时返回双 ID，不作为业务访问授权 |
 | 限流与故障 | 429 + rate_limited、超时/取消、连接/TLS、5xx 分别映射约定状态；501 不映射 lookup_not_implemented；状态/错误码不匹配按第 4.8 节处理 |
 | 敏感数据与快照 | responseMsg 在成功和失败时均记录，敏感值先脱敏再截断和转义；不打印完整请求/响应，包装不入 Kafka/Doris；认证头和业务 token 不落日志/事件/数据库；两类查询独立，两个事件共享冻结快照 |

@@ -20,7 +20,9 @@ func TestHTTPSContractAndFailures(t *testing.T) {
 		body, kind, want string
 	}{
 		{"mapped", 200, lookupSuccessJSON(`{"service_id":"s","service_name":"模型服务","provider_id":"p","provider_name":"供应商"}`), "application/json", ""},
-		{"not_found", 200, `{"responseCode":"not_found","responseMsg":"未登记","success":false,"data":null}`, "application/json", "unknown_host"},
+		{"ambiguous_or_missing", 200, `{"responseCode":"650013","responseMsg":"无法唯一确定服务/供应商或密钥/客户归属","success":false}`, "application/json", "lookup_invalid_response"},
+		{"parameter_invalid", 200, `{"responseCode":"100001","responseMsg":"无效的参数！","success":false}`, "application/json", "lookup_unavailable"},
+		{"authentication_failed", 401, `{"success":false,"responseCode":"401","responseMsg":"Unauthorized"}`, "application/json", "lookup_unavailable"},
 		{"old_not_found", 404, `{"error":{"code":"not_found"}}`, "application/json", "lookup_invalid_response"},
 		{"bad_404", 404, `<html>not found</html>`, "text/html", "lookup_invalid_response"},
 		{"bad_error", 404, `{"error":{"code":"other"}}`, "application/json", "lookup_invalid_response"},

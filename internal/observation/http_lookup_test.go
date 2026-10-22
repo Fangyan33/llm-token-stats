@@ -22,11 +22,14 @@ import (
 func TestHTTPBusinessErrorsPreserveOtherIdentity(t *testing.T) {
 	t.Setenv("HTTP_SNAPSHOT_CREDENTIAL", "synthetic-directory-access")
 	for _, failedSide := range []string{"service", "customer"} {
-		for _, code := range []string{"unauthenticated", "forbidden", "not_found", "ambiguous_mapping"} {
+		for _, code := range []string{"650013", "100001", "401"} {
 			t.Run(failedSide+"/"+code, func(t *testing.T) {
 				directory := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 					w.Header().Set("Content-Type", "application/json")
 					if r.URL.Path == "/"+failedSide {
+						if code == "401" {
+							w.WriteHeader(http.StatusUnauthorized)
+						}
 						json.NewEncoder(w).Encode(map[string]any{"responseCode": code, "responseMsg": "查询失败", "success": false, "data": nil})
 						return
 					}
@@ -52,13 +55,8 @@ func TestHTTPBusinessErrorsPreserveOtherIdentity(t *testing.T) {
 				st := &pb.Start{RequestAuthority: "model.example.com", ApiKey: []byte("synthetic-business-token")}
 				e := s.resolve(ctx, st)
 				want := "lookup_unavailable"
-				if code == "ambiguous_mapping" {
+				if code == "650013" {
 					want = "lookup_invalid_response"
-				} else if code == "not_found" {
-					want = "unknown_host"
-					if failedSide == "customer" {
-						want = "unknown_api_key"
-					}
 				}
 				if failedSide == "service" {
 					if e.MappingStatus != want || e.ServiceID != nil || e.ServiceName != nil || e.ProviderID != nil || e.ProviderName != nil || e.MappingVersion != nil || e.CustomerMappingStatus != "mapped" || e.CustomerID == nil || *e.CustomerName != "客户" || e.CustomerMappingVersion == nil || e.IdentityStatus != "known" {

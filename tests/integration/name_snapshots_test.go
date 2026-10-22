@@ -46,7 +46,8 @@ func testNamesThroughKafkaToDoris(t *testing.T, secure bool) {
 		if r.Method != "POST" || r.Header.Get("x-remote-data") != credential {
 			t.Error("remote authentication")
 			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(map[string]any{"responseCode": "unauthenticated", "responseMsg": "接口认证失败", "success": false, "data": nil})
+			w.WriteHeader(http.StatusUnauthorized)
+			json.NewEncoder(w).Encode(map[string]any{"responseCode": "401", "responseMsg": "Unauthorized", "success": false})
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")

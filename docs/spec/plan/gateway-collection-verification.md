@@ -349,3 +349,19 @@ Host 无效或未匹配时，在提取凭据、分配正文改写资源及建立
 | HTTP/HTTPS 名称链路 | go test -count=1 -tags=integration -v ./tests/integration -run '^TestHTTPNamesThroughKafkaToDoris$' 通过，64.894 秒；两种协议均验证异步日志、三个名称的 Kafka/Doris/视图快照、重命名历史及包装字段不入库 |
 
 本次定向入库回归复用上一节临时独立消费组，结束后已停止临时 Consumer；原消费组的恢复元数据和位点未修改。未重新执行上一节 451.185 秒的完整本地集成套件，也未部署生产；当前修复的全量单元/竞态、构建/ABI、阻塞故障及 HTTP/HTTPS 名称入库结果以上述记录为准。
+
+## 2026-10-21：归属 API 数值字符串错误码修订
+
+当前契约替代此前英文业务码：成功仍为 HTTP 200 / "000000" / success=true；无结果或多条结果均为 HTTP 200 / "650013" / success=false，统一映射 lookup_invalid_response，不能依据该码或消息推断 unknown_host/unknown_api_key。第三方参数校验失败为 HTTP 200 / "100001" / success=false，映射 lookup_unavailable。认证失败改为 HTTP 401 / "401" / success=false；合法包装中的 Unauthorized 消息也进入既有脱敏、非阻塞日志队列。旧英文码、数字类型业务码和 HTTP 200 / "401" 不作为有效兼容格式。
+
+HTTP 401 始终按访问故障分类；只有满足 JSON 类型、严格字段、控制值及大小约束的认证响应才记录动态字段。错误正文畸形、类型不符、读取失败或超限时仅保留固定诊断，不回显正文。查询预算、256 条日志队列及丢失计数保持原行为。Kafka/Doris 结构和事件枚举不变；失败侧 ID/名称/版本为 null，成功侧快照保留。
+
+| 验证 | 本次结果与边界 |
+| --- | --- |
+| 无缓存全量检查 | GOFLAGS=-count=1 make test 通过：85 项 Python 测试、6 份事件样例、主模块与独立插件 Go 竞态全部通过；真实 HTTP/TLS 用例获得端口权限后执行 |
+| 新码与兼容边界 | 服务/客户均覆盖 650013 与 100001 的 data 缺省/null、零条/多条消息不改变分类、矛盾 success/非空失败 data 拒绝、旧英文业务码及数字类型业务码拒绝；HTTP 400/429/5xx 保留原回归 |
+| 认证响应与隔离 | HTTP 401 包装、Unauthorized 日志、凭据/token 脱敏、正文读取失败/畸形/超限/未知字段和矛盾控制值均验证；650013、100001、401 的双侧独立失败测试保留另一侧 ID/名称/版本；日志背压、token 清理及额度释放回归通过 |
+| 构建与文档 | make build wasm 通过，Observer/Consumer/fixture 构建与 Wasm ABI 检查通过；归属接口文档 7 份 JSON 示例可解析，契约校验和 git diff --check 通过；组件说明及 Kafka 接入指南已同步当前映射 |
+| 定向名称入库 | 使用既有临时消费组执行 HTTP/HTTPS 名称链路，整体 112.506 秒未通过；HTTP 子用例通过（39.81 秒），HTTPS 第二次请求等待 Doris 可见性失败（HTTPS 子用例 72.55 秒）。两个接口均已返回 mapped；测试日志显示连续 Doris SQL 读取超时，随后只读诊断测得宿主机负载 109.27、交换分区约 3589 MiB 已使用，不据此宣称 HTTPS 端到端入库验收通过 |
+
+临时验证 Consumer 已由监督脚本停止，原组位点、恢复元数据及运行配置未更改。未重跑完整本地集成或部署生产，保留失败日志 /tmp/identity-error-codes-integration.log；环境恢复后仍需复验 HTTPS 端到端名称入库。

@@ -25,10 +25,9 @@ func TestResponseEnvelopes(t *testing.T) {
 	for _, kind := range []string{"service", "customer"} {
 		t.Run(kind, func(t *testing.T) {
 			data := `{"service_id":"s","service_name":"服务","provider_id":"p","provider_name":"供应商"}`
-			notFound := "unknown_host"
 			id, name := "s", "服务"
 			if kind == "customer" {
-				data, notFound = `{"api_key_id":"k","customer_id":"c","customer_name":"客户"}`, "unknown_api_key"
+				data = `{"api_key_id":"k","customer_id":"c","customer_name":"客户"}`
 				id, name = "k", "客户"
 			}
 			good := lookupSuccessJSON(data)
@@ -57,7 +56,10 @@ func TestResponseEnvelopes(t *testing.T) {
 				{"id_boundary", lookupSuccessJSON(strings.Replace(data, `"`+id+`"`, `"`+strings.Repeat(id, 128)+`"`, 1)), ""},
 				{"name_boundary", lookupSuccessJSON(strings.Replace(data, `"`+name+`"`, `"`+strings.Repeat("中", 170)+`ab"`, 1)), ""},
 				{"unknown_code", `{"responseCode":"unexpected","success":false}`, "lookup_invalid_response"},
-				{"numeric_error_code", `{"responseCode":"404","success":false}`, "lookup_invalid_response"},
+				{"zero_matches", `{"responseCode":"650013","responseMsg":"未查询到数据","success":false}`, "lookup_invalid_response"},
+				{"multiple_matches", `{"responseCode":"650013","responseMsg":"查询数据多条","success":false}`, "lookup_invalid_response"},
+				{"number_parameter_code", `{"responseCode":100001,"success":false}`, "lookup_invalid_response"},
+				{"number_mapping_code", `{"responseCode":650013,"success":false}`, "lookup_invalid_response"},
 				{"unknown_field", strings.Replace(good, `"success":true`, `"extra":1,"success":true`, 1), "lookup_invalid_response"},
 				{"duplicate_code", strings.Replace(good, `"success":true`, `"responseCode":"000000","success":true`, 1), "lookup_invalid_response"},
 				{"duplicate_data_field", lookupSuccessJSON(`{"service_id":"s","service_id":"x"}`), "lookup_invalid_response"},
@@ -68,12 +70,10 @@ func TestResponseEnvelopes(t *testing.T) {
 				{"flat_response", data, "lookup_invalid_response"},
 				{"oversize_envelope", strings.Replace(good, "请求处理成功", strings.Repeat("x", maxResponseBytes), 1), "lookup_invalid_response"},
 			}
-			for _, code := range []string{"unauthenticated", "forbidden", "not_found", "ambiguous_mapping"} {
-				want := "lookup_unavailable"
-				if code == "not_found" {
-					want = notFound
-				} else if code == "ambiguous_mapping" {
-					want = "lookup_invalid_response"
+			for _, code := range []string{"650013", "100001", "unauthenticated", "forbidden", "not_found", "ambiguous_mapping", "401"} {
+				want := "lookup_invalid_response"
+				if code == "100001" {
+					want = "lookup_unavailable"
 				}
 				for _, tail := range []string{"", `,"data":null`} {
 					cases = append(cases, struct{ name, body, want string }{code + tail,
@@ -138,7 +138,7 @@ func TestResponseMessageLogPrivacy(t *testing.T) {
 			body := map[string]any{"responseCode": "000000", "success": success, "responseMsg": message,
 				"data": map[string]string{"api_key_id": "private-id", "customer_id": "private-customer", "customer_name": "private-name"}}
 			if !success {
-				body["responseCode"], body["data"] = "not_found", nil
+				body["responseCode"], body["data"] = "650013", nil
 			}
 			encoded, _ := json.Marshal(body)
 			var logs bytes.Buffer
@@ -169,6 +169,92 @@ func TestResponseMessageLogPrivacy(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestAuthenticationResponseEnvelopes(t *testing.T) {
+	for _, kind := range []string{"service", "customer"} {
+		t.Run(kind, func(t *testing.T) {
+			privateMessage := "synthetic-credential"
+			if kind == "customer" {
+				privateMessage += " synthetic-token"
+			}
+			privateBody, _ := json.Marshal(map[string]any{"responseCode": "401", "success": false, "responseMsg": privateMessage})
+			for _, tc := range []struct {
+				name, body, media string
+				valid             bool
+			}{
+				{"unauthorized", `{"success":false,"responseCode":"401","responseMsg":"Unauthorized"}`, "application/json", true},
+				{"null_data", `{"success":false,"responseCode":"401","responseMsg":"Unauthorized","data":null}`, "application/json", true},
+				{"no_message", `{"success":false,"responseCode":"401"}`, "application/json", true},
+				{"redaction", string(privateBody), "application/json", true},
+				{"read_failure", "", "application/json", false},
+				{"html", `private gateway error`, "text/html", false},
+				{"malformed", `{"responseCode":"401","responseMsg":"private"`, "application/json", false},
+				{"duplicate", `{"responseCode":"401","responseCode":"401","responseMsg":"private","success":false}`, "application/json", false},
+				{"number_code", `{"responseCode":401,"responseMsg":"private","success":false}`, "application/json", false},
+				{"unknown_field", `{"responseCode":"401","responseMsg":"private","success":false,"extra":1}`, "application/json", false},
+				{"wrong_code", `{"responseCode":"650013","responseMsg":"private","success":false}`, "application/json", false},
+				{"wrong_success", `{"responseCode":"401","responseMsg":"private","success":true}`, "application/json", false},
+				{"no_success", `{"responseCode":"401","responseMsg":"private"}`, "application/json", false},
+				{"non_null_data", `{"responseCode":"401","responseMsg":"private","success":false,"data":{}}`, "application/json", false},
+				{"oversize", `{"responseCode":"401","success":false,"responseMsg":"` + strings.Repeat("private", maxResponseBytes/7+1) + `"}`, "application/json", false},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					var logs bytes.Buffer
+					r := &remote{uri: "http://directory.invalid/", credential: "synthetic-credential", logger: log.New(&logs, "", 0), client: &http.Client{Transport: lookupTransport(func(*http.Request) (*http.Response, error) {
+						var body io.Reader = strings.NewReader(tc.body)
+						if tc.name == "read_failure" {
+							body = failedLookupResponseReader{}
+						}
+						return &http.Response{StatusCode: http.StatusUnauthorized, Header: http.Header{"Content-Type": []string{tc.media}}, Body: io.NopCloser(body)}, nil
+					})}}
+					flushLogs := testResponseLogQueue(t, r)
+					var err error
+					if kind == "service" {
+						var got ServiceIdentity
+						got, err = (serviceRemote{r}).Resolve(context.Background(), ServiceLookupRequest{})
+						if got != (ServiceIdentity{}) {
+							t.Fatal("authentication failure returned service identity")
+						}
+					} else {
+						var got CustomerIdentity
+						got, err = (customerRemote{r}).Resolve(context.Background(), []byte("synthetic-token"))
+						if got != (CustomerIdentity{}) {
+							t.Fatal("authentication failure returned customer identity")
+						}
+					}
+					flushLogs()
+					if err == nil || Failure(err) != "lookup_unavailable" || strings.Count(logs.String(), "\n") != 1 || strings.Contains(logs.String(), "private") || strings.Contains(logs.String(), "synthetic-credential") || strings.Contains(logs.String(), "synthetic-token") {
+						t.Fatal("authentication failure classification or log privacy", err)
+					}
+					var entry map[string]any
+					if json.Unmarshal(bytes.TrimSpace(logs.Bytes()), &entry) != nil || entry["http_status"] != float64(401) || entry["status"] != "lookup_unavailable" || entry["level"] != "WARN" {
+						t.Fatal("authentication log metadata")
+					}
+					if tc.valid {
+						expectedMessage := "Unauthorized"
+						if tc.name == "redaction" {
+							expectedMessage = "[REDACTED]"
+							if kind == "customer" {
+								expectedMessage += " [REDACTED]"
+							}
+						}
+						if entry["responseCode"] != "401" || entry["success"] != false || (tc.name != "no_message" && entry["responseMsg"] != expectedMessage) {
+							t.Fatal("valid authentication response was not logged")
+						}
+					} else if _, ok := entry["responseMsg"]; ok {
+						t.Fatal("invalid authentication response fields were logged")
+					}
+				})
+			}
+		})
+	}
+}
+
+type failedLookupResponseReader struct{}
+
+func (failedLookupResponseReader) Read([]byte) (int, error) {
+	return 0, errors.New("private-response-read-error")
 }
 
 func TestLogMessageLimitAndFailurePrivacy(t *testing.T) {

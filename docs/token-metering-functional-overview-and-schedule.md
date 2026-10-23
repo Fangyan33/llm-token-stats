@@ -66,7 +66,7 @@
 | A6 | 网关鉴权 | 通过 Istio/Envoy ext_authz 验证 Key、有效期及访问范围，失败请求不进入模型服务 | 一期 |
 | A7 | 访问范围 | 按 API Key 配置允许访问的服务与路由；未明确授权默认拒绝 | 一期 |
 
-当前归属接口已实现并以未实现占位运行：Wasm 临时发送入口 authority 与 Authorization: Bearer token，Observer 固定集群/环境并调用服务/客户 resolver；合法输入的四项 ID 和版本为 null，两类状态为 lookup_not_implemented，原始 usage 保留，identity_status=invalid、usage_eligible=false。真实 HTTP、第三方鉴权和网络缓存未实现；应用维度及 PG 归属读取均已删除。 业务访问继续由已有网关鉴权独立判定，不把统计归属查询放进同步 ext_authz。
+当前归属接口已实现并以未实现占位运行：Wasm 临时发送入口 authority 与 Authorization: Bearer token，Observer 固定集群/环境并调用服务/客户 resolver；合法输入的四项 ID 和版本为 null，两类状态为 lookup_not_implemented，原始 usage 保留，identity_status=invalid、usage_eligible=false。HTTP/HTTPS、x-remote-data 认证及实例内成功结果缓存已实现；配置 URI 为空时继续占位，真实第三方联调须在部署环境验收；应用维度及 PG 归属读取均已删除。 业务访问继续由已有网关鉴权独立判定，不把统计归属查询放进同步 ext_authz。
 
 真实 Auth、凭证生命周期及访问范围属于独立工作包。本次不建设密钥管理 API，不限制第三方 Key 为自造格式，不返回假客户，不访问 PG。当前接口未实现与真实凭证无效是不同状态；前者不能阻断业务或被计为已知客户。
 

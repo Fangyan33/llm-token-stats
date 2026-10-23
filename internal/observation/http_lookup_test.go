@@ -98,6 +98,7 @@ func TestBlockedLogsReleaseTokensAndLookupAdmission(t *testing.T) {
 	}))
 	defer directory.Close()
 	s := &Server{Cfg: config.Observer{ClusterName: "cluster-a", DeploymentEnvironment: "stg", LookupConcurrency: 1, LookupTimeoutMS: 500}, Health: &health.State{}}
+	disableLookupCache(s)
 	var err error
 	s.ServiceResolver, err = identitylookup.NewService(config.Lookup{URI: directory.URL + "/service", CredentialEnv: "HTTP_LOG_BACKPRESSURE_CREDENTIAL"})
 	if err != nil {

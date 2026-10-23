@@ -6,7 +6,7 @@ LLM Token Stats 在网关旁路观察大模型请求和响应，提取模型返�
 
 当前协议已移除 application_id。Wasm 仅从 Authorization: Bearer 提取临时 api_key，并发送入口 authority。Observer 使用配置的 cluster_name/deployment_environment，通过服务和客户查询接口解析归属。
 
-两个归属接口支持配置 HTTP/HTTPS POST JSON 调用及 x-remote-data 认证；URI 为空时使用未实现占位。Observer 固定 prd/stg/dev 环境，在有界异步任务中取得 ID 和名称快照；service_name、provider_name、customer_name 经 Kafka 写入 Doris 独立列及 event_json。占位或失败侧的 ID、名称和版本为 null，不回源补写历史；原始 usage 保留，业务 token 不进入事件、数据库或日志。具体说明见[归属接口说明](docs/spec/plan/host-service-provider-implementation.md)。
+两个归属接口支持配置 HTTP/HTTPS POST JSON 调用及 x-remote-data 认证；URI 为空时使用未实现占位。Observer 固定 prd/stg/dev 环境，在有界异步任务中取得 ID 和名称快照；service_name、provider_name、customer_name 经 Kafka 写入 Doris 独立列及 event_json。占位或失败侧的 ID、名称和版本为 null，不回源补写历史；原始 usage 保留，业务 token 不进入事件、数据库或日志。两个接口默认各缓存成功结果 30 分钟，瞬时故障时最多再沿用 15 分钟；认证或业务明确错误清除旧值，历史快照保持不变。缓存通过各自的 `cache` 配置调整，修改后重启 Observer。具体说明见[归属接口说明](docs/spec/plan/host-service-provider-implementation.md)。
 
 ## 架构与组件职责
 

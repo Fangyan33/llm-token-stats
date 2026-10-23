@@ -365,3 +365,43 @@ HTTP 401 始终按访问故障分类；只有满足 JSON 类型、严格字段�
 | 定向名称入库 | 使用既有临时消费组执行 HTTP/HTTPS 名称链路，整体 112.506 秒未通过；HTTP 子用例通过（39.81 秒），HTTPS 第二次请求等待 Doris 可见性失败（HTTPS 子用例 72.55 秒）。两个接口均已返回 mapped；测试日志显示连续 Doris SQL 读取超时，随后只读诊断测得宿主机负载 109.27、交换分区约 3589 MiB 已使用，不据此宣称 HTTPS 端到端入库验收通过 |
 
 临时验证 Consumer 已由监督脚本停止，原组位点、恢复元数据及运行配置未更改。未重跑完整本地集成或部署生产，保留失败日志 /tmp/identity-error-codes-integration.log；环境恢复后仍需复验 HTTPS 端到端名称入库。
+
+
+## 2026-10-22：归属查询结果缓存
+
+Observer 的服务与客户查询分别增加实例内 LRU 成功缓存，默认每类 10000 条、TTL 30 分钟；仅瞬时故障时额外沿用旧值最多 15 分钟，同条目失败后 5 秒内不重查。缓存命中和并发查询合并先于远端并发/速率额度检查，部分命中不被另一侧过载清除。服务键包含规范 Host、集群和环境；客户键使用进程随机密钥的 HMAC-SHA256，不保存原始 token 或响应消息。实例重启清空缓存，独立配置可关闭任一接口的缓存和查询合并。
+
+内部错误区分允许回退的网络/超时/5xx/有效 429/本地额度不足，以及必须作废旧值的 401/403、100001/650013、非法响应或其他明确错误。迟到成功不写缓存；迟到明确错误可撤销旧条目，已冻结事件保持不变。HTTP 日志仍仅由实际调用产生，沿用有界非阻塞队列；缓存命中、合并等待、旧值回退、失败、容量淘汰及条目数提供两类固定指标，不引入 Host 或摘要标签。Kafka/Doris 的字段、摘要与事件枚举保持既有契约。
+
+| 验证 | 本次结果与边界 |
+| --- | --- |
+| 全量单元检查 | make test 通过：85 项 Python 检查、6 份事件契约样例、主模块与独立插件 Go 竞态测试全部通过，使用默认 Go 测试缓存；真实 HTTP/TLS 端口用例获得权限后执行。最后补充未约定 HTTP 600 不允许回退的边界，两个归属相关包的竞态回归再次通过 |
+| 缓存与资源边界 | 可控时钟覆盖 TTL、刷新后续期、宽限期硬截止、5 秒重查间隔、关闭缓存与零宽限期、失败不缓存、LRU 淘汰、部署上下文和进程隔离；20 个并发加入者只共享一次服务/客户查询，立即清理自身 token；额度占满时命中/单侧成功/旧值仍保留，等待者截止不取消共享任务，迟到 worker 不提前释放额度或更新快照 |
+| 错误策略与日志回归 | HTTP 503、有效 429 允许回退；401/403、100001/650013、非法响应清除旧值，后续 503 无法恢复被清除条目。原有阻塞日志 writer、300 次双侧查询、token 清理与额度释放回归通过；迟到明确错误清除旧值也有竞态测试 |
+| 构建与 ABI | make build、make wasm 通过；Observer/Consumer/fixture 构建与 Wasm ABI/gRPC hostcall 检查通过，无 socket imports |
+| 完整本地集成 | GOFLAGS=-count=1 make local-test 通过，156.536 秒；业务 JSON/SSE/unknown、Host 筛选、正文边界、Kafka 黑洞、确认丢失、消费攒批/再均衡/恢复、冲突、归属快照与 Wasm 下载故障恢复全部通过 |
+| HTTP/HTTPS 缓存入库 | TestCachedHTTPNamesThroughKafkaToDoris 的 HTTP、HTTPS 均通过；每种协议 5 次观察请求各调用服务/客户接口 3 次（首次、成功刷新、失败刷新），验证新鲜命中、刷新与旧值回退。三个名称在两类事件、Kafka 原消息、Doris 独立列/event_json 及视图中一致，历史旧名称保留；关闭缓存的原名称用例也通过 |
+| 配置与文档 | 本地/生产示例、Compose、Kubernetes 与离线打包配置测试通过；归属实现说明、组件说明、Kafka 指南及 Doris 字典/生成器同步缓存语义。9 份 JSON 文档示例均可解析，git diff --check 通过 |
+
+本地原 Consumer 的 readyz 返回 503，本次未修复或重置其消费组。完整集成使用临时独立组 identity-cache-validation-20261022（临时健康端口 19994，flush_interval_ms=1000）写入既有 metering_development，结束后监督脚本已停止临时 Consumer，保留原组位点、恢复元数据及运行配置。只重载本地 Observer 与 Envoy 以使用新构建；联调继续保留现有 Kafka/Doris 数据卷。诊断日志为 /tmp/identity-cache-local-test.log、/tmp/identity-cache-validation-consumer.log 及 /tmp/llm-cache-make-test.log。Wasm SHA-256 为 62b26402c0f6eff9efb6b95625cbb0e1350657f09d690d465b70d2c1b55dcc3e。
+
+本次采用合成第三方目录，不代表真实第三方数据、生产容量或 G0–G5 已验收。缓存会使名称与归属变更在正常情况下最多延迟约 30 分钟，持续瞬时故障时最多约 45 分钟反映到新请求；历史请求保持既有冻结快照。
+
+## 2026-10-23：认证响应头即时撤销缓存
+
+两个归属接口收到 HTTP 401/403 响应头后，立即向协调器确认不可回退的 lookup_unavailable，撤销旧缓存以及同键尚未冻结的候选。401 正文仍在原查询任务与原截止时间内读取，仅用于既有脱敏日志；正文阻塞、读取失败或随后取消不能将已确认的认证失败改为可沿用旧值的超时。403 保持固定诊断。通知不提前释放查询额度或清理仍在使用的客户 token，不新增正文读取任务。
+
+撤销同时覆盖新鲜命中、重查冷却期、共享查询等待者，以及条目已被 LRU 淘汰或过期后仍被请求持有的候选。待冻结候选通过有界生命周期的共享状态接收撤销；已冻结事件保持不变，另一侧成功结果保留，后续新请求仍可重新查询，不增加失败负缓存。同一实际查询的失败指标仅计一次。
+
+| 验证 | 本次结果与边界 |
+| --- | --- |
+| 无缓存全量检查 | GOFLAGS='-count=1 -p=1' make test 通过：85 项 Python 检查、6 份事件契约样例、主模块及独立插件 Go 竞态测试全部通过；串行运行测试包，真实 HTTP/TLS 用例完整执行 |
+| 响应头与正文边界 | net.Pipe 覆盖服务/客户接口的完整 401、正文超时、读取失败和 403；确认认证失败先于正文处理发布，分类不因取消改变，合法完整消息仍脱敏记录，残缺正文仅记录固定诊断 |
+| 撤销与资源回归 | 覆盖新鲜/冷却/淘汰/过期候选、并发共享等待者、失败指标只计一次、待冻结状态清理及后续重新查询；真实 HTTP 慢速 401 验证两侧独立撤销、无旧值回退、不提前释放额度或清理 token，后续 503 不能恢复旧归属 |
+| 构建与 ABI | make build wasm 通过；Observer、Consumer、fixture 构建及 Wasm ABI/gRPC hostcall 检查通过，无 socket imports |
+| HTTP/HTTPS 专项入库 | go test -count=1 -tags=integration -timeout=180s -v ./tests/integration -run '^TestCachedHTTPNamesThroughKafkaToDoris$' 通过，共 18.424 秒；每种协议 6 次观察请求各实际调用服务/客户接口 4 次，覆盖缓存命中、刷新、503 旧值回退、冷却和慢速 401 |
+| 认证失败事件 | 最后一次请求的客户状态为 lookup_unavailable，客户 ID、名称、API key ID 和映射版本在两类事件中均为 null，身份无效且不进入 usage_effective；服务侧仍保留允许回退的名称。逐字核对 Kafka 消息与 Doris event_json，同时验证独立列和请求视图 |
+| 完整本地集成 | GOFLAGS='-count=1 -p=1' make local-test 未通过，600.199 秒触发测试总超时；此前出现业务网关 403、Doris SQL i/o timeout 及事件可见性超时。超时栈在等待 SQL 入库，不是目录夹具清理阻塞；上述专项通过不能代替完整联调验收 |
+| 文档与清理 | 归属实现说明、组件说明和 Kafka 指南已同步响应头撤销与诊断正文边界；gofmt 与 git diff --check 通过。两次临时 Consumer 均已停止，原组位点、恢复元数据及仓库运行配置未修改 |
+
+联调复用临时独立组 identity-cache-validation-20261022、健康端口 19994 和当前开发库 metering_development。原 Consumer 的 readyz 仍为 503，本次未修复该问题或重置其位点；本地 Observer 已重载新构建，保留现有 Kafka/Doris 数据卷。全量检查日志为 /tmp/identity-auth-header-make-test-serial.log，构建日志为 /tmp/identity-auth-header-build.log，完整联调失败日志为 /tmp/identity-auth-header-local-test.log，专项成功日志为 /tmp/identity-auth-header-focused-test.log。本次使用合成第三方目录，未验收真实第三方或生产 G0–G5。

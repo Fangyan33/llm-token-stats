@@ -83,6 +83,9 @@ class KubernetesCollectionTests(unittest.TestCase):
     def test_kubernetes_consumer_and_observer_share_isolated_topic(self):
         topic, group = k8s.isolated_names('0123456789ab')
         observer, consumer, credentials = k8s.local_configs('192.0.2.10', topic, group)
+        source = json.loads((k8s.ROOT / 'configs/observer.production.example.json').read_text())
+        for kind in ('service_lookup', 'customer_lookup'):
+            self.assertEqual(observer['observer'][kind]['cache'], source['observer'][kind]['cache'])
         for settings in (observer['observer'], consumer['consumer']):
             self.assertNotIn('accepted_service_ids', settings)
             self.assertNotIn('accepted_request_hosts', settings)

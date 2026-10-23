@@ -50,15 +50,31 @@ func (UnimplementedCustomerResolver) Resolve(context.Context, []byte) (CustomerI
 func ValidID(s string) bool   { return s != "" && len(s) <= 128 && utf8.ValidString(s) }
 func ValidName(s string) bool { return s != "" && len(s) <= 512 && utf8.ValidString(s) }
 
-type lookupError string
+type lookupError struct {
+	code      string
+	transient bool
+}
 
-func (e lookupError) Error() string { return string(e) }
-func failure(code string) error     { return lookupError(code) }
+func (e lookupError) Error() string { return e.code }
+func failure(code string) error {
+	return lookupError{code: code, transient: code == "lookup_timeout" || code == "lookup_overloaded" || code == "lookup_rate_limited"}
+}
+func transientFailure(code string) error { return lookupError{code: code, transient: true} }
+
+// CanUseStale is deliberately narrower than Failure: authentication and input
+// errors share lookup_unavailable with transport failures, but revoke old data.
+func CanUseStale(err error) bool {
+	var e lookupError
+	if errors.As(err, &e) {
+		return e.transient
+	}
+	return errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled)
+}
 
 func Failure(err error) string {
 	var e lookupError
 	if errors.As(err, &e) {
-		return string(e)
+		return e.code
 	}
 	if errors.Is(err, ErrLookupNotImplemented) {
 		return "lookup_not_implemented"

@@ -52,6 +52,9 @@ type Server struct {
 	CustomerResolver identitylookup.CustomerResolver
 	lookupOnce       sync.Once
 	lookupSlots      chan struct{}
+	lookups          *lookupState
+	lookupInitErr    error
+	lookupNow        func() time.Time // Optional cache clock for deterministic tests.
 }
 
 func (s *Server) reserve(n int64) bool {
@@ -509,37 +512,20 @@ func (s *Server) emptySnapshot(st *pb.Start, reason string) events.Event {
 	return e
 }
 
-// No queue: at most LookupConcurrency transient credentials and HTTP tasks.
-// Only a small immutable attribution result crosses back into the receive loop.
+// Admission is applied inside resolveQueries after cache hits and shared flights
+// have been found. Only an immutable snapshot crosses into the receive loop.
 func (s *Server) beginResolve(ctx context.Context, st *pb.Start) <-chan events.Event {
-	s.lookupOnce.Do(func() {
-		n := s.Cfg.LookupConcurrency
-		if n == 0 {
-			n = 64
-		}
-		s.lookupSlots = make(chan struct{}, n)
-	})
 	result := make(chan events.Event, 1)
-	select {
-	case s.lookupSlots <- struct{}{}:
-		input := &pb.Start{RequestAuthority: st.RequestAuthority, ApiKey: st.ApiKey}
-		st.RequestAuthority = ""
-		st.ApiKey = nil
-		ms := s.Cfg.LookupTimeoutMS
-		if ms == 0 {
-			ms = 200
-		}
-		deadline, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Duration(ms)*time.Millisecond)
-		go func() {
-			defer cancel()
-			result <- s.resolveQueries(deadline, input, func() { <-s.lookupSlots })
-		}()
-	default:
-		result <- s.emptySnapshot(st, "lookup_overloaded")
-		clear(st.ApiKey)
-		st.ApiKey = nil
-		st.RequestAuthority = ""
-		s.Health.Count("lookup_overloaded")
+	input := &pb.Start{RequestAuthority: st.RequestAuthority, ApiKey: st.ApiKey}
+	st.RequestAuthority, st.ApiKey = "", nil
+	ms := s.Cfg.LookupTimeoutMS
+	if ms == 0 {
+		ms = 200
 	}
+	deadline, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Duration(ms)*time.Millisecond)
+	go func() {
+		defer cancel()
+		result <- s.resolveQueries(deadline, input, nil)
+	}()
 	return result
 }

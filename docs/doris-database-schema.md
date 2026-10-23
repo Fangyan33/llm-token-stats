@@ -8,9 +8,9 @@
 
 - 一个逻辑请求最多包含 request_started、usage_observed 两类事件；查询调用量按 logical_request_id 统计，不能按事件行数统计。
 - 原始用量 NULL 表示未知，0 表示已知零。输入/输出及缓存、推理子项不能重复相加。usage_eligible 表示统计候选，不表示收费资格。
-- Observer 支持 HTTP/HTTPS 归属查询，环境仅接受 prd/stg/dev；ID 与服务、供应商和客户名称作为请求快照保存。空 URI 占位或查询失败侧为 NULL，不伪造归属。
+- Observer 支持 HTTP/HTTPS 归属查询，环境仅接受 prd/stg/dev；ID 与服务、供应商和客户名称作为请求快照保存。默认缓存成功结果 30 分钟，瞬时故障最多再沿用 15 分钟并保持 mapped；明确错误作废旧值。名称可能来自缓存，历史记录不补写；空 URI 或无可用结果侧为 NULL。
 - 采集范围由 Wasm 的 accepted_request_hosts 统一筛选；无效或不匹配的 Host 不产生观察事件，Observer / Consumer 不做服务或 Host 白名单过滤，历史诊断仍按原契约保存。
-- 观察取消后保留已完成的单侧归属，未返回侧在原查询截止时间标为 lookup_timeout；快照冻结后不接受迟到回写。
+- 观察取消后保留已完成的单侧归属，未返回侧在原查询截止时间复核旧值回退资格；无法回退时标为 lookup_timeout，快照冻结后不接受迟到回写。
 - 全部时间按 UTC。Unix 毫秒字段带 _ms；DATETIME(3) 是 UTC 审计时间。offset 仅在同一 topic/分区比较，first/last 包含，next 不包含。
 - Unique Key 是 Doris 幂等键。下述关系是应用逻辑关联，没有声明数据库外键。协调表不是数据库锁，也不使 Kafka/Doris 成为分布式事务。
 - usage-worker、统计 HTTP API 尚未实现。已有汇总 DDL 和合成 SQL 验证不代表生产发布状态、查询一致性或真实客户归属已经交付。

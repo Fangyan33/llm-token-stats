@@ -69,13 +69,21 @@ Observer 环境仅接受 `prd`、`stg`、`dev`。分别设置 `observer.service_
 
 两个接口的 HTTP 200 响应使用 `responseCode`、`responseMsg`、`success`、`data` 包装。成功要求 `responseCode="000000"`、`success=true`，原有 ID 与名称位于 `data`。未查询到数据或查询出多条数据使用 HTTP 200、`responseCode="650013"`，统一映射为 `lookup_invalid_response`，不能推断为未登记；第三方入参检查不合法使用 HTTP 200、`responseCode="100001"`，映射为 `lookup_unavailable`。两者 `success=false`，`data` 为 null 或缺省。认证失败使用 HTTP 401、`responseCode="401"`、`success=false`、`responseMsg="Unauthorized"`，映射为 `lookup_unavailable`，合法认证响应的消息同样记录脱敏日志。HTTP 400、429、5xx 保持原故障处理，不兼容旧英文业务码。不接受旧扁平成功响应，详细映射见[归属接口契约](spec/plan/host-service-provider-implementation.md#48-错误契约与-observer-映射)。
 
-每次 HTTP 查询完成后，Observer 将一条 `event=identity_lookup_response` 的 JSON 记录非阻塞交付给共享日志队列，含查询类型、HTTP 状态、业务码、成功标志、`responseMsg` 和最终状态；成功 INFO、失败 WARN。消息不参与判断，可省略或为空；写日志前先替换当前凭据及客户 token，再按 UTF-8 边界限制为 1024 字节，转义换行和控制字符。未取得有效外层字段时仅记录固定诊断，不打印原始正文；不记录 URL、请求体、认证头或 data。响应包装不进入 Kafka/Doris，ID 与名称仍按原快照保存。 两类查询共用 256 条待写日志的进程级队列和单个后台写入协程；日志输出阻塞不影响归属结果返回、token 清理和查询额度释放。队列满时丢弃新日志，`/metrics` 中的 `metering_lookup_logs_dropped_total` 累计队列满丢失数。仅已脱敏的日志文本进入队列，不重试，进程退出不等待日志排空。
+每次 HTTP 查询完成后，Observer 将一条 `event=identity_lookup_response` 的 JSON 记录非阻塞交付给共享日志队列，含查询类型、HTTP 状态、业务码、成功标志、`responseMsg` 和该次调用的本地状态；成功 INFO、失败 WARN。消息不参与判断，可省略或为空；写日志前先替换当前凭据及客户 token，再按 UTF-8 边界限制为 1024 字节，转义换行和控制字符。未取得有效外层字段时仅记录固定诊断，不打印原始正文；不记录 URL、请求体、认证头或 data。响应包装不进入 Kafka/Doris，ID 与名称仍按原快照保存。 两类查询共用 256 条待写日志的进程级队列和单个后台写入协程；日志输出阻塞不影响归属结果返回、token 清理和查询额度释放。队列满时丢弃新日志，`/metrics` 中的 `metering_lookup_logs_dropped_total` 累计队列满丢失数。仅已脱敏的日志文本进入队列，不重试，进程退出不等待日志排空。
 
-`lookup_timeout_ms` 默认 200 ms（最大 2000），两类查询并行共享截止时间，从取得并发额度时计时；`lookup_max_concurrency` 默认 64（最大 256），不排队；每项 `max_requests_per_second` 默认 1000，独立限速且不等待。响应正文和响应头各限 8192 字节，不跟随重定向、不使用环境代理、不自动重试、不缓存原始 token。进度 ACK 和正文处理不等待外部查询；两类事件在相同快照冻结后发送。
+`lookup_timeout_ms` 默认 200 ms（最大 2000），两类查询并行使用请求级等待截止时间，从查询协调开始时计时；共享任务沿用首次发起时的截止时间，加入者不延长；`lookup_max_concurrency` 默认 64（最大 256），不排队；每项 `max_requests_per_second` 默认 1000，独立限速且不等待。缓存命中和合并等待先于远端额度检查，不占远端并发或速率额度；只有发起新任务的请求占用并发额度。响应正文和响应头各限 8192 字节，不跟随重定向、不使用环境代理、不自动重试、不缓存原始 token。进度 ACK 和正文处理不等待外部查询；两类事件在相同快照冻结后发送。
+
+每项 `service_lookup.cache` / `customer_lookup.cache` 默认启用实例内 LRU 成功缓存：`max_entries=10000`、`ttl_seconds=1800`、`stale_if_error_seconds=900`、`stale_retry_interval_seconds=5`。两个接口独立配置；省略字段用默认值，`enabled=false` 关闭该接口缓存及查询合并，宽限期设为 0 关闭旧值回退。容量范围 1–100000，TTL 1–86400 秒，宽限期 0–86400 秒，重查间隔 1–300 秒。部署、离线打包配置沿用相同默认值；修改配置后重启 Observer，实例重启会清空缓存。
+
+服务键包含规范 Host、固定集群和环境；客户键是使用进程随机密钥生成的 API Key HMAC-SHA256，不保存原始 token。相同键的并发未命中共享一次查询，加入者立即清理自身 token。TTL 到期等待刷新；仅网络故障、超时、HTTP 5xx、契约有效的 429 或本地额度不足，可在额外 15 分钟内沿用旧值并保持 `mapped`。失败后同条目 5 秒内不重查，到期由下一次观察触发刷新；没有定时后台刷新。HTTP 401/403、100001、650013、非法响应及其他明确错误立即清除旧值。命中或失败不延长寿命，默认最多沿用至成功查询后的 45 分钟；名称与归属变化因此可能延迟反映，历史数据保持原快照。详细规则见[归属结果缓存](spec/plan/host-service-provider-implementation.md#410-归属结果缓存)。
+
+缓存命中不重复记录 responseMsg；实际刷新失败仍记录实际调用结果。缓存指标以 `metering_lookup_cache_service_` / `metering_lookup_cache_customer_` 为前缀，提供 `hits_total`、`misses_total`、`shared_waits_total`、`stale_used_total`、`refresh_failures_total`、`evictions_total` 和 `entries`，不含 Host 或密钥摘要。
+
+HTTP 401/403 在响应头确认后立即登记不可回退的 `lookup_unavailable`，撤销旧条目及同键未冻结的缓存候选；401 的正文仅用于诊断，缓慢、不完整或超时的正文不能使事件回退为旧归属的 `mapped`。原 worker 仍在原查询预算及 8192 字节上限内读取 401 正文，完整有效的 `responseMsg` 继续脱敏入队；不增加后台读取任务，查询额度与 token 仍在 worker 实际退出后释放。同次查询只统计一次失败，已冻结事件保持原快照。
 
 HTTP 客户端总超时为 2 秒，拨号（含 DNS 解析）和 TLS 握手各有独立的 2 秒超时。查询截止后，尚在建立的连接仍受阶段超时约束，故障连接最终关闭并释放每主机连接额度；阶段超时归类为 `lookup_timeout`。
 
-HTTP 不读取 `ca_file`，传输保护由部署链路提供；HTTPS 使用镜像自带的系统根证书及可选附加 CA，持续校验证书和主机名，不自动降级为 HTTP。观察取消、超时或 ACK 失败时，已接纳查询继续到完成或原截止时间，保留成功侧的 ID 和名称，仅未返回侧标为 `lookup_timeout`。事件仅定稿一次，保留已校验的 End；迟到结果不改写快照。查询额度直到底层任务真正退出才释放，客户查询返回后清理 token。该行为不改变业务转发和 Kafka 投递边界，也不保证进程退出时查询完成。
+HTTP 不读取 `ca_file`，传输保护由部署链路提供；HTTPS 使用镜像自带的系统根证书及可选附加 CA，持续校验证书和主机名，不自动降级为 HTTP。观察取消、超时或 ACK 失败时，已接纳查询继续到完成或原截止时间，保留成功侧的 ID 和名称，未返回侧按缓存规则复核旧值，无法回退时标为 `lookup_timeout`。事件仅定稿一次，保留已校验的 End；迟到结果不改写快照。查询额度直到底层任务真正退出才释放，客户查询返回后清理 token。该行为不改变业务转发和 Kafka 投递边界，也不保证进程退出时查询完成。
 
 名称从接口返回值保存到 Kafka 必填键及 Doris `service_name`、`provider_name`、`customer_name` 可空列，单项非空 UTF-8、最多 512 字节。`requests`、`request_statistics`、`event_details` 和 `usage_effective` 可直接查询名称；同一请求名称不一致按冲突隔离。重命名保留历史快照，名称不参与稳定身份摘要或日/月汇总分组。明细保留期内可按请求 ID 查询：
 

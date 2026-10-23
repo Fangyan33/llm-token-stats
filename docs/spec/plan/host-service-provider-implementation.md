@@ -1,6 +1,6 @@
 # 通过第三方 API 解析服务、供应商与客户归属的实现计划
 
-修订日期：2026-10-21。状态：P0–P7 的占位链路、HTTP 查询、请求头认证、prd/stg/dev 环境枚举、名称快照持久化，以及响应包装、数值字符串错误码与 responseMsg 脱敏日志均已实现；本地验证结果见第 8 节和验证记录。功能尚未上线，生产第三方地址、凭据及完整 G0–G5 尚待真实环境验收。
+修订日期：2026-10-23。状态：P0–P7 的占位链路、HTTP 查询、请求头认证、prd/stg/dev 环境枚举、名称快照持久化，以及响应包装、数值字符串错误码、responseMsg 脱敏日志和实例内结果缓存均已实现；401/403 在响应头确认时撤销旧值及未定稿候选。本地验证结果见第 8 节和验证记录。功能尚未上线，生产第三方地址、凭据及完整 G0–G5 尚待真实环境验收。
 
 Observer 在配置非空 HTTP/HTTPS URI 后启用真实 POST JSON 查询，使用独立的 x-remote-data 凭据；空 URI 继续返回 lookup_not_implemented。service_name、provider_name、customer_name 与 ID 一起冻结，经 Kafka、Consumer 写入 Doris 独立列及 event_json。环境仅接受 prd/stg/dev，不接受旧值或别名；不回填既有事件。业务 api_key 仍固定来自 Authorization: Bearer。
 
@@ -29,7 +29,7 @@ Observer 在配置非空 HTTP/HTTPS URI 后启用真实 POST JSON 查询，使�
 - 只维护一套事件及配置契约，直接更新当前 schema、样例和摘要；开发验证使用新契约合成数据，不接入旧格式开发消息。
 - 同一契约下的事件重放去重、内容冲突检查和 Consumer 位点屏障继续有效。
 
-P0–P7 覆盖采集组件和占位链路；本次增量实现 HTTP 适配、请求头认证、环境枚举切换及名称存储。当前不实现缓存或自动重试，真实第三方业务联调由实际部署环境完成。真实 Auth 服务、汇总 Worker、统计查询 API、扣款和账单按各自工作包交付。
+P0–P7 覆盖采集组件和占位链路；本次增量实现 HTTP 适配、请求头认证、环境枚举切换及名称存储。当前已实现实例内有界成功结果缓存与短暂故障旧值回退，不做单次 HTTP 调用的自动重试；真实第三方业务联调由实际部署环境完成。真实 Auth 服务、汇总 Worker、统计查询 API、扣款和账单按各自工作包交付。
 
 ## 2. 调整前后对照
 
@@ -151,22 +151,22 @@ api_key 来源已确认，固定为 `Authorization: Bearer <token>` 的 token；
 
 配置、事件 Schema、样例及部署上下文现已统一使用 `prd/stg/dev`。旧值没有兼容别名；历史记录不重写，旧格式开发消息不接入新契约。
 
-每个 service_lookup/customer_lookup 支持 uri、credential_env、ca_file、max_requests_per_second。uri 为空时不调用第三方；非空时将完整 HTTP/HTTPS 端点直接使用，不拼接路径。URI 禁止 userinfo、query 和 fragment；地址、认证凭据不进入 Kafka 事件。credential_env 为环境变量名，ca_file 仅在 HTTPS 下用于补充私有 CA，HTTP 不读取该文件；HTTPS 不关闭证书或主机名校验。凭据轮换后重启 Observer 读取新值。
+每个 service_lookup/customer_lookup 支持 uri、credential_env、ca_file、max_requests_per_second 和 cache。uri 为空时不调用第三方；非空时将完整 HTTP/HTTPS 端点直接使用，不拼接路径。URI 禁止 userinfo、query 和 fragment；地址、认证凭据不进入 Kafka 事件。credential_env 为环境变量名，ca_file 仅在 HTTPS 下用于补充私有 CA，HTTP 不读取该文件；HTTPS 不关闭证书或主机名校验。凭据轮换后重启 Observer 读取新值。
 
 执行与资源配置：
 
 | 字段 | 默认值 | 约束与行为 |
 | --- | --- | --- |
-| observer.lookup_timeout_ms | 200 | 1–2000 ms；两个查询并行使用同一请求级截止时间 |
-| observer.lookup_max_concurrency | 64 | 1–256；最多同时保留这些请求的临时 token，每请求最多两个 HTTP 调用；不排队，超出立即 lookup_overloaded |
+| observer.lookup_timeout_ms | 200 | 1–2000 ms；每个请求的两侧并行等待；共享任务沿用首次发起的截止时间，加入者不延长任务 |
+| observer.lookup_max_concurrency | 64 | 1–256；最多同时接纳这些发起新远端任务的请求，每请求最多两个 HTTP 调用及一个临时 token；不排队。命中缓存、合并等待不占额度，未命中侧额度不足为 lookup_overloaded，符合条件时回退旧值 |
 | observer.service_lookup.max_requests_per_second / customer_lookup.max_requests_per_second | 1000 | 每接口独立令牌桶，容量与每秒速率相同；0 表示使用默认值，上限 100000；不足时 lookup_overloaded，不等待 |
 | HTTP 响应正文 / 响应头上限 | 各 8192 字节 | 正文超限为 lookup_invalid_response；HTTP 连接、TLS、鉴权和服务错误按第 4.8 节分类 |
 
 HTTP 客户端总超时为 2 秒；拨号（含 DNS 解析）和 TLS 握手另各设独立的 2 秒超时。请求仍按查询截止时间返回；Transport 在请求结束后继续执行的连接建立流程受上述阶段超时约束，失败连接关闭后释放每主机连接额度。阶段超时归类为 lookup_timeout。
 
-查询取得并发额度时开始计时，查询上下文独立于观察流取消及观察截止时间。观察取消或超时后停止处理观察数据，已接纳查询继续到两侧完成或原查询截止时间；截止时先收取已提交结果，仅未返回侧为 lookup_timeout。成功侧的 ID、名称和版本保留，两事件共用冻结快照，迟到结果不回写。底层任务真正退出后才释放查询额度，客户任务返回后清理其借用的 token；收尾不无限等待不响应取消的 resolver。所有退出路径仅定稿一次，ACK 失败不丢弃已校验的 End。查询成功不恢复观察完整性或有效统计资格。
+查询协调开始时设置请求级等待截止时间，查询上下文独立于观察流取消及观察截止时间。缓存命中直接返回，需要新远端任务时非阻塞申请并发额度；共享任务使用首次发起请求的截止时间，不被加入者延长。观察取消或超时后停止处理观察数据，已接纳查询继续到两侧完成或原查询截止时间；截止时先收取已提交结果，未返回侧按第 4.10 节复核旧值回退资格，无可用旧值时为 lookup_timeout。成功侧的 ID、名称和版本保留，两事件共用冻结快照，迟到结果不回写。底层任务真正退出后才释放查询额度，客户任务返回后清理其借用的 token；收尾不无限等待不响应取消的 resolver。所有退出路径仅定稿一次，ACK 失败不丢弃已校验的 End。查询成功不恢复观察完整性或有效统计资格。
 
-HTTP 不读取 ca_file；其 x-remote-data 和业务 api_key 的传输保护由部署链路提供。HTTPS 使用至少 TLS 1.2、系统 CA 及可选附加 CA，Observer 运行镜像包含系统 CA bundle，证书和主机名验证始终启用。两种协议均不使用环境代理、不跟随重定向、不自动重试；HTTPS 失败不自动降级到 HTTP。不记录完整请求/响应正文或凭据，responseMsg 仅按第 4.9 节脱敏记录；不保存 token 用于刷新，当前不实现正负缓存。第三方实际调用配额需在部署时据实调整，采集失败继续 fail-open；本地合成服务验证不等于真实第三方或生产 TLS 已验收。上述收尾保证限于 Observer 正常运行期间，不扩大进程退出、Kafka 投递或 Doris 可见性保证。
+HTTP 不读取 ca_file；其 x-remote-data 和业务 api_key 的传输保护由部署链路提供。HTTPS 使用至少 TLS 1.2、系统 CA 及可选附加 CA，Observer 运行镜像包含系统 CA bundle，证书和主机名验证始终启用。两种协议均不使用环境代理、不跟随重定向、不自动重试；HTTPS 失败不自动降级到 HTTP。不记录完整请求/响应正文或凭据，responseMsg 仅按第 4.9 节脱敏记录；不保存 token 用于刷新；成功结果缓存见第 4.10 节，不缓存失败结果。第三方实际调用配额需在部署时据实调整，采集失败继续 fail-open；本地合成服务验证不等于真实第三方或生产 TLS 已验收。上述收尾保证限于 Observer 正常运行期间，不扩大进程退出、Kafka 投递或 Doris 可见性保证。
 
 成功解析结果的版本摘要已加入唯一事件模型：mapping_version 为 `[规则版本, cluster_name, deployment_environment, request_host, service_id, provider_id]` 的规范 JSON SHA-256，customer_mapping_version 为 `[规则版本, cluster_name, deployment_environment, api_key_id, customer_id]` 的同类摘要。二者均为 64 字符小写十六进制，排除密钥原文及进程随机值；占位结果版本均为 null。测试成功结果可生成摘要，不能将其称为第三方目录发布版本。
 
@@ -286,6 +286,8 @@ service_name、provider_name、customer_name 均为查询时的展示名称，�
 
 ### 4.8 错误契约与 Observer 映射
 
+以下描述一次远端调用的原始分类。启用缓存时，瞬时故障可按第 4.10 节回退完整旧值，最终事件保持 mapped；认证或业务明确错误不能回退。
+
 服务和客户接口使用相同的数值字符串错误码。未查询到数据或查询出多条数据都使用 HTTP 200、responseCode="650013"；不再区分未登记与歧义，失败的 data 可以缺省或为 null：
 
 ```json
@@ -335,23 +337,63 @@ HTTP 适配器按以下规则分类；空 URI 占位仍直接返回 lookup_not_i
 - responseCode 必须为 JSON 字符串，数值 650013、100001 等不转换为字符串。HTTP 200 + responseCode="401" 也是未约定响应，不作为认证失败兼容格式。
 - 整个响应含外层包装共用 8192 字节正文上限；重复键、未知字段、非法编码、非法 JSON 均拒绝。responseMsg 不参与状态判断，但存在时必须是字符串。
 - 650013 同时表示零条和多条结果，不能根据该码或 responseMsg 推断“未登记”；统一为 lookup_invalid_response，不产生 unknown_host/unknown_api_key，也不任取一项归属。100001 是第三方返回的入参校验失败，按 lookup_unavailable 处理；本地非法 Host/token 仍在调用前分别产生 invalid_host/invalid_api_key，不发送对应请求。
-- HTTP 401 按访问故障处理。正文满足 application/json、大小和严格 JSON 校验，responseCode="401"、success=false 且 data 为 null 或缺省时，将其 responseMsg 按第 4.9 节记录；正文不符、读取失败或超限不改变 HTTP 401 的 lookup_unavailable 分类，不记录其中的动态字段。
+- HTTP 401/403 在响应头确认时同步通知协调器，在缓存锁内登记不可回退的 lookup_unavailable、撤销旧条目及同键尚未冻结的缓存候选。此确认优先于后续超时分类；诊断正文尚未结束也不能把旧归属以 mapped 写入事件。通知不提前释放查询额度或 token，不增加后台正文读取任务。
+- HTTP 401 的正文仍由原 worker 在原查询截止时间及 8192 字节上限内读取。正文满足 application/json、大小和严格 JSON 校验，responseCode="401"、success=false 且 data 为 null 或缺省时，将其 responseMsg 按第 4.9 节记录；正文不符、读取失败、超时或超限不改变已确认的 lookup_unavailable 分类，不记录其中的动态字段。HTTP 403 继续只记录固定 HTTP 诊断，不解析正文。
 - 查询自身超时或取消为 lookup_timeout；观察流取消仍按第 4.4 节等待原查询截止时间。连接/TLS 故障、实际 HTTP 403 和任意 HTTP 5xx 为 lookup_unavailable，不依赖其错误正文。
 - HTTP 400 + invalid_request、429 + rate_limited 保留原错误体匹配规则。旧 HTTP 404/409、普通 404 页面、其余状态与错误体不匹配或其他未约定响应（包括其他 2xx、3xx）为 lookup_invalid_response。
 - 本地预算不足为 lookup_overloaded；当前实现不排队、不自动重试。lookup_not_implemented 仅表示内部占位，HTTP 501 按 5xx 故障处理。
 
-两类查询独立保留成功结果。失败侧的 ID、名称和版本均为 null；成功结果的 mapping_version/customer_mapping_version 仍由 Observer 计算。两个事件共用冻结快照，不使用迟到结果重写历史事件。Kafka/Doris 保留原事件状态枚举，历史 unknown_host/unknown_api_key 仍可读取，但当前远端适配器不再根据错误码生成这两个状态。
+两类查询独立保留成功结果。无法从缓存或远端取得有效结果的一侧，其 ID、名称和版本均为 null；成功结果的 mapping_version/customer_mapping_version 仍由 Observer 计算。两个事件共用冻结快照，不使用迟到结果重写历史事件。Kafka/Doris 保留原事件状态枚举，历史 unknown_host/unknown_api_key 仍可读取，但当前远端适配器不再根据错误码生成这两个状态。
 
 ### 4.9 responseMsg 日志
 
-HTTP 适配器在每次查询及归属字段校验结束后，尝试将一条已脱敏、截断并序列化的日志非阻塞入队，由单个后台写入协程通过 Observer 现有标准错误日志输出带默认时间前缀的 JSON 记录：event=identity_lookup_response、level、lookup_type（service/customer）、http_status、responseCode、success、responseMsg、status。成功为 INFO/mapped，失败为 WARN 及固定映射状态；HTTP 尚无响应时省略 http_status。没有取得有效外层字段时仅记录固定诊断字段，不打印原始错误或正文。success 保留远端标志，status 表示本地最终分类；外层有效而 data 无效时，仍记录脱敏后的消息，最终状态为 lookup_invalid_response。
+HTTP 适配器在每次查询及归属字段校验结束后，尝试将一条已脱敏、截断并序列化的日志非阻塞入队，由单个后台写入协程通过 Observer 现有标准错误日志输出带默认时间前缀的 JSON 记录：event=identity_lookup_response、level、lookup_type（service/customer）、http_status、responseCode、success、responseMsg、status。成功为 INFO/mapped，失败为 WARN 及固定映射状态；HTTP 尚无响应时省略 http_status。没有取得有效外层字段时仅记录固定诊断字段，不打印原始错误或正文。success 保留远端标志，status 表示该次 HTTP 调用的本地分类，缓存回退后的事件状态另按第 4.10 节确定；外层有效而 data 无效时，仍记录脱敏后的消息，该次调用状态为 lookup_invalid_response。
 
-- 成功与业务失败均尝试记录 responseMsg；消息省略或为空时省略该日志字段，不影响归属结果。占位 resolver 不调用 HTTP 适配器，不产生此日志。
+- 仅实际 HTTP 调用尝试记录 responseMsg，缓存命中和旧值回退不重放历史消息；实际调用的成功与业务失败均尝试记录 responseMsg；消息省略或为空时省略该日志字段，不影响归属结果。占位 resolver 不调用 HTTP 适配器，不产生此日志。
+- 401 的归属失败先于诊断正文处理生效，但仍保留原预算内完成的合法 responseMsg。正文处理结束后仅入队一条日志；超时或不完整正文只记录固定状态，不能为了日志延长查询截止时间或另起读取任务。
 - 两类查询共用进程级队列，最多保留 256 条待写日志和 1 条正在写入的日志，只启动 1 个后台写入协程。stderr 或日志管道阻塞不阻塞 resolver 返回、token 清理或查询额度释放；队列满时直接丢弃新日志，通过 Observer /metrics 的 metering_lookup_logs_dropped_total 累计队列满丢失数，不向同一日志管道报告丢失。
 - 日志尽力交付，不重试、不按请求创建写入协程；进程退出不等待队列排空，未写日志可能丢失。队列仅保存处理后的日志文本及输出目标，不保留请求、响应对象、凭据、token 或捕获这些值的闭包。
 - responseMsg 与日志中的 responseCode 先替换当前调用的 x-remote-data 凭据和客户查询业务 token，替换标记为 [REDACTED]；重叠凭据优先匹配较长值，再按 UTF-8 边界截断到 1024 字节，最后转义换行及控制字符。转义后的日志文本长度可增加。
 - 日志不打印 URL、请求体、认证头、data 或完整响应，也不回显网络异常文本。消息只用于排障，不参与归属或业务授权。
 - responseCode、responseMsg、success、data 包装不进入 Kafka、Doris、映射版本或摘要；仅 data 内校验通过的 ID 和名称进入既有请求快照。
+
+### 4.10 归属结果缓存
+
+服务归属和客户归属分别使用 Observer 实例内的有界 LRU 成功缓存，重启后清空。缓存仅保存已完整校验的 ID、名称和有效期，不保存原始 API Key、请求/响应正文或 responseMsg；失败结果不进入缓存。两个接口可独立设置以下 cache 配置，省略字段采用默认值：
+
+```json
+{
+  "cache": {
+    "enabled": true,
+    "max_entries": 10000,
+    "ttl_seconds": 1800,
+    "stale_if_error_seconds": 900,
+    "stale_retry_interval_seconds": 5
+  }
+}
+```
+
+| 字段 | 约束与行为 |
+| --- | --- |
+| enabled | 默认 true；false 恢复该接口逐次查询，同时关闭查询合并及旧值回退 |
+| max_entries | 每接口 1–100000，默认 10000；达到容量按最近访问顺序淘汰 |
+| ttl_seconds | 1–86400 秒，默认 1800；从远端完整成功结果被接纳时计算，命中不续期 |
+| stale_if_error_seconds | 0–86400 秒，默认 900；TTL 到期后的额外宽限期，0 禁用旧值回退 |
+| stale_retry_interval_seconds | 1–300 秒，默认 5；瞬时失败后，同一旧条目在该间隔内不重复查询 |
+
+服务缓存键为规范 request_host、固定 cluster_name 和 deployment_environment 的完整组合。客户缓存键为原始、大小写敏感 API Key 的 HMAC-SHA256，使用该 Observer 启动时随机生成的进程内密钥；摘要仅作内部键，不进入日志、指标、Kafka 或 Doris。每个实例独立缓存与冷启动；配置和第三方凭据轮换后重启 Observer 生效。
+
+命中缓存先于远端并发额度和速率限制。同一缓存键的并发未命中只发起一次远端调用，其余请求共享结果且不保留自己的原始 token；缓存关闭时不合并。不同键的新任务继续受 lookup_max_concurrency 限制，不增加等待队列。部分命中时，另一侧过载不清除已知结果。发起任务的并发额度保留至实际 worker 退出，不响应取消的 resolver 不能通过超时绕过额度；不在持有缓存锁时调用 HTTP、日志输出或健康回调。
+
+TTL 过期后的首次请求等待刷新，成功后原子替换完整归属并重置 TTL。只有网络/连接故障、超时、HTTP 5xx、符合第 4.8 节契约的 429、以及本地并发/速率额度不足，允许回退宽限期内的旧值。HTTP 401/403、业务码 100001/650013、非法响应及其他非瞬时错误立即作废旧条目，按既有状态返回；lookup_unavailable 内部区分故障来源，不能仅按该公共状态决定回退。后续瞬时故障不能恢复已作废的条目。
+
+401/403 的作废动作发生在响应头确认后、读取诊断正文前。查询保存固定的已确认失败，缓存键对应的未定稿候选共用可撤销状态；即使条目已过期或被 LRU 淘汰，已取出的旧副本仍须在冻结时复核该状态。同键并发共享者、重查间隔内命中和新鲜候选都不能越过已确认的失败。撤销状态只随活动查询/候选存活，定稿时释放，不形成持久负缓存；查询真正退出后允许新请求重新查询，新的完整成功结果可正常缓存。失败计数对同次查询只增加一次，已冻结事件不追溯改写。
+
+瞬时失败后，旧条目在重查间隔内直接返回；间隔结束后由下一次业务观察触发刷新。不存在定时刷新或保存 token 后台重试。宽限期以最后一次成功查询计算，失败、命中和重查均不延长，默认最多沿用至成功后的 45 分钟。截止时先处理已发布结果，再复核尚未完成侧的缓存资格和硬截止时间，避免超时竞态丢失旧值或使用已作废条目。迟到成功不写缓存；迟到的明确错误仍可作废旧条目，但不改写已冻结事件。
+
+命中或回退均使用既有 mapped、known 状态及完整 ID/名称，映射版本仍只按既有 ID 元组计算。名称和归属变更在缓存刷新后作用于新请求，历史 Kafka/Doris 事件不回源补写。默认正常情况下最多约 30 分钟反映变更，持续瞬时故障时最多约 45 分钟；容量淘汰或重启可能提前刷新。HTTP 响应包装和缓存来源不新增到事件契约。
+
+/metrics 提供 metering_lookup_cache_service_*、metering_lookup_cache_customer_*：hits_total（新鲜命中）、misses_total（新鲜缓存未命中，含合并与宽限期命中）、shared_waits_total、stale_used_total、refresh_failures_total（填充/刷新或本地准入失败次数）、evictions_total（容量淘汰）及 entries（实际保存条目数，过期惰性清理）。指标只用两种固定查询类型，不包含 Host、token 或摘要。日志仍仅由实际 HTTP 调用产生，即使最终回退旧值也记录实际查询故障；日志交付保持有界、非阻塞。
 
 ## 5. 协议、事件与语义
 

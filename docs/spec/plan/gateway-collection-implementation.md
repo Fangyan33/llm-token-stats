@@ -59,4 +59,4 @@ Observer 新增可选固定文件下载服务，Wasm 随 Observer 镜像发布�
 
 ## 2026-10-16 Host 与 API Key 归属映射增量计划
 
-当前归属接口已实现并以未实现占位运行：Wasm 临时发送入口 authority 与 Authorization: Bearer token，Observer 固定集群/环境并调用服务/客户 resolver；合法输入的四项 ID 和版本为 null，两类状态为 lookup_not_implemented，原始 usage 保留，identity_status=invalid、usage_eligible=false。真实 HTTP、第三方鉴权和网络缓存未实现；应用维度及 PG 归属读取均已删除。 详见[归属接口计划](host-service-provider-implementation.md)，前面历史记录不作为旧模型兼容要求。
+当前归属接口已实现并以未实现占位运行：Wasm 临时发送入口 authority 与 Authorization: Bearer token，Observer 固定集群/环境并调用服务/客户 resolver；合法输入的四项 ID 和版本为 null，两类状态为 lookup_not_implemented，原始 usage 保留，identity_status=invalid、usage_eligible=false。HTTP/HTTPS、x-remote-data 认证及实例内成功结果缓存已实现；配置 URI 为空时继续占位，真实第三方联调须在部署环境验收；应用维度及 PG 归属读取均已删除。 详见[归属接口计划](host-service-provider-implementation.md)，前面历史记录不作为旧模型兼容要求。

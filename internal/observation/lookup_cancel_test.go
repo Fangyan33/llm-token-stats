@@ -19,7 +19,15 @@ import (
 )
 
 func lookupServer(k *sink) *Server {
-	return &Server{Cfg: config.Observer{ProducerID: "test", ClusterName: "cluster", DeploymentEnvironment: "dev", MaxActive: 4, ParserBudget: 64 << 20, MaxObservationMS: 5000, LookupTimeoutMS: 150, LookupConcurrency: 1, AcceptedConfigs: []string{"v1"}, AcceptedAdapters: []string{"chat_completions_v1"}}, Sink: k, Health: &health.State{}, ServiceResolver: serviceFake{}, CustomerResolver: customerFake{}}
+	s := &Server{Cfg: config.Observer{ProducerID: "test", ClusterName: "cluster", DeploymentEnvironment: "dev", MaxActive: 4, ParserBudget: 64 << 20, MaxObservationMS: 5000, LookupTimeoutMS: 150, LookupConcurrency: 1, AcceptedConfigs: []string{"v1"}, AcceptedAdapters: []string{"chat_completions_v1"}}, Sink: k, Health: &health.State{}, ServiceResolver: serviceFake{}, CustomerResolver: customerFake{}}
+	disableLookupCache(s)
+	return s
+}
+
+func disableLookupCache(s *Server) {
+	disabled := false
+	s.Cfg.ServiceLookup.Cache.Enabled = &disabled
+	s.Cfg.CustomerLookup.Cache.Enabled = &disabled
 }
 
 func lookupStart() *pb.Start {

@@ -31,13 +31,27 @@
       "uri": "",
       "credential_env": "METERING_SERVICE_LOOKUP_TOKEN",
       "ca_file": "",
-      "max_requests_per_second": 1000
+      "max_requests_per_second": 1000,
+      "cache": {
+        "enabled": true,
+        "max_entries": 10000,
+        "ttl_seconds": 1800,
+        "stale_if_error_seconds": 900,
+        "stale_retry_interval_seconds": 5
+      }
     },
     "customer_lookup": {
       "uri": "",
       "credential_env": "METERING_CUSTOMER_LOOKUP_TOKEN",
       "ca_file": "",
-      "max_requests_per_second": 1000
+      "max_requests_per_second": 1000,
+      "cache": {
+        "enabled": true,
+        "max_entries": 10000,
+        "ttl_seconds": 1800,
+        "stale_if_error_seconds": 900,
+        "stale_retry_interval_seconds": 5
+      }
     },
     "lookup_timeout_ms": 200,
     "lookup_max_concurrency": 64

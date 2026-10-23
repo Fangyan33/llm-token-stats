@@ -182,6 +182,12 @@ class CollectionContractsTest(unittest.TestCase):
                                     ('deploy/local/consumer.json', 'consumer'),
                                     ('configs/consumer.production.example.json', 'consumer')]:
             settings = contracts.load(ROOT / filename)[component]
+            if component == 'observer':
+                for kind in ('service_lookup', 'customer_lookup'):
+                    self.assertEqual(settings[kind]['cache'], {
+                        'enabled': True, 'max_entries': 10000, 'ttl_seconds': 1800,
+                        'stale_if_error_seconds': 900, 'stale_retry_interval_seconds': 5,
+                    })
             self.assertNotIn('accepted_request_hosts', settings)
             self.assertNotIn('accepted_service_ids', settings)
             self.assertNotIn('accepted_routes', settings)

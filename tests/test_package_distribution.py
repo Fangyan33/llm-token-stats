@@ -79,6 +79,9 @@ class DistributionTests(unittest.TestCase):
         self.assertEqual(observer['kafka'], {'bootstrap_servers': ['kafka.isolated.svc.cluster.local:9092'],
                                             'topic': 'offline-events'})
         self.assertEqual(observer['observer']['deployment_environment'], 'dev')
+        source = json.loads((bundle.ROOT / 'configs/observer.production.example.json').read_text())
+        for kind in ('service_lookup', 'customer_lookup'):
+            self.assertEqual(observer['observer'][kind]['cache'], source['observer'][kind]['cache'])
         for settings in (observer['observer'], consumer['consumer']):
             self.assertNotIn('accepted_service_ids', settings)
             self.assertNotIn('accepted_request_hosts', settings)

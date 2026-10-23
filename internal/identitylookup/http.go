@@ -137,11 +137,22 @@ func (r *remote) post(ctx context.Context, input, output any, record *responseRe
 		if errors.As(err, &timeout) && timeout.Timeout() {
 			return failure("lookup_timeout")
 		}
-		return failure("lookup_unavailable")
+		return transientFailure("lookup_unavailable")
 	}
 	defer res.Body.Close()
 	record.HTTPStatus = res.StatusCode
-	if res.StatusCode == 403 || res.StatusCode >= 500 {
+	if res.StatusCode == http.StatusUnauthorized || res.StatusCode == http.StatusForbidden {
+		// Authentication is known from headers. Reading a slow diagnostic body
+		// must not let the coordinator reinterpret it as a transient timeout.
+		reportFailure(ctx, failure("lookup_unavailable"))
+	}
+	if res.StatusCode >= 500 {
+		if res.StatusCode < 600 {
+			return transientFailure("lookup_unavailable")
+		}
+		return failure("lookup_unavailable")
+	}
+	if res.StatusCode == 403 {
 		return failure("lookup_unavailable")
 	}
 	raw, err := io.ReadAll(io.LimitReader(res.Body, maxResponseBytes+1))
@@ -167,7 +178,7 @@ func (r *remote) post(ctx context.Context, input, output any, record *responseRe
 		if errors.As(err, &timeout) && timeout.Timeout() {
 			return failure("lookup_timeout")
 		}
-		return failure("lookup_unavailable")
+		return transientFailure("lookup_unavailable")
 	}
 	if mediaErr != nil || kind != "application/json" || len(raw) > maxResponseBytes {
 		return failure("lookup_invalid_response")

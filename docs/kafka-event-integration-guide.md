@@ -4,9 +4,13 @@
 
 本页描述唯一有效事件模型：应用维度已删除，归属由 Observer 的服务/客户接口解析。两个归属接口支持配置 HTTP/HTTPS POST JSON 调用及 x-remote-data 认证；URI 为空时使用未实现占位。Observer 固定 prd/stg/dev 环境，在有界异步任务中取得 ID 和名称快照；service_name、provider_name、customer_name 经 Kafka 写入 Doris 独立列及 event_json。占位或失败侧的 ID、名称和版本为 null，不回源补写历史；原始 usage 保留，业务 token 不进入事件、数据库或日志。
 
+Observer 默认对两个接口分别缓存完整成功结果 30 分钟；仅瞬时故障时额外沿用旧值最多 15 分钟，每条目失败后 5 秒内不重查。认证失败、业务码 100001/650013 或非法响应作废旧值。缓存命中及旧值回退沿用 mapped 和完整 ID/名称，事件字段不变；缓存来源通过 Observer 指标观察。名称是本次观察使用的归属快照，可能来自缓存，默认变更延迟最多约 30 分钟，持续瞬时故障时最多约 45 分钟；不保证是第三方此刻的最新值，也不改写历史。配置及边界见[归属结果缓存](spec/plan/host-service-provider-implementation.md#410-归属结果缓存)。
+
 当前[归属接口契约](spec/plan/host-service-provider-implementation.md#48-错误契约与-observer-映射)中，HTTP 200 + `responseCode="650013"` 同时表示零条或多条结果，统一映射为 `lookup_invalid_response`；HTTP 200 + `responseCode="100001"` 及 HTTP 401 认证失败映射为 `lookup_unavailable`。当前远端适配器不再从错误码产生 `unknown_host` / `unknown_api_key`，历史事件枚举仍保留。响应包装字段不进入 Kafka，消费者继续读取两类固定映射状态及冻结的 ID、名称快照。
 
-观察取消、超时或 ACK 失败时，已接纳的归属查询继续到完成或原查询截止时间，保留成功侧的 ID、名称及版本，仅未返回侧标为 lookup_timeout。开始事件与结果事件共用冻结快照，迟到结果不回写；归属成功不恢复观察完整性或有效统计资格。该规则限于 Observer 正常运行期间，不保证事件必然投递到 Kafka。
+观察取消、超时或 ACK 失败时，已接纳的归属查询继续到完成或原查询截止时间，保留成功侧的 ID、名称及版本，未返回侧复核旧缓存回退资格，无法回退时标为 lookup_timeout。开始事件与结果事件共用冻结快照，迟到结果不回写；归属成功不恢复观察完整性或有效统计资格。该规则限于 Observer 正常运行期间，不保证事件必然投递到 Kafka。
+
+归属查询在定稿前已确认 HTTP 401/403 响应头时，该侧保持 `lookup_unavailable`，ID、名称和版本为 null；诊断正文读取超时不能覆盖认证失败或恢复旧归属的 `mapped`。此规则同样作用于同键尚未冻结的缓存候选，已冻结事件不追溯改写，另一侧成功归属继续保留。
 
 正式字段契约见 [事件 Schema](../api/events/v1/metering-event.schema.json)，合成事件见 [testdata/collection](../testdata/collection)。运行时还须执行 UTF-8 字节、状态关系、来源与 Kafka key 校验；[离线校验器](../scripts/validate_collection_contracts.py)提供可复现参考。Doris Consumer 的写入/冲突/dirty/提交恢复顺序见[闭环清单](gateway-collection-design-closure.md#5-consumer-提交与恢复屏障)。
 

@@ -22,10 +22,47 @@ type Kafka struct {
 	PasswordEnv string   `json:"password_env"`
 }
 type Lookup struct {
-	URI           string `json:"uri"`
-	CredentialEnv string `json:"credential_env"`
-	CAFile        string `json:"ca_file"`
-	MaxRPS        int    `json:"max_requests_per_second"`
+	URI           string      `json:"uri"`
+	CredentialEnv string      `json:"credential_env"`
+	CAFile        string      `json:"ca_file"`
+	MaxRPS        int         `json:"max_requests_per_second"`
+	Cache         LookupCache `json:"cache"`
+}
+
+// Pointers distinguish omitted defaults from explicit false and zero values.
+type LookupCache struct {
+	Enabled                   *bool `json:"enabled,omitempty"`
+	MaxEntries                *int  `json:"max_entries,omitempty"`
+	TTLSeconds                *int  `json:"ttl_seconds,omitempty"`
+	StaleIfErrorSeconds       *int  `json:"stale_if_error_seconds,omitempty"`
+	StaleRetryIntervalSeconds *int  `json:"stale_retry_interval_seconds,omitempty"`
+}
+
+type LookupCacheSettings struct {
+	Enabled       bool
+	MaxEntries    int
+	TTL           time.Duration
+	StaleIfError  time.Duration
+	RetryInterval time.Duration
+}
+
+func (c LookupCache) Settings() (LookupCacheSettings, error) {
+	value := func(p *int, fallback int) int {
+		if p != nil {
+			return *p
+		}
+		return fallback
+	}
+	entries, ttl := value(c.MaxEntries, 10000), value(c.TTLSeconds, 1800)
+	stale, retry := value(c.StaleIfErrorSeconds, 900), value(c.StaleRetryIntervalSeconds, 5)
+	if entries < 1 || entries > 100000 || ttl < 1 || ttl > 86400 || stale < 0 || stale > 86400 || retry < 1 || retry > 300 {
+		return LookupCacheSettings{}, fmt.Errorf("config_lookup_cache")
+	}
+	return LookupCacheSettings{
+		Enabled:    c.Enabled == nil || *c.Enabled,
+		MaxEntries: entries, TTL: time.Duration(ttl) * time.Second,
+		StaleIfError: time.Duration(stale) * time.Second, RetryInterval: time.Duration(retry) * time.Second,
+	}, nil
 }
 
 type Observer struct {
@@ -112,6 +149,9 @@ func (c *Config) ObserverDefaults() error {
 		return fmt.Errorf("config_lookup")
 	}
 	for _, lookup := range []Lookup{c.Observer.ServiceLookup, c.Observer.CustomerLookup} {
+		if _, err := lookup.Cache.Settings(); err != nil {
+			return err
+		}
 		if lookup.MaxRPS < 0 || lookup.MaxRPS > 100000 {
 			return fmt.Errorf("config_lookup")
 		}

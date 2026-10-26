@@ -240,12 +240,12 @@ class CollectionContractsTest(unittest.TestCase):
             with self.subTest(field=name):
                 self.assert_config_invalid(lambda c: c.update({name: value}))
 
-    def test_release_rejects_placeholder(self):
-        with self.assertRaises(contracts.ContractError):
-            contracts.validate_config(self.config, release=True)
+    def test_gateway_identity_cannot_be_configured(self):
+        contracts.validate_config(self.config, release=True)
         config = copy.deepcopy(self.config)
-        config["gateway_instance_id"] = "58c2a12d-5467-4eb5-bc56-29bd7e271dd0"
-        contracts.validate_config(config, release=True)
+        config['gateway_instance_id'] = 'shared-or-stale-id'
+        with self.assertRaises(contracts.ContractError):
+            contracts.validate_config(config, release=True)
 
     def test_mapping_null_pairs_and_secret_rejection(self):
         for field in ('api_key','application_id'):

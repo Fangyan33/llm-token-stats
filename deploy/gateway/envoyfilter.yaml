@@ -2,16 +2,15 @@
 # Auth must already be installed before this filter; verify config_dump order.
 apiVersion: networking.istio.io/v1alpha3
 kind: EnvoyFilter
-metadata: {name: gateway-observer, namespace: REPLACE_GATEWAY_NAMESPACE}
+metadata: {name: REPLACE_ENVOYFILTER_NAME, namespace: REPLACE_GATEWAY_NAMESPACE}
 spec:
-  workloadSelector: {labels: {istio: ingressgateway}}
+  workloadSelector: {labels: REPLACE_GATEWAY_LABELS}
   configPatches:
     - applyTo: HTTP_FILTER
       match:
         context: GATEWAY
         proxy:
           metadata:
-            NAME: REPLACE_GATEWAY_POD_NAME
             NAMESPACE: REPLACE_GATEWAY_NAMESPACE
         listener:
           filterChain:

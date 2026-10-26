@@ -62,7 +62,7 @@ UUIDv4 不包含时间。`request_started_at_ms` 仍由网关观察并作为事�
 | `observation_id` | 字符串 / 否 | 一期与 `logical_request_id` 相同，表示本次观察。 |
 | `observation_scope` | 字符串 / 否 | 当前固定为 `gateway_response`，表示网关可见的一次逻辑响应，并非所有上游尝试。 |
 | `producer_id` | 字符串 / 否 | 生成事件的 Observer 实例标识。 |
-| `gateway_instance_id` | 字符串 / 否 | 观察该请求的网关实例标识。 |
+| `gateway_instance_id` | 字符串 / 否 | 观察该请求的网关实例标识，新版为运行时 `namespace/pod-name`；同名 Pod 重建后不变，历史事件可为 Pod UID。 |
 | `config_version` | 字符串 / 否 | 请求开始时冻结的采集配置版本，用于解释当时的采集规则。非空合法 UTF-8，最多 128 字节，需在 Observer 和 Consumer 的 `accepted_config_versions` 中登记；当前配置示例使用 `collection-v1`。 |
 | `adapter_id` | 字符串 / 否 | 解析上游协议的适配器 ID；当前接入范围固定为 `chat_completions_v1`。 |
 | `route_name` | 字符串 / 否 | 真实 Envoy HTTP 路由名；不可读时为 `unknown`。仅用于诊断、审计，不参与身份一致性、准入或价格选择；不是 VirtualService 名称或后端 ID。字段保留非空字符串，业务上可缺失；当前网关不输出 `*`，Consumer 不按诊断值判断身份。事件不携带原始 URL 或 query。 |
@@ -144,7 +144,7 @@ UUIDv4 不包含时间。`request_started_at_ms` 仍由网关观察并作为事�
   "observation_id": "7f6c2a90-4b13-4b68-9d21-67283e0c5f44",
   "observation_scope": "gateway_response",
   "producer_id": "observer-pod-uid",
-  "gateway_instance_id": "gateway-pod-uid",
+  "gateway_instance_id": "istio-system/gateway-example",
   "config_version": "collection-v1",
   "adapter_id": "chat_completions_v1",
   "route_name": "llm-chat",

@@ -92,7 +92,7 @@ make package PACKAGE_DIR=dist/package-with-dependencies \
 
 两种模式都保留 Kafka / Doris 的单节点部署 YAML、初始化 Job 和全部配置。默认包部署前，目标节点需能拉取 Kafka / Doris 镜像，或已预先导入对应镜像；Istio 继续复用已有网关。`manifest.json` 的 `images` 记录全部镜像引用，`archived_images` 记录实际归档内容，`external_images` 记录需要目标环境准备的镜像。
 
-省略 `--accepted-request-host` 时，打包默认写入 `accepted_request_hosts: ["*"]`，匹配全部合法 DNS Host。显式提供参数时完整覆盖默认值，多个域名或模式重复传参，支持精确域名、`*.company.com`（任意层级子域名，不含根域名）和 `*`；通配符需加引号，避免被 Shell 展开。脚本在查询目标集群、构建或导出镜像前校验并规范化名单，拒绝显式空名单、非法项、重复项、超限及非 ASCII 字符。规范化后的名单写入每个 Pod 的关闭态/启用态 EnvoyFilter、`manifest.json` 和包内 README。
+省略 `--accepted-request-host` 时，打包默认写入 `accepted_request_hosts: ["*"]`，匹配全部合法 DNS Host。显式提供参数时完整覆盖默认值，多个域名或模式重复传参，支持精确域名、`*.company.com`（任意层级子域名，不含根域名）和 `*`；通配符需加引号，避免被 Shell 展开。脚本在构建或导出镜像前校验并规范化名单，拒绝显式空名单、非法项、重复项、超限及非 ASCII 字符。规范化后的名单写入工作负载的关闭态/启用态 EnvoyFilter、`manifest.json` 和包内 README。
 
 镜像构建使用本仓库 Kubernetes 测试所用的 host 网络，并传入代理环境变量；需要切换网络时可指定 `--build-network default`。服务镜像版本取自当前 Git tag / commit hash，Wasm 随 Observer 镜像分发。包内还包含镜像 ID、Wasm 摘要和全包文件校验和。输出目录非空时，打包脚本会拒绝覆盖，可通过 `PACKAGE_DIR` 指定新目录。
 
@@ -102,9 +102,9 @@ make package PACKAGE_DIR=dist/package-with-dependencies \
 
 Kafka 默认使用 24 分区、单副本，数据保留 72 小时。存储默认使用集群 StorageClass，可通过 `--storage-class` 和 `--kafka-storage`、`--doris-fe-storage`、`--doris-be-storage` 调整。分发配置使用明文 Kafka、Doris root 空密码和 `dev` 环境标识，适用于受控开发环境。生产环境的独立基础设施和认证配置见下文。
 
-部署复用目标集群已有的 Istio 和网关。打包时，脚本默认只读查询当前 kubectl context 中 `istio-system` 下带 `istio=ingressgateway` 标签的实际 Pod；可通过 `--context`、`--gateway-namespace` 指定目标。打包机器无法访问目标集群时，使用 `PACKAGE_ARGS='--accepted-request-host api.company.com --gateway-pod 实际Pod名=实际PodUID'` 提供目标 Pod，多个 Pod 需重复传参。
+部署复用目标集群已有的 Istio 和网关。打包不访问 Kubernetes，也不读取当前 context，不绑定 Pod 名称、UID 或副本数。通过 `--gateway-namespace` 和可重复的 `--gateway-label KEY=VALUE` 指定目标工作负载，默认 `istio-system`、`istio=ingressgateway`；显式标签替换默认选择器，多个标签同时匹配。无需更改已有网关 Pod 模板。
 
-包根目录的 `envoyfilter.yaml` 汇总全部目标 Pod 的关闭态 EnvoyFilter；`gateway/disabled/`、`gateway/enabled/` 继续按 Pod 提供关闭态、启用态的完整清单。汇总文件与 `gateway/disabled/` 内容相同，选择一个入口即可。先部署 `k8s/` 中的采集组件，等待 Observer 就绪后，再单独应用 EnvoyFilter。网关必须带有 `istio=ingressgateway` 标签，Pod 重建或扩容后需要重新打包。输出 YAML 不含 `REPLACE_*` 或 `RENDER_*`，部署时无需再次替换或渲染。
+包根目录的 `envoyfilter.yaml` 提供关闭态 EnvoyFilter；`gateway/disabled/envoyfilter.yaml`、`gateway/enabled/envoyfilter.yaml` 提供同一工作负载的两种状态。根文件与 disabled 文件相同，选择一个入口即可。先部署 `k8s/` 中的采集组件，等待 Observer 就绪后再应用 EnvoyFilter。扩容后的匹配副本自动获得插件，无需重新打包。输出 YAML 不含待替换字段，可直接 apply。
 
 分发后进入包目录执行：
 
@@ -136,24 +136,17 @@ kubectl apply -f gateway/enabled/
 
 Release 默认仅携带 Observer / Consumer 镜像和嵌入的 Wasm，保留 Kafka / Doris 部署 YAML，不携带 Kafka、Doris、Istio proxyv2 镜像。目标环境需能拉取或预先导入依赖镜像。
 
-GitHub Runner 无需访问目标 Kubernetes 集群，但必须提供目标网关的真实身份；业务域名参数可按需限定，省略时匹配全部合法 DNS Host。在仓库 Settings → Secrets and variables → Actions → Variables 配置以下 Repository variables：
+GitHub Runner 无需访问目标 Kubernetes 集群，也不需要 Pod 身份；业务域名参数可按需限定，省略时匹配全部合法 DNS Host。在仓库 Settings → Secrets and variables → Actions → Variables 配置以下 Repository variables：
 
 | Variable | 格式与用途 |
 | --- | --- |
 | `RELEASE_ACCEPTED_REQUEST_HOSTS` | 可选，业务 Host 的 JSON 字符串数组，如 `["api.company.com", "*.company.com"]`；未配置时默认 `["*"]` |
-| `RELEASE_GATEWAY_PODS` | 必填，实际 `NAME=UID` 的 JSON 字符串数组，覆盖需要安装插件的全部网关 Pod |
+| `RELEASE_GATEWAY_LABELS` | 可选，网关标签的 JSON 字符串数组，如 `["app=ai-gateway"]`；默认 `["istio=ingressgateway"]` |
 | `RELEASE_NAMESPACE` | 可选，采集命名空间，默认 `metering` |
 | `RELEASE_GATEWAY_NAMESPACE` | 可选，网关命名空间，默认 `istio-system` |
 | `RELEASE_STORAGE_CLASS` | 可选，StorageClass 名称；未配置时使用目标集群默认值 |
 
-在能够访问目标集群的机器上获取网关身份，将输出的完整 JSON 数组保存为 `RELEASE_GATEWAY_PODS`：
-
-```sh
-kubectl -n istio-system get pods -l istio=ingressgateway -o json |
-  python3 -c 'import json,sys; print(json.dumps([p["metadata"]["name"]+"="+p["metadata"]["uid"] for p in json.load(sys.stdin)["items"] if not p["metadata"].get("deletionTimestamp")]))'
-```
-
-修改网关命名空间时同步调整查询命令和 Variable。网关 Pod 重建、扩容或更换目标集群后，更新 Variable 并用新 tag 重新发布；旧包仍只匹配原 Pod。
+网关扩容或 Pod 重建不需要修改发布参数；命名空间和标签需与目标部署约定一致。
 
 将工作流和脚本提交到 GitHub 后，基于包含这些文件的提交创建并推送 tag：
 
@@ -162,7 +155,7 @@ git tag v0.1.0
 git push origin v0.1.0
 ```
 
-待发布 tag 必须包含发布工作流和脚本。发布参数从上述 Repository variables 读取，未设置的可选参数使用表中默认值；域名、Pod 身份和命名空间都按现有打包契约校验。
+待发布 tag 必须包含发布工作流和脚本。发布参数从上述 Repository variables 读取，未设置的可选参数使用表中默认值；域名、工作负载标签和命名空间都按现有打包契约校验。
 
 成功后，在仓库 Releases 对应版本的 Assets 下载 `llm-token-stats-<tag>-linux-amd64.tgz`、`SHA256SUMS`、`manifest.json` 和 `DOWNLOAD.md`。解压后，关闭态 EnvoyFilter 汇总文件位于 `package/envoyfilter.yaml`，启用态清单位于 `package/gateway/enabled/`。GitHub Release 单个附件必须小于 2 GiB；压缩包超过 1900 MiB 时，工作流上传 `.tgz.part000`、`.tgz.part001` 等分卷。下载全部附件到同一空目录，按该 Release 的说明校验、合并和解压，再执行包内 `package/README.md` 中的部署命令。[附件大小限制](https://docs.github.com/en/repositories/releasing-projects-on-github/about-releases#storage-and-bandwidth-quotas)
 
@@ -439,7 +432,7 @@ kubectl -n metering get pods,svc
 
 配置或 Secret 更新后，使用 `kubectl rollout restart deployment/对应名称 -n metering` 重启服务。升级配置版本时，先让 Observer 同时接受新旧版本，再更新网关；Consumer 需保留在线数据窗口内的历史注册信息。
 
-### 5. 核对下载服务并按 Pod 渲染 Wasm 配置
+### 5. 核对下载服务并按工作负载渲染 Wasm 配置
 
 确认所有 Observer 副本都已使用目标镜像，且下载内容与发布产物的摘要一致后，再通过现有 Istio 发布配置准备独立灰度网关。保留已有网关的镜像、服务、端口、路由、鉴权与网格设置。以下假设灰度网关的 Deployment 名为 `istio-ingressgateway-canary`，请按实际名称替换：
 
@@ -450,23 +443,23 @@ kubectl -n istio-system get pods -l istio=ingressgateway -o wide
 
 # 从上述 Deployment 选取一个实际 Pod，替换名称。
 export GATEWAY_POD=替换为灰度网关Pod名
-export GATEWAY_POD_UID="$(kubectl -n istio-system get pod "$GATEWAY_POD" -o jsonpath='{.metadata.uid}')"
 
 python3 scripts/render_gateway_filter.py \
   --config "$DEPLOY_DIR/gateway-observer.json" \
   --wasm-file dist/gateway-observer-v1.wasm \
   --wasm-url http://metering-observer.metering.svc.cluster.local:9093/wasm/gateway-observer-v1.wasm \
   --wasm-cluster 'outbound|9093||metering-observer.metering.svc.cluster.local' \
-  --gateway-pod-name "$GATEWAY_POD" \
+  --gateway-label app=istio-ingressgateway-canary \
   --gateway-namespace istio-system \
-  --gateway-pod-uid "$GATEWAY_POD_UID" \
-  --output "$DEPLOY_DIR/envoyfilter.$GATEWAY_POD_UID.disabled.yaml"
-kubectl apply -f "$DEPLOY_DIR/envoyfilter.$GATEWAY_POD_UID.disabled.yaml"
+  --output "$DEPLOY_DIR/envoyfilter.disabled.yaml"
+kubectl apply -f "$DEPLOY_DIR/envoyfilter.disabled.yaml"
 ```
 
-渲染器验证 Wasm 配置和产物文件头后，计算文件 SHA-256，写入实际 Pod UID，并生成唯一的 EnvoyFilter 名称。过滤器通过代理启动时的 `metadata.NAME/NAMESPACE` 精确匹配目标 Pod；`--gateway-pod-name` 必填，`--gateway-namespace` 默认为 `istio-system`。
+渲染器验证配置和 Wasm 产物，计算文件 SHA-256，根据排序后的工作负载标签生成稳定的 `gateway-observer-<摘要>` 名称。同一选择器的启用态、关闭态与版本更新使用同一资源，不同选择器使用独立资源。过滤器保留代理 `metadata.NAMESPACE` 匹配，即使资源位于 Istio 根配置命名空间，也只作用于目标命名空间；上例的 `app=istio-ingressgateway-canary` 必须替换为已有灰度工作负载的实际启动标签。
 
-请先渲染 [EnvoyFilter 模板](deploy/gateway/envoyfilter.yaml) 再发布，不要直接 apply 模板，也不要让整个 Deployment 共用一个实例 ID。Istio 1.13 的代理标签取自启动快照，Pod 启动后补加 UID 标签无法可靠匹配 EnvoyFilter，无需再添加 `metering-instance` 标签。
+`gateway_instance_id` 由 Wasm 在插件启动时读取 Envoy 的 `node.metadata.NAMESPACE` 和 `node.metadata.NAME`，组合为 `namespace/pod-name`；配置 JSON 不再接受此字段。Istio 1.13.5 默认提供这两项元数据，无需修改网关 Pod 模板。多个副本共享同一 EnvoyFilter，各自读取实例名称，扩容或重建后无需重新渲染。标识不包含 Pod UID，同名 Pod 重建后标识不变；跨集群分析需结合 `cluster_name`。身份缺失、非法或组合后超过现有协议的 128 字节上限时停止该插件采集，增加 `metering_gateway_identity_unavailable_total`，业务继续放行；不截断名称、不回退到固定值，也不读取客户端请求头。
+
+请先渲染 [EnvoyFilter 模板](deploy/gateway/envoyfilter.yaml) 再发布，不要直接 apply 仓库模板；分发包中的 YAML 已完成渲染。
 
 当前仅采集 `POST /v1/chat/completions`，不限制 VirtualService、HTTP 路由名或域名。入口使用以下规则，`route_name: "*"` 接受任意路由名及路由名不可读的情况，无需配置路由 metadata：
 
@@ -507,11 +500,11 @@ python3 scripts/render_gateway_filter.py \
   --wasm-file dist/gateway-observer-v1.wasm \
   --wasm-url http://metering-observer.metering.svc.cluster.local:9093/wasm/gateway-observer-v1.wasm \
   --wasm-cluster 'outbound|9093||metering-observer.metering.svc.cluster.local' \
-  --gateway-pod-name "$GATEWAY_POD" \
+  --gateway-label app=istio-ingressgateway-canary \
   --gateway-namespace istio-system \
-  --gateway-pod-uid "$GATEWAY_POD_UID" --enable \
-  --output "$DEPLOY_DIR/envoyfilter.$GATEWAY_POD_UID.enabled.yaml"
-kubectl apply -f "$DEPLOY_DIR/envoyfilter.$GATEWAY_POD_UID.enabled.yaml"
+  --enable \
+  --output "$DEPLOY_DIR/envoyfilter.enabled.yaml"
+kubectl apply -f "$DEPLOY_DIR/envoyfilter.enabled.yaml"
 ```
 
 通过灰度入口发送已授权的 JSON / SSE 测试请求，检查业务响应、Observer / Consumer 的 `/metrics`、Kafka group lag，以及 Doris 中对应的 `events_raw`、`requests` 和 `consumer_batch_receipts`。
@@ -522,17 +515,17 @@ Consumer 按分区攒批，默认达到 5000 条、4 MiB 或等待 15 秒时写�
 
 Observer 只提供当前镜像内的一个 Wasm 版本。升级时，先发布 Observer，等待所有副本的下载摘要一致，再更新网关的 URL 和摘要配置。滚动升级期间，按旧摘要下载可能失败，采集允许暂时缺失；已加载的插件可以继续运行，但旧网关重启后不保证还能下载到旧文件。
 
-下载服务恢复后，需要触发插件重新安装或重启网关，并按实际 Pod UID 重新渲染配置。原样重复 apply 同一配置不一定触发下载，不能依赖它自动恢复。版本回退时，先恢复对应的 Observer 镜像，再恢复对应的网关配置。
+下载服务恢复后，需要触发插件重新安装或重启网关，并核对其工作负载仍匹配过滤器。原样重复 apply 同一配置不一定触发下载，不能依赖它自动恢复。版本回退时，先恢复对应的 Observer 镜像，再恢复对应的网关配置。
 
-需要立即停止采集时，先重新应用同一 Pod 的关闭配置；若模块加载或 ABI 错误导致配置无法生效，再移除该 Pod 专属过滤器：
+需要立即停止采集时，先重新应用同一工作负载的关闭配置；若模块加载或 ABI 错误导致配置无法生效，再移除该工作负载的过滤器：
 
 ```sh
-kubectl apply -f "$DEPLOY_DIR/envoyfilter.$GATEWAY_POD_UID.disabled.yaml"
+kubectl apply -f "$DEPLOY_DIR/envoyfilter.disabled.yaml"
 # 必要时移除采集过滤器，并核验原有鉴权和业务路由仍有效。
-kubectl -n istio-system delete envoyfilter "gateway-observer-$GATEWAY_POD_UID"
+kubectl delete -f "$DEPLOY_DIR/envoyfilter.disabled.yaml"
 ```
 
-每个网关 Pod 都需要独立渲染配置。Pod 重建或扩容后，需获取实际 Pod 名称和 UID，重新渲染并发布对应过滤器，同时清理旧 UID 的资源。仓库尚未提供自动执行这些操作的控制器，需要将其纳入发布流程。关闭配置用于停止采集；底层模块加载失败时，即使配置了 `fail_open`，也不能保证网关成功启动。
+同一命名空间中匹配标签的网关副本共用一个 EnvoyFilter，实例身份由各自运行时读取。升级旧包时先删除旧包 `gateway/disabled/` 中按 UID 命名或固定名 `gateway-observer` 的过滤器，再安装新版，避免重复采集；这会有短暂采集中断。修改选择器会生成新资源，需先移除旧清单对应的过滤器；正式与灰度网关应使用互斥标签。旧 JSON 中的 `gateway_instance_id` 已移除，配置必须与新版 Wasm 配套发布。关闭配置用于停止采集；底层模块加载失败时，即使配置了 `fail_open`，也不能保证网关成功启动。
 
 本地集成结果仅覆盖本地环境。扩大灰度前，需在真实环境验证改写、解析和故障恢复；生产验收还包括性能、数据质量和回退检查。完整 G0 至 G5 要求见[闭环与验收清单](docs/gateway-collection-design-closure.md)，已有本地证据见[验证记录](docs/spec/plan/gateway-collection-verification.md)。
 

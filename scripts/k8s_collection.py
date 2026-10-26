@@ -110,12 +110,12 @@ def local_configs(host, topic, group, database="metering_development"):
     return observer, consumer, credentials
 
 
-def validate_events(results, rows, gateway_uid, producer_ids, topic):
+def validate_events(results, rows, gateway_instance_id, producer_ids, topic):
     for result in results:
         matches = [row for row in rows if row[0] == result['x_request_id']]
         require(len(matches) == 2 and {row[1] for row in matches} == {'request_started', 'usage_observed'},
                 '每个请求必须恰有 request_started 和 usage_observed 两条事件')
-        require(all(row[8] == gateway_uid and row[9] in producer_ids and row[10] == topic for row in matches),
+        require(all(row[8] == gateway_instance_id and row[9] in producer_ids and row[10] == topic for row in matches),
                 '事件必须来自本次 Kubernetes 网关、Observer 和独立 topic')
         require(len({row[11] for row in matches}) == 1
                 and matches[0][11] in ('synthetic-model-route', 'unknown'),
@@ -137,7 +137,7 @@ def validate_events(results, rows, gateway_uid, producer_ids, topic):
                       cluster_name=usage[18],deployment_environment=usage[19],request_host=usage[20])
 
 
-def offsets_caught_up(raw, topic):
+def offsets_caught_up(raw, topic, expected_events=6):
     rows = [line.split() for line in raw.splitlines() if topic in line.split()]
     if len(rows) != 3 or any(len(row) != 9 for row in rows):
         return False
@@ -152,7 +152,7 @@ def offsets_caught_up(raw, topic):
             return False
         if row[6] == '-':
             return False
-    return sum(offsets) == 6
+    return sum(offsets) == expected_events
 
 
 class Harness:
@@ -299,7 +299,7 @@ class Harness:
         pods = self.pods('metering-wasm-gateway')
         require(len(pods) == 1, '测试网关必须恰有一个 Pod')
         self.gateway = pods[0]
-        self.gateway_uid = self.gateway['metadata']['uid']
+        self.gateway_instance_id = self.namespace + '/' + self.gateway['metadata']['name']
         config = json.loads((ROOT / 'configs/gateway-observer.example.json').read_text())
         config['accepted_request_hosts'] = ['wasm-verify.local']
         config['observer_cluster'] = 'outbound|9090||metering-observer.' + self.namespace + '.svc.cluster.local'
@@ -307,24 +307,25 @@ class Harness:
         write_json(path, config)
         output = self.output / 'envoyfilter.yaml'
         dns = 'metering-observer.' + self.namespace + '.svc.cluster.local'
-        run([sys.executable, 'scripts/render_gateway_filter.py', '--gateway-pod-uid', self.gateway_uid,
-             '--gateway-pod-name', self.gateway['metadata']['name'], '--gateway-namespace', self.namespace,
+        run([sys.executable, 'scripts/render_gateway_filter.py', '--gateway-label', 'istio=' + self.namespace,
+             '--gateway-namespace', self.namespace,
              '--config', str(path), '--wasm-url', 'http://' + dns + ':9093/wasm/gateway-observer-v1.wasm',
              '--wasm-cluster', 'outbound|9093||' + dns, '--enable', '--output', str(output)])
         resource = json.loads(self.kubectl('create', '--dry-run=client', '-f', str(output), '-o', 'json'))
+        self.filter_name = resource['metadata']['name']
         resource['metadata'].setdefault('labels', {})[OWNER_KEY] = OWNER
         resource['spec']['workloadSelector']['labels'] = {'istio': self.namespace}
         write_json(self.output / 'envoyfilter.json', resource)
         self.apply(resource)
         return resource
 
-    def dump(self):
+    def dump(self, pod_name=None):
         return json.loads(run(['istioctl', '--context', self.args.context, 'proxy-config', 'all',
-                               self.gateway['metadata']['name'], '-n', self.namespace, '-o', 'json']).stdout)
+                               pod_name or self.gateway['metadata']['name'], '-n', self.namespace, '-o', 'json']).stdout)
 
-    def wait_wasm(self, present=True):
+    def wait_wasm(self, present=True, pod_name=None):
         def probe():
-            dump = self.dump()
+            dump = self.dump(pod_name)
             configs = wasm_configs(dump)
             if not present:
                 return dump if not configs else None
@@ -335,12 +336,12 @@ class Harness:
         return wait_for('网关已激活的 Wasm 配置收敛', probe)
 
     @contextlib.contextmanager
-    def forwarding(self):
+    def forwarding(self, pod_name=None):
         # 让 kubectl 选择空闲端口，进程由本用例持有，退出时必定停止。
-        log_path = self.output / 'port-forward.log'
+        log_path = self.output / ('port-forward.' + pod_name + '.log' if pod_name else 'port-forward.log')
         with log_path.open('w') as log:
             process = subprocess.Popen([*self.kube, '-n', self.namespace, 'port-forward',
-                                        '--address=127.0.0.1', 'service/wasm-gateway', ':8080'],
+                                        '--address=127.0.0.1', 'pod/' + pod_name if pod_name else 'service/wasm-gateway', ':8080'],
                                        cwd=ROOT, stdout=log, stderr=subprocess.STDOUT, text=True)
             try:
                 def ready():
@@ -371,17 +372,46 @@ class Harness:
             return response.status, response.read(), response.headers
 
     def check_match(self, resource):
-        other = copy.deepcopy(resource)
-        other['spec']['configPatches'][0]['match']['proxy']['metadata']['NAME'] = 'no-such-verification-pod'
+        wrong_selector = copy.deepcopy(resource)
+        wrong_selector['spec']['workloadSelector']['labels'] = {'istio': 'no-such-verification-workload'}
+        wrong_namespace = copy.deepcopy(resource)
+        wrong_namespace['spec']['configPatches'][0]['match']['proxy']['metadata']['NAMESPACE'] = 'no-such-verification-namespace'
+        for other in (wrong_selector, wrong_namespace):
+            try:
+                self.apply(other)
+                self.wait_wasm(False)
+                require(self.request('/healthz')[0] == 200, '未安装插件时业务健康请求失败')
+            finally:
+                self.apply(resource)
+                restored = self.wait_wasm()
+        write_json(self.output / 'config.final.json', restored)
+
+    def check_workload_isolation(self, resource):
+        before = self.get('-n', self.namespace, 'get', 'envoyfilter', self.filter_name)
+        output = self.output / 'envoyfilter.canary.yaml'
+        dns = 'metering-observer.' + self.namespace + '.svc.cluster.local'
+        run([sys.executable, 'scripts/render_gateway_filter.py',
+             '--gateway-label', 'istio=canary-' + self.run_id, '--gateway-namespace', self.namespace,
+             '--config', str(self.output / 'gateway-observer.json'),
+             '--wasm-url', 'http://' + dns + ':9093/wasm/gateway-observer-v1.wasm',
+             '--wasm-cluster', 'outbound|9093||' + dns, '--output', str(output)])
+        other = json.loads(self.kubectl('create', '--dry-run=client', '-f', str(output), '-o', 'json'))
+        name = other['metadata']['name']
+        require(name != self.filter_name, '不同工作负载必须使用不同的 EnvoyFilter 名称')
+        other['metadata'].setdefault('labels', {})[OWNER_KEY] = OWNER
         try:
             self.apply(other)
-            self.wait_wasm(False)
-            require(self.request('/healthz')[0] == 200, '未安装插件时业务健康请求失败')
+            after = self.get('-n', self.namespace, 'get', 'envoyfilter', self.filter_name)
+            require(before['metadata']['resourceVersion'] == after['metadata']['resourceVersion']
+                    and before['spec'] == after['spec'], '第二个工作负载覆盖了原有过滤器')
+            self.wait_wasm()
+            write_json(self.output / 'workload-isolation.result.json', {
+                'primary_name': self.filter_name, 'canary_name': name, 'primary_unchanged': True,
+                'proxy_namespace_match': resource['spec']['configPatches'][0]['match']['proxy']['metadata']})
         finally:
-            self.apply(resource)
-        write_json(self.output / 'config.final.json', self.wait_wasm())
+            self.kubectl('-n', self.namespace, 'delete', 'envoyfilter', name, '--ignore-not-found')
 
-    def requests(self):
+    def requests(self, gateway_instance_id=None, output_name='requests.result.json'):
         results = []
         for scenario in ('json', 'sse', 'unknown'):
             body = {'model': 'fixture', 'stream': scenario != 'json',
@@ -408,12 +438,37 @@ class Harness:
             return rows if len(rows) >= 6 else None
         rows = wait_for('Kubernetes Consumer 写入 Doris', events, 90)
         producers = {p['metadata']['uid'] for p in self.pods('metering-observer')}
-        validate_events(results, rows, self.gateway_uid, producers, self.topic)
+        validate_events(results, rows, gateway_instance_id or self.gateway_instance_id, producers, self.topic)
         require(all(row[18] == self.args.kind_cluster for row in rows), '集群配置未固定')
         raw = self.sql('SELECT event_json FROM metering.events_raw WHERE x_request_id IN (' + ids + ');')
         require(self.credential not in raw and '"api_key"' not in raw, '事件包含原始凭证')
-        write_json(self.output / 'requests.result.json', results)
+        write_json(self.output / output_name, results)
         return results
+
+    def check_gateway_scale(self):
+        before = self.get('-n', self.namespace, 'get', 'envoyfilter', self.filter_name)
+        self.kubectl('-n', self.namespace, 'scale', 'deployment/wasm-gateway', '--replicas=2')
+        self.kubectl('-n', self.namespace, 'rollout', 'status', 'deployment/wasm-gateway',
+                     '--timeout=180s', timeout=195)
+        pods = self.pods('metering-wasm-gateway')
+        require(len(pods) == 2 and self.gateway['metadata']['uid'] in {p['metadata']['uid'] for p in pods},
+                '扩容必须保留原网关并增加一个新副本')
+        results = []
+        for pod in pods:
+            name = pod['metadata']['name']
+            self.wait_wasm(pod_name=name)
+            with self.forwarding(pod_name=name):
+                requests = self.requests(self.namespace + '/' + name, 'requests.' + name + '.json')
+            results.append({'pod': name, 'instance_id': self.namespace + '/' + name, 'requests': requests})
+        after = self.get('-n', self.namespace, 'get', 'envoyfilter', self.filter_name)
+        require(before['metadata']['resourceVersion'] == after['metadata']['resourceVersion']
+                and before['spec'] == after['spec'], '扩容期间不得重新渲染或修改 EnvoyFilter')
+        wait_for('扩容后 18 条事件消费完成', lambda: offsets_caught_up(
+            self.kafka('consumer-groups', '--describe', '--group', self.group), self.topic, 18), 90)
+        summary = {'replicas_before': 1, 'replicas_after': 2, 'envoyfilter_unchanged': True,
+                   'committed_events': 18, 'gateways': results}
+        write_json(self.output / 'gateway-scale.result.json', summary)
+        return summary
 
     def ignored_requests(self):
         def selected():
@@ -487,9 +542,9 @@ class Harness:
                 'group_id': self.group, 'committed_events': 6,
                 'members_with_k8s_consumer_stopped': 0, 'members_after_restore': 1}
 
-    def verify_pods(self):
+    def verify_pods(self, gateway_replicas=1):
         pods = self.get('-n', self.namespace, 'get', 'pods')['items']
-        require(len(pods) == 5, '预期 2 个 Observer、1 个 Consumer、1 个 fixture、1 个网关 Pod')
+        require(len(pods) == 4 + gateway_replicas, '测试 Pod 数量与 Observer/Consumer/fixture/网关副本数不符')
         for pod in pods:
             statuses = pod['status'].get('containerStatuses', [])
             require(statuses and all(s['ready'] and s['restartCount'] == 0 for s in statuses),
@@ -558,10 +613,13 @@ class Harness:
             self.wait_wasm()
             with self.forwarding():
                 self.check_match(resource)
+                self.check_workload_isolation(resource)
                 results = self.requests()
                 ignored = self.ignored_requests()
             consumer = self.check_consumer()
-            self.verify_pods()
+            print('验证同一 EnvoyFilter 自动覆盖扩容后的网关副本', flush=True)
+            gateway_scaling = self.check_gateway_scale()
+            self.verify_pods(gateway_replicas=2)
             after = self.gateway_snapshot()
             write_json(self.output / 'existing-gateway-after.json', after)
             require(before == after, '既有 istio-system 网关身份或重启次数发生变化')
@@ -570,7 +628,8 @@ class Harness:
                        'wasm_sha256': self.sha, 'kafka_topic': self.topic, 'doris_database': self.database,
                        'cluster_name':self.args.kind_cluster,'deployment_environment':'stg',
                        'lookup_implementation':'unimplemented','consumer': consumer,
-                       'requests': results, 'ignored_requests': ignored, 'existing_gateway_unchanged': True}
+                       'requests': results, 'ignored_requests': ignored, 'gateway_scaling': gateway_scaling,
+                       'existing_gateway_unchanged': True}
             write_json(self.output / 'result.json', summary)
             print(json.dumps(summary, ensure_ascii=False, indent=2), flush=True)
             print('PASS：Kubernetes 网关 → Observer → Compose Kafka → Kubernetes Consumer → Compose Doris', flush=True)

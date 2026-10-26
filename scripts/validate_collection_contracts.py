@@ -326,7 +326,6 @@ def validate_config(config, release=False):
     require(config["rewrite_reservation_bytes"] * config["root_max_rewrites"] <= config["root_rewrite_budget_bytes"], "rewrite_root_capacity")
     require(config["tick_ms"] <= min(config["rewrite_timeout_ms"], config["ack_timeout_ms"], config["end_ack_timeout_ms"]), "tick_deadline_capacity")
     if release:
-        require(config["gateway_instance_id"] != "RENDER_FROM_POD_UID", "unresolved_gateway_instance")
         require(".example." not in config["observer_cluster"], "unresolved_observer_cluster")
         if config["enabled"]:
             require(any(r.get("enabled", False) for r in config["routes"]), "enabled_without_routes")

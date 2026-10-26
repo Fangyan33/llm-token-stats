@@ -405,3 +405,35 @@ Observer 的服务与客户查询分别增加实例内 LRU 成功缓存，默认
 | 文档与清理 | 归属实现说明、组件说明和 Kafka 指南已同步响应头撤销与诊断正文边界；gofmt 与 git diff --check 通过。两次临时 Consumer 均已停止，原组位点、恢复元数据及仓库运行配置未修改 |
 
 联调复用临时独立组 identity-cache-validation-20261022、健康端口 19994 和当前开发库 metering_development。原 Consumer 的 readyz 仍为 503，本次未修复该问题或重置其位点；本地 Observer 已重载新构建，保留现有 Kafka/Doris 数据卷。全量检查日志为 /tmp/identity-auth-header-make-test-serial.log，构建日志为 /tmp/identity-auth-header-build.log，完整联调失败日志为 /tmp/identity-auth-header-local-test.log，专项成功日志为 /tmp/identity-auth-header-focused-test.log。本次使用合成第三方目录，未验收真实第三方或生产 G0–G5。
+
+
+## 2026-10-26：运行时网关名称与独立分发包
+
+- Wasm 启动时读取 `node.metadata.NAMESPACE`、`node.metadata.NAME`，写入 `gateway_instance_id=namespace/pod-name`；不修改已有网关 Pod 模板，JSON 配置已移除静态实例 ID。名称复用时标识也复用；缺失、非法或超过 128 字节时停止采集并计数，业务放行。
+- 打包不再查询 Kubernetes 或保存 Pod 名称/UID；按命名空间和工作负载标签生成一份共享 EnvoyFilter。默认选择器为 `istio=ingressgateway`，可重复指定 `--gateway-label` 替换。Release 同步改用可选 `RELEASE_GATEWAY_LABELS`。
+- `make test` 通过：87 个 Python 用例、主模块及插件 Go 竞态测试。`make wasm` 及 ABI 检查通过。新包 `dist/package-runtime-name` 的 SHA256SUMS、全部 k8s YAML 和根 EnvoyFilter 的 kubectl 客户端校验通过。
+- Kubernetes 1.22.17 / Istio 1.13.5 隔离用例通过，命名空间 `metering-wasm-runtime-name`，run-id `b79567b9962a`。先验证单副本 JSON/SSE/unknown 及 Consumer 停止恢复，再将网关从 1 扩到 2；扩容期间 EnvoyFilter 的 resourceVersion 和 spec 均未改变。两个副本分别记录自己的 `namespace/pod-name`，三种请求各执行一次，累计 18 条事件进入独立 Doris 数据库，独立消费组位点追平。原有 istio-system 网关的 Pod 名称、UID、重启次数均不变。
+- 证据：`.tmp/k8s-collection/kind-kind/metering-wasm-runtime-name/b79567b9962a/result.json`、`gateway-scale.result.json`、每个 Pod 的请求结果及配置转储。测试与分发包的 Wasm SHA256 相同：`9472342fda72187321d314389edf945bf7a80aba85b412c9061de3215db8b323`。
+- 原有 Compose `GOFLAGS=-count=1 make local-test` 未通过：事件等待失败并在 600 秒超时，现场 Consumer 报 `watermark_untrusted` / 分区暂停。未清库、重置或跳过其 offset；这项失败与上述独立 topic/数据库的 Kubernetes 用例分别记录。隔离用例通过不代表生产 G0–G5 验收。
+- 升级须移除旧包按 UID 命名的 EnvoyFilter，避免与共享过滤器同时安装；配置与 Wasm 配套更新，历史事件的 Pod UID 保留原值。
+
+
+## 2026-10-26：EnvoyFilter 命名空间及多工作负载隔离修复
+
+- P1：恢复 `match.proxy.metadata.NAMESPACE`，仅移除 Pod `NAME` 限制。根配置命名空间的渲染产物同样保留目标代理命名空间约束。
+- P2：资源名称由排序后的工作负载标签生成 `gateway-observer-<16位摘要>`；不同标签独立，同一标签在参数顺序、启用/关闭和 Wasm 版本变化时名称不变。分发 manifest 记录 `gateway_filter_name`，回退命令按原清单删除资源。迁移需先移除旧的固定名或按 UID 命名的过滤器，选择器变更也需处理旧资源。
+- `make test` 通过：88 个 Python 用例及主模块/插件 Go 竞态检查。`make wasm`、ABI 检查、`GOFLAGS='-count=1 -run=TestWasmDownloadArtifact' make local-test` 通过；本次未重跑已知失败的 Compose 全套集成测试。
+- `make k8s-test K8S_TEST_ARGS='--namespace metering-wasm-scope-review'` 通过，run-id `8202f2f8839b`。真实 Istio 控制面分别验证错误选择器、错误代理 NAMESPACE 不加载插件且业务健康请求返回 200，恢复后插件重新加载。
+- 在同一测试命名空间应用第二套工作负载过滤器，名称分别为 `gateway-observer-c55628380056da13`、`gateway-observer-ce7dcee9e7e22ca6`；原资源的 resourceVersion 和 spec 不变。随后完成 JSON/SSE/unknown、Consumer 停止/恢复、网关 1→2 扩容，18 条事件进入独立 Doris 库且位点追平，既有 istio-system 网关身份及重启次数不变。
+- 证据目录：`.tmp/k8s-collection/kind-kind/metering-wasm-scope-review/8202f2f8839b/`，包含 `workload-isolation.result.json`、`gateway-scale.result.json` 与 `result.json`。真实根配置命名空间的跨命名空间场景本次未另建网关验证；根命名空间产物的 NAMESPACE 约束由渲染回归测试与客户端校验覆盖。
+- 新包 `dist/package-runtime-name-isolated` 的全部文件摘要、k8s 资源与两种状态 EnvoyFilter 的 kubectl 客户端校验通过。默认过滤器名称为 `gateway-observer-3c6cdab7dccf3f46`，Wasm 摘要与真实联调一致。
+
+
+## 2026-10-26：Pod DNS subdomain 名称边界修复
+
+- 分开验证命名空间与 Pod 名称：命名空间保持 DNS label 的 63 字节限制，Pod 名称按 Kubernetes DNS subdomain 的整体 253 字节规则，不再对每段误加 63 字节限制；实例标识 `namespace/pod-name` 仍不得超过 128 字节，不截断名称。
+- 先补回归并复现旧实现：命名空间 test 配合 64 字符 Pod 名称，以及两类合法 128 字节实例标识，均未产生有效 Start。最小修复后通过，另覆盖 129 字节拒绝、64 字符命名空间拒绝、非法点/连字符边界和非 ASCII 拒绝。
+- `make test` 通过（88 项 Python 测试、主模块和插件 Go 竞态测试）；TinyGo 及 ABI 检查通过；本地 Observer/Envoy 加载新产物后，`GOFLAGS='-count=1 -run=TestWasmDownloadArtifact' make local-test` 通过。未重跑已知失败的 Compose 全套用例。
+- 独立 Kubernetes 用例 `make k8s-test K8S_TEST_ARGS='--namespace metering-wasm-pod-name'` 通过，run-id `a5407427a99d`，继续覆盖部署隔离、1→2 网关扩容及 18 条事件入库。
+- 随后运行 `.tmp/verify_long_pod_name.py`，在同一隔离命名空间创建真实 Pod（名称为 64 个 a），经同一 EnvoyFilter 自动安装插件。JSON/SSE/unknown 三类请求分别保存完整实例名称（87 字节），新增 6 条事件进入独立 Doris 库，累计 24 条提交完成；原有 istio-system 网关未变。该长名 Pod 已删除。
+- 证据：`.tmp/k8s-collection/kind-kind/metering-wasm-pod-name/a5407427a99d/long-pod-name.result.json`、`requests.long-pod-name.json`、`result.json`。新包 `dist/package-pod-name-fix` 的 Wasm 摘要与真实长名 Pod 验证一致：`3795ee822b8a13c5a12763cf7d79b34871b82931a7c3c72622de7514942c71e6`。

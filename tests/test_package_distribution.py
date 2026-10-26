@@ -1,4 +1,6 @@
+import argparse
 import json
+import re
 from pathlib import Path
 import subprocess
 import sys
@@ -26,12 +28,10 @@ class DistributionTests(unittest.TestCase):
             with self.subTest(patterns=str(patterns)[:80]), tempfile.TemporaryDirectory() as directory:
                 args = self.args('--output', str(Path(directory) / 'package'))
                 args.accepted_request_host = patterns
-                with patch.object(bundle, 'gateway_pods') as pods, \
-                     patch.object(bundle, 'prepare_images') as images, \
+                with patch.object(bundle, 'prepare_images') as images, \
                      patch.object(bundle, 'run') as run:
                     with self.assertRaises(ValueError):
                         bundle.package(args)
-                    pods.assert_not_called()
                     images.assert_not_called()
                     run.assert_not_called()
                 self.assertFalse(args.output.exists())
@@ -109,42 +109,36 @@ class DistributionTests(unittest.TestCase):
         self.assertIn('"config": |\n    a\n    b\n', text)
         self.assertIn('"enabled": false\n', text)
 
-    def test_gateway_outputs_have_real_identity_exact_wasm_and_both_states(self):
-        args = self.args('--namespace', 'isolated', '--accepted-request-host', 'API.Corp.internal.',
+    def test_gateway_outputs_use_workload_selector_without_static_identity(self):
+        args = self.args('--namespace', 'isolated', '--gateway-label', 'app=ai-gateway',
+                         '--accepted-request-host', 'API.Corp.internal.',
                          '--accepted-request-host', '*.Corp.internal.')
-        pods = [bundle.gateway_identity('ingressgateway-abc=7f6c2a90-4b13-4b68-9d21-67283e0c5f44'),
-                bundle.gateway_identity('ingressgateway-def=7f6c2a90-4b13-4b68-9d21-67283e0c5f45')]
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory)
             artifact = output / 'test.wasm'
             artifact.write_bytes(b'\x00asm\x01\x00\x00\x00synthetic')
-            bundle.render_manifests(args, self.images(), pods, output, wasm_file=artifact)
-            for pod in pods:
-                for mode in ('disabled', 'enabled'):
-                    text = (output / 'gateway' / mode / (pod['uid'] + '.yaml')).read_text()
-                    self.assertNotIn('REPLACE_', text)
-                    self.assertNotIn('RENDER_', text)
-                    self.assertNotIn('Template only', text)
-                    self.assertIn('NAME: "' + pod['name'] + '"', text)
-                    self.assertIn(bundle.checksum(artifact), text)
-                    self.assertIn('metering-observer.isolated.svc.cluster.local', text)
-                    line = next(row.strip() for row in text.splitlines() if row.strip().startswith('value: "'))
-                    config = json.loads(json.loads(line[len('value: '):]))
-                    self.assertEqual(config['enabled'], mode == 'enabled')
-                    self.assertEqual(config['gateway_instance_id'], pod['uid'])
-                    self.assertEqual(config['accepted_request_hosts'], ['api.corp.internal', '*.corp.internal'])
-                    self.assertNotIn('.example.invalid', text)
-            combined = (output / 'envoyfilter.yaml').read_text()
-            configs = [json.loads(json.loads(line.strip()[len('value: '):]))
-                       for line in combined.splitlines() if line.strip().startswith('value: "')]
-            self.assertEqual(combined.count('kind: EnvoyFilter'), len(pods))
-            self.assertEqual({config['gateway_instance_id'] for config in configs}, {pod['uid'] for pod in pods})
-            self.assertTrue(all(config['enabled'] is False for config in configs))
-            self.assertTrue(all(config['accepted_request_hosts'] == ['api.corp.internal', '*.corp.internal']
-                                for config in configs))
-            self.assertNotIn('REPLACE_', combined)
-            self.assertNotIn('RENDER_', combined)
+            bundle.render_manifests(args, self.images(), output, wasm_file=artifact)
+            names = []
+            for mode in ('disabled', 'enabled'):
+                text = (output / 'gateway' / mode / 'envoyfilter.yaml').read_text()
+                names.append(re.search(r'^metadata: \{name: ([a-z0-9-]+),', text, re.M).group(1))
+                self.assertNotIn('REPLACE_', text)
+                self.assertNotIn('RENDER_', text)
+                self.assertNotIn('Template only', text)
+                self.assertIn('proxy:\n          metadata:\n            NAMESPACE: \"istio-system\"', text)
+                self.assertNotIn('            NAME:', text)
+                self.assertIn('"app": "ai-gateway"', text)
+                self.assertIn(bundle.checksum(artifact), text)
+                self.assertIn('metering-observer.isolated.svc.cluster.local', text)
+                line = next(row.strip() for row in text.splitlines() if row.strip().startswith('value: "'))
+                config = json.loads(json.loads(line[len('value: '):]))
+                self.assertEqual(config['enabled'], mode == 'enabled')
+                self.assertNotIn('gateway_instance_id', config)
+                self.assertEqual(config['accepted_request_hosts'], ['api.corp.internal', '*.corp.internal'])
+            self.assertEqual((output / 'envoyfilter.yaml').read_text(),
+                             (output / 'gateway/disabled/envoyfilter.yaml').read_text())
             self.assertFalse((output / 'gateway-observer.json').exists())
+            self.assertEqual(names[0], names[1])
 
     def test_omitted_hosts_default_all_and_explicit_hosts_replace_default(self):
         args = bundle.parser().parse_args([])
@@ -159,8 +153,7 @@ class DistributionTests(unittest.TestCase):
             wasm_file = root / 'test.wasm'
             wasm_file.write_bytes(b'\x00asm\x01\x00\x00\x00synthetic')
             args = bundle.parser().parse_args([
-                '--output', str(root / 'package'),
-                '--gateway-pod', 'gateway-abc=7f6c2a90-4b13-4b68-9d21-67283e0c5f44'])
+                '--output', str(root / 'package')])
             original_run = bundle.run
             original_render = bundle.render_manifests
 
@@ -168,10 +161,11 @@ class DistributionTests(unittest.TestCase):
                 if command[:2] == ['docker', 'save']:
                     Path(command[command.index('--output') + 1]).write_bytes(b'synthetic archive')
                     return
+                self.assertNotEqual(command[0], 'kubectl')
                 return original_run(command, **kwargs)
 
-            def render(args, images, pods, output):
-                original_render(args, images, pods, output, wasm_file=wasm_file)
+            def render(args, images, output):
+                original_render(args, images, output, wasm_file=wasm_file)
 
             with patch.object(bundle, 'checksum', return_value=bundle.file_sha256(wasm_file)), \
                     patch.object(bundle, 'resolve_image_tag', return_value='version'), \
@@ -181,6 +175,10 @@ class DistributionTests(unittest.TestCase):
                 bundle.package(args)
             manifest = json.loads((args.output / 'manifest.json').read_text())
             self.assertEqual(manifest['accepted_request_hosts'], ['*'])
+            self.assertNotIn('gateway_pods', manifest)
+            self.assertEqual(manifest['gateway_selector'], {'istio': 'ingressgateway'})
+            self.assertIn('metadata: {name: ' + manifest['gateway_filter_name'] + ',',
+                          (args.output / 'envoyfilter.yaml').read_text())
             text = (args.output / 'envoyfilter.yaml').read_text()
             config_line = next(line.strip() for line in text.splitlines() if line.strip().startswith('value: "'))
             config = json.loads(json.loads(config_line[len('value: '):]))
@@ -192,7 +190,7 @@ class DistributionTests(unittest.TestCase):
             with tarfile.open(parts[0], 'r:gz') as archive:
                 self.assertEqual(archive.extractfile('package/envoyfilter.yaml').read().decode(), text)
                 for mode in ('disabled', 'enabled'):
-                    self.assertIn('package/gateway/' + mode + '/7f6c2a90-4b13-4b68-9d21-67283e0c5f44.yaml',
+                    self.assertIn('package/gateway/' + mode + '/envoyfilter.yaml',
                                   archive.getnames())
 
     def test_explicit_all_hosts_is_supported(self):
@@ -203,7 +201,6 @@ class DistributionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             args = self.args('--output', str(Path(directory) / 'package'))
             with patch.object(bundle, 'checksum', return_value='wasm-sha'), \
-                    patch.object(bundle, 'gateway_pods', return_value=[]), \
                     patch.object(bundle, 'resolve_image_tag', return_value='version'), \
                     patch.object(bundle, 'render_manifests'), \
                     patch.object(bundle, 'prepare_images', return_value={}), \
@@ -223,7 +220,6 @@ class DistributionTests(unittest.TestCase):
                 options = ['--include-dependency-images'] if include_dependencies else []
                 args = self.args('--output', str(Path(directory) / 'package'), *options)
                 with patch.object(bundle, 'checksum', return_value='wasm-sha'), \
-                        patch.object(bundle, 'gateway_pods', return_value=[]), \
                         patch.object(bundle, 'resolve_image_tag', return_value='version'), \
                         patch.object(bundle, 'render_manifests') as render, \
                         patch.object(bundle, 'prepare_images', return_value={}) as prepare, \
@@ -251,15 +247,16 @@ class DistributionTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, '平台'):
                 bundle.prepare_images(self.args(), self.images())
 
-    def test_gateway_discovery_is_read_only_and_excludes_terminating_pods(self):
-        uid = '7f6c2a90-4b13-4b68-9d21-67283e0c5f44'
-        data = {'items': [{'metadata': {'name': 'gateway-active', 'uid': uid}},
-                          {'metadata': {'name': 'gateway-old', 'uid': uid, 'deletionTimestamp': 'now'}}]}
-        with patch.object(bundle, 'run', return_value=subprocess.CompletedProcess([], 0, json.dumps(data))) as run:
-            pods = bundle.gateway_pods(self.args('--context', 'target'))
-        self.assertEqual(pods, [{'name': 'gateway-active', 'uid': uid}])
-        self.assertEqual(run.call_args.args[0], ['kubectl', '--context', 'target', '-n', 'istio-system',
-                                                'get', 'pods', '-l', 'istio=ingressgateway', '-o', 'json'])
+    def test_workload_selector_defaults_and_validation(self):
+        self.assertEqual(bundle.selector(self.args().gateway_label), {'istio': 'ingressgateway'})
+        self.assertEqual(bundle.selector(self.args('--gateway-label', 'app=ai-gateway',
+                          '--gateway-label', 'example.com/group=prod').gateway_label),
+                         {'app': 'ai-gateway', 'example.com/group': 'prod'})
+        for value in ('bad/key/name=x', '=foo', 'app=bad value', '/key=value', 'a..b/key=x', 'a'*64+'=x'):
+            with self.subTest(value=value), self.assertRaises(argparse.ArgumentTypeError):
+                bundle.label(value)
+        with self.assertRaises(ValueError):
+            bundle.selector([('app', 'a'), ('app', 'b')])
 
 
 if __name__ == '__main__':

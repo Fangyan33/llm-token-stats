@@ -10,9 +10,9 @@ import re
 import subprocess
 import sys
 import tempfile
-import uuid
 
 from image_tag import resolve_image_tag
+from gateway_workload import filter_name, label, selector
 from render_doris_sql import database_name, render_sql
 from wasm_artifact import checksum
 from validate_collection_contracts import load, normalize_request_host_pattern, validate_config
@@ -33,17 +33,6 @@ def dns_name(value):
     if len(value) > 63 or not re.fullmatch(r'[a-z0-9](?:[a-z0-9-]*[a-z0-9])?', value):
         raise argparse.ArgumentTypeError('名称必须为不超过 63 字符的 Kubernetes DNS 标签')
     return value
-
-
-def gateway_identity(value):
-    try:
-        name, uid = value.split('=', 1)
-        if (not re.fullmatch(r'[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?', name)
-                or len(name) > 253 or str(uuid.UUID(uid)) != uid):
-            raise ValueError()
-    except ValueError:
-        raise argparse.ArgumentTypeError('网关 Pod 必须为 NAME=小写规范UUID') from None
-    return {'name': name, 'uid': uid}
 
 
 def yaml_text(value, indent=0):
@@ -246,26 +235,6 @@ def applications(args, images):
     return resources
 
 
-def gateway_pods(args):
-    if args.gateway_pod:
-        pods = args.gateway_pod
-    else:
-        command = ['kubectl']
-        if args.context:
-            command += ['--context', args.context]
-        raw = run([*command, '-n', args.gateway_namespace, 'get', 'pods', '-l',
-                   'istio=ingressgateway', '-o', 'json']).stdout
-        pods = [item['metadata'] for item in json.loads(raw)['items']
-                if not item['metadata'].get('deletionTimestamp')]
-    if not pods:
-        raise ValueError('没有找到网关 Pod；可用 --gateway-pod NAME=UID 指定目标环境的实际 Pod')
-    if len({pod['uid'] for pod in pods}) != len(pods) or len({pod['name'] for pod in pods}) != len(pods):
-        raise ValueError('网关 Pod 名称或 UID 重复')
-    for pod in pods:
-        gateway_identity(pod['name'] + '=' + pod['uid'])
-    return pods
-
-
 def gateway_configuration(args):
     hosts = ['*'] if args.accepted_request_host is None else args.accepted_request_host
     if not hosts:
@@ -278,7 +247,7 @@ def gateway_configuration(args):
     return config
 
 
-def render_manifests(args, images, pods, output, wasm_file=None):
+def render_manifests(args, images, output, wasm_file=None):
     gateway_config = gateway_configuration(args)
     ns = args.namespace
     write_yaml(output / 'k8s/00-namespace.yaml', [{
@@ -292,29 +261,24 @@ def render_manifests(args, images, pods, output, wasm_file=None):
     dns = f'metering-observer.{ns}.svc.cluster.local'
     config_path = output / 'gateway-observer.json'
     config_path.write_text(json.dumps(gateway_config, indent=2) + '\n')
-    disabled_filters = []
-    for pod in pods:
-        for mode in ('disabled', 'enabled'):
-            target = output / 'gateway' / mode / (pod['uid'] + '.yaml')
-            command = [sys.executable, str(ROOT / 'scripts/render_gateway_filter.py'),
-                       '--gateway-pod-name', pod['name'], '--gateway-pod-uid', pod['uid'],
-                       '--gateway-namespace', args.gateway_namespace, '--config', str(config_path),
-                       '--wasm-file', str(wasm_file or ROOT / 'dist/gateway-observer-v1.wasm'),
-                       '--wasm-url', 'http://' + dns + ':9093/wasm/gateway-observer-v1.wasm',
-                       '--wasm-cluster', 'outbound|9093||' + dns, '--output', str(target)]
-            if mode == 'enabled':
-                command.append('--enable')
-            run(command)
-            text = target.read_text()
-            text = text.replace('# Template only: the JSON is default-disabled and must be rendered/validated.',
-                                '# 已按目标网关 Pod 渲染，可直接 kubectl apply。')
-            target.write_text(text)
-            if mode == 'disabled':
-                disabled_filters.append(text.rstrip() + '\n')
-    if not disabled_filters:
-        raise ValueError('没有生成目标网关的 EnvoyFilter')
-    (output / 'envoyfilter.yaml').write_text('---\n'.join(disabled_filters), encoding='utf-8')
-    # 原始配置只作为渲染输入，不向使用者分发含 RENDER_FROM_POD_UID 的文件。
+    for mode in ('disabled', 'enabled'):
+        target = output / 'gateway' / mode / 'envoyfilter.yaml'
+        command = [sys.executable, str(ROOT / 'scripts/render_gateway_filter.py'),
+                   '--gateway-namespace', args.gateway_namespace, '--config', str(config_path),
+                   '--wasm-file', str(wasm_file or ROOT / 'dist/gateway-observer-v1.wasm'),
+                   '--wasm-url', 'http://' + dns + ':9093/wasm/gateway-observer-v1.wasm',
+                   '--wasm-cluster', 'outbound|9093||' + dns, '--output', str(target)]
+        for key, value in selector(args.gateway_label).items():
+            command += ['--gateway-label', key + '=' + value]
+        if mode == 'enabled':
+            command.append('--enable')
+        run(command)
+        text = target.read_text().replace(
+            '# Template only: the JSON is default-disabled and must be rendered/validated.',
+            '# 已渲染，可直接 kubectl apply；实例身份在 Wasm 运行时读取。')
+        target.write_text(text)
+        if mode == 'disabled':
+            (output / 'envoyfilter.yaml').write_text(text, encoding='utf-8')
     config_path.unlink()
 
 
@@ -353,7 +317,7 @@ def package(args):
         raise ValueError('输出目录已存在且非空，请通过 PACKAGE_DIR 指定新目录：' + str(target))
     gateway_config = gateway_configuration(args)
     wasm_sha = checksum(ROOT / 'dist/gateway-observer-v1.wasm')
-    pods = gateway_pods(args)
+    labels = selector(args.gateway_label)
     tag = resolve_image_tag()
     images = {'observer': 'metering-observer:' + tag, 'consumer': 'metering-consumer:' + tag,
               **RUNTIME_IMAGES}
@@ -364,8 +328,8 @@ def package(args):
     with tempfile.TemporaryDirectory(prefix='.metering-package-', dir=target.parent) as directory:
         output = Path(directory) / 'package'
         output.mkdir(mode=0o700)
-        render_manifests(args, images, pods, output)
-        # 配置、Pod 身份、Wasm 校验全部通过后，才构建镜像并导出。
+        render_manifests(args, images, output)
+        # 配置、工作负载标签、Wasm 校验全部通过后，才构建镜像并导出。
         records = prepare_images(args, archived_images)
         (output / 'images').mkdir()
         print('导出镜像：' + ', '.join(archived_images.values()), flush=True)
@@ -376,9 +340,10 @@ def package(args):
                     'image_details': records, 'wasm_sha256': wasm_sha,
                     'namespace': args.namespace, 'gateway_namespace': args.gateway_namespace,
                     'accepted_request_hosts': gateway_config['accepted_request_hosts'],
-                    'gateway_pods': [{'name': pod['name'], 'uid': pod['uid']} for pod in pods]}
+                    'gateway_selector': labels, 'gateway_filter_name': filter_name(labels),
+                    'gateway_identity_source': 'node.metadata.NAMESPACE/NAME'}
         (output / 'manifest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + '\n')
-        (output / 'README.md').write_text(package_readme(args, pods), encoding='utf-8')
+        (output / 'README.md').write_text(package_readme(args), encoding='utf-8')
         files = sorted(path for path in output.rglob('*') if path.is_file())
         (output / 'SHA256SUMS').write_text(''.join(
             file_sha256(path) + '  ' + str(path.relative_to(output)) + '\n' for path in files))
@@ -386,7 +351,7 @@ def package(args):
     print('分发包已生成：' + str(target), flush=True)
 
 
-def package_readme(args, pods):
+def package_readme(args):
     hosts = gateway_configuration(args)['accepted_request_hosts']
     image_note = ('镜像归档包含 Observer、Consumer、Kafka、Doris、Istio proxyv2。'
                   if args.include_dependency_images else
@@ -406,8 +371,9 @@ archived_images 记录归档内镜像，external_images 记录需由目标环境
 Wasm Host 白名单：{json.dumps(hosts, ensure_ascii=False)}，同时记录于 manifest.json 和每个 EnvoyFilter。
 省略 --accepted-request-host 时默认 ["*"]，匹配全部合法 DNS Host；显式传参完整覆盖默认值。
 后缀通配匹配子域名，不含根域名。
-包根目录 envoyfilter.yaml 汇总全部目标 Pod 的关闭态 EnvoyFilter；
-gateway/disabled/ 和 gateway/enabled/ 按 Pod 分别提供关闭态与启用态配置。
+包根目录 envoyfilter.yaml 提供关闭态 EnvoyFilter；
+gateway/disabled/ 和 gateway/enabled/ 分别提供同一工作负载的关闭态与启用态配置。
+打包不查询 Kubernetes，不记录 Pod 名称或 UID。实例标识在运行时读取为 namespace/pod-name。
 
 归属 API 默认 URI 为空，使用占位实现。启用服务查询时，在 `k8s/20-config.yaml` 的
 `observer.json` 中保留实际 `service_lookup.uri`，将 `service_lookup.credential_env` 设为
@@ -449,6 +415,9 @@ kubectl -n {args.namespace} rollout status deployment/metering-observer --timeou
 kubectl -n {args.namespace} get pods,svc,pvc
 ```
 
+从旧包升级时先删除旧包 gateway/disabled/ 中按 UID 命名或固定名 gateway-observer 的 EnvoyFilter，避免重复安装；
+不要同时保留新旧过滤器。旧配置中的 gateway_instance_id 已移除，必须使用与新 Wasm 配套的配置。
+
 确认 Wasm 下载内容与 manifest.json 的 wasm_sha256 一致、过滤器顺序为 ext_authz → Wasm → router 后，
 对已存在的网关应用插件。先应用包根目录汇总的关闭态配置，再按验证结果启用采集：
 
@@ -460,10 +429,15 @@ kubectl apply -f gateway/enabled/
 kubectl apply -f envoyfilter.yaml
 ```
 
-网关命名空间：{args.gateway_namespace}；本包仅匹配以下实际 Pod：
-
-''' + ''.join(f"- `{pod['name']}`，UID `{pod['uid']}`\n" for pod in pods) + '''
-网关 Pod 重建、扩容或更换目标集群后，必须使用新的 Pod 名称和 UID 重新打包。
+网关命名空间：{args.gateway_namespace}；工作负载标签：{json.dumps(selector(args.gateway_label), ensure_ascii=False)}。
+EnvoyFilter 名称：{filter_name(selector(args.gateway_label))}，同样记录于 manifest.json 的 gateway_filter_name。
+代理 NAMESPACE 匹配将作用范围固定在上述命名空间，即使该命名空间是 Istio 根配置命名空间。
+名称由排序后的标签生成；不同工作负载使用独立名称，同一标签的启用态、关闭态和版本更新保持名称一致。
+变更选择器会产生新资源，需先移除旧清单对应的过滤器；正式与灰度网关应使用互斥的标签。
+网关 Pod 扩容、重建后自动应用同一过滤器，不需要重新打包；无需修改网关 Pod 模板。
+同名 Pod 重建后实例标识相同，不能用于区分 Pod 生命周期。跨集群查询需结合 cluster_name。
+若运行时身份字段缺失、非法或 namespace/pod-name 超过 128 字节，插件停止采集并计数
+metering_gateway_identity_unavailable_total，业务继续放行，不回退到固定值或截断名称。
 envoyfilter.yaml 与 gateway/disabled/ 内容相同，选择其中一个入口即可。
 gateway 目录中全部为最终 YAML，不含待替换字段；不要递归同时 apply disabled 和 enabled。
 初始化 Job 只处理本包的单节点 Kafka / Doris；已有旧事件表会拒绝初始化，请使用隔离命名空间 / 数据卷。
@@ -479,9 +453,8 @@ def parser():
     p.add_argument('--gateway-namespace', type=dns_name, default='istio-system')
     p.add_argument('--accepted-request-host', action='append', metavar='HOST',
                    help='目标业务 Host 白名单，可重复；省略时默认 *，显式传参完整覆盖默认值')
-    p.add_argument('--gateway-pod', type=gateway_identity, action='append', default=[], metavar='NAME=UID',
-                   help='目标网关实际 Pod，可重复；省略时只读查询目标集群 istio=ingressgateway 的 Pod')
-    p.add_argument('--context', help='查询目标网关时使用的 kubectl context')
+    p.add_argument('--gateway-label', type=label, action='append', metavar='KEY=VALUE',
+                   help='目标网关标签，可重复；省略时默认 istio=ingressgateway')
     p.add_argument('--cluster-name', default='metering-single-node')
     p.add_argument('--database', type=database_name, default='metering')
     p.add_argument('--topic', default='llm-metering-events')

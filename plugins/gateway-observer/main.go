@@ -67,6 +67,7 @@ type root struct {
 	types.DefaultPluginContext
 	id           uint32
 	cfg          gatewayconfig.Config
+	instanceID   string
 	states       map[uint32]*state
 	requests     map[uint32]*httpContext
 	inflight     int64
@@ -108,6 +109,7 @@ func (r *root) count(name string) {
 }
 func (r *root) OnPluginStart(_ int) types.OnPluginStartStatus {
 	r.cleanup()
+	r.instanceID = ""
 	r.resourceMetrics()
 	b, err := proxywasm.GetPluginConfiguration()
 	if err == nil {
@@ -117,6 +119,16 @@ func (r *root) OnPluginStart(_ int) types.OnPluginStartStatus {
 		r.cfg.Enabled = false
 		r.count("config_invalid")
 		return types.OnPluginStartStatusOK
+	}
+	if r.cfg.Enabled {
+		// Istio 1.13 exposes these bootstrap properties without changing the gateway
+		// Pod template. Resolve once per root, never from request headers or config.
+		r.instanceID = gatewayInstanceID(property("node", "metadata", "NAMESPACE"), property("node", "metadata", "NAME"))
+		if r.instanceID == "" {
+			r.cfg.Enabled = false
+			r.count("gateway_identity_unavailable")
+			return types.OnPluginStartStatusOK
+		}
 	}
 	if proxywasm.SetTickPeriodMilliSeconds(uint32(r.cfg.TickMS)) != nil {
 		r.cfg.Enabled = false
@@ -266,15 +278,16 @@ func (r *root) OnTick() {
 
 type httpContext struct {
 	types.DefaultHttpContext
-	root     *root
-	id       uint32
-	selected bool
-	cfg      gatewayconfig.Config
-	s        *state
-	rewrite  bool
-	timer    *deadline
-	status   uint64
-	closed   bool
+	root       *root
+	id         uint32
+	selected   bool
+	cfg        gatewayconfig.Config
+	instanceID string
+	s          *state
+	rewrite    bool
+	timer      *deadline
+	status     uint64
+	closed     bool
 }
 
 func header(k string) string         { v, _ := proxywasm.GetHttpRequestHeader(k); return v }
@@ -287,6 +300,32 @@ func property(path ...string) string {
 	return string(b)
 }
 func idValid(s string) bool { return len(s) > 0 && len(s) <= 128 && utf8.ValidString(s) }
+
+// Keep the existing event/wire limit; reject rather than truncate identities.
+func gatewayInstanceID(namespace, name string) string {
+	validLabel := func(s string) bool {
+		if len(s) == 0 || s[0] == '-' || s[len(s)-1] == '-' {
+			return false
+		}
+		for _, c := range s {
+			if !(c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || c == '-') {
+				return false
+			}
+		}
+		return true
+	}
+	// Namespaces use DNS labels (63 bytes); Pod names use DNS subdomains
+	// (253 bytes total, with no per-label length limit in Kubernetes validation).
+	if len(namespace) > 63 || !validLabel(namespace) || len(name) > 253 || len(namespace)+1+len(name) > 128 {
+		return ""
+	}
+	for _, label := range strings.Split(name, ".") {
+		if !validLabel(label) {
+			return ""
+		}
+	}
+	return namespace + "/" + name
+}
 func (h *httpContext) OnHttpRequestHeaders(_ int, eos bool) types.Action {
 	now := time.Now()
 	r := h.root
@@ -313,6 +352,7 @@ func (h *httpContext) OnHttpRequestHeaders(_ int, eos bool) types.Action {
 	}
 	h.selected = true
 	h.cfg = r.cfg
+	h.instanceID = r.instanceID
 	r.count("requests_selected")
 	ct, enc := header("content-type"), header("content-encoding")
 	mt, _, err := mime.ParseMediaType(strings.ToLower(ct))
@@ -351,7 +391,7 @@ func (h *httpContext) OnHttpRequestHeaders(_ int, eos bool) types.Action {
 	r.resourceMetrics()
 	s.eos[0] = eos
 	b := w.UInt(nil, 1, uint64(now.UnixMilli()))
-	b = w.String(b, 2, h.cfg.GatewayInstanceID)
+	b = w.String(b, 2, h.instanceID)
 	b = w.String(b, 3, h.cfg.ConfigVersion)
 	b = w.String(b, 4, routeinfo.Name(actualRoute))
 	b = w.String(b, 6, rule.AdapterID)

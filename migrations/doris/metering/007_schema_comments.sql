@@ -13,7 +13,7 @@ ALTER TABLE metering.events_raw MODIFY COLUMN x_request_id COMMENT '网关可见
 ALTER TABLE metering.events_raw MODIFY COLUMN observation_id COMMENT '观察标识，当前与 logical_request_id 相同';
 ALTER TABLE metering.events_raw MODIFY COLUMN observation_scope COMMENT '观察范围，当前固定 gateway_response，不代表所有隐藏的上游尝试';
 ALTER TABLE metering.events_raw MODIFY COLUMN producer_id COMMENT '生成此事件的 Observer 实例标识，部署时使用实际 Pod UID';
-ALTER TABLE metering.events_raw MODIFY COLUMN gateway_instance_id COMMENT '观察请求的网关实例标识，部署时使用实际 Pod UID';
+ALTER TABLE metering.events_raw MODIFY COLUMN gateway_instance_id COMMENT '观察请求的网关实例标识，新版为命名空间/Pod名称，历史值可能为Pod UID';
 ALTER TABLE metering.events_raw MODIFY COLUMN config_version COMMENT '请求开始时冻结的采集配置版本，需在 Observer 和 Consumer 登记';
 ALTER TABLE metering.events_raw MODIFY COLUMN adapter_id COMMENT '响应协议适配器，当前为 chat_completions_v1';
 ALTER TABLE metering.events_raw MODIFY COLUMN route_name COMMENT '实际 Envoy HTTP 路由名，不可读时为 unknown；仅诊断，不代表 VirtualService 或归属';
@@ -251,7 +251,7 @@ ALTER VIEW metering.event_variants (
     observation_id COMMENT '观察标识，当前与 logical_request_id 相同',
     observation_scope COMMENT '观察范围，当前固定 gateway_response，不代表所有隐藏的上游尝试',
     producer_id COMMENT '生成此事件的 Observer 实例标识，部署时使用实际 Pod UID',
-    gateway_instance_id COMMENT '观察请求的网关实例标识，部署时使用实际 Pod UID',
+    gateway_instance_id COMMENT '观察请求的网关实例标识，新版为命名空间/Pod名称，历史值可能为Pod UID',
     config_version COMMENT '请求开始时冻结的采集配置版本，需在 Observer 和 Consumer 登记',
     adapter_id COMMENT '响应协议适配器，当前为 chat_completions_v1',
     route_name COMMENT '实际 Envoy HTTP 路由名，不可读时为 unknown；仅诊断，不代表 VirtualService 或归属',
@@ -332,7 +332,7 @@ ALTER VIEW metering.events_valid (
     observation_id COMMENT '观察标识，当前与 logical_request_id 相同',
     observation_scope COMMENT '观察范围，当前固定 gateway_response，不代表所有隐藏的上游尝试',
     producer_id COMMENT '生成此事件的 Observer 实例标识，部署时使用实际 Pod UID',
-    gateway_instance_id COMMENT '观察请求的网关实例标识，部署时使用实际 Pod UID',
+    gateway_instance_id COMMENT '观察请求的网关实例标识，新版为命名空间/Pod名称，历史值可能为Pod UID',
     config_version COMMENT '请求开始时冻结的采集配置版本，需在 Observer 和 Consumer 登记',
     adapter_id COMMENT '响应协议适配器，当前为 chat_completions_v1',
     route_name COMMENT '实际 Envoy HTTP 路由名，不可读时为 unknown；仅诊断，不代表 VirtualService 或归属',
@@ -404,7 +404,7 @@ ALTER VIEW metering.event_details (
     observation_id COMMENT '观察标识，当前与 logical_request_id 相同',
     observation_scope COMMENT '观察范围，当前固定 gateway_response，不代表所有隐藏的上游尝试',
     producer_id COMMENT '生成此事件的 Observer 实例标识，部署时使用实际 Pod UID',
-    gateway_instance_id COMMENT '观察请求的网关实例标识，部署时使用实际 Pod UID',
+    gateway_instance_id COMMENT '观察请求的网关实例标识，新版为命名空间/Pod名称，历史值可能为Pod UID',
     config_version COMMENT '请求开始时冻结的采集配置版本，需在 Observer 和 Consumer 登记',
     adapter_id COMMENT '响应协议适配器，当前为 chat_completions_v1',
     route_name COMMENT '实际 Envoy HTTP 路由名，不可读时为 unknown；仅诊断，不代表 VirtualService 或归属',
@@ -557,7 +557,7 @@ ALTER VIEW metering.usage_effective (
     observation_id COMMENT '观察标识，当前与 logical_request_id 相同',
     observation_scope COMMENT '观察范围，当前固定 gateway_response，不代表所有隐藏的上游尝试',
     producer_id COMMENT '生成此事件的 Observer 实例标识，部署时使用实际 Pod UID',
-    gateway_instance_id COMMENT '观察请求的网关实例标识，部署时使用实际 Pod UID',
+    gateway_instance_id COMMENT '观察请求的网关实例标识，新版为命名空间/Pod名称，历史值可能为Pod UID',
     config_version COMMENT '请求开始时冻结的采集配置版本，需在 Observer 和 Consumer 登记',
     adapter_id COMMENT '响应协议适配器，当前为 chat_completions_v1',
     route_name COMMENT '实际 Envoy HTTP 路由名，不可读时为 unknown；仅诊断，不代表 VirtualService 或归属',

@@ -100,7 +100,7 @@ flowchart TD
 | observation_id | VARCHAR(36) | 否 | 未声明 | — | 观察标识，当前与 logical_request_id 相同 |
 | observation_scope | VARCHAR(32) | 否 | 未声明 | — | 观察范围，当前固定 gateway_response，不代表所有隐藏的上游尝试 |
 | producer_id | VARCHAR(128) | 否 | 未声明 | — | 生成此事件的 Observer 实例标识，部署时使用实际 Pod UID |
-| gateway_instance_id | VARCHAR(128) | 否 | 未声明 | — | 观察请求的网关实例标识，部署时使用实际 Pod UID |
+| gateway_instance_id | VARCHAR(128) | 否 | 未声明 | — | 观察请求的网关实例标识，新版为命名空间/Pod名称，历史值可能为Pod UID |
 | config_version | VARCHAR(128) | 否 | 未声明 | — | 请求开始时冻结的采集配置版本，需在 Observer 和 Consumer 登记 |
 | adapter_id | VARCHAR(64) | 否 | 未声明 | — | 响应协议适配器，当前为 chat_completions_v1 |
 | route_name | VARCHAR(128) | 否 | 未声明 | — | 实际 Envoy HTTP 路由名，不可读时为 unknown；仅诊断，不代表 VirtualService 或归属 |
@@ -554,7 +554,7 @@ flowchart TD
 | observation_id | VARCHAR(36) | 否 | —（派生） | — | 观察标识，当前与 logical_request_id 相同 |
 | observation_scope | VARCHAR(32) | 否 | —（派生） | — | 观察范围，当前固定 gateway_response，不代表所有隐藏的上游尝试 |
 | producer_id | VARCHAR(128) | 否 | —（派生） | — | 生成此事件的 Observer 实例标识，部署时使用实际 Pod UID |
-| gateway_instance_id | VARCHAR(128) | 否 | —（派生） | — | 观察请求的网关实例标识，部署时使用实际 Pod UID |
+| gateway_instance_id | VARCHAR(128) | 否 | —（派生） | — | 观察请求的网关实例标识，新版为命名空间/Pod名称，历史值可能为Pod UID |
 | config_version | VARCHAR(128) | 否 | —（派生） | — | 请求开始时冻结的采集配置版本，需在 Observer 和 Consumer 登记 |
 | adapter_id | VARCHAR(64) | 否 | —（派生） | — | 响应协议适配器，当前为 chat_completions_v1 |
 | route_name | VARCHAR(128) | 否 | —（派生） | — | 实际 Envoy HTTP 路由名，不可读时为 unknown；仅诊断，不代表 VirtualService 或归属 |
@@ -663,7 +663,7 @@ flowchart TD
 | observation_id | VARCHAR(36) | 否 | —（派生） | — | 观察标识，当前与 logical_request_id 相同 |
 | observation_scope | VARCHAR(32) | 否 | —（派生） | — | 观察范围，当前固定 gateway_response，不代表所有隐藏的上游尝试 |
 | producer_id | VARCHAR(128) | 否 | —（派生） | — | 生成此事件的 Observer 实例标识，部署时使用实际 Pod UID |
-| gateway_instance_id | VARCHAR(128) | 否 | —（派生） | — | 观察请求的网关实例标识，部署时使用实际 Pod UID |
+| gateway_instance_id | VARCHAR(128) | 否 | —（派生） | — | 观察请求的网关实例标识，新版为命名空间/Pod名称，历史值可能为Pod UID |
 | config_version | VARCHAR(128) | 否 | —（派生） | — | 请求开始时冻结的采集配置版本，需在 Observer 和 Consumer 登记 |
 | adapter_id | VARCHAR(64) | 否 | —（派生） | — | 响应协议适配器，当前为 chat_completions_v1 |
 | route_name | VARCHAR(128) | 否 | —（派生） | — | 实际 Envoy HTTP 路由名，不可读时为 unknown；仅诊断，不代表 VirtualService 或归属 |
@@ -748,7 +748,7 @@ flowchart TD
 | observation_id | VARCHAR(36) | 否 | —（派生） | — | 观察标识，当前与 logical_request_id 相同 |
 | observation_scope | VARCHAR(32) | 否 | —（派生） | — | 观察范围，当前固定 gateway_response，不代表所有隐藏的上游尝试 |
 | producer_id | VARCHAR(128) | 否 | —（派生） | — | 生成此事件的 Observer 实例标识，部署时使用实际 Pod UID |
-| gateway_instance_id | VARCHAR(128) | 否 | —（派生） | — | 观察请求的网关实例标识，部署时使用实际 Pod UID |
+| gateway_instance_id | VARCHAR(128) | 否 | —（派生） | — | 观察请求的网关实例标识，新版为命名空间/Pod名称，历史值可能为Pod UID |
 | config_version | VARCHAR(128) | 否 | —（派生） | — | 请求开始时冻结的采集配置版本，需在 Observer 和 Consumer 登记 |
 | adapter_id | VARCHAR(64) | 否 | —（派生） | — | 响应协议适配器，当前为 chat_completions_v1 |
 | route_name | VARCHAR(128) | 否 | —（派生） | — | 实际 Envoy HTTP 路由名，不可读时为 unknown；仅诊断，不代表 VirtualService 或归属 |
@@ -875,7 +875,7 @@ flowchart TD
 | observation_id | VARCHAR(36) | 否 | —（派生） | — | 观察标识，当前与 logical_request_id 相同 |
 | observation_scope | VARCHAR(32) | 否 | —（派生） | — | 观察范围，当前固定 gateway_response，不代表所有隐藏的上游尝试 |
 | producer_id | VARCHAR(128) | 否 | —（派生） | — | 生成此事件的 Observer 实例标识，部署时使用实际 Pod UID |
-| gateway_instance_id | VARCHAR(128) | 否 | —（派生） | — | 观察请求的网关实例标识，部署时使用实际 Pod UID |
+| gateway_instance_id | VARCHAR(128) | 否 | —（派生） | — | 观察请求的网关实例标识，新版为命名空间/Pod名称，历史值可能为Pod UID |
 | config_version | VARCHAR(128) | 否 | —（派生） | — | 请求开始时冻结的采集配置版本，需在 Observer 和 Consumer 登记 |
 | adapter_id | VARCHAR(64) | 否 | —（派生） | — | 响应协议适配器，当前为 chat_completions_v1 |
 | route_name | VARCHAR(128) | 否 | —（派生） | — | 实际 Envoy HTTP 路由名，不可读时为 unknown；仅诊断，不代表 VirtualService 或归属 |

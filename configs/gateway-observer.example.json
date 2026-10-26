@@ -2,7 +2,6 @@
   "schema_version": 1,
   "enabled": false,
   "config_version": "collection-v1",
-  "gateway_instance_id": "RENDER_FROM_POD_UID",
   "observer_cluster": "outbound|9090||metering-observer.metering.svc.cluster.local",
   "routes": [
     {

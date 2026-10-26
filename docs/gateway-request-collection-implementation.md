@@ -158,7 +158,7 @@ message Start {
   reserved 5, 7, 8, 9, 10;
   reserved "service_id", "api_key_id", "customer_id", "application_id", "identity_status";
   int64 request_started_at_ms = 1;
-  string gateway_instance_id = 2;  // Pod UID，不是客户端输入
+  string gateway_instance_id = 2;  // 运行时 namespace/pod-name，不是客户端输入；历史数据可能为 Pod UID
   string config_version = 3;
   string route_name = 4;           // 真实 Envoy 路由名，仅诊断；不可读为 unknown，不作为接纳条件
   string adapter_id = 6;
@@ -504,7 +504,7 @@ sequenceDiagram
   "observation_id": "7f6c2a90-4b13-4b68-9d21-67283e0c5f44",
   "observation_scope": "gateway_response",
   "producer_id": "observer-pod-uid",
-  "gateway_instance_id": "gateway-pod-uid",
+  "gateway_instance_id": "istio-system/gateway-example",
   "config_version": "collection-v1",
   "adapter_id": "chat_completions_v1",
   "route_name": "llm-chat",
@@ -717,7 +717,6 @@ Consumer/Doris 故障可以依赖 Kafka 72 小时保留恢复，与禁止采集�
   "schema_version": 1,
   "enabled": false,
   "config_version": "collection-v1",
-  "gateway_instance_id": "RENDER_FROM_POD_UID",
   "observer_cluster": "outbound|9090||metering-observer.metering.svc.cluster.local",
   "routes": [
     {
@@ -759,7 +758,7 @@ Consumer/Doris 故障可以依赖 Kafka 72 小时保留恢复，与禁止采集�
 }
 ```
 
-`gateway_instance_id` 由发布渲染器从目标 Kubernetes Pod 的实际 UID 注入插件配置，生产不得给多个 Pod 写同一个常量。EnvoyFilter 使用代理启动元数据 `NAME/NAMESPACE` 精确匹配目标 Pod，不依赖启动后补加的 UID 标签；Pod 重建后获取新名称、UID 重新渲染。UID 不从 HTTP 请求头读取。
+`gateway_instance_id` 由 Wasm 在插件启动时读取 Envoy 的 `node.metadata.NAMESPACE` 和 `node.metadata.NAME`，组合为 `namespace/pod-name`；配置 JSON 不再接受此字段。Istio 1.13.5 默认提供这两项元数据，无需修改网关 Pod 模板。多个副本共享同一 EnvoyFilter，各自读取实例名称，扩容或重建后无需重新渲染。标识不包含 Pod UID，同名 Pod 重建后标识不变；跨集群分析需结合 `cluster_name`。身份缺失、非法或组合后超过现有协议的 128 字节上限时停止该插件采集，增加 `metering_gateway_identity_unavailable_total`，业务继续放行；不截断名称、不回退到固定值，也不读取客户端请求头。
 
 顶层 `accepted_request_hosts` 是唯一采集 Host 白名单，支持精确域名、`*.example.com`（任意层级子域名，不含根域名）和 `*`（所有合法 DNS Host）；缺省或空名单不采集。规则最多 1024 项，且整体 Wasm 配置仍须满足 64 KiB 上限；转小写并去末尾点，拒绝 IP、端口、URL、其他通配符及规范化后的重复项。Wasm 读取 `:authority`，先拒绝非 ASCII 字符再规范化，不使用转发头；未匹配或无效 Host 在凭据提取、正文改写资源分配和建流之前直接透传，不产生事件。Observer / Consumer 不维护服务或 Host 白名单，保留配置版本、协议与字段一致性校验。升级先启用新 Wasm Host 筛选，再移除下游旧名单；需重新构建产物、更新摘要和渲染 EnvoyFilter。
 

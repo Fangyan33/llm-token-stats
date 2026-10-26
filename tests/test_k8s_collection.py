@@ -29,6 +29,26 @@ class KubernetesCollectionTests(unittest.TestCase):
                 self.assertEqual(saved['image_tag'], version)
                 self.assertEqual(list(saved['images'].values()), expected)
 
+    def test_match_probe_changes_selector_and_restores_shared_filter(self):
+        with tempfile.TemporaryDirectory() as directory:
+            harness = self.harness(directory)
+            resource = {'spec': {'workloadSelector': {'labels': {'istio': harness.namespace}},
+                                 'configPatches': [{'match': {'context': 'GATEWAY',
+                                                            'proxy': {'metadata': {'NAMESPACE': harness.namespace}}}}]}}
+            original = copy.deepcopy(resource)
+            with patch.object(harness, 'apply') as apply, \
+                    patch.object(harness, 'wait_wasm', return_value={}) as wait, \
+                    patch.object(harness, 'request', return_value=(200, {}, b'')):
+                harness.check_match(resource)
+            self.assertEqual(apply.call_args_list[0].args[0]['spec']['workloadSelector']['labels'],
+                             {'istio': 'no-such-verification-workload'})
+            self.assertEqual(apply.call_args_list[1].args[0], original)
+            self.assertEqual(apply.call_args_list[2].args[0]['spec']['configPatches'][0]['match']['proxy']['metadata'],
+                             {'NAMESPACE': 'no-such-verification-namespace'})
+            self.assertEqual(apply.call_args_list[3].args[0], original)
+            self.assertEqual(resource, original)
+            self.assertEqual([call.args for call in wait.call_args_list], [(False,), (), (False,), ()])
+
     def test_namespace_guard_excludes_existing_system_and_business_namespaces(self):
         self.assertEqual(k8s.namespace_name('metering-wasm-verify'), 'metering-wasm-verify')
         for name in ('default', 'istio-system', 'ai-gateway-ns', 'metering-wasm-',
@@ -100,21 +120,21 @@ class KubernetesCollectionTests(unittest.TestCase):
     def test_acceptance_rejects_compose_producer_wrong_topic_and_unknown_zero(self):
         results = [{'scenario': 'unknown', 'x_request_id': 'request'}]
         rows = [['request', 'request_started', 'logical', 'unknown', 'NULL', 'NULL',
-                 'complete', '0', 'gateway-uid', 'observer-pod-uid', 'test-topic', 'synthetic-model-route'],
+                 'complete', '0', 'gateway-test/gateway-pod', 'observer-pod-uid', 'test-topic', 'synthetic-model-route'],
                 ['request', 'usage_observed', 'logical', 'unknown', 'NULL', 'NULL',
-                 'complete', '0', 'gateway-uid', 'observer-pod-uid', 'test-topic', 'synthetic-model-route']]
+                 'complete', '0', 'gateway-test/gateway-pod', 'observer-pod-uid', 'test-topic', 'synthetic-model-route']]
         for row in rows:
             row.extend(['NULL'] * 4 + ['lookup_not_implemented'] * 2 + ['kind','stg','wasm-verify.local','NULL','NULL'])
-        k8s.validate_events(copy.deepcopy(results), rows, 'gateway-uid', {'observer-pod-uid'}, 'test-topic')
+        k8s.validate_events(copy.deepcopy(results), rows, 'gateway-test/gateway-pod', {'observer-pod-uid'}, 'test-topic')
         missing = copy.deepcopy(rows)
         for row in missing:
             row[11] = 'unknown'
-        k8s.validate_events(copy.deepcopy(results), missing, 'gateway-uid', {'observer-pod-uid'}, 'test-topic')
+        k8s.validate_events(copy.deepcopy(results), missing, 'gateway-test/gateway-pod', {'observer-pod-uid'}, 'test-topic')
         for column, value in ((9, 'compose-observer'), (10, 'llm-metering-events'), (4, '0'), (11, '*'), (11, 'llm-chat')):
             invalid = copy.deepcopy(rows)
             invalid[1][column] = value
             with self.assertRaises(RuntimeError):
-                k8s.validate_events(copy.deepcopy(results), invalid, 'gateway-uid', {'observer-pod-uid'}, 'test-topic')
+                k8s.validate_events(copy.deepcopy(results), invalid, 'gateway-test/gateway-pod', {'observer-pod-uid'}, 'test-topic')
 
     def test_warming_configuration_is_not_accepted_as_active_wasm(self):
         wasm = {'name': 'envoy.filters.http.wasm', 'typed_config': {'config': {'name': 'gateway-observer'}}}
@@ -128,6 +148,10 @@ class KubernetesCollectionTests(unittest.TestCase):
                'group topic 1 2 2 0 member /172.19.0.1 kgo\n'
                'group topic 2 - 0 - member /172.19.0.1 kgo\n')
         self.assertTrue(k8s.offsets_caught_up(raw, 'topic'))
+        self.assertFalse(k8s.offsets_caught_up(raw, 'topic', expected_events=18))
+        scaled = raw.replace('0 4 4 0', '0 12 12 0').replace('1 2 2 0', '1 6 6 0')
+        self.assertTrue(k8s.offsets_caught_up(scaled, 'topic', expected_events=18))
+        self.assertFalse(k8s.offsets_caught_up(scaled, 'topic'))
         self.assertFalse(k8s.offsets_caught_up(raw.replace('1 2 2 0', '1 1 2 1'), 'topic'))
         self.assertFalse(k8s.offsets_caught_up(raw.replace('2 - 0 -', '2 - 1 -'), 'topic'))
         self.assertFalse(k8s.offsets_caught_up(raw.replace('member', '-'), 'topic'))

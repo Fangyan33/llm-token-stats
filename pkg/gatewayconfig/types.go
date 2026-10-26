@@ -12,7 +12,6 @@ type Config struct {
 	SchemaVersion           int64    `json:"schema_version"`
 	Enabled                 bool     `json:"enabled"`
 	ConfigVersion           string   `json:"config_version"`
-	GatewayInstanceID       string   `json:"gateway_instance_id"`
 	ObserverCluster         string   `json:"observer_cluster"`
 	AcceptedRequestHosts    []string `json:"accepted_request_hosts"`
 	Routes                  []Route  `json:"routes"`

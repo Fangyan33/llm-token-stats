@@ -27,7 +27,7 @@ CI 中的 TinyGo 容器使用 Runner 的 UID/GID，并将容器内的 HOME 设�
 
 镜像版本使用 `python3 scripts/image_tag.py` 解析：当前 HEAD 有 Git tag 时取该 tag，无 tag 时取至少 12 位 commit 短 hash；多个 tag 按 Git 版本排序取最高项，历史 tag 不沿用，不兼容 Docker tag 的名称会报错。README 的服务镜像构建与 `make k8s-test` 使用同一规则；Kubernetes 测试的 topic / 消费组仍通过随机 run-id 隔离。
 
-`make package` 另构建 Observer / Consumer 镜像，并默认仅将这两个镜像保存到 `dist/package/images/images.tar`。指定 `--include-dependency-images` 后才额外归档 Kafka、Doris、Istio proxyv2；默认部署前需保证目标节点能拉取或已导入依赖镜像。分发包始终提供单节点 Kafka / Doris 的持久化部署、topic / 数据库初始化 Job、采集服务、全部 ConfigMap / Secret，以及针对实际网关 Pod 渲染的关闭态 / 启用态 EnvoyFilter；全部为可直接 `kubectl apply` 的 YAML。包根目录的 `envoyfilter.yaml` 汇总全部目标 Pod 的关闭态配置，`gateway/disabled/` 与 `gateway/enabled/` 按 Pod 保留两种状态；Observer 就绪后再单独应用 EnvoyFilter。`manifest.json` 分别记录全部镜像引用、归档镜像和需外部准备的镜像。省略 `--accepted-request-host` 时，打包写入 `["*"]`，匹配全部合法 DNS Host；显式提供时完整覆盖默认值，可重复传入目标域名、后缀通配或 `*`，并写入两种状态的 EnvoyFilter、manifest 和包内说明。显式空名单或非法名单在集群查询及镜像构建前失败。默认只读查询当前 context 的既有网关，也可通过 `PACKAGE_ARGS` 提供目标 context 或实际 Pod 名称 / UID。指定输出目录使用 `PACKAGE_DIR`，完整命令、镜像导入和部署顺序见 [README 分发说明](../README.md#分发镜像与完整-kubernetes-清单)。该包采用开发环境的单节点、明文 Kafka 与 Doris root 空密码，生产仍使用下文的独立基础设施和认证配置。
+`make package` 另构建 Observer / Consumer 镜像，并默认仅将这两个镜像保存到 `dist/package/images/images.tar`。指定 `--include-dependency-images` 后才额外归档 Kafka、Doris、Istio proxyv2；默认部署前需保证目标节点能拉取或已导入依赖镜像。分发包始终提供单节点 Kafka / Doris 的持久化部署、topic / 数据库初始化 Job、采集服务、全部 ConfigMap / Secret，以及针对网关工作负载渲染的关闭态 / 启用态 EnvoyFilter；全部为可直接 `kubectl apply` 的 YAML。包根目录的 `envoyfilter.yaml` 提供工作负载的关闭态配置，`gateway/disabled/` 与 `gateway/enabled/` 保留两种状态；Observer 就绪后再单独应用 EnvoyFilter。`manifest.json` 分别记录全部镜像引用、归档镜像和需外部准备的镜像。省略 `--accepted-request-host` 时，打包写入 `["*"]`，匹配全部合法 DNS Host；显式提供时完整覆盖默认值，可重复传入目标域名、后缀通配或 `*`，并写入两种状态的 EnvoyFilter、manifest 和包内说明。显式空名单或非法名单在镜像构建前失败。打包不访问集群，也不绑定 Pod；可通过 `PACKAGE_ARGS` 的 `--gateway-namespace`、`--gateway-label KEY=VALUE` 选择目标工作负载。指定输出目录使用 `PACKAGE_DIR`，完整命令、镜像导入和部署顺序见 [README 分发说明](../README.md#分发镜像与完整-kubernetes-清单)。该包采用开发环境的单节点、明文 Kafka 与 Doris root 空密码，生产仍使用下文的独立基础设施和认证配置。
 
 本地栈的已发布端口统一绑定 `0.0.0.0`，可使用服务器 IP 从远端访问：
 
@@ -138,23 +138,22 @@ Host 无效或不匹配时，在提取凭据、建立观察流、缓存或改写
 
 部署模板在 [Observer](../deploy/observer/observer.yaml)、[Consumer](../deploy/consumer/consumer.yaml)、[EnvoyFilter](../deploy/gateway/envoyfilter.yaml)。先 `make wasm`，再构建 Observer/Consumer Dockerfile 镜像，替换 image digest，建立 metering namespace、对应 ConfigMap/Secret，再使用模板。生产配置示例在 `configs/*.production.example.json`，其中地址是待核对的样例，不代表已部署。Kafka 支持挂载 CA/客户端证书与 SASL PLAIN 环境变量；`kafka.topic` 支持合法 Kafka 名称，Observer 与 Consumer 必须配置一致，生产约定使用 `llm-metering-events`，隔离测试使用专属 topic。Doris DSN、HTTP 用户及密码从 Secret 环境变量读取。DSN 必须显式配置连接、读写超时、UTC 会话；禁止将密码写入配置或提交仓库。需要受控网络与网格 mTLS，模板没有代替真实认证、网络策略或 G0 验收。
 
-EnvoyFilter 模板不可原样 apply；必须校验渲染后的 JSON。按一个实际网关 Pod 名称和 UID 渲染，默认关闭：
+EnvoyFilter 模板不可原样 apply；必须校验渲染后的 JSON。按命名空间和已有工作负载标签渲染，默认关闭：
 
 ```sh
-export GATEWAY_POD=替换为实际网关Pod名称
-export GATEWAY_POD_UID="$(kubectl -n istio-system get pod "$GATEWAY_POD" -o jsonpath='{.metadata.uid}')"
 python3 scripts/render_gateway_filter.py \
-  --gateway-pod-name "$GATEWAY_POD" \
+  --gateway-label istio=ingressgateway \
   --gateway-namespace istio-system \
-  --gateway-pod-uid "$GATEWAY_POD_UID" \
   --wasm-file dist/gateway-observer-v1.wasm \
   --wasm-url http://metering-observer.metering.svc.cluster.local:9093/wasm/gateway-observer-v1.wasm \
   --wasm-cluster 'outbound|9093||metering-observer.metering.svc.cluster.local' \
   --output dist/envoyfilter.disabled.yaml
-# G0/G1 通过后，为该 Pod 使用显式 --enable。
+# G0/G1 通过后，为该工作负载使用显式 --enable。
 ```
 
-渲染器通过代理启动元数据 `NAME/NAMESPACE` 匹配目标 Pod，实际 Pod UID 只作为该 Pod 的 `gateway_instance_id` 和资源名称后缀；每次 Pod 重建都要获取新名称、UID 并重新渲染，不能共享一个实例 ID。Istio 1.13 启动后补加的 Pod 标签未进入代理标签快照，不能依靠补 UID 标签实现匹配。`--gateway-pod-name` 必填，`--gateway-namespace` 默认 `istio-system`。可通过 config_dump 检查启动元数据和实际过滤器，字段机制见 [Istio 1.13 ProxyMatch](https://istio.io/v1.13/docs/reference/config/networking/envoy-filter/#EnvoyFilter-ProxyMatch)。Wasm 使用远程 URL、HTTP 集群和实际文件 SHA-256 加载，不要求网关镜像预置文件；模板插在 router 前，要求 ext_authz 已在它之前，以真实 config_dump 核验。每 Worker 一份 Root，初始 2 Worker；热更新存活代数、Pod 选择及回退需另做灰度验收。路由可信 metadata 由网关路由配置提供，不由这个过滤器自动创建。
+`gateway_instance_id` 由 Wasm 在插件启动时读取 Envoy 的 `node.metadata.NAMESPACE` 和 `node.metadata.NAME`，组合为 `namespace/pod-name`；配置 JSON 不再接受此字段。Istio 1.13.5 默认提供这两项元数据，无需修改网关 Pod 模板。多个副本共享同一 EnvoyFilter，各自读取实例名称，扩容或重建后无需重新渲染。标识不包含 Pod UID，同名 Pod 重建后标识不变；跨集群分析需结合 `cluster_name`。命名空间按 DNS label 校验（最多 63 字节），Pod 名称按 Kubernetes DNS subdomain 校验（总长最多 253 字节，不另限每段 63 字节）；身份缺失、非法或组合后超过现有协议的 128 字节上限时停止该插件采集，增加 `metering_gateway_identity_unavailable_total`，业务继续放行；不截断名称、不回退到固定值，也不读取客户端请求头。
+
+过滤器通过代理 `metadata.NAMESPACE` 与工作负载启动标签共同匹配，根配置命名空间中的资源也不会跨命名空间生效。资源名称由排序后的标签生成稳定摘要，不同工作负载独立，同一工作负载的启用态和关闭态名称相同；选择器变更需先删除旧清单对应的资源。默认 `istio-system`、`istio=ingressgateway`，通过 `--gateway-label` 可替换默认标签。Wasm 使用远程 URL、HTTP 集群和实际文件 SHA-256 加载；模板插在 router 前，要求 ext_authz 已在它之前，以真实 config_dump 核验。每 Worker 一份 Root；生产热更新及回退仍需完成灰度验收。从旧版迁移先移除按 UID 命名或固定名 `gateway-observer` 的过滤器，避免新旧重复安装。
 
 Istio 的 `outbound|端口|子集|服务DNS` 是路由集群名，不能原样作为 Go gRPC 服务的 HTTP/2 `:authority`。插件保持 `cluster_name` 不变，自动将这类集群的 authority 设置为 `服务DNS:端口`；普通本地集群名保持原值，不改变集群 TLS/SNI。自定义 ext_authz 若同样使用 Istio 集群名，必须在其 `grpc_service.envoy_grpc.authority` 显式填写有效服务 DNS。
 
@@ -182,7 +181,7 @@ sha256sum dist/gateway-observer-v1.wasm dist/gateway-observer.download.wasm
 
 网关使用原生 `code.remote` 加载，下载超时 5 秒、额外重试 0 次、`fail_open: true`。保留 HTTP_FILTER 直接插入方式，不依赖 Istio agent 的 ECDS 文件重写。下载 HTTP 集群默认是 `outbound|9093||metering-observer.metering.svc.cluster.local`；采集 gRPC 仍使用 9090 的 HTTP/2 集群，不能混用。生产须核对实际集群存在，NetworkPolicy、网格 mTLS 与授权允许相应流量；下载端口默认 ClusterIP 内网访问，Observer 本身不终止 TLS、不提供下载鉴权。首次加载有下载等待，已运行的业务请求不会逐次下载。
 
-仅保留当前镜像的单个文件。先更新所有 Observer 副本并核对下载摘要，再更新网关配置。滚动期间旧摘要可能校验失败，允许暂时缺少采集；已加载实例可继续运行，但旧网关重启后不保证取得旧文件。下载服务恢复后需要触发插件重新安装或重启网关；Pod 重建后仍须按新 UID 渲染。原样重复 apply 同一配置不保证触发下载，不承诺自动恢复。版本回退先恢复对应 Observer 镜像，再恢复其匹配的网关配置。需要立即停采时关闭或删除该 Pod 的采集过滤器；`fail_open` 不覆盖任意初始化、ABI 或资源故障。
+仅保留当前镜像的单个文件。先更新所有 Observer 副本并核对下载摘要，再更新网关配置。滚动期间旧摘要可能校验失败，允许暂时缺少采集；已加载实例可继续运行，但旧网关重启后不保证取得旧文件。下载服务恢复后需要触发插件重新安装或重启网关；新 Pod 自动匹配工作负载过滤器。原样重复 apply 同一配置不保证触发下载，不承诺自动恢复。版本回退先恢复对应 Observer 镜像，再恢复其匹配的网关配置。需要立即停采时关闭或删除对应工作负载的采集过滤器；`fail_open` 不覆盖任意初始化、ABI 或资源故障。
 
 ## Consumer 恢复与统计边界
 

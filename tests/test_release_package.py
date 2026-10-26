@@ -19,8 +19,7 @@ class ReleasePackageTests(unittest.TestCase):
     def environment(self):
         return {
             'RELEASE_ACCEPTED_REQUEST_HOSTS': '["API.Company.com.", "*.company.com"]',
-            'RELEASE_GATEWAY_PODS': json.dumps([
-                'gateway-abc=7f6c2a90-4b13-4b68-9d21-67283e0c5f44']),
+            'RELEASE_GATEWAY_LABELS': '["app=ai-gateway"]',
         }
 
     def test_inputs_use_existing_contract_without_cluster_access(self):
@@ -29,9 +28,15 @@ class ReleasePackageTests(unittest.TestCase):
         run.assert_not_called()
         args = release.bundle.parser().parse_args(options)
         self.assertEqual(args.accepted_request_host, ['api.company.com', '*.company.com'])
-        self.assertEqual(args.gateway_pod[0]['name'], 'gateway-abc')
+        self.assertEqual(release.bundle.selector(args.gateway_label), {'app': 'ai-gateway'})
         self.assertEqual(args.platform, 'linux/amd64')
         self.assertFalse(args.include_dependency_images)
+
+    def test_release_needs_no_environment_inputs(self):
+        with patch.object(release.bundle, "run") as run:
+            args = release.bundle.parser().parse_args(release.package_options({}))
+        run.assert_not_called()
+        self.assertEqual(release.bundle.selector(args.gateway_label), {"istio": "ingressgateway"})
 
     def test_missing_or_blank_host_input_defaults_to_all_hosts(self):
         for host_input in (None, '', '   '):
@@ -55,8 +60,8 @@ class ReleasePackageTests(unittest.TestCase):
             ('RELEASE_ACCEPTED_REQUEST_HOSTS', '[1]'),
             ('RELEASE_ACCEPTED_REQUEST_HOSTS', '["api.company.com", "API.COMPANY.COM"]'),
             ('RELEASE_ACCEPTED_REQUEST_HOSTS', '["$(touch /tmp/injected)"]'),
-            ('RELEASE_GATEWAY_PODS', '["gateway=invalid"]'),
-            ('RELEASE_GATEWAY_PODS', '["gateway`id`=7f6c2a90-4b13-4b68-9d21-67283e0c5f44"]'),
+            ('RELEASE_GATEWAY_LABELS', '["bad/key/name=x"]'),
+            ('RELEASE_GATEWAY_LABELS', '["gateway`id`=value"]'),
             ('RELEASE_NAMESPACE', 'metering;id'),
             ('RELEASE_STORAGE_CLASS', '$(shell id)'),
         ]

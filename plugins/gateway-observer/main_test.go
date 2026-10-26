@@ -153,6 +153,10 @@ func testHostWithRoute(t *testing.T, route string) proxytest.HostEmulator {
 }
 
 func testHostWithConfig(t *testing.T, route string, change func(map[string]any)) proxytest.HostEmulator {
+	return testHostWithIdentity(t, route, change, "test", "test-gateway")
+}
+
+func testHostWithIdentity(t *testing.T, route string, change func(map[string]any), namespace, name string) proxytest.HostEmulator {
 	t.Helper()
 	proxytest.ResetGrpc()
 	b, err := os.ReadFile("../../configs/gateway-observer.example.json")
@@ -162,12 +166,17 @@ func testHostWithConfig(t *testing.T, route string, change func(map[string]any))
 	var c map[string]any
 	json.Unmarshal(b, &c)
 	c["enabled"] = true
-	c["gateway_instance_id"] = "test-gateway"
 	if change != nil {
 		change(c)
 	}
 	b, _ = json.Marshal(c)
 	option := proxytest.NewEmulatorOption().WithVMContext(&vm{}).WithPluginConfiguration(b)
+	if namespace != "" {
+		option = option.WithProperty([]string{"node", "metadata", "NAMESPACE"}, []byte(namespace))
+	}
+	if name != "" {
+		option = option.WithProperty([]string{"node", "metadata", "NAME"}, []byte(name))
+	}
 	if route != "" {
 		option = option.WithProperty([]string{"route_name"}, []byte(route))
 	}
@@ -351,5 +360,89 @@ func TestRewriteEOSAndLateACK(t *testing.T) {
 	proxytest.EmitGrpcReceive(proxytest.PluginContextID, calls[0].Token, a)
 	if !calls[0].Cancelled {
 		t.Fatal("not released")
+	}
+}
+
+func TestRuntimeGatewayIdentity(t *testing.T) {
+	for _, tc := range []struct {
+		namespace, name string
+		valid           bool
+	}{
+		{"gateways", "gateway-a", true},
+		{"gateways", "gateway-b", true}, // same configuration, a newly scaled replica
+		{"other", "gateway-a", true},
+		{"gateways", "gateway-a", true},                                      // same name reused: intentionally the same identity
+		{"n", strings.Repeat("a", 63) + "." + strings.Repeat("b", 62), true}, // 128 bytes
+		{"test", strings.Repeat("a", 64), true},                              // Kubernetes DNS subdomains have no per-label length limit.
+		{"test", strings.Repeat("a", 64) + ".pod", true},
+		{strings.Repeat("n", 63), strings.Repeat("a", 64), true}, // exactly 128 bytes
+		{"n", strings.Repeat("a", 126), true},                    // exactly 128 bytes, one long Pod-name label
+		{"n", strings.Repeat("a", 127), false},                   // 129 bytes: do not truncate
+		{strings.Repeat("n", 64), "pod", false},                  // namespaces still use DNS label limits
+		{"test.ns", "pod", false},
+		{"", "gateway-a", false}, {"gateways", "", false},
+		{"bad/namespace", "gateway-a", false}, {"gateways", "bad/name", false},
+		{"gateways", "UPPER", false}, {"gateways", "a..b", false},
+		{"gateways", "-pod", false}, {"gateways", "pod-", false},
+		{"gateways", ".pod", false}, {"gateways", "pod.", false},
+		{"gateways", "pod.-name", false}, {"gateways", "pod-.name", false},
+		{"gateways", string([]byte{0xff}), false},
+		{"nn", strings.Repeat("a", 63) + "." + strings.Repeat("b", 62), false}, // no truncation
+	} {
+		t.Run(tc.namespace+"/"+tc.name, func(t *testing.T) {
+			h := testHostWithIdentity(t, "llm-chat", nil, tc.namespace, tc.name)
+			id := h.InitializeHttpContext()
+			headers := [][2]string{{":method", "POST"}, {":path", "/v1/chat/completions"}, {":authority", "model.example.invalid"}, {"gateway_instance_id", "forged"}, {"x-pod-name", "forged"}}
+			if action := h.CallOnRequestHeaders(id, headers, false); action != types.ActionContinue {
+				t.Fatalf("business request blocked: %v", action)
+			}
+			calls := proxytest.GrpcCalls()
+			if !tc.valid {
+				if len(calls) != 0 {
+					t.Fatal("invalid identity emitted observations")
+				}
+				if n, err := h.GetCounterMetric("metering_gateway_identity_unavailable_total"); err != nil || n != 1 {
+					t.Fatalf("missing identity rejection metric: %d %v", n, err)
+				}
+				if !reflect.DeepEqual(h.GetCurrentRequestHeaders(id), headers) {
+					t.Fatal("business headers changed")
+				}
+				return
+			}
+			var frame pb.ObservationFrame
+			if len(calls) != 1 || len(calls[0].Messages) != 1 || proto.Unmarshal(calls[0].Messages[0], &frame) != nil || frame.GetStart() == nil {
+				t.Fatal("missing valid Start")
+			}
+			if got := frame.GetStart().GatewayInstanceId; got != tc.namespace+"/"+tc.name {
+				t.Fatalf("identity = %q", got)
+			}
+		})
+	}
+}
+
+func TestReloadCannotRetainInvalidGatewayIdentity(t *testing.T) {
+	h := testHost(t)
+	if err := h.SetProperty([]string{"node", "metadata", "NAME"}, []byte("invalid/name")); err != nil {
+		t.Fatal(err)
+	}
+	if h.StartPlugin() != types.OnPluginStartStatusOK {
+		t.Fatal("reload must fail open")
+	}
+	id := h.InitializeHttpContext()
+	h.CallOnRequestHeaders(id, [][2]string{{":method", "POST"}, {":path", "/v1/chat/completions"}, {":authority", "model.example.invalid"}}, false)
+	if len(proxytest.GrpcCalls()) != 0 {
+		t.Fatal("stale identity emitted observations after reload")
+	}
+}
+
+func TestConfiguredGatewayIdentityRejected(t *testing.T) {
+	h := testHostWithConfig(t, "llm-chat", func(c map[string]any) { c["gateway_instance_id"] = "legacy-shared-id" })
+	id := h.InitializeHttpContext()
+	h.CallOnRequestHeaders(id, [][2]string{{":method", "POST"}, {":path", "/v1/chat/completions"}, {":authority", "model.example.invalid"}}, false)
+	if len(proxytest.GrpcCalls()) != 0 {
+		t.Fatal("configured identity was accepted")
+	}
+	if n, err := h.GetCounterMetric("metering_config_invalid_total"); err != nil || n != 1 {
+		t.Fatalf("missing rejection metric: %d %v", n, err)
 	}
 }

@@ -7,7 +7,7 @@
 ## 拓扑与前置条件
 
 ```text
-合成请求 → Kubernetes 测试网关 → Kubernetes fixture（合成访问允许与模型）
+合成请求 → Kubernetes 测试网关（1→2 副本）→ Kubernetes fixture（合成访问允许与模型）
                      │ 下载 Wasm / gRPC 旁路
                      ↓
              Kubernetes Observer × 2
@@ -37,7 +37,7 @@ make k8s-test
 
 共享基础设施已运行且迁移完成时，可直接 `make k8s-test`。无需启动 Compose Observer、Consumer、Fixture 或 Envoy；如果它们已经运行，也可以保持运行。该用例为每次执行生成独立的 `llm-metering-k8s-<run-id>` topic 和消费组，使用 3 个分区、24 小时保留期，避免 Compose Consumer 参与测试数据消费。不会复用 `llm-metering-events` 或 `llm-metering-doris-v1`。
 
-`make k8s-test` 编译二进制和 Wasm、构建并导入 Observer / Consumer / fixture 测试镜像，然后在 `metering-wasm-verify` 命名空间部署。网关使用原始 `docker.io/istio/proxyv2:1.13.5`，不挂载 Wasm。重复执行会先清理同名且带有本测试归属标签的旧测试环境；无归属标签时拒绝删除。原 `istio-system` 网关不参与发布。
+`make k8s-test` 编译二进制和 Wasm、构建并导入 Observer / Consumer / fixture 测试镜像，然后在 `metering-wasm-verify` 命名空间部署。网关使用原始 `docker.io/istio/proxyv2:1.13.5`，不挂载 Wasm。重复执行会先清理同名且带有本测试归属标签的旧测试环境；无归属标签时拒绝删除。原 `istio-system` 网关不参与发布。基础请求与 Consumer 停止/恢复验证后，用例将测试网关从 1 扩到 2 副本，分别向两个 Pod 发送 JSON、SSE、缺失 usage 请求；共享 EnvoyFilter 在扩容期间保持原 resourceVersion 与配置。每个副本的事件必须记录自己的 `namespace/pod-name`，最终 18 条事件均入库并提交 offset。
 
 三个测试镜像的版本统一取当前 HEAD 上的 Git tag，无 tag 时取至少 12 位 commit 短 hash，例如 `metering-observer:v1.2.3` 或 `metering-observer:2d36b71036b8`。同一提交有多个 tag 时按 Git 版本排序取最高项，轻量 / 附注 tag 均支持；不使用历史提交的 tag。不符合 Docker tag 限制的 Git tag 会使构建失败。版本解析由 [image_tag.py](../scripts/image_tag.py) 提供，与 README 的服务镜像构建命令一致。随机 run-id 仅用于测试隔离，镜像版本及完整镜像名另存于 `images.json` 和成功结果 `result.json`。
 
@@ -70,22 +70,24 @@ curl --noproxy '*' -N -H 'Host: wasm-verify.local' -H 'Authorization: Bearer syn
 | 镜像与下载 | 原始 Istio 网关镜像无 Wasm 挂载；两个 Observer 镜像内文件及从 Service 实际下载的 SHA-256 与构建产物一致 |
 | 网格 | Observer 入站 STRICT mTLS 下，9093 下载、9090 gRPC 及实际采集入库成功 |
 | 配置收敛 | 已激活监听器内 `code.remote` 摘要及 enabled 状态正确，等待 XDS 收敛后才发验收请求 |
-| Pod 匹配 | 错误 NAME 不安装采集过滤器，业务健康请求仍为 200；恢复实际 Pod NAME / NAMESPACE 后重新加载 |
+| Pod 匹配 | 分别验证错误 workloadSelector、错误代理 NAMESPACE 均不安装过滤器，业务健康请求仍为 200；恢复后重新加载 |
 | 请求过滤 | 使用 `route_name: "*"`；真实 HTTP 路由命名为 `synthetic-model-route`，不注入计量 route metadata，仍采集 POST 精确路径；JSON 场景附查询串也命中 |
 | 忽略请求 | GET / HEAD / OPTIONS / PUT，及 POST 的其它路径、尾斜杠、子路径共 8 个反例均不增加网关 selected 计数，Doris 事件为 0 |
 | 普通 JSON | HTTP 200，Doris 中恰有两条对应事件；用量 known、输入 10、输出 4、complete、usage_eligible=0，身份 invalid |
 | SSE | HTTP 200，返回 `[DONE]`，Doris 事件与正常 JSON 用量及占位身份一致；fixture 要求 include_usage，间接验证网关改写 |
 | SSE 缺 usage | HTTP 200，事件 unknown，输入 / 输出 NULL，complete、usage_eligible=0 |
 | 归属占位 | 四项 ID 和两个版本为 NULL，两种状态为 lookup_not_implemented，cluster_name 为测试集群、environment=test、request_host=wasm-verify.local；密钥不入事件 |
-| 数据来源 | 三个请求的 gateway_instance_id 为实际网关 Pod UID，producer_id 属于 Kubernetes Observer，kafka_topic 为本次独立 topic，事件 route_name 为真实 HTTP 路由名 `synthetic-model-route`；若该版本属性不可读则为 `unknown`，两事件保持一致，不允许写 `*` |
+| 数据来源 | 三个请求的 gateway_instance_id 为实际网关 namespace/pod-name，producer_id 属于 Kubernetes Observer，kafka_topic 为本次独立 topic，事件 route_name 为真实 HTTP 路由名 `synthetic-model-route`；若该版本属性不可读则为 `unknown`，两事件保持一致，不允许写 `*` |
 | 独立 Consumer | 3 个分区无积压，已有记录的分区提交位点合计为 6（空分区允许尚无提交）；Doris 有对应分区起点及可见批次回执；缩容 Kubernetes Consumer 至 0 后该组为 Empty / 0 成员，恢复至 1 后为 Stable / 1 成员且原消费位点保持 |
+| 多工作负载 | 同一命名空间渲染第二套标签，生成独立 EnvoyFilter 名称；应用后原资源的 resourceVersion 和 spec 保持不变 |
+| 网关扩容 | 1→2 副本，共用未改动的 EnvoyFilter；新旧 Pod 各自上报 namespace/pod-name，18 条事件入库且消费位点追平 |
 | 原网关隔离 | 测试前后 `istio-system` 原网关 Pod 名称、UID 和容器重启次数一致 |
 
 2026-10-15 本次验证中，请求头阶段未读到真实路由属性，三种场景的事件均记录 `route_name: "unknown"`；不会用配置通配符或 VirtualService 名称填充。单元测试另覆盖实际路由名可读时原样保存。
 
 kind 到 Compose 的连接经过 SNAT，broker 记录的 HOST 可能是 Docker 网桥地址。用例通过 Kubernetes Consumer 实际停止 / 恢复与消费组成员数的对应变化核验归属，不用 broker 所见地址推断 Pod IP。
 
-结果在 `.tmp/k8s-collection/<context>/<namespace>/<run-id>/`，包括 `result.json`、请求与 logical_request_id、实际清单、config_dump、Consumer 位点、停止 / 恢复的消费组状态和 Doris 回执。失败时另保存 Pod、事件、describe 和容器日志；均为已忽略的本地文件。最近一次测试的清理信息保存在同级 `state.json`。
+结果在 `.tmp/k8s-collection/<context>/<namespace>/<run-id>/`，包括 `result.json`、请求与 logical_request_id、实际清单、config_dump、Consumer 位点、停止 / 恢复的消费组状态、`gateway-scale.result.json` 与 Doris 回执。失败时另保存 Pod、事件、describe 和容器日志；均为已忽略的本地文件。最近一次测试的清理信息保存在同级 `state.json`。
 
 ## 清理
 

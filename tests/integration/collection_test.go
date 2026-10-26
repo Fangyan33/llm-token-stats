@@ -134,6 +134,9 @@ func TestCollectionEndToEnd(t *testing.T) {
 			if err = json.Unmarshal([]byte(raw), &event); err != nil || event.RouteName != "unknown" {
 				t.Fatal("unnamed Envoy route must be recorded as unknown")
 			}
+			if event.GatewayInstanceID != "local/gateway-test" {
+				t.Fatalf("runtime gateway identity = %q", event.GatewayInstanceID)
+			}
 			if event.MappingStatus != "lookup_not_implemented" || event.CustomerMappingStatus != "lookup_not_implemented" || event.IdentityStatus != "invalid" || event.ServiceID != nil || event.ProviderID != nil || event.ApiKeyID != nil || event.CustomerID != nil || strings.Contains(raw, "synthetic-sentinel-key") {
 				t.Fatal("unsafe or fabricated mapping")
 			}

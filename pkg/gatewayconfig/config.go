@@ -20,11 +20,8 @@ func Decode(b []byte) (Config, error) {
 			return c, errors.New("config_request_hosts") // Explicit null is not an array.
 		}
 	}
-	if c.SchemaVersion != 1 || !str(c.ConfigVersion, 128) || !str(c.GatewayInstanceID, 128) || !str(c.ObserverCluster, 256) || len(c.Routes) > 128 {
+	if c.SchemaVersion != 1 || !str(c.ConfigVersion, 128) || !str(c.ObserverCluster, 256) || len(c.Routes) > 128 {
 		return c, errors.New("config_invalid")
-	}
-	if c.Enabled && strings.Contains(c.GatewayInstanceID, "RENDER_") {
-		return c, errors.New("config_placeholder")
 	}
 	var err error
 	c.AcceptedRequestHosts, err = requesthost.NormalizePatterns(c.AcceptedRequestHosts)

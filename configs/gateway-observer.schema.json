@@ -7,7 +7,6 @@
     "schema_version",
     "enabled",
     "config_version",
-    "gateway_instance_id",
     "observer_cluster",
     "routes",
     "chunk_bytes",
@@ -39,11 +38,6 @@
       "type": "boolean"
     },
     "config_version": {
-      "type": "string",
-      "minLength": 1,
-      "maxLength": 128
-    },
-    "gateway_instance_id": {
       "type": "string",
       "minLength": 1,
       "maxLength": 128

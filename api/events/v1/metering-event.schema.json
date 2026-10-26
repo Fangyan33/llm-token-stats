@@ -94,7 +94,8 @@
     "gateway_instance_id": {
       "type": "string",
       "minLength": 1,
-      "maxLength": 128
+      "maxLength": 128,
+      "description": "运行时 namespace/pod-name；历史事件可保留原 Pod UID，不用于区分同名 Pod 的重建。"
     },
     "config_version": {
       "type": "string",
@@ -108,7 +109,7 @@
       "type": "string",
       "minLength": 1,
       "maxLength": 128,
-      "description": "Envoy \u5b9e\u9645 HTTP \u8def\u7531\u540d\uff0c\u4ec5\u7528\u4e8e\u8bca\u65ad\uff1b\u4e0d\u53ef\u8bfb\u65f6\u4e3a unknown\uff0c\u4e0d\u53c2\u4e0e\u8eab\u4efd\u4e00\u81f4\u6027\u6216\u670d\u52a1\u63a5\u7eb3\u3002\u5386\u53f2\u4e8b\u4ef6\u4e2d\u7684 * \u4fdd\u7559\u539f\u503c\u3002"
+      "description": "Envoy 实际 HTTP 路由名，仅用于诊断；不可读时为 unknown，不参与身份一致性或服务接纳。历史事件中的 * 保留原值。"
     },
     "request_host": {
       "type": [

@@ -40,15 +40,15 @@ def package_options(environment):
     # 先按现有契约校验所有输入，再将受限字符集的值交给 Make，避免二次展开注入。
     hosts = (string_array(environment, 'RELEASE_ACCEPTED_REQUEST_HOSTS')
              if environment.get('RELEASE_ACCEPTED_REQUEST_HOSTS', '').strip() else ['*'])
-    pods = string_array(environment, 'RELEASE_GATEWAY_PODS')
     namespace = bundle.dns_name(environment.get('RELEASE_NAMESPACE') or 'metering')
     gateway_namespace = bundle.dns_name(environment.get('RELEASE_GATEWAY_NAMESPACE') or 'istio-system')
     options = ['--namespace', namespace, '--gateway-namespace', gateway_namespace]
     for host in hosts:
         options += ['--accepted-request-host', bundle.normalize_request_host_pattern(host)]
-    for pod in pods:
-        identity = bundle.gateway_identity(pod)
-        options += ['--gateway-pod', identity['name'] + '=' + identity['uid']]
+    if environment.get('RELEASE_GATEWAY_LABELS', '').strip():
+        for item in string_array(environment, 'RELEASE_GATEWAY_LABELS'):
+            key, value = bundle.label(item)
+            options += ['--gateway-label', key + '=' + value]
     storage_class = environment.get('RELEASE_STORAGE_CLASS', '')
     if storage_class:
         # Kubernetes StorageClass 名称可包含点，使用 DNS 子域名规则。
@@ -59,7 +59,7 @@ def package_options(environment):
         options += ['--storage-class', storage_class]
     args = bundle.parser().parse_args(options)
     bundle.gateway_configuration(args)
-    bundle.gateway_pods(args)  # 显式身份校验，不访问 Kubernetes。
+    bundle.selector(args.gateway_label)
     return options
 
 

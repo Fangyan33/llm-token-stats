@@ -28,7 +28,7 @@ message Start {
   reserved 5, 7, 8, 9, 10;
   reserved "service_id", "api_key_id", "customer_id", "application_id", "identity_status";
   int64 request_started_at_ms = 1;
-  string gateway_instance_id = 2;  // Pod UID，不是客户端输入
+  string gateway_instance_id = 2;  // 运行时 namespace/pod-name，不是客户端输入；历史数据可能为 Pod UID
   string config_version = 3;
   string route_name = 4;           // 真实 Envoy 路由名，仅诊断；不可读为 unknown，不作为接纳条件
   string adapter_id = 6;

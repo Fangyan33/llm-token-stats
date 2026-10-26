@@ -409,6 +409,24 @@ Wasm Host 白名单：{json.dumps(hosts, ensure_ascii=False)}，同时记录于 
 包根目录 envoyfilter.yaml 汇总全部目标 Pod 的关闭态 EnvoyFilter；
 gateway/disabled/ 和 gateway/enabled/ 按 Pod 分别提供关闭态与启用态配置。
 
+归属 API 默认 URI 为空，使用占位实现。启用服务查询时，在 `k8s/20-config.yaml` 的
+`observer.json` 中保留实际 `service_lookup.uri`，将 `service_lookup.credential_env` 设为
+`METERING_SERVICE_LOOKUP_TOKEN`。`credential_env` 只能填写环境变量名，不能填写密钥；
+密钥通过 `metering-observer-lookups` Secret 的同名键注入，现有 Deployment 已配置 `envFrom`。
+客户查询 URI 为空时无需配置客户查询密钥；启用后同理使用 `METERING_CUSTOMER_LOOKUP_TOKEN`。
+
+已部署环境可先用 `kubectl -n {args.namespace} edit configmap metering-observer` 修正变量名，
+再从无额外换行的密钥文件更新 Secret，并重启 Observer：
+
+```sh
+kubectl -n {args.namespace} create secret generic metering-observer-lookups --from-file=METERING_SERVICE_LOOKUP_TOKEN=/安全目录/service-lookup-token --dry-run=client -o yaml | kubectl apply -f -
+kubectl -n {args.namespace} rollout restart deployment/metering-observer
+kubectl -n {args.namespace} rollout status deployment/metering-observer --timeout=5m
+```
+
+`config_lookup` 表示归属查询参数或凭据变量名校验失败；变量名合法但对应密钥缺失时，报 `lookup_credential`。
+将同一修正同步到留存的 YAML；包内空 Secret 用于初次部署，提供真实密钥后不要用空内容覆盖它。
+
 在本目录校验：
 
 ```sh

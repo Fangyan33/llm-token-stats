@@ -98,6 +98,8 @@ make package PACKAGE_DIR=dist/package-with-dependencies \
 
 包内 `k8s/` 包含已渲染的完整 YAML：Namespace、持久化的单节点 Kafka / Doris、Observer / Consumer Deployment 与 Service、全部 ConfigMap / Secret、Kafka topic 初始化 Job，以及 Doris `001/002/004/005/006/007` 迁移和初始化 Job。
 
+启用归属查询 API 时，`service_lookup.credential_env` 只填写环境变量名 `METERING_SERVICE_LOOKUP_TOKEN`，真实密钥放入 `metering-observer-lookups` Secret 的同名键；不要将密钥直接填进 `credential_env`。客户查询同理使用 `METERING_CUSTOMER_LOOKUP_TOKEN`，URI 为空时无需提供凭据。修改 ConfigMap / Secret 后重启 Observer；包内 README 提供具体命令。
+
 Kafka 默认使用 24 分区、单副本，数据保留 72 小时。存储默认使用集群 StorageClass，可通过 `--storage-class` 和 `--kafka-storage`、`--doris-fe-storage`、`--doris-be-storage` 调整。分发配置使用明文 Kafka、Doris root 空密码和 `dev` 环境标识，适用于受控开发环境。生产环境的独立基础设施和认证配置见下文。
 
 部署复用目标集群已有的 Istio 和网关。打包时，脚本默认只读查询当前 kubectl context 中 `istio-system` 下带 `istio=ingressgateway` 标签的实际 Pod；可通过 `--context`、`--gateway-namespace` 指定目标。打包机器无法访问目标集群时，使用 `PACKAGE_ARGS='--accepted-request-host api.company.com --gateway-pod 实际Pod名=实际PodUID'` 提供目标 Pod，多个 Pod 需重复传参。

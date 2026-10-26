@@ -167,3 +167,58 @@ func TestLookupEnvironmentAndBounds(t *testing.T) {
 		}
 	}
 }
+
+func TestLookupStartupErrorsIdentifyFieldWithoutInput(t *testing.T) {
+	const sensitive = "private-credential/never-log-this"
+	for _, tc := range []struct {
+		name, field string
+		change      func(*Observer)
+	}{
+		{"timeout", "lookup_timeout_ms", func(o *Observer) { o.LookupTimeoutMS = 2001 }},
+		{"concurrency", "lookup_max_concurrency", func(o *Observer) { o.LookupConcurrency = 257 }},
+		{"service_rate", "service_lookup.max_requests_per_second", func(o *Observer) { o.ServiceLookup.MaxRPS = -1 }},
+		{"customer_rate", "customer_lookup.max_requests_per_second", func(o *Observer) { o.CustomerLookup.MaxRPS = 100001 }},
+		{"service_credential", "service_lookup.credential_env", func(o *Observer) { o.ServiceLookup.CredentialEnv = sensitive }},
+		{"customer_credential", "customer_lookup.credential_env", func(o *Observer) {
+			o.CustomerLookup.URI = "https://example.invalid/customer"
+			o.CustomerLookup.CredentialEnv = sensitive
+		}},
+		{"service_ca", "service_lookup.ca_file", func(o *Observer) { o.ServiceLookup.CAFile = sensitive + strings.Repeat("x", 4096) }},
+		{"customer_ca", "customer_lookup.ca_file", func(o *Observer) {
+			o.CustomerLookup.URI = "https://example.invalid/customer"
+			o.CustomerLookup.CAFile = sensitive + strings.Repeat("x", 4096)
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("POD_UID", "observer-test")
+			c, err := Read("../../configs/observer.local.json")
+			if err != nil {
+				t.Fatal(err)
+			}
+			c.Observer.ServiceLookup.URI = "https://example.invalid/service"
+			tc.change(&c.Observer)
+			err = c.ObserverDefaults()
+			if err == nil || !strings.HasPrefix(err.Error(), "config_lookup:") || !strings.Contains(err.Error(), "observer."+tc.field) {
+				t.Fatalf("missing field diagnostic: %v", err)
+			}
+			if strings.Contains(err.Error(), sensitive) || strings.Contains(err.Error(), "example.invalid") {
+				t.Fatal("configuration error contains input")
+			}
+		})
+	}
+}
+
+func TestServiceLookupEnabledWithCustomerLookupEmpty(t *testing.T) {
+	t.Setenv("POD_UID", "observer-test")
+	c, err := Read("../../configs/observer.production.example.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.Observer.ClusterName = "test-cluster"
+	c.Observer.DeploymentEnvironment = "stg"
+	c.Observer.ServiceLookup.URI = "http://service.example.invalid/api/service/subsystem-by-host"
+	c.Observer.CustomerLookup.URI = ""
+	if err := c.ObserverDefaults(); err != nil {
+		t.Fatalf("service lookup with customer placeholder rejected: %v", err)
+	}
+}

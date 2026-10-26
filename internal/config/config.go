@@ -145,18 +145,30 @@ func (c *Config) ObserverDefaults() error {
 	if c.Observer.LookupConcurrency == 0 {
 		c.Observer.LookupConcurrency = 64
 	}
-	if c.Observer.LookupTimeoutMS < 1 || c.Observer.LookupTimeoutMS > 2000 || c.Observer.LookupConcurrency < 1 || c.Observer.LookupConcurrency > 256 {
-		return fmt.Errorf("config_lookup")
+	if c.Observer.LookupTimeoutMS < 1 || c.Observer.LookupTimeoutMS > 2000 {
+		return fmt.Errorf("config_lookup: observer.lookup_timeout_ms must be in [1, 2000]")
 	}
-	for _, lookup := range []Lookup{c.Observer.ServiceLookup, c.Observer.CustomerLookup} {
+	if c.Observer.LookupConcurrency < 1 || c.Observer.LookupConcurrency > 256 {
+		return fmt.Errorf("config_lookup: observer.lookup_max_concurrency must be in [1, 256]")
+	}
+	for _, named := range []struct {
+		name   string
+		lookup Lookup
+	}{{"service_lookup", c.Observer.ServiceLookup}, {"customer_lookup", c.Observer.CustomerLookup}} {
+		lookup := named.lookup
 		if _, err := lookup.Cache.Settings(); err != nil {
 			return err
 		}
 		if lookup.MaxRPS < 0 || lookup.MaxRPS > 100000 {
-			return fmt.Errorf("config_lookup")
+			return fmt.Errorf("config_lookup: observer.%s.max_requests_per_second must be in [0, 100000]", named.name)
 		}
-		if lookup.URI != "" && (!regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`).MatchString(lookup.CredentialEnv) || lookup.CAFile != "" && !text(lookup.CAFile, 4096)) {
-			return fmt.Errorf("config_lookup")
+		if lookup.URI != "" {
+			if !regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`).MatchString(lookup.CredentialEnv) {
+				return fmt.Errorf("config_lookup: observer.%s.credential_env must be an environment variable name", named.name)
+			}
+			if lookup.CAFile != "" && !text(lookup.CAFile, 4096) {
+				return fmt.Errorf("config_lookup: observer.%s.ca_file must be valid UTF-8 and at most 4096 bytes", named.name)
+			}
 		}
 	}
 	if w := c.Observer.WasmDownload; w != nil {

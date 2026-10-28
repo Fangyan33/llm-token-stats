@@ -7,12 +7,12 @@ import (
 )
 
 func TestStandardInterop(t *testing.T) {
-	b := Frame(1, 10, String(UInt(nil, 1, 1234), 2, "gateway"))
+	b := Frame(1, 10, String(String(UInt(nil, 1, 1234), 2, "gateway"), 18, "Client-Request:42"))
 	var f pb.ObservationFrame
-	if proto.Unmarshal(b, &f) != nil || f.GetStart().GatewayInstanceId != "gateway" {
+	if proto.Unmarshal(b, &f) != nil || f.GetStart().GatewayInstanceId != "gateway" || f.GetStart().GetLogicalRequestId() != "Client-Request:42" || Validate(b, "frame") != nil {
 		t.Fatal("decode")
 	}
-	a, _ := proto.Marshal(&pb.ObservationAck{LogicalRequestId: "7f6c2a90-4b13-4b68-9d21-67283e0c5f44", AcceptedFrameSeq: 4, Reason: "accepted"})
+	a, _ := proto.Marshal(&pb.ObservationAck{ObservationId: "7f6c2a90-4b13-4b68-9d21-67283e0c5f44", AcceptedFrameSeq: 4, Reason: "accepted"})
 	if ack, err := DecodeAck(a); err != nil || ack.Seq != 4 {
 		t.Fatal("ack")
 	}
@@ -29,7 +29,7 @@ func TestReservedIdentityAndCredentialWireLimits(t *testing.T) {
 			t.Fatal("reserved identity accepted")
 		}
 	}
-	for _, payload := range [][]byte{Bytes(nil, 17, make([]byte, 4097)), String(nil, 16, string(make([]byte, 513))), append(Bytes(nil, 17, []byte("first")), Bytes(nil, 17, []byte("second"))...)} {
+	for _, payload := range [][]byte{Bytes(nil, 17, make([]byte, 4097)), String(nil, 16, string(make([]byte, 513))), Bytes(nil, 18, make([]byte, 129)), String(nil, 18, string([]byte{255})), append(String(nil, 18, "first"), String(nil, 18, "second")...), append(Bytes(nil, 17, []byte("first")), Bytes(nil, 17, []byte("second"))...)} {
 		if Validate(Frame(1, 10, payload), "frame") == nil {
 			t.Fatal("unbounded or repeated credential accepted")
 		}

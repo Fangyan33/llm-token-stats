@@ -21,7 +21,7 @@ func TestDiagnosticRouteIdentityAndSnapshotConflicts(t *testing.T) {
 	s := localStore(t, "http://127.0.0.1:18040")
 	cl := kafka(t)
 	topic, group := batchingTopic(t, cl)
-	for _, mode := range []string{"diagnostic_route", "tenant_conflict", "provider_conflict", "environment_conflict", "name_conflict"} {
+	for _, mode := range []string{"diagnostic_route", "tenant_conflict", "provider_conflict", "environment_conflict", "name_conflict", "client_id_conflict"} {
 		t.Run(mode, func(t *testing.T) {
 			now := time.Now()
 			id := uuid(t)
@@ -39,7 +39,7 @@ func TestDiagnosticRouteIdentityAndSnapshotConflicts(t *testing.T) {
 				if err := json.Unmarshal(data, &e); err != nil {
 					t.Fatal(err)
 				}
-				e.LogicalRequestID, e.ObservationID, e.XRequestID = id, id, &id
+				e.ObservationID, e.XRequestID = id, &id
 				e.EventID = id + ":start"
 				if e.EventType == "usage_observed" {
 					e.EventID = id + ":usage"
@@ -52,6 +52,9 @@ func TestDiagnosticRouteIdentityAndSnapshotConflicts(t *testing.T) {
 					}
 					if mode == "name_conflict" {
 						e.ServiceName = events.Ptr("不同名称")
+					}
+					if mode == "client_id_conflict" {
+						e.LogicalRequestID = events.Ptr("different-client-id")
 					}
 					if mode == "environment_conflict" {
 						e.DeploymentEnvironment = "prd"
@@ -81,15 +84,15 @@ func TestDiagnosticRouteIdentityAndSnapshotConflicts(t *testing.T) {
 				t.Helper()
 				for _, view := range []string{"requests", "request_statistics"} {
 					var conflict int
-					if err := s.DB.QueryRowContext(ctx, "SELECT has_conflict FROM metering_development."+view+" WHERE logical_request_id=?", id).Scan(&conflict); err != nil || conflict != want {
+					if err := s.DB.QueryRowContext(ctx, "SELECT has_conflict FROM metering_development."+view+" WHERE observation_id=?", id).Scan(&conflict); err != nil || conflict != want {
 						t.Fatalf("%s conflict=%d want=%d: %v", view, conflict, want, err)
 					}
 				}
 				var marks, eligible int
-				if err := s.DB.QueryRowContext(ctx, "SELECT COUNT(*) FROM metering_development.request_conflict_ids WHERE logical_request_id=?", id).Scan(&marks); err != nil || marks != want {
+				if err := s.DB.QueryRowContext(ctx, "SELECT COUNT(*) FROM metering_development.request_conflict_ids WHERE observation_id=?", id).Scan(&marks); err != nil || marks != want {
 					t.Fatalf("persistent conflict=%d: %v", marks, err)
 				}
-				if err := s.DB.QueryRowContext(ctx, "SELECT COUNT(*) FROM metering_development.usage_effective WHERE logical_request_id=?", id).Scan(&eligible); err != nil || eligible != 1-want {
+				if err := s.DB.QueryRowContext(ctx, "SELECT COUNT(*) FROM metering_development.usage_effective WHERE observation_id=?", id).Scan(&eligible); err != nil || eligible != 1-want {
 					t.Fatalf("effective usage=%d: %v", eligible, err)
 				}
 			}
@@ -109,10 +112,10 @@ func TestDiagnosticRouteIdentityAndSnapshotConflicts(t *testing.T) {
 			}
 			var count int
 			var stored string
-			if err := s.DB.QueryRowContext(ctx, "SELECT COUNT(*) FROM metering_development.events_raw WHERE logical_request_id=?", id).Scan(&count); err != nil || count != 2 {
+			if err := s.DB.QueryRowContext(ctx, "SELECT COUNT(*) FROM metering_development.events_raw WHERE observation_id=?", id).Scan(&count); err != nil || count != 2 {
 				t.Fatalf("replay changed row count=%d: %v", count, err)
 			}
-			if err := s.DB.QueryRowContext(ctx, "SELECT identity_hash FROM metering_development.events_raw WHERE logical_request_id=? AND event_type='request_started'", id).Scan(&stored); err != nil || stored != expectedHash {
+			if err := s.DB.QueryRowContext(ctx, "SELECT identity_hash FROM metering_development.events_raw WHERE observation_id=? AND event_type='request_started'", id).Scan(&stored); err != nil || stored != expectedHash {
 				t.Fatalf("immutable evidence rewritten: %v", err)
 			}
 			// Even a diagnostic-only change is a different immutable event payload.

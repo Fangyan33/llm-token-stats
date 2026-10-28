@@ -39,6 +39,7 @@ message Start {
   string request_authority = 16;   // Entry authority, at most 512 UTF-8 bytes
   bytes api_key = 17;              // Transient Bearer token, at most 4096 bytes; never log
   optional string x_request_id = 15; // 网关可见的 X-Request-Id，仅辅助关联
+  optional string logical_request_id = 18; // Wasm 按配置从客户端请求头提取；未命中不设置
 }
 
 message ResponseHeaders {
@@ -71,7 +72,7 @@ message End {
 }
 
 message ObservationAck {
-  string logical_request_id = 1;   // Observer 在有效 Start 后分配，后续 ACK 保持一致
+  string observation_id = 1;       // Observer 在有效 Start 后分配，后续 ACK 保持一致
   uint64 accepted_frame_seq = 2;   // 连续处理完成的最高 frame_seq
   bool close_stream = 3;
   string reason = 4;              // 固定原因码，禁止透传异常文本

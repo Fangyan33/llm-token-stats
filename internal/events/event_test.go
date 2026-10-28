@@ -17,7 +17,7 @@ func TestFixturesGolden(t *testing.T) {
 	for _, f := range files {
 		t.Run(filepath.Base(f), func(t *testing.T) {
 			b, _ := os.ReadFile(f)
-			idStart := []byte(`"logical_request_id": "`)
+			idStart := []byte(`"observation_id": "`)
 			idx := bytes.Index(b, idStart)
 			id := b[idx+len(idStart) : idx+len(idStart)+36]
 			e, err := Decode(b, id, time.Time{})
@@ -36,7 +36,7 @@ func TestFixturesGolden(t *testing.T) {
 			if string(h) != Hash(canonical)+"\n"+IdentityHash(e)+"\n" {
 				t.Fatal("hash mismatch")
 			}
-			for _, bad := range [][]byte{bytes.Replace(b, []byte(`"schema_version": 1`), []byte(`"schema_version": 2`), 1), bytes.Replace(b, []byte(`"schema_version": 1`), []byte(`"schema_version": 1, "schema_version": 1`), 1)} {
+			for _, bad := range [][]byte{bytes.Replace(b, []byte(`"schema_version": 1`), []byte(`"schema_version": 3`), 1), bytes.Replace(b, []byte(`"schema_version": 1`), []byte(`"schema_version": 1, "schema_version": 1`), 1)} {
 				if _, err = Decode(bad, id, time.Time{}); err == nil {
 					t.Fatal("accepted invalid event")
 				}
@@ -49,6 +49,38 @@ func TestRawUsageRejectsNull(t *testing.T) {
 	for _, s := range []string{`{"prompt_tokens":null}`, `{"completion_tokens_details":{"reasoning_tokens":null}}`} {
 		if RawValid(s) == nil {
 			t.Fatal("raw usage null accepted as number")
+		}
+	}
+}
+
+func TestClientRequestIDIsOptionalAndIndependentOfObservation(t *testing.T) {
+	data, err := os.ReadFile("../../testdata/collection/usage-known.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	base, err := Decode(data, []byte("7f6c2a90-4b13-4b68-9d21-67283e0c5f44"), time.Time{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, clientID := range []*string{nil, Ptr("Client-Correlation:42"), Ptr(strings.Repeat("a", 128))} {
+		e := *base
+		e.LogicalRequestID = clientID
+		b, _ := Canonical(&e)
+		if _, err := Decode(b, []byte(e.ObservationID), time.Time{}); err != nil {
+			t.Fatal("valid optional client ID rejected", err)
+		}
+		if clientID != nil {
+			if _, err := Decode(b, []byte(*clientID), time.Time{}); err == nil {
+				t.Fatal("client correlation ID accepted as Kafka key")
+			}
+		}
+	}
+	for _, clientID := range []string{"", "bad id", "a,b", "客户端", strings.Repeat("a", 129)} {
+		e := *base
+		e.LogicalRequestID = Ptr(clientID)
+		b, _ := Canonical(&e)
+		if _, err := Decode(b, []byte(e.ObservationID), time.Time{}); err == nil {
+			t.Fatal("invalid client ID accepted")
 		}
 	}
 }
@@ -70,10 +102,11 @@ func TestDiagnosticRouteExcludedFromIdentity(t *testing.T) {
 		func(e *Event) { e.CustomerID = Ptr("other") },
 		func(e *Event) { e.ProviderID = Ptr("other") },
 		func(e *Event) { e.IdentityStatus = "invalid" },
-		func(e *Event) { e.ConfigVersion = "v2" },
+		func(e *Event) { e.ConfigVersion = "other-config" },
 		func(e *Event) { e.GatewayInstanceID = "other" },
 		func(e *Event) { e.AdapterID = "other" },
 		func(e *Event) { e.XRequestID = nil },
+		func(e *Event) { e.LogicalRequestID = Ptr("other-client-id") },
 	} {
 		copy := *e
 		change(&copy)
@@ -97,7 +130,7 @@ func TestMappingInvariantsAndSecretRejection(t *testing.T) {
 	unknown.ServiceName, unknown.ProviderName = nil, nil
 	unknown.MappingStatus = "lookup_not_implemented"
 	b, _ := Canonical(&unknown)
-	if _, err = Decode(b, []byte(unknown.LogicalRequestID), time.Time{}); err != nil {
+	if _, err = Decode(b, []byte(unknown.ObservationID), time.Time{}); err != nil {
 		t.Fatal("known customer/unknown service rejected", err)
 	}
 	for _, change := range []func(*Event){
@@ -111,13 +144,13 @@ func TestMappingInvariantsAndSecretRejection(t *testing.T) {
 		e := *base
 		change(&e)
 		b, _ := Canonical(&e)
-		if _, err = Decode(b, []byte(e.LogicalRequestID), time.Time{}); err == nil {
+		if _, err = Decode(b, []byte(e.ObservationID), time.Time{}); err == nil {
 			t.Fatal("inconsistent mapping accepted")
 		}
 	}
 	for _, field := range []string{"api_key", "application_id"} {
 		injected := append([]byte(`{"`+field+`":"must-not-persist",`), data[1:]...)
-		if _, err = Decode(injected, []byte(base.LogicalRequestID), time.Time{}); err == nil {
+		if _, err = Decode(injected, []byte(base.ObservationID), time.Time{}); err == nil {
 			t.Fatal("removed or sensitive event field accepted")
 		}
 	}

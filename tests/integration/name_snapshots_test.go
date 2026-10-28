@@ -164,7 +164,7 @@ func testNamesThroughKafkaToDoris(t *testing.T, secure, cached bool) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		id := ack.LogicalRequestId
+		id := ack.ObservationId
 		body := []byte(`{"model":"names","usage":{"prompt_tokens":10,"completion_tokens":4,"total_tokens":14}}`)
 		frames := []*pb.ObservationFrame{
 			{Payload: &pb.ObservationFrame_ResponseHeaders{ResponseHeaders: &pb.ResponseHeaders{HttpStatus: 200, ContentType: "application/json"}}},
@@ -213,9 +213,9 @@ func testNamesThroughKafkaToDoris(t *testing.T, secure, cached bool) {
 		want := names[i]
 		eventually(t, func() bool {
 			var n int
-			return db.QueryRow("SELECT COUNT(*) FROM metering_development.events_raw WHERE logical_request_id=?", id).Scan(&n) == nil && n == 2
+			return db.QueryRow("SELECT COUNT(*) FROM metering_development.events_raw WHERE observation_id=?", id).Scan(&n) == nil && n == 2
 		})
-		rows, err := db.Query("SELECT service_name,provider_name,customer_name,event_json,kafka_partition,kafka_offset FROM metering_development.events_raw WHERE logical_request_id=?", id)
+		rows, err := db.Query("SELECT service_name,provider_name,customer_name,event_json,kafka_partition,kafka_offset FROM metering_development.events_raw WHERE observation_id=?", id)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -258,13 +258,13 @@ func testNamesThroughKafkaToDoris(t *testing.T, secure, cached bool) {
 		for _, view := range []string{"requests", "request_statistics", "event_details", "usage_effective"} {
 			if cached && i == len(ids)-1 && view == "usage_effective" {
 				var count int
-				if err := db.QueryRow("SELECT COUNT(*) FROM metering_development.usage_effective WHERE logical_request_id=?", id).Scan(&count); err != nil || count != 1 {
+				if err := db.QueryRow("SELECT COUNT(*) FROM metering_development.usage_effective WHERE observation_id=?", id).Scan(&count); err != nil || count != 1 {
 					t.Fatal("valid service usage lost because customer attribution is unknown")
 				}
 				continue
 			}
 			var name string
-			if err := db.QueryRow("SELECT service_name FROM metering_development."+view+" WHERE logical_request_id=? LIMIT 1", id).Scan(&name); err != nil || name != "服务"+want {
+			if err := db.QueryRow("SELECT service_name FROM metering_development."+view+" WHERE observation_id=? LIMIT 1", id).Scan(&name); err != nil || name != "服务"+want {
 				t.Fatalf("%s name: %q %v", view, name, err)
 			}
 		}

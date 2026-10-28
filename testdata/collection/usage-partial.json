@@ -2,7 +2,7 @@
   "schema_version": 1,
   "event_id": "7f6c2a90-4b13-4b68-9d21-67283e0c5f44:usage",
   "event_type": "usage_observed",
-  "logical_request_id": "7f6c2a90-4b13-4b68-9d21-67283e0c5f44",
+  "logical_request_id": "Client-Request-42",
   "x_request_id": "b3e1fba5-16a4-4dfb-aa84-50141e80d473",
   "observation_id": "7f6c2a90-4b13-4b68-9d21-67283e0c5f44",
   "observation_scope": "gateway_response",

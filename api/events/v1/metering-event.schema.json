@@ -67,8 +67,14 @@
       ]
     },
     "logical_request_id": {
-      "type": "string",
-      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+      "type": [
+        "string",
+        "null"
+      ],
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9._:-]+$",
+      "description": "Wasm 按 logical_request_id_headers 顺序提取的客户端请求 ID；可空、可重复，不作为内部键。"
     },
     "x_request_id": {
       "type": [
@@ -81,7 +87,8 @@
     },
     "observation_id": {
       "type": "string",
-      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+      "description": "Observer 生成的规范 UUIDv4，作为 Kafka key、事件关联、去重和冲突检测的内部标识。"
     },
     "observation_scope": {
       "const": "gateway_response"

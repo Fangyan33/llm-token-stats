@@ -48,7 +48,7 @@ class CollectionContractsTest(unittest.TestCase):
         self.assert_event_invalid(lambda e: e.pop("response_model"))
         self.assert_event_invalid(lambda e: e.update(messages=[]))
         self.assert_event_invalid(lambda e: e.update(schema_version=True))
-        self.assert_event_invalid(lambda e: e.update(schema_version=2))
+        self.assert_event_invalid(lambda e: e.update(schema_version=3))
 
     def test_duplicate_json_keys_and_nonfinite_numbers(self):
         for text in ('{"schema_version":1,"schema_version":1}', '{"value":NaN}', '{"value":Infinity}'):
@@ -96,7 +96,7 @@ class CollectionContractsTest(unittest.TestCase):
         self.assertEqual(event["usage_status"], "partial")
 
     def test_start_and_end_invariants(self):
-        self.assert_event_invalid(lambda e: e.update(event_type="request_started", event_id=e["logical_request_id"] + ":start"))
+        self.assert_event_invalid(lambda e: e.update(event_type="request_started", event_id=e["observation_id"] + ":start"))
         self.assert_event_invalid(lambda e: e.update(terminal_observed=False))
         self.assert_event_invalid(lambda e: e.update(terminal_observed=False, request_finished_at_ms=None, anomaly_codes=["missing_end"]))
         self.assert_event_invalid(lambda e: e.update(observation_status="partial"))
@@ -110,8 +110,8 @@ class CollectionContractsTest(unittest.TestCase):
         self.assert_event_invalid(lambda e: e.update(customer_id=None))
         self.assert_event_invalid(lambda e: e.update(identity_status="invalid"))
         self.assert_event_invalid(lambda e: e.update(observation_id="9f6c2a90-4b13-4b68-9d21-67283e0c5f44"))
-        self.assert_event_invalid(lambda e: e.update(logical_request_id=e["logical_request_id"].upper()))
-        self.assert_event_invalid(lambda e: e.update(event_id=e["logical_request_id"] + ":start"))
+        self.assert_event_invalid(lambda e: e.update(observation_id=e["observation_id"].upper()))
+        self.assert_event_invalid(lambda e: e.update(event_id=e["observation_id"] + ":start"))
         self.assert_event_invalid(lambda e: e.update(x_request_id="bad request"))
         self.assert_event_invalid(lambda e: e.update(http_status=100))
         self.assert_event_invalid(lambda e: e.update(http_status=600))
@@ -120,6 +120,24 @@ class CollectionContractsTest(unittest.TestCase):
         event = copy.deepcopy(self.event)
         event.update(api_key_id=None, customer_id=None, customer_name=None, customer_mapping_version=None, customer_mapping_status="lookup_not_implemented", identity_status="invalid", usage_eligible=False, anomaly_codes=["identity_invalid"])
         contracts.validate_event(event)
+
+    def test_optional_client_id_and_header_configuration(self):
+        for value in (None, 'Client-Request:Mixed_Case.42', 'a' * 128):
+            event = copy.deepcopy(self.event)
+            event['logical_request_id'] = value
+            contracts.validate_event(event, event['observation_id'].encode())
+        for value in ('', 'a' * 129, 'bad id', 'a,b', '客户端'):
+            self.assert_event_invalid(lambda e: e.update(logical_request_id=value))
+        for value in (None, 'x-client-id', [''], [':path'], ['x id'], ['x-K-id'],
+                      ['x-id', 'X-ID'], ['a'] * 9, ['a' * 129]):
+            self.assert_config_invalid(lambda c: c.update(logical_request_id_headers=value))
+        for value in ([], ['X-Client-ID', 'request_id']):
+            config = copy.deepcopy(self.config)
+            config['logical_request_id_headers'] = value
+            contracts.validate_config(config)
+        config = copy.deepcopy(self.config)
+        config.pop('logical_request_id_headers')
+        contracts.validate_config(config)
 
     def test_unknown_customer_can_have_eligible_usage(self):
         event = copy.deepcopy(self.event)

@@ -1,12 +1,12 @@
 # Doris 数据库表与字段说明
 
-本文描述当前唯一采集模型，面向开发、运维和数据使用者。实体表的类型、键、说明来自仓库 DDL；视图类型及可空性经 Doris 4.1.3 元数据核对。整数显示宽度和 DECIMALV3 名称归一化为 SQL 类型。
+本文描述当前唯一采集模型，面向开发、运维和数据使用者。实体表的类型、键、说明来自仓库 DDL；视图类型及可空性按 SQL 和既有类型推导，需在目标 Doris 4.1.3 核验。整数显示宽度和 DECIMALV3 名称归一化为 SQL 类型。
 
-覆盖 10 张实体表、122 个实体字段，以及 5 个逻辑视图、189 个逻辑视图字段，以及 2 个异步物化视图。当前本地 Consumer 写入 metering_development；迁移仅定义当前最终结构，不提供旧开发库的原地升级。
+覆盖 10 张实体表、122 个实体字段，以及 5 个逻辑视图、191 个逻辑视图字段，以及 2 个异步物化视图。当前本地 Consumer 写入 metering_development；迁移仅定义当前最终结构，不提供旧开发库的原地升级。
 
 ## 使用口径
 
-- 一个逻辑请求最多包含 request_started、usage_observed 两类事件；查询调用量按 logical_request_id 统计，不能按事件行数统计。
+- 一个观察请求最多包含 request_started、usage_observed 两类事件；查询调用量按 observation_id 统计，不能按事件行数统计。logical_request_id 保存可空、可重复的客户端 ID，x_request_id 保存网关可见的 X-Request-Id。
 - 原始用量 NULL 表示未知，0 表示已知零。输入/输出及缓存、推理子项不能重复相加。usage_eligible 表示统计候选，不表示收费资格。
 - Observer 支持 HTTP/HTTPS 归属查询，环境仅接受 prd/stg/dev；ID 与服务、供应商和客户名称作为请求快照保存。默认缓存成功结果 30 分钟，瞬时故障最多再沿用 15 分钟并保持 mapped；明确错误作废旧值。名称可能来自缓存，历史记录不补写；空 URI 或无可用结果侧为 NULL。
 - 采集范围由 Wasm 的 accepted_request_hosts 统一筛选；无效或不匹配的 Host 不产生观察事件，Observer / Consumer 不做服务或 Host 白名单过滤，历史诊断仍按原契约保存。
@@ -29,7 +29,7 @@
 | [summary_mv_refresh_runs](#summary_mv_refresh_runs) | 实体表 | 物化视图刷新任务审计与恢复 | 已实现 |
 | [summary_mv_refresh_inputs](#summary_mv_refresh_inputs) | 实体表 | 物化视图日刷新输入集合；成功任务才确认这些通知 | 已实现 |
 | [summary_mv_refresh_state](#summary_mv_refresh_state) | 实体表 | 日月物化视图覆盖与最近成功状态 | 已实现 |
-| [event_conflicts](#event_conflicts) | 逻辑视图 | 同一逻辑请求及事件 ID 的内容冲突诊断 | 已实现 |
+| [event_conflicts](#event_conflicts) | 逻辑视图 | 同一观察请求及事件 ID 的内容冲突诊断 | 已实现 |
 | [event_details](#event_details) | 逻辑视图 | 事件业务字段明细投影 | 已实现 |
 | [requests](#requests) | 逻辑视图 | 跨在线日期合并开始与结果事件的请求级诊断投影 | 已实现 |
 | [usage_effective](#usage_effective) | 逻辑视图 | 无请求冲突的有效统计候选用量明细 | 已实现 |
@@ -79,21 +79,21 @@ flowchart TD
 | 写入者 | Consumer |
 | 读取者 | 冲突核验、明细视图、统计投影 |
 | 数据粒度 | 一条规范事件内容变体 |
-| 唯一键 | request_date, logical_request_id, event_id, payload_hash |
-| 分区、分桶及保留 | UTC 请求日期动态分区，保留前 12 个完整月加当月，由 Worker 按月首清理；按请求 ID 分 16 桶 |
+| 唯一键 | request_date, observation_id, event_id, payload_hash |
+| 分区、分桶及保留 | UTC 请求日期动态分区，保留前 12 个完整月加当月，由 Worker 按月首清理；按观察 ID 分 16 桶 |
 | 实现状态 | 已实现 |
 | 定义来源 | [001_init.sql](../migrations/doris/metering/001_init.sql) |
 
 | 字段 | 类型 | 可空 | 默认值 | 键属性 | 说明 |
 | --- | --- | --- | --- | --- | --- |
 | request_date | DATE | 否 | 未声明 | 唯一键 | UTC 请求日期，由 request_started_at_ms 换算，不由事件到达时间或 UUID 推导 |
-| logical_request_id | VARCHAR(36) | 否 | 未声明 | 唯一键 | Observer 为一次观察生成的规范 UUIDv4；请求级主标识及 Kafka key |
-| event_id | VARCHAR(42) | 否 | 未声明 | 唯一键 | 事件标识，逻辑请求 ID 加 :start 或 :usage；同 ID 不同内容属于冲突 |
+| observation_id | VARCHAR(36) | 否 | 未声明 | 唯一键 | Observer 为一次观察生成的规范 UUIDv4；内部主标识及 Kafka key |
+| event_id | VARCHAR(42) | 否 | 未声明 | 唯一键 | 事件标识，观察 ID 加 :start 或 :usage；同 ID 不同内容属于冲突 |
 | payload_hash | CHAR(64) | 否 | 未声明 | 唯一键 | 当前规范事件 JSON 的 SHA-256；与事件 ID 共同保留内容变体并实现幂等 |
 | schema_version | INT | 否 | 未声明 | — | 唯一事件契约版本，当前为 1；未知版本由 Consumer 暂停对应分区 |
 | event_type | VARCHAR(32) | 否 | 未声明 | — | 事件类型：request_started 或 usage_observed；两者合计仍是一次请求 |
 | x_request_id | VARCHAR(128) | 是 | 未声明 | — | 网关可见的 X-Request-Id，仅辅助关联；可空、可重复，不用于授权或去重 |
-| observation_id | VARCHAR(36) | 否 | 未声明 | — | 观察标识，当前与 logical_request_id 相同 |
+| logical_request_id | VARCHAR(128) | 是 | 未声明 | — | Wasm 按配置提取的客户端请求 ID；可空、可重复，不用于内部去重 |
 | observation_scope | VARCHAR(32) | 否 | 未声明 | — | 观察范围，当前固定 gateway_response，不代表所有隐藏的上游尝试 |
 | producer_id | VARCHAR(128) | 否 | 未声明 | — | 生成此事件的 Observer 实例标识，部署时使用实际 Pod UID |
 | gateway_instance_id | VARCHAR(128) | 否 | 未声明 | — | 观察请求的网关实例标识，新版为命名空间/Pod名称，历史值可能为Pod UID |
@@ -115,7 +115,7 @@ flowchart TD
 | customer_id | VARCHAR(128) | 是 | 未声明 | — | 与 api_key_id 同次成功解析得到的客户 ID；未知为 NULL，不采信客户端自报 ID |
 | provider_id | VARCHAR(128) | 是 | 未声明 | — | 服务接口返回的服务所属供应商 ID；未知为 NULL，不代表隐藏的实际执行方 |
 | identity_status | VARCHAR(16) | 否 | 未声明 | — | 客户归属状态：known 或 invalid；仅完整客户解析成功为 known，不表示鉴权判定 |
-| identity_hash | CHAR(64) | 否 | 未声明 | — | 固定十五项归属与部署快照元组的规范 SHA-256，不含原始密钥或诊断路由 |
+| identity_hash | CHAR(64) | 否 | 未声明 | — | 固定十六项归属与部署快照元组的规范 SHA-256，不含原始密钥或诊断路由 |
 | request_started_at_ms | BIGINT | 否 | 未声明 | — | 网关观察到请求头的 Unix 毫秒时间；决定 UTC 统计日期 |
 | observation_ended_at_ms | BIGINT | 是 | 未声明 | — | Observer 结束观察的 Unix 毫秒时间；start 为 NULL，不等于业务结束时间 |
 | request_finished_at_ms | BIGINT | 是 | 未声明 | — | 有效网关 End 提供的请求结束 Unix 毫秒时间；未收到有效 End 时为 NULL |
@@ -163,15 +163,15 @@ flowchart TD
 | 类型 | 实体表，Unique Key Merge-on-Write |
 | 写入者 | Consumer 批次处理及补偿巡检 |
 | 读取者 | requests、request_statistics |
-| 数据粒度 | 一个存在冲突的逻辑请求 |
-| 唯一键 | logical_request_id |
-| 分区、分桶及保留 | 按请求 ID 分 16 桶；长期保留，当前不自动清理 |
+| 数据粒度 | 一个存在冲突的观察请求 |
+| 唯一键 | observation_id |
+| 分区、分桶及保留 | 按观察 ID 分 16 桶；长期保留，当前不自动清理 |
 | 实现状态 | 已实现 |
 | 定义来源 | [001_init.sql](../migrations/doris/metering/001_init.sql) |
 
 | 字段 | 类型 | 可空 | 默认值 | 键属性 | 说明 |
 | --- | --- | --- | --- | --- | --- |
-| logical_request_id | VARCHAR(36) | 否 | 未声明 | 唯一键 | Observer 为一次观察生成的规范 UUIDv4；请求级主标识及 Kafka key |
+| observation_id | VARCHAR(36) | 否 | 未声明 | 唯一键 | Observer 为一次观察生成的规范 UUIDv4；内部主标识及 Kafka key |
 | detected_at | DATETIME(3) | 否 | 未声明 | — | Consumer 发现冲突或消费缺口的 UTC 时间 |
 
 ## ingest_rejections
@@ -391,16 +391,16 @@ GAP、未生成、过期与已确认零请求分别展示。
 
 ## event_conflicts
 
-**作用：** 同一逻辑请求及事件 ID 的内容冲突诊断。
+**作用：** 同一观察请求及事件 ID 的内容冲突诊断。
 
-按逻辑请求和事件 ID 分组，只返回内容变体行数大于 1 的事件，并列出摘要。
+按观察请求和事件 ID 分组，只返回内容变体行数大于 1 的事件，并列出摘要。
 
 | 属性 | 说明 |
 | --- | --- |
 | 类型 | 逻辑视图，无物理数据副本 |
 | 写入者 | 逻辑视图，无独立写入 |
 | 读取者 | event_details、冲突诊断 |
-| 数据粒度 | 同一逻辑请求和事件 ID 的冲突组 |
+| 数据粒度 | 同一观察请求和事件 ID 的冲突组 |
 | 唯一键 | 无独立唯一键 |
 | 分区、分桶及保留 | 跨全部在线日期分区查询，无物理存储 |
 | 实现状态 | 已实现 |
@@ -408,9 +408,9 @@ GAP、未生成、过期与已确认零请求分别展示。
 
 | 字段 | 类型 | 可空 | 默认值 | 键属性 | 说明 |
 | --- | --- | --- | --- | --- | --- |
-| logical_request_id | VARCHAR(36) | 否 | —（派生） | — | Observer 为一次观察生成的规范 UUIDv4；请求级主标识及 Kafka key |
-| event_id | VARCHAR(42) | 否 | —（派生） | — | 事件标识，逻辑请求 ID 加 :start 或 :usage；同 ID 不同内容属于冲突 |
-| variant_count | BIGINT | 否 | —（派生） | — | 同一逻辑请求和事件 ID 在在线日期分区中的内容变体行数，大于 1 才进入此视图 |
+| observation_id | VARCHAR(36) | 否 | —（派生） | — | Observer 为一次观察生成的规范 UUIDv4；内部主标识及 Kafka key |
+| event_id | VARCHAR(42) | 否 | —（派生） | — | 事件标识，观察 ID 加 :start 或 :usage；同 ID 不同内容属于冲突 |
+| variant_count | BIGINT | 否 | —（派生） | — | 同一观察和事件 ID 在在线日期分区中的内容变体行数，大于 1 才进入此视图 |
 | payload_hashes | ARRAY<CHAR(64)> | 否 | —（派生） | — | 同一事件的内容变体摘要集合，用于排查冲突，不含原始消息 |
 
 ## event_details
@@ -433,13 +433,13 @@ GAP、未生成、过期与已确认零请求分别展示。
 | 字段 | 类型 | 可空 | 默认值 | 键属性 | 说明 |
 | --- | --- | --- | --- | --- | --- |
 | request_date | DATE | 否 | —（派生） | — | UTC 请求日期，由 request_started_at_ms 换算，不由事件到达时间或 UUID 推导 |
-| logical_request_id | VARCHAR(36) | 否 | —（派生） | — | Observer 为一次观察生成的规范 UUIDv4；请求级主标识及 Kafka key |
-| event_id | VARCHAR(42) | 否 | —（派生） | — | 事件标识，逻辑请求 ID 加 :start 或 :usage；同 ID 不同内容属于冲突 |
+| observation_id | VARCHAR(36) | 否 | —（派生） | — | Observer 为一次观察生成的规范 UUIDv4；内部主标识及 Kafka key |
+| event_id | VARCHAR(42) | 否 | —（派生） | — | 事件标识，观察 ID 加 :start 或 :usage；同 ID 不同内容属于冲突 |
 | payload_hash | CHAR(64) | 否 | —（派生） | — | 当前规范事件 JSON 的 SHA-256；与事件 ID 共同保留内容变体并实现幂等 |
 | schema_version | INT | 否 | —（派生） | — | 唯一事件契约版本，当前为 1；未知版本由 Consumer 暂停对应分区 |
 | event_type | VARCHAR(32) | 否 | —（派生） | — | 事件类型：request_started 或 usage_observed；两者合计仍是一次请求 |
 | x_request_id | VARCHAR(128) | 是 | —（派生） | — | 网关可见的 X-Request-Id，仅辅助关联；可空、可重复，不用于授权或去重 |
-| observation_id | VARCHAR(36) | 否 | —（派生） | — | 观察标识，当前与 logical_request_id 相同 |
+| logical_request_id | VARCHAR(128) | 是 | —（派生） | — | Wasm 按配置提取的客户端请求 ID；可空、可重复，不用于内部去重 |
 | observation_scope | VARCHAR(32) | 否 | —（派生） | — | 观察范围，当前固定 gateway_response，不代表所有隐藏的上游尝试 |
 | producer_id | VARCHAR(128) | 否 | —（派生） | — | 生成此事件的 Observer 实例标识，部署时使用实际 Pod UID |
 | gateway_instance_id | VARCHAR(128) | 否 | —（派生） | — | 观察请求的网关实例标识，新版为命名空间/Pod名称，历史值可能为Pod UID |
@@ -503,7 +503,7 @@ GAP、未生成、过期与已确认零请求分别展示。
 | 类型 | 逻辑视图，无物理数据副本 |
 | 写入者 | 逻辑视图，无独立写入 |
 | 读取者 | 请求诊断、usage_effective |
-| 数据粒度 | 一个逻辑请求，跨在线日期聚合 |
+| 数据粒度 | 一个观察请求，跨在线日期聚合 |
 | 唯一键 | 无独立唯一键 |
 | 分区、分桶及保留 | 无物理存储，查询会涉及全部在线日期证据 |
 | 实现状态 | 已实现 |
@@ -512,9 +512,10 @@ GAP、未生成、过期与已确认零请求分别展示。
 | 字段 | 类型 | 可空 | 默认值 | 键属性 | 说明 |
 | --- | --- | --- | --- | --- | --- |
 | request_date | DATE | 否 | —（派生） | — | UTC 请求日期，由 request_started_at_ms 换算，不由事件到达时间或 UUID 推导 |
-| logical_request_id | VARCHAR(36) | 否 | —（派生） | — | Observer 为一次观察生成的规范 UUIDv4；请求级主标识及 Kafka key |
-| start_variants | BIGINT | 否 | —（派生） | — | 该逻辑请求的开始事件内容变体数；大于 1 表示冲突，不是调用次数 |
-| usage_variants | BIGINT | 否 | —（派生） | — | 该逻辑请求的结果事件内容变体数；0 表示未观察结果，大于 1 表示冲突 |
+| observation_id | VARCHAR(36) | 否 | —（派生） | — | Observer 为一次观察生成的规范 UUIDv4；内部主标识及 Kafka key |
+| logical_request_id | VARCHAR(128) | 是 | —（派生） | — | Wasm 按配置提取的客户端请求 ID；可空、可重复，不用于内部去重 |
+| start_variants | BIGINT | 否 | —（派生） | — | 该观察的开始事件内容变体数；大于 1 表示冲突，不是调用次数 |
+| usage_variants | BIGINT | 否 | —（派生） | — | 该观察的结果事件内容变体数；0 表示未观察结果，大于 1 表示冲突 |
 | request_started_at_ms | BIGINT | 否 | —（派生） | — | 网关观察到请求头的 Unix 毫秒时间；决定 UTC 统计日期 |
 | x_request_id | VARCHAR(128) | 是 | —（派生） | — | 网关可见的 X-Request-Id，仅辅助关联；可空、可重复，不用于授权或去重 |
 | customer_id | VARCHAR(128) | 是 | —（派生） | — | 与 api_key_id 同次成功解析得到的客户 ID；未知为 NULL，不采信客户端自报 ID |
@@ -560,13 +561,13 @@ GAP、未生成、过期与已确认零请求分别展示。
 | 字段 | 类型 | 可空 | 默认值 | 键属性 | 说明 |
 | --- | --- | --- | --- | --- | --- |
 | request_date | DATE | 否 | —（派生） | — | UTC 请求日期，由 request_started_at_ms 换算，不由事件到达时间或 UUID 推导 |
-| logical_request_id | VARCHAR(36) | 否 | —（派生） | — | Observer 为一次观察生成的规范 UUIDv4；请求级主标识及 Kafka key |
-| event_id | VARCHAR(42) | 否 | —（派生） | — | 事件标识，逻辑请求 ID 加 :start 或 :usage；同 ID 不同内容属于冲突 |
+| observation_id | VARCHAR(36) | 否 | —（派生） | — | Observer 为一次观察生成的规范 UUIDv4；内部主标识及 Kafka key |
+| event_id | VARCHAR(42) | 否 | —（派生） | — | 事件标识，观察 ID 加 :start 或 :usage；同 ID 不同内容属于冲突 |
 | payload_hash | CHAR(64) | 否 | —（派生） | — | 当前规范事件 JSON 的 SHA-256；与事件 ID 共同保留内容变体并实现幂等 |
 | schema_version | INT | 否 | —（派生） | — | 唯一事件契约版本，当前为 1；未知版本由 Consumer 暂停对应分区 |
 | event_type | VARCHAR(32) | 否 | —（派生） | — | 事件类型：request_started 或 usage_observed；两者合计仍是一次请求 |
 | x_request_id | VARCHAR(128) | 是 | —（派生） | — | 网关可见的 X-Request-Id，仅辅助关联；可空、可重复，不用于授权或去重 |
-| observation_id | VARCHAR(36) | 否 | —（派生） | — | 观察标识，当前与 logical_request_id 相同 |
+| logical_request_id | VARCHAR(128) | 是 | —（派生） | — | Wasm 按配置提取的客户端请求 ID；可空、可重复，不用于内部去重 |
 | observation_scope | VARCHAR(32) | 否 | —（派生） | — | 观察范围，当前固定 gateway_response，不代表所有隐藏的上游尝试 |
 | producer_id | VARCHAR(128) | 否 | —（派生） | — | 生成此事件的 Observer 实例标识，部署时使用实际 Pod UID |
 | gateway_instance_id | VARCHAR(128) | 否 | —（派生） | — | 观察请求的网关实例标识，新版为命名空间/Pod名称，历史值可能为Pod UID |
@@ -630,7 +631,7 @@ GAP、未生成、过期与已确认零请求分别展示。
 | 类型 | 逻辑视图，无物理数据副本 |
 | 写入者 | 逻辑投影 |
 | 读取者 | usage_daily_mv |
-| 数据粒度 | 日期加逻辑请求 ID |
+| 数据粒度 | 日期加观察请求 ID |
 | 唯一键 | 无独立唯一键 |
 | 分区、分桶及保留 | 继承原始日分区范围 |
 | 实现状态 | 已实现 |
@@ -639,11 +640,12 @@ GAP、未生成、过期与已确认零请求分别展示。
 | 字段 | 类型 | 可空 | 默认值 | 键属性 | 说明 |
 | --- | --- | --- | --- | --- | --- |
 | request_date | DATE | 否 | —（派生） | — | UTC 请求日期，由 request_started_at_ms 换算，不由事件到达时间或 UUID 推导 |
-| logical_request_id | VARCHAR(36) | 否 | —（派生） | — | Observer 为一次观察生成的规范 UUIDv4；请求级主标识及 Kafka key |
-| start_variants | BIGINT | 否 | —（派生） | — | 该逻辑请求的开始事件内容变体数；大于 1 表示冲突，不是调用次数 |
-| usage_variants | BIGINT | 否 | —（派生） | — | 该逻辑请求的结果事件内容变体数；0 表示未观察结果，大于 1 表示冲突 |
-| started_count | BIGINT | 否 | —（派生） | — | 该日期内同一逻辑请求的不同开始时间数量；大于 1 表示时间冲突 |
-| identity_count | BIGINT | 否 | —（派生） | — | 该日期内同一逻辑请求的不同十五项归属与部署快照数量；大于 1 表示冲突 |
+| observation_id | VARCHAR(36) | 否 | —（派生） | — | Observer 为一次观察生成的规范 UUIDv4；内部主标识及 Kafka key |
+| logical_request_id | VARCHAR(128) | 是 | —（派生） | — | Wasm 按配置提取的客户端请求 ID；可空、可重复，不用于内部去重 |
+| start_variants | BIGINT | 否 | —（派生） | — | 该观察的开始事件内容变体数；大于 1 表示冲突，不是调用次数 |
+| usage_variants | BIGINT | 否 | —（派生） | — | 该观察的结果事件内容变体数；0 表示未观察结果，大于 1 表示冲突 |
+| started_count | BIGINT | 否 | —（派生） | — | 该日期内同一观察的不同开始时间数量；大于 1 表示时间冲突 |
+| identity_count | BIGINT | 否 | —（派生） | — | 该日期内同一观察的不同十六项归属与部署快照数量；大于 1 表示冲突 |
 | name_count | BIGINT | 否 | —（派生） | — | 同请求不同名称快照元组数量；大于 1 表示冲突 |
 | customer_id | VARCHAR(128) | 是 | —（派生） | — | 与 api_key_id 同次成功解析得到的客户 ID；未知为 NULL，不采信客户端自报 ID |
 | provider_id | VARCHAR(128) | 是 | —（派生） | — | 服务接口返回的服务所属供应商 ID；未知为 NULL，不代表隐藏的实际执行方 |
@@ -706,10 +708,10 @@ GAP、未生成、过期与已确认零请求分别展示。
 | service_id | VARCHAR(65533) | 是 | —（派生） | — | 服务统计维度；未知保持 NULL，已知服务统计包含客户未知请求 |
 | model | STRING | 否 | —（派生） | — | 统计模型维度，优先响应模型、其次请求模型；两者均缺失用空串表示未知 |
 | usage_source | STRING | 否 | —（派生） | — | 统计用量来源分组：reported、unknown、missing、mixed；estimated_model 和 estimated_generic 为预留估算分类 |
-| request_count | BIGINT | 否 | —（派生） | — | 该分组无冲突的已观察逻辑请求数，包含客户未知及用量不完整请求 |
-| started_request_count | BIGINT | 否 | —（派生） | — | 该分组中恰有一条 request_started 事件的逻辑请求数 |
-| usage_observed_request_count | BIGINT | 否 | —（派生） | — | 该分组中恰有一条 usage_observed 事件的逻辑请求数 |
-| usage_missing_request_count | BIGINT | 否 | —（派生） | — | 该分组中未观察到 usage_observed 事件的逻辑请求数 |
+| request_count | BIGINT | 否 | —（派生） | — | 该分组无冲突的已观察观察请求数，包含客户未知及用量不完整请求 |
+| started_request_count | BIGINT | 否 | —（派生） | — | 该分组中恰有一条 request_started 事件的观察请求数 |
+| usage_observed_request_count | BIGINT | 否 | —（派生） | — | 该分组中恰有一条 usage_observed 事件的观察请求数 |
+| usage_missing_request_count | BIGINT | 否 | —（派生） | — | 该分组中未观察到 usage_observed 事件的观察请求数 |
 | eligible_usage_request_count | BIGINT | 否 | —（派生） | — | 该分组中有唯一结果、statistics_usage_eligible=1 且输入输出用量均非 NULL 的请求数 |
 | ineligible_usage_request_count | BIGINT | 否 | —（派生） | — | 该分组中未满足有效用量统计条件的请求数，与有效请求数合计为 request_count |
 | http_2xx_request_count | BIGINT | 否 | —（派生） | — | 该分组中网关可见 HTTP 状态为 200 至 299 的请求数 |
@@ -755,10 +757,10 @@ GAP、未生成、过期与已确认零请求分别展示。
 | service_id | VARCHAR(65533) | 是 | —（派生） | — | 服务统计维度；未知保持 NULL，已知服务统计包含客户未知请求 |
 | model | STRING | 否 | —（派生） | — | 统计模型维度，优先响应模型、其次请求模型；两者均缺失用空串表示未知 |
 | usage_source | STRING | 否 | —（派生） | — | 统计用量来源分组：reported、unknown、missing、mixed；estimated_model 和 estimated_generic 为预留估算分类 |
-| request_count | BIGINT | 否 | —（派生） | — | 该分组无冲突的已观察逻辑请求数，包含客户未知及用量不完整请求 |
-| started_request_count | BIGINT | 否 | —（派生） | — | 该分组中恰有一条 request_started 事件的逻辑请求数 |
-| usage_observed_request_count | BIGINT | 否 | —（派生） | — | 该分组中恰有一条 usage_observed 事件的逻辑请求数 |
-| usage_missing_request_count | BIGINT | 否 | —（派生） | — | 该分组中未观察到 usage_observed 事件的逻辑请求数 |
+| request_count | BIGINT | 否 | —（派生） | — | 该分组无冲突的已观察观察请求数，包含客户未知及用量不完整请求 |
+| started_request_count | BIGINT | 否 | —（派生） | — | 该分组中恰有一条 request_started 事件的观察请求数 |
+| usage_observed_request_count | BIGINT | 否 | —（派生） | — | 该分组中恰有一条 usage_observed 事件的观察请求数 |
+| usage_missing_request_count | BIGINT | 否 | —（派生） | — | 该分组中未观察到 usage_observed 事件的观察请求数 |
 | eligible_usage_request_count | BIGINT | 否 | —（派生） | — | 该分组中有唯一结果、statistics_usage_eligible=1 且输入输出用量均非 NULL 的请求数 |
 | ineligible_usage_request_count | BIGINT | 否 | —（派生） | — | 该分组中未满足有效用量统计条件的请求数，与有效请求数合计为 request_count |
 | http_2xx_request_count | BIGINT | 否 | —（派生） | — | 该分组中网关可见 HTTP 状态为 200 至 299 的请求数 |

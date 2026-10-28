@@ -6,6 +6,8 @@
 
 当前已删除 application_id。Wasm 只从 Authorization: Bearer 提取临时 api_key，并发送入口 authority；Observer 使用配置的 cluster_name/deployment_environment，分别通过服务和客户查询接口取得归属。两个归属接口支持配置 HTTP/HTTPS POST JSON 调用及 x-remote-data 认证；URI 为空时使用未实现占位。Observer 固定 prd/stg/dev 环境，在有界异步任务中取得 ID 和名称快照；service_name、provider_name、customer_name 经 Kafka 写入 Doris 独立列及 event_json。占位或失败侧的 ID、名称和版本为 null，不回源补写历史；原始 usage 保留，业务 token 不进入事件、数据库或日志。 [归属接口实现计划](spec/plan/host-service-provider-implementation.md)定义 HTTP 对接和名称保存边界。
 
+当前请求标识分为：Observer 生成的内部 `observation_id`、Wasm 从 `logical_request_id_headers` 有序列表提取的可空客户端 `logical_request_id`，以及网关可见的 `x_request_id`。候选列表缺省或为空时不采集客户端 ID；最多 8 个头，取首个非空且匹配 `[A-Za-z0-9._:-]{1,128}` 的单值，跳过缺失、非法或重复头，不截断、不补值。配置示例按 `x-client-request-id`、`request_id` 排序。客户端 ID 可重复，内部关联和计数统一使用 `observation_id`；采集插件不再注入 `X-Metering-Request-Id`。Kafka 事件保持唯一的 `schema_version=1` 契约，当前模型直接采用上述字段语义。详情见[采集标识契约](gateway-request-collection-implementation.md#22-请求标识及时间)。
+
 ## 构建与本地运行
 
 需要 Go 1.25.0、TinyGo 0.40.1、Python 3.10+、Docker Compose。插件使用独立模块及仓库内 SDK v0.24.0 扩展副本，依赖由 go.mod/go.sum 锁定。
@@ -90,10 +92,10 @@ HTTP 不读取 `ca_file`，传输保护由部署链路提供；HTTPS 使用镜�
 名称从接口返回值保存到 Kafka 必填键及 Doris `service_name`、`provider_name`、`customer_name` 可空列，单项非空 UTF-8、最多 512 字节。`requests`、`request_statistics`、`event_details` 和 `usage_effective` 可直接查询名称；同一请求名称不一致按冲突隔离。重命名保留历史快照，名称不参与稳定身份摘要或日/月汇总分组。明细保留期内可按请求 ID 查询：
 
 ```sql
-SELECT logical_request_id, service_id, service_name,
+SELECT observation_id, service_id, service_name,
        provider_id, provider_name, customer_id, customer_name
 FROM metering_development.requests
-WHERE logical_request_id = '<logical_request_id>' AND has_conflict = 0;
+WHERE observation_id = '<observation_id>' AND has_conflict = 0;
 ```
 
 新库初始化直接包含名称列及最终视图；名称只作为请求快照保存。迁移不再提供补列、重建旧视图或补注释脚本，本地入口要求已有库与当前模型一致，否则应选择隔离空库重新初始化。工具不会自动删除旧开发数据。

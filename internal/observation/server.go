@@ -15,6 +15,7 @@ import (
 	"github.com/Fangyan33/llm-token-stats/pkg/credentials"
 	"github.com/Fangyan33/llm-token-stats/pkg/observationwire"
 	"github.com/Fangyan33/llm-token-stats/pkg/requesthost"
+	"github.com/Fangyan33/llm-token-stats/pkg/requestid"
 	"github.com/Fangyan33/llm-token-stats/pkg/routeinfo"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -217,7 +218,7 @@ func (s *Server) Observe(stream pb.ObservationService_ObserveServer) error {
 			}
 		}
 		e.EventType = "usage_observed"
-		e.EventID = e.LogicalRequestID + ":usage"
+		e.EventID = e.ObservationID + ":usage"
 		e.ObservationEndedAtMs = events.Ptr(time.Now().UnixMilli())
 		e.EventCreatedAtMs = time.Now().UnixMilli()
 		e.RequestModel = p.RequestModel
@@ -341,8 +342,8 @@ func (s *Server) Observe(stream pb.ObservationService_ObserveServer) error {
 				start = st
 				st.RouteName = routeinfo.Name(st.RouteName)
 				e = &snapshot
-				e.SchemaVersion, e.EventID, e.EventType = 1, id+":start", "request_started"
-				e.LogicalRequestID, e.ObservationID, e.ObservationScope = id, id, "gateway_response"
+				e.SchemaVersion, e.EventID, e.EventType = events.SchemaVersion, id+":start", "request_started"
+				e.LogicalRequestID, e.ObservationID, e.ObservationScope = st.LogicalRequestId, id, "gateway_response"
 				e.XRequestID, e.ProducerID, e.GatewayInstanceID = st.XRequestId, s.Cfg.ProducerID, st.GatewayInstanceId
 				e.ConfigVersion, e.AdapterID, e.RouteName = st.ConfigVersion, st.AdapterId, st.RouteName
 				e.RequestStartedAtMs, e.EventCreatedAtMs = st.RequestStartedAtMs, time.Now().UnixMilli()
@@ -354,7 +355,7 @@ func (s *Server) Observe(stream pb.ObservationService_ObserveServer) error {
 				eos[0] = st.RequestEndStream
 				p.Content(true, st.RequestContentType, st.RequestContentEncoding)
 				seq = f.FrameSeq
-				queue(&pb.ObservationAck{LogicalRequestId: id, AcceptedFrameSeq: seq, Reason: "accepted"})
+				queue(&pb.ObservationAck{ObservationId: id, AcceptedFrameSeq: seq, Reason: "accepted"})
 				continue
 			}
 			if st := f.GetStart(); st != nil {
@@ -419,18 +420,18 @@ func (s *Server) Observe(stream pb.ObservationService_ObserveServer) error {
 				reason = "parse_limit"
 			}
 			if !valid {
-				id := e.LogicalRequestID
-				queue(&pb.ObservationAck{LogicalRequestId: e.LogicalRequestID, AcceptedFrameSeq: seq, Reason: "accepted"})
+				id := e.ObservationID
+				queue(&pb.ObservationAck{ObservationId: e.ObservationID, AcceptedFrameSeq: seq, Reason: "accepted"})
 				final(reason, nil)
-				queue(&pb.ObservationAck{LogicalRequestId: id, AcceptedFrameSeq: seq, CloseStream: true, Reason: reason})
+				queue(&pb.ObservationAck{ObservationId: id, AcceptedFrameSeq: seq, CloseStream: true, Reason: reason})
 				return status.Error(codes.InvalidArgument, reason)
 			}
 			seq = f.FrameSeq
-			latest = &pb.ObservationAck{LogicalRequestId: e.LogicalRequestID, AcceptedFrameSeq: seq, Reason: "accepted"}
+			latest = &pb.ObservationAck{ObservationId: e.ObservationID, AcceptedFrameSeq: seq, Reason: "accepted"}
 			if end != nil {
 				acceptedEnd = end
 				done := make(chan error, 1)
-				a := ackWrite{a: &pb.ObservationAck{LogicalRequestId: e.LogicalRequestID, AcceptedFrameSeq: seq, Reason: "accepted"}, done: done}
+				a := ackWrite{a: &pb.ObservationAck{ObservationId: e.ObservationID, AcceptedFrameSeq: seq, Reason: "accepted"}, done: done}
 				select {
 				case <-acks:
 				default:
@@ -451,7 +452,7 @@ func (s *Server) Observe(stream pb.ObservationService_ObserveServer) error {
 					if e != nil {
 						closed := make(chan error, 1)
 						select {
-						case acks <- ackWrite{a: &pb.ObservationAck{LogicalRequestId: e.LogicalRequestID, AcceptedFrameSeq: seq, CloseStream: true, Reason: "finalized"}, done: closed}:
+						case acks <- ackWrite{a: &pb.ObservationAck{ObservationId: e.ObservationID, AcceptedFrameSeq: seq, CloseStream: true, Reason: "finalized"}, done: closed}:
 						case <-ctx.Done():
 							return nil
 						}
@@ -485,6 +486,9 @@ func validIdentity(s *string) bool     { return s != nil && validString(*s, 128)
 func validString(s string, n int) bool { return len(s) > 0 && len(s) <= n && utf8.ValidString(s) }
 func (s *Server) validStart(st *pb.Start) bool {
 	if st.RequestStartedAtMs < 1 || st.RequestStartedAtMs > 253402300799999 || st.RequestStartedAtMs > time.Now().UnixMilli()+300000 || st.Method != "POST" || !validString(st.GatewayInstanceId, 128) || !validString(st.ConfigVersion, 128) || st.AdapterId != "chat_completions_v1" || !events.Has(s.Cfg.AcceptedConfigs, st.ConfigVersion) || !events.Has(s.Cfg.AcceptedAdapters, st.AdapterId) || len(st.RequestContentType) > 128 || len(st.RequestContentEncoding) > 128 {
+		return false
+	}
+	if st.LogicalRequestId != nil && !requestid.Valid(*st.LogicalRequestId) {
 		return false
 	}
 	if st.XRequestId != nil {

@@ -40,7 +40,7 @@ docker compose -f deploy/doris/compose.yaml exec doris mysql -uroot -h127.0.0.1 
 
 ## 存储与统计
 
-`events_raw` 使用 Unique Key `(request_date, logical_request_id, event_id, payload_hash)`：同内容重放幂等，不同摘要保留冲突证据。原始事件和拒收诊断按 UTC 日期分区，Doris 自动预建当天及未来两日，usage-worker 按月首清理。原始、日、月统计统一保留前 12 个完整自然月加当月。冲突标记、通知与消费恢复事实独立保留，防止证据过期后冲突请求恢复有效。
+`events_raw` 使用 Unique Key `(request_date, observation_id, event_id, payload_hash)`：同内容重放幂等，不同摘要保留冲突证据。原始事件和拒收诊断按 UTC 日期分区，Doris 自动预建当天及未来两日，usage-worker 按月首清理。原始、日、月统计统一保留前 12 个完整自然月加当月。冲突标记、通知与消费恢复事实独立保留，防止证据过期后冲突请求恢复有效。
 
 Consumer 确认原始/拒收、冲突、通知和批次凭据全部可见后才提交 Kafka offset。Stream Load 每批固定 label，使用 `format: json`、`read_json_by_line: true`、`max_filter_ratio: 0`、`timezone: +00:00`，核对状态、行数和可见性。未知 schema 暂停对应分区。
 

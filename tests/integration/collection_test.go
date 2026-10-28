@@ -118,17 +118,15 @@ func TestCollectionEndToEnd(t *testing.T) {
 			if tc.stream && !bytes.Contains(out, []byte("data: [DONE]")) {
 				t.Fatal("SSE did not finish")
 			}
-			for _, id := range res.Header.Values("x-metering-request-id") {
-				if !eventsUUID(id) {
-					t.Fatal("upstream forged metering header survived")
-				}
+			if len(res.Header.Values("x-metering-request-id")) != 0 {
+				t.Fatal("observation ID leaked into response headers")
 			}
 			var id, raw, status, observation string
 			var part int32
 			var eligible int
 			var input, output sql.NullInt64
 			eventually(t, func() bool {
-				return db.QueryRow("SELECT logical_request_id,event_json,kafka_partition,usage_status,observation_status,usage_eligible,input_tokens,output_tokens FROM metering_development.events_raw WHERE x_request_id=? AND event_type='usage_observed'", xid).Scan(&id, &raw, &part, &status, &observation, &eligible, &input, &output) == nil
+				return db.QueryRow("SELECT observation_id,event_json,kafka_partition,usage_status,observation_status,usage_eligible,input_tokens,output_tokens FROM metering_development.events_raw WHERE x_request_id=? AND event_type='usage_observed'", xid).Scan(&id, &raw, &part, &status, &observation, &eligible, &input, &output) == nil
 			})
 			var event events.Event
 			if err = json.Unmarshal([]byte(raw), &event); err != nil || event.RouteName != "unknown" {
@@ -151,7 +149,7 @@ func TestCollectionEndToEnd(t *testing.T) {
 				t.Fatal("reported usage mismatch")
 			}
 			var count int
-			if err = db.QueryRow("SELECT COUNT(*) FROM metering_development.events_raw WHERE logical_request_id=?", id).Scan(&count); err != nil || count != 2 {
+			if err = db.QueryRow("SELECT COUNT(*) FROM metering_development.events_raw WHERE observation_id=?", id).Scan(&count); err != nil || count != 2 {
 				t.Fatalf("event count=%d err=%v", count, err)
 			}
 			offset := publish(t, cl, "llm-metering-development", part, id, []byte(raw))
@@ -159,7 +157,7 @@ func TestCollectionEndToEnd(t *testing.T) {
 				var n int
 				return db.QueryRow("SELECT COUNT(*) FROM metering_development.consumer_batch_receipts WHERE kafka_topic='llm-metering-development' AND kafka_partition=? AND first_offset<=? AND next_offset>?", part, offset, offset).Scan(&n) == nil && n > 0
 			})
-			if err = db.QueryRow("SELECT COUNT(*) FROM metering_development.events_raw WHERE logical_request_id=?", id).Scan(&count); err != nil || count != 2 {
+			if err = db.QueryRow("SELECT COUNT(*) FROM metering_development.events_raw WHERE observation_id=?", id).Scan(&count); err != nil || count != 2 {
 				t.Fatal("identical replay was not deduplicated")
 			}
 			if tc.name == "json" {
@@ -170,9 +168,9 @@ func TestCollectionEndToEnd(t *testing.T) {
 				publish(t, cl, "llm-metering-development", part, id, variant)
 				eventually(t, func() bool {
 					var n int
-					return db.QueryRow("SELECT COUNT(*) FROM metering_development.request_conflict_ids WHERE logical_request_id=?", id).Scan(&n) == nil && n == 1
+					return db.QueryRow("SELECT COUNT(*) FROM metering_development.request_conflict_ids WHERE observation_id=?", id).Scan(&n) == nil && n == 1
 				})
-				if err = db.QueryRow("SELECT has_conflict FROM metering_development.requests WHERE logical_request_id=?", id).Scan(&count); err != nil || count != 1 {
+				if err = db.QueryRow("SELECT has_conflict FROM metering_development.requests WHERE observation_id=?", id).Scan(&count); err != nil || count != 1 {
 					t.Fatal("conflict leaked into valid request projection")
 				}
 				eventually(t, func() bool {
@@ -349,7 +347,7 @@ func TestUnknownSchemaPausesPartition(t *testing.T) {
 		return e == nil && len(r.Topics) > 0 && r.Topics[0].Partitions[0].Offset == 1
 	})
 	cancel()
-	publish(t, cl, topic, 0, "synthetic", []byte(`{"schema_version":2}`))
+	publish(t, cl, topic, 0, "synthetic", []byte(`{"schema_version":3}`))
 	eventually(t, func() bool { return !h.Ready.Load() })
 	ctx, cancel = context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -384,7 +382,7 @@ func TestProducerBlackholeIsBounded(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer p.Close()
-	e := &events.Event{LogicalRequestID: uuid(t)}
+	e := &events.Event{ObservationID: uuid(t)}
 	start := time.Now()
 	for i := 0; i < 1024; i++ {
 		p.Emit(e)
@@ -430,7 +428,7 @@ func TestHTTPRewriteBoundariesAndTimeout(t *testing.T) {
 		size   int
 		slow   bool
 		stream bool
-	}{{"boundary", 262144, false, false}, {"over_limit", 262145, false, false}, {"one_megabyte", 1 << 20, false, false}, {"timeout", 128, true, false}, {"start_ack_header", 128, false, true}} {
+	}{{"boundary", 262144, false, false}, {"over_limit", 262145, false, false}, {"one_megabyte", 1 << 20, false, false}, {"timeout", 128, true, false}, {"slow_response_without_id_header", 128, false, true}} {
 		t.Run(tc.name, func(t *testing.T) {
 			body := []byte(prefix + strings.Repeat("x", tc.size-len(prefix)-len(suffix)) + suffix)
 			if tc.stream {
@@ -456,13 +454,12 @@ func TestHTTPRewriteBoundariesAndTimeout(t *testing.T) {
 				t.Fatalf("body changed or failed: status=%d", res.StatusCode)
 			}
 			if tc.stream {
-				id := res.Header.Get("x-metering-request-id")
-				if !eventsUUID(id) {
-					t.Fatal("Start ACK ID missing before deliberately delayed response")
+				if res.Header.Get("x-metering-request-id") != "" {
+					t.Fatal("observation injected a response ID")
 				}
 				eventually(t, func() bool {
 					var n int
-					return db.QueryRow("SELECT COUNT(*) FROM metering_development.events_raw WHERE logical_request_id=? AND x_request_id=?", id, xid).Scan(&n) == nil && n == 2
+					return db.QueryRow("SELECT COUNT(*) FROM metering_development.events_raw WHERE x_request_id=?", xid).Scan(&n) == nil && n == 2
 				})
 			}
 			if tc.slow {

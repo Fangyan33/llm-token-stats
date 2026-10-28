@@ -128,7 +128,7 @@ def validate_events(results, rows, gateway_instance_id, producer_ids, topic):
         expected = ['unknown', 'NULL', 'NULL'] if result['scenario'] == 'unknown' else ['known', '10', '4']
         require(usage[3:6] == expected and usage[7] == '0',
                 '用量或 unknown/NULL 语义不符合预期')
-        result.update(logical_request_id=usage[2], usage_status=usage[3],
+        result.update(observation_id=usage[2], usage_status=usage[3],
                       input_tokens=None if usage[4] == 'NULL' else int(usage[4]),
                       output_tokens=None if usage[5] == 'NULL' else int(usage[5]),
                       gateway_instance_id=usage[8], observer_producer_id=usage[9],
@@ -427,7 +427,7 @@ class Harness:
             results.append({'scenario': scenario, 'x_request_id': request_id, 'http_status': status,
                             'content_type': headers.get('Content-Type')})
         ids = ','.join("'" + r['x_request_id'] + "'" for r in results)
-        sql = ('SELECT x_request_id,event_type,logical_request_id,usage_status,input_tokens,output_tokens,'
+        sql = ('SELECT x_request_id,event_type,observation_id,usage_status,input_tokens,output_tokens,'
                'observation_status,usage_eligible,gateway_instance_id,producer_id,kafka_topic,route_name,'
                'service_id,provider_id,api_key_id,customer_id,mapping_status,customer_mapping_status,'
                'cluster_name,deployment_environment,request_host,mapping_version,customer_mapping_version '

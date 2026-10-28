@@ -135,7 +135,7 @@ func Validate(b []byte, kind string) error {
 		if isString && !utf8.Valid(f.B) {
 			return Err
 		}
-		if kind == "start" && (f.N == 17 && len(f.B) > 4096 || f.N == 16 && len(f.B) > 512) {
+		if kind == "start" && (f.N == 17 && len(f.B) > 4096 || f.N == 16 && len(f.B) > 512 || f.N == 18 && len(f.B) > 128) {
 			return Err
 		}
 		if kind == "chunk" && f.N == 4 && len(f.B) > 16384 {
@@ -171,7 +171,7 @@ func descriptor(kind string, n int) (int, bool, string, bool) {
 		if n == 17 {
 			return 2, true, "", false
 		}
-		if n >= 2 && n <= 16 {
+		if n >= 2 && n <= 16 || n == 18 {
 			return 2, true, "", true
 		}
 	case "headers":

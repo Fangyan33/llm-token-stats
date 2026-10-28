@@ -39,5 +39,9 @@
   "accepted_request_hosts": [
     "model.example.invalid",
     "*.example.invalid"
+  ],
+  "logical_request_id_headers": [
+    "x-client-request-id",
+    "request_id"
   ]
 }

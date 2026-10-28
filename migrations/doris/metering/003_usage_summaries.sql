@@ -4,15 +4,16 @@
 
 SET time_zone = '+00:00';
 
--- 日统计输入视图：按 UTC 请求日期和逻辑请求 ID 合并开始与结果事件，派生模型、用量来源及统计资格。
+-- 日统计输入视图：按 UTC 请求日期和观察 ID 合并开始与结果事件，派生模型、用量来源及统计资格。
 -- 保留未知归属和冲突标识，供日物化视图排除冲突后按八个维度聚合；资格判断不修改原始事件。
 CREATE VIEW IF NOT EXISTS metering.request_statistics (
     request_date COMMENT 'UTC 请求日期，由 request_started_at_ms 换算，不由事件到达时间或 UUID 推导',
-    logical_request_id COMMENT 'Observer 为一次观察生成的规范 UUIDv4；请求级主标识及 Kafka key',
-    start_variants COMMENT '该逻辑请求的开始事件内容变体数；大于 1 表示冲突，不是调用次数',
-    usage_variants COMMENT '该逻辑请求的结果事件内容变体数；0 表示未观察结果，大于 1 表示冲突',
-    started_count COMMENT '该日期内同一逻辑请求的不同开始时间数量；大于 1 表示时间冲突',
-    identity_count COMMENT '该日期内同一逻辑请求的不同十五项归属与部署快照数量；大于 1 表示冲突',
+    observation_id COMMENT 'Observer 为一次观察生成的规范 UUIDv4；内部主标识及 Kafka key',
+    logical_request_id COMMENT 'Wasm 按配置提取的客户端请求 ID；可空、可重复，不用于内部去重',
+    start_variants COMMENT '该观察的开始事件内容变体数；大于 1 表示冲突，不是调用次数',
+    usage_variants COMMENT '该观察的结果事件内容变体数；0 表示未观察结果，大于 1 表示冲突',
+    started_count COMMENT '该日期内同一观察的不同开始时间数量；大于 1 表示时间冲突',
+    identity_count COMMENT '该日期内同一观察的不同十六项归属与部署快照数量；大于 1 表示冲突',
     name_count COMMENT '同请求不同名称快照元组数量；大于 1 表示冲突',
     customer_id COMMENT '与 api_key_id 同次成功解析得到的客户 ID；未知为 NULL，不采信客户端自报 ID',
     provider_id COMMENT '服务接口返回的服务所属供应商 ID；未知为 NULL，不代表隐藏的实际执行方',
@@ -50,7 +51,7 @@ CREATE VIEW IF NOT EXISTS metering.request_statistics (
 SELECT a.*,
        CASE WHEN a.start_variants > 1 OR a.usage_variants > 1
                  OR a.started_count > 1 OR a.identity_count > 1 OR a.name_count > 1
-                 OR c.logical_request_id IS NOT NULL THEN 1 ELSE 0 END AS has_conflict,
+                 OR c.observation_id IS NOT NULL THEN 1 ELSE 0 END AS has_conflict,
        COALESCE(NULLIF(a.response_model, ''), NULLIF(a.request_model, ''), '') AS model,
        CASE WHEN a.usage_variants = 0 THEN 'missing'
             WHEN a.input_tokens IS NULL OR a.output_tokens IS NULL THEN 'unknown'
@@ -59,11 +60,11 @@ SELECT a.*,
             WHEN a.input_tokens_source = 'estimated_generic' AND a.output_tokens_source = 'estimated_generic' THEN 'estimated_generic'
             ELSE 'mixed' END AS usage_source
 FROM (
-    SELECT request_date, logical_request_id,
+    SELECT request_date, observation_id, MAX(logical_request_id) AS logical_request_id,
            SUM(CASE WHEN event_type = 'request_started' THEN 1 ELSE 0 END) AS start_variants,
            SUM(CASE WHEN event_type = 'usage_observed' THEN 1 ELSE 0 END) AS usage_variants,
            COUNT(DISTINCT request_started_at_ms) AS started_count,
-           COUNT(DISTINCT CAST(JSON_ARRAY(service_id, provider_id, api_key_id, customer_id, identity_status, config_version, gateway_instance_id, adapter_id, x_request_id, cluster_name, deployment_environment, mapping_status, mapping_version, customer_mapping_status, customer_mapping_version) AS STRING)) AS identity_count,
+           COUNT(DISTINCT CAST(JSON_ARRAY(service_id, provider_id, api_key_id, customer_id, identity_status, config_version, gateway_instance_id, adapter_id, x_request_id, logical_request_id, cluster_name, deployment_environment, mapping_status, mapping_version, customer_mapping_status, customer_mapping_version) AS STRING)) AS identity_count,
            COUNT(DISTINCT CAST(JSON_ARRAY(service_name, provider_name, customer_name) AS STRING)) AS name_count,
            MAX(customer_id) AS customer_id, MAX(provider_id) AS provider_id,
            MAX(api_key_id) AS api_key_id, MAX(service_id) AS service_id,
@@ -87,9 +88,9 @@ FROM (
            MAX(CASE WHEN event_type = 'usage_observed' THEN reported_total_tokens END) AS reported_total_tokens,
            MAX(CASE WHEN event_type = 'usage_observed' AND observation_status = 'complete' AND terminal_observed = 1 AND usage_status = 'known' AND input_tokens IS NOT NULL AND output_tokens IS NOT NULL AND SIZE(ARRAY_EXCEPT(anomaly_codes, ['invalid_model', 'identity_invalid'])) = 0 THEN 1 ELSE 0 END) AS statistics_usage_eligible
     FROM metering.events_raw
-    GROUP BY request_date, logical_request_id
+    GROUP BY request_date, observation_id
 ) a
-LEFT JOIN metering.request_conflict_ids c ON a.logical_request_id = c.logical_request_id;
+LEFT JOIN metering.request_conflict_ids c ON a.observation_id = c.observation_id;
 
 -- 日用量物化视图：从请求统计投影按日期及八个维度汇总无冲突请求数、有效 token 和质量指标。
 -- 由 usage-worker 仅刷新已结束日期；公共统计保留未知归属，客户及 API Key 报表需过滤对应未知 ID。
@@ -103,10 +104,10 @@ CREATE MATERIALIZED VIEW IF NOT EXISTS metering.usage_daily_mv (
     service_id COMMENT '服务统计维度；未知保持 NULL，已知服务统计包含客户未知请求',
     model COMMENT '统计模型维度，优先响应模型、其次请求模型；两者均缺失用空串表示未知',
     usage_source COMMENT '统计用量来源分组：reported、unknown、missing、mixed；estimated_model 和 estimated_generic 为预留估算分类',
-    request_count COMMENT '该分组无冲突的已观察逻辑请求数，包含客户未知及用量不完整请求',
-    started_request_count COMMENT '该分组中恰有一条 request_started 事件的逻辑请求数',
-    usage_observed_request_count COMMENT '该分组中恰有一条 usage_observed 事件的逻辑请求数',
-    usage_missing_request_count COMMENT '该分组中未观察到 usage_observed 事件的逻辑请求数',
+    request_count COMMENT '该分组无冲突的已观察观察请求数，包含客户未知及用量不完整请求',
+    started_request_count COMMENT '该分组中恰有一条 request_started 事件的观察请求数',
+    usage_observed_request_count COMMENT '该分组中恰有一条 usage_observed 事件的观察请求数',
+    usage_missing_request_count COMMENT '该分组中未观察到 usage_observed 事件的观察请求数',
     eligible_usage_request_count COMMENT '该分组中有唯一结果、statistics_usage_eligible=1 且输入输出用量均非 NULL 的请求数',
     ineligible_usage_request_count COMMENT '该分组中未满足有效用量统计条件的请求数，与有效请求数合计为 request_count',
     http_2xx_request_count COMMENT '该分组中网关可见 HTTP 状态为 200 至 299 的请求数',
@@ -171,10 +172,10 @@ CREATE MATERIALIZED VIEW IF NOT EXISTS metering.usage_monthly_mv (
     service_id COMMENT '服务统计维度；未知保持 NULL，已知服务统计包含客户未知请求',
     model COMMENT '统计模型维度，优先响应模型、其次请求模型；两者均缺失用空串表示未知',
     usage_source COMMENT '统计用量来源分组：reported、unknown、missing、mixed；estimated_model 和 estimated_generic 为预留估算分类',
-    request_count COMMENT '该分组无冲突的已观察逻辑请求数，包含客户未知及用量不完整请求',
-    started_request_count COMMENT '该分组中恰有一条 request_started 事件的逻辑请求数',
-    usage_observed_request_count COMMENT '该分组中恰有一条 usage_observed 事件的逻辑请求数',
-    usage_missing_request_count COMMENT '该分组中未观察到 usage_observed 事件的逻辑请求数',
+    request_count COMMENT '该分组无冲突的已观察观察请求数，包含客户未知及用量不完整请求',
+    started_request_count COMMENT '该分组中恰有一条 request_started 事件的观察请求数',
+    usage_observed_request_count COMMENT '该分组中恰有一条 usage_observed 事件的观察请求数',
+    usage_missing_request_count COMMENT '该分组中未观察到 usage_observed 事件的观察请求数',
     eligible_usage_request_count COMMENT '该分组中有唯一结果、statistics_usage_eligible=1 且输入输出用量均非 NULL 的请求数',
     ineligible_usage_request_count COMMENT '该分组中未满足有效用量统计条件的请求数，与有效请求数合计为 request_count',
     http_2xx_request_count COMMENT '该分组中网关可见 HTTP 状态为 200 至 299 的请求数',

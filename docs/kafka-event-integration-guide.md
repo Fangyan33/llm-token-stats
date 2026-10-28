@@ -1,6 +1,6 @@
 # Kafka 计量事件应用接入指南
 
-本文面向订阅计量事件的应用开发者，描述[网关请求采集开发实现方案](gateway-request-collection-implementation.md)对应的当前 **schema_version=1 契约**。采集、Kafka 和 Doris 已有真实本地链路验证，记录见[验证记录](spec/plan/gateway-collection-verification.md)；生产 Broker、认证权限及完整 G0–G5 尚需在实际环境验收。
+本文面向订阅计量事件的应用开发者，描述[网关请求采集开发实现方案](gateway-request-collection-implementation.md)对应的当前 **schema_version=1 契约**。既有链路的历史验证见[验证记录](spec/plan/gateway-collection-verification.md)；本次请求标识变更的验证边界见[请求标识验证记录](spec/plan/request-id-verification.md)，历史结果不作为本次数据库链路已通过的证据。生产 Broker、认证权限及完整 G0–G5 尚需在实际环境验收。
 
 本页描述唯一有效事件模型：应用维度已删除，归属由 Observer 的服务/客户接口解析。两个归属接口支持配置 HTTP/HTTPS POST JSON 调用及 x-remote-data 认证；URI 为空时使用未实现占位。Observer 固定 prd/stg/dev 环境，在有界异步任务中取得 ID 和名称快照；service_name、provider_name、customer_name 经 Kafka 写入 Doris 独立列及 event_json。占位或失败侧的 ID、名称和版本为 null，不回源补写历史；原始 usage 保留，业务 token 不进入事件、数据库或日志。
 
@@ -23,7 +23,7 @@ Observer 默认对两个接口分别缓存完整成功结果 30 分钟；仅瞬�
 | 项目 | 约定 |
 | --- | --- |
 | Topic | 由 Observer 和 Consumer 的 `kafka.topic` 配置决定；生产配置示例为 `llm-metering-events`，当前本地联调为 `llm-metering-development` |
-| Kafka key | `logical_request_id` 的 UTF-8 字节；同一请求的事件使用同一个 key |
+| Kafka key | `observation_id` 的 UTF-8 字节；同一请求的事件使用同一个 key |
 | Kafka value | UTF-8 JSON，固定字段集，`schema_version=1` |
 | 事件类型 | `request_started` 与 `usage_observed`；不存在独立的 `request_finished` |
 | 事件大小 | JSON 序列化后最多 32 KiB |
@@ -36,15 +36,15 @@ Observer 默认对两个接口分别缓存完整成功结果 30 分钟；仅瞬�
 1. `request_started`：Observer 接到有效请求开始观察消息后尝试发送。它说明观察到请求开始，不包含 token 用量。
 2. `usage_observed`：Observer 定稿时尝试发送，合并用量和网关可观察的终态。即使 token 未知或没有收到有效的网关 End，也可能发送这条事件。
 
-两条事件独立发送，可能只有一条到达；下游不能要求先看到 start 才处理 usage，也不能把 start 和 usage 算成两次模型调用。Kafka 重放可能带来物理重复。唯一请求标识是 `logical_request_id`，事件级标识是 `event_id`；`x_request_id` 仅供辅助排查。
+两条事件独立发送，可能只有一条到达；下游不能要求先看到 start 才处理 usage，也不能把 start 和 usage 算成两次模型调用。Kafka 重放可能带来物理重复。唯一请求标识是 `observation_id`，事件级标识是 `event_id`；`x_request_id` 仅供辅助排查。
 
-### 1.1 `logical_request_id` 由 Observer 生成
+### 1.1 `observation_id` 由 Observer 生成
 
-Observer 是唯一的请求 ID 生成方。网关 Wasm 只在请求头回调记录 `request_started_at_ms` 并随首帧 `Start` 发送；它不生成或提交 `logical_request_id`。Observer 收到并校验有效 Start 后，通过操作系统安全随机源生成 **UUIDv4**：读取 16 字节随机数，设置版本位为 4、变体位为 RFC 规定值，输出 36 字符小写规范形式 `xxxxxxxx-xxxx-4xxx-[89ab]xxx-xxxxxxxxxxxx`。例如 `7f6c2a90-4b13-4b68-9d21-67283e0c5f44`。随机源失败则拒绝该观察流并报警，不退化为时间戳、Pod UID 或客户端请求头。[RFC 9562 UUIDv4](https://www.rfc-editor.org/rfc/rfc9562.html#section-5.4)
+Observer 是唯一的请求 ID 生成方。网关 Wasm 只在请求头回调记录 `request_started_at_ms` 并随首帧 `Start` 发送；它不生成或提交 `observation_id`。Observer 收到并校验有效 Start 后，通过操作系统安全随机源生成 **UUIDv4**：读取 16 字节随机数，设置版本位为 4、变体位为 RFC 规定值，输出 36 字符小写规范形式 `xxxxxxxx-xxxx-4xxx-[89ab]xxx-xxxxxxxxxxxx`。例如 `7f6c2a90-4b13-4b68-9d21-67283e0c5f44`。随机源失败则拒绝该观察流并报警，不退化为时间戳、Pod UID 或客户端请求头。[RFC 9562 UUIDv4](https://www.rfc-editor.org/rfc/rfc9562.html#section-5.4)
 
-ID 与一个 gRPC 观察流绑定一次，Observer 在有效 Start ACK 中回传；后续 ACK、`request_started` 与 `usage_observed` 复用它。`observation_id` 一期等于该 UUID，Kafka key 是它的 UTF-8 字节，`event_id` 分别追加 `:start` 和 `:usage`。Kafka 发送失败、End 缺失或消息重放都不重新生成 ID；客户端重新发起请求得到新观察流和新 UUID。
+ID 与一个 gRPC 观察流绑定一次，Observer 在有效 Start ACK 中回传；后续 ACK、`request_started` 与 `usage_observed` 复用它。Kafka key 是该 `observation_id` 的 UTF-8 字节，`event_id` 分别追加 `:start` 和 `:usage`。Kafka 发送失败、End 缺失或消息重放都不重新生成 ID；客户端重新发起请求得到新观察流和新 UUID。
 
-UUIDv4 不包含时间。`request_started_at_ms` 仍由网关观察并作为事件字段，Consumer 从该字段计算 UTC `request_date`；不得从 UUID 推导日期。相同 UUID 的开始和结果事件应携带相同开始时间；不一致时按请求冲突处理。响应头 `X-Metering-Request-Id` 仅在网关发出响应头前收到有效 Start ACK 时才能携带该 UUID，故可能缺失；有响应头也不保证 Kafka 已收到事件。下游按事件 ID 去重，不以 `x_request_id` 重新构造请求 ID。具体协议、跨日期冲突和查询方式见[采集开发方案](gateway-request-collection-implementation.md#22-请求标识及时间)。
+UUIDv4 不包含时间。`request_started_at_ms` 仍由网关观察并作为事件字段，Consumer 从该字段计算 UTC `request_date`；不得从 UUID 推导日期。相同 UUID 的开始和结果事件应携带相同开始时间；不一致时按请求冲突处理。采集插件不再注入 `X-Metering-Request-Id` 响应头。`logical_request_id` 来自 Wasm 配置的客户端请求头，未命中为 `null`；`x_request_id` 保持网关可见值。下游按事件 ID 去重，不以 `x_request_id` 重新构造请求 ID。具体协议、跨日期冲突和查询方式见[采集开发方案](gateway-request-collection-implementation.md#22-请求标识及时间)。
 
 ## 2. Kafka value 字段字典
 
@@ -55,11 +55,11 @@ UUIDv4 不包含时间。`request_started_at_ms` 仍由网关观察并作为事�
 | 字段 | JSON 类型 / 可空 | 含义与使用规则 |
 | --- | --- | --- |
 | `schema_version` | 整数 / 否 | 事件结构版本，当前为 `1`。不认识的版本应暂停该分区并报警，不能按旧字段默认值继续处理。 |
-| `event_id` | 字符串 / 否 | 事件级逻辑 ID；开始事件为 `<logical_request_id>:start`，结果事件为 `<logical_request_id>:usage`。用于去重并检测同 ID 不同内容的冲突。 |
+| `event_id` | 字符串 / 否 | 事件级逻辑 ID；开始事件为 `<observation_id>:start`，结果事件为 `<observation_id>:usage`。用于去重并检测同 ID 不同内容的冲突。 |
 | `event_type` | 字符串 / 否 | 仅 `request_started` 或 `usage_observed`。 |
-| `logical_request_id` | 字符串 / 否 | Observer 收到有效 Start 后生成的规范小写 UUIDv4，同时也是 Kafka key 的文本值；同一观察的两种事件共用，不编码请求时间。 |
+| `observation_id` | 字符串 / 否 | Observer 收到有效 Start 后生成的规范小写 UUIDv4，同时也是 Kafka key 的文本值；同一观察的两种事件共用，不编码请求时间。 |
 | `x_request_id` | 字符串 / 是 | 网关当时可见的 `X-Request-Id`，可能缺失、复用或来自客户端；只用于辅助关联，不用于去重或授权。 |
-| `observation_id` | 字符串 / 否 | 一期与 `logical_request_id` 相同，表示本次观察。 |
+| `logical_request_id` | 字符串 / 是 | Wasm 按配置顺序提取的客户端请求 ID；可空、可重复，不要求 UUID，不用于去重或授权。 |
 | `observation_scope` | 字符串 / 否 | 当前固定为 `gateway_response`，表示网关可见的一次逻辑响应，并非所有上游尝试。 |
 | `producer_id` | 字符串 / 否 | 生成事件的 Observer 实例标识。 |
 | `gateway_instance_id` | 字符串 / 否 | 观察该请求的网关实例标识，新版为运行时 `namespace/pod-name`；同名 Pod 重建后不变，历史事件可为 Pod UID。 |
@@ -120,7 +120,7 @@ UUIDv4 不包含时间。`request_started_at_ms` 仍由网关观察并作为事�
 
 | 字段组 | `request_started` | `usage_observed` |
 | --- | --- | --- |
-| `event_id` | `<logical_request_id>:start` | `<logical_request_id>:usage` |
+| `event_id` | `<observation_id>:start` | `<observation_id>:usage` |
 | `usage` | `null` | 六个 `{value,source}` 子字段 |
 | `usage_status` / `usage_eligible` | `not_applicable` / `false` | 按定稿结果填写；仅满足有效用量统计候选条件时，`usage_eligible` 才为 `true` |
 | `raw_usage_json` | `"{}"` | 白名单 usage 依据；没有则 `"{}"` |
@@ -139,9 +139,9 @@ UUIDv4 不包含时间。`request_started_at_ms` 仍由网关观察并作为事�
   "schema_version": 1,
   "event_id": "7f6c2a90-4b13-4b68-9d21-67283e0c5f44:usage",
   "event_type": "usage_observed",
-  "logical_request_id": "7f6c2a90-4b13-4b68-9d21-67283e0c5f44",
-  "x_request_id": "b3e1fba5-16a4-4dfb-aa84-50141e80d473",
   "observation_id": "7f6c2a90-4b13-4b68-9d21-67283e0c5f44",
+  "x_request_id": "b3e1fba5-16a4-4dfb-aa84-50141e80d473",
+  "logical_request_id": "Client-Request-42",
   "observation_scope": "gateway_response",
   "producer_id": "observer-pod-uid",
   "gateway_instance_id": "istio-system/gateway-example",
@@ -210,12 +210,12 @@ UUIDv4 不包含时间。`request_started_at_ms` 仍由网关观察并作为事�
 }
 ```
 
-Kafka record 的 key 是上述 `logical_request_id`，不在 JSON 内另设 `kafka_key`。Kafka topic、partition、offset 和消费时间是传输/消费元数据，不属于事件 JSON；Doris 的 `payload_hash`、`identity_hash`、`event_json`、`ingested_at` 等也是消费后产生的列，不要求上游事件携带。
+Kafka record 的 key 是上述 `observation_id`，不在 JSON 内另设 `kafka_key`。Kafka topic、partition、offset 和消费时间是传输/消费元数据，不属于事件 JSON；Doris 的 `payload_hash`、`identity_hash`、`event_json`、`ingested_at` 等也是消费后产生的列，不要求上游事件携带。
 
 ## 4. 消费处理顺序
 
 1. 用独立消费组订阅 Topic，关闭自动提交。新组从最早可用 offset 还是最新 offset 开始，须在接入时明确；示例从保留窗口内最早记录开始。
-2. 按 UTF-8 JSON 解析，校验最多 32 KiB、`schema_version`、`logical_request_id` 是规范小写 UUIDv4（`^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`）、Kafka key 与该 ID 一致、事件类型和 `event_id` 后缀。未知版本停止处理并报警，不能跳过后提交。
+2. 按 UTF-8 JSON 解析，校验最多 32 KiB、`schema_version=1`、`observation_id` 是规范小写 UUIDv4（`^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`）、Kafka key 与该 ID 一致、事件类型和 `event_id` 后缀。未知版本停止处理并报警，不能跳过后提交。
 3. 根据 `event_id` 做幂等处理；若同一 `event_id` 出现不同规范事件内容，隔离并报警，不能随意挑一条覆盖。用量只来自 `usage_observed`，而且是否进入正式统计还需检查 `usage_eligible` 和请求冲突。
 4. 业务处理或持久化成功后再提交对应分区的下一个 offset。处理成功但提交失败会重放，所以幂等是必要条件；永久非法记录应走有界诊断流程，不能静默跳过。
 5. 监控每个分区的消费延迟与 72 小时保留窗口。单个请求缺少 start 或 usage 时保留“缺失/未知”状态，不用零值补齐。
@@ -259,7 +259,7 @@ type Event struct {
     SchemaVersion    int    `json:"schema_version"`
     EventID          string `json:"event_id"`
     EventType        string `json:"event_type"`
-    LogicalRequestID string `json:"logical_request_id"`
+    ObservationID    string `json:"observation_id"`
     Usage            *struct {
         CachedWriteTokens TokenValue `json:"cached_write_tokens"`
     } `json:"usage"`
@@ -276,14 +276,14 @@ func handle(r *kgo.Record) error {
     if e.SchemaVersion != 1 {
         return fmt.Errorf("unsupported schema_version: %d", e.SchemaVersion)
     }
-    if string(r.Key) != e.LogicalRequestID {
-        return fmt.Errorf("Kafka key and logical_request_id differ")
+    if string(r.Key) != e.ObservationID {
+        return fmt.Errorf("Kafka key and observation_id differ")
     }
     suffix := map[string]string{
         "request_started": ":start",
         "usage_observed":  ":usage",
     }[e.EventType]
-    if suffix == "" || e.EventID != e.LogicalRequestID+suffix {
+    if suffix == "" || e.EventID != e.ObservationID+suffix {
         return fmt.Errorf("invalid event identity")
     }
     if e.EventType == "request_started" && e.Usage != nil {
@@ -387,7 +387,7 @@ public class MeteringConsumer {
         if (event.path("schema_version").asInt(-1) != 1) {
             throw new IllegalArgumentException("unsupported schema_version");
         }
-        String requestId = event.path("logical_request_id").asText();
+        String requestId = event.path("observation_id").asText();
         String type = event.path("event_type").asText();
         String suffix = switch (type) {
             case "request_started" -> ":start";

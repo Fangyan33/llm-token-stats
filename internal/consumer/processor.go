@@ -42,7 +42,7 @@ func (p *Processor) Process(ctx context.Context, b *Batch) error {
 	}
 	ids := []string{}
 	for _, e := range b.Events {
-		ids = append(ids, e.LogicalRequestID)
+		ids = append(ids, e.ObservationID)
 	}
 	ev, err := p.Store.Evidence(ctx, sorted(ids))
 	if err != nil {
@@ -73,7 +73,7 @@ func (p *Processor) Process(ctx context.Context, b *Batch) error {
 			conflict = conflict || len(vs) > 1
 		}
 		if conflict {
-			marks = append(marks, map[string]any{"logical_request_id": id, "detected_at": b.At})
+			marks = append(marks, map[string]any{"observation_id": id, "detected_at": b.At})
 			hs := []string{}
 			for _, e := range es {
 				hs = append(hs, e.Hash)
@@ -85,7 +85,7 @@ func (p *Processor) Process(ctx context.Context, b *Batch) error {
 		}
 	}
 	sort.Slice(marks, func(i, j int) bool {
-		return marks[i]["logical_request_id"].(string) < marks[j]["logical_request_id"].(string)
+		return marks[i]["observation_id"].(string) < marks[j]["observation_id"].(string)
 	})
 	if err = p.load(ctx, "request_conflict_ids", b, marks, nil); err != nil {
 		return err

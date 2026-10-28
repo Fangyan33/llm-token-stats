@@ -68,7 +68,7 @@ func quote(v any) string {
 	return "'" + strings.ReplaceAll(strings.ReplaceAll(fmt.Sprint(v), "\\", "\\\\"), "'", "''") + "'"
 }
 
-var keys = map[string][]string{"events_raw": {"request_date", "logical_request_id", "event_id", "payload_hash"}, "ingest_rejections": {"kafka_record_date", "kafka_topic", "kafka_partition", "kafka_offset", "payload_hash"}, "request_conflict_ids": {"logical_request_id"}, "summary_dirty_notifications": {"stat_date", "notification_id"}, "consumer_batch_receipts": {"kafka_topic", "kafka_partition", "first_offset", "last_offset", "batch_id"}, "consumer_partition_origins": {"group_id", "kafka_topic", "kafka_partition", "origin_id"}, "consumer_partition_gaps": {"group_id", "kafka_topic", "kafka_partition", "gap_id"}}
+var keys = map[string][]string{"events_raw": {"request_date", "observation_id", "event_id", "payload_hash"}, "ingest_rejections": {"kafka_record_date", "kafka_topic", "kafka_partition", "kafka_offset", "payload_hash"}, "request_conflict_ids": {"observation_id"}, "summary_dirty_notifications": {"stat_date", "notification_id"}, "consumer_batch_receipts": {"kafka_topic", "kafka_partition", "first_offset", "last_offset", "batch_id"}, "consumer_partition_origins": {"group_id", "kafka_topic", "kafka_partition", "origin_id"}, "consumer_partition_gaps": {"group_id", "kafka_topic", "kafka_partition", "gap_id"}}
 
 func (s *Store) visible(ctx context.Context, label string) (bool, error) {
 	rows, err := s.DB.QueryContext(ctx, "SHOW TRANSACTION FROM "+s.Database()+" WHERE LABEL = "+quote(label))
@@ -199,7 +199,7 @@ func (s *Store) Evidence(ctx context.Context, ids []string) ([]consumer.Evidence
 			qs = append(qs, quote(id))
 		}
 		// Compare the single contract using typed identity columns.
-		r, err := s.DB.QueryContext(ctx, "SELECT CAST(request_date AS STRING),logical_request_id,payload_hash,"+IdentityKeySQL+","+NameKeySQL+",request_started_at_ms,event_id FROM "+s.Database()+".events_raw WHERE logical_request_id IN ("+strings.Join(qs, ",")+")")
+		r, err := s.DB.QueryContext(ctx, "SELECT CAST(request_date AS STRING),observation_id,payload_hash,"+IdentityKeySQL+","+NameKeySQL+",request_started_at_ms,event_id FROM "+s.Database()+".events_raw WHERE observation_id IN ("+strings.Join(qs, ",")+")")
 		if err != nil {
 			return nil, errors.New("doris_evidence")
 		}
@@ -226,7 +226,7 @@ func (s *Store) Evidence(ctx context.Context, ids []string) ([]consumer.Evidence
 
 // IdentityKeySQL keeps the field order aligned with events.IdentityHash and the request projections.
 // This JSON tuple is used only for equality within Doris, not as a payload hash.
-const IdentityKeySQL = "CAST(JSON_ARRAY(service_id, provider_id, api_key_id, customer_id, identity_status, config_version, gateway_instance_id, adapter_id, x_request_id, cluster_name, deployment_environment, mapping_status, mapping_version, customer_mapping_status, customer_mapping_version) AS STRING)"
+const IdentityKeySQL = "CAST(JSON_ARRAY(service_id, provider_id, api_key_id, customer_id, identity_status, config_version, gateway_instance_id, adapter_id, x_request_id, logical_request_id, cluster_name, deployment_environment, mapping_status, mapping_version, customer_mapping_status, customer_mapping_version) AS STRING)"
 
 const NameKeySQL = "CAST(JSON_ARRAY(service_name, provider_name, customer_name) AS STRING)"
 

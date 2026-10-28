@@ -66,7 +66,7 @@ func assertFrozenPair(t *testing.T, k *sink, service, customer string) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, err := events.Decode(b, []byte(e.LogicalRequestID), time.Now()); err != nil {
+		if _, err := events.Decode(b, []byte(e.ObservationID), time.Now()); err != nil {
 			t.Fatal("invalid finalized event", err)
 		}
 	}

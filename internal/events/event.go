@@ -29,7 +29,7 @@ func Canonical(e *Event) ([]byte, error) {
 	return b, nil
 }
 func IdentityHash(e *Event) string {
-	return Tuple([]any{e.ServiceID, e.ProviderID, e.ApiKeyID, e.CustomerID, e.IdentityStatus, e.ConfigVersion, e.GatewayInstanceID, e.AdapterID, e.XRequestID, e.ClusterName, e.DeploymentEnvironment, e.MappingStatus, e.MappingVersion, e.CustomerMappingStatus, e.CustomerMappingVersion})
+	return Tuple([]any{e.ServiceID, e.ProviderID, e.ApiKeyID, e.CustomerID, e.IdentityStatus, e.ConfigVersion, e.GatewayInstanceID, e.AdapterID, e.XRequestID, e.LogicalRequestID, e.ClusterName, e.DeploymentEnvironment, e.MappingStatus, e.MappingVersion, e.CustomerMappingStatus, e.CustomerMappingVersion})
 }
 func Decode(b, key []byte, now time.Time) (*Event, error) {
 	if len(b) > MaxBytes {
@@ -40,7 +40,7 @@ func Decode(b, key []byte, now time.Time) (*Event, error) {
 		return nil, errors.New("event_json")
 	}
 	if v, ok := obj["schema_version"].(json.Number); ok {
-		if n, err := v.Int64(); err == nil && n > 0 && n != 1 {
+		if n, err := v.Int64(); err == nil && n > 0 && n != SchemaVersion {
 			return nil, errors.New("unknown_schema")
 		}
 	}
@@ -51,14 +51,14 @@ func Decode(b, key []byte, now time.Time) (*Event, error) {
 	if strictjson.Decode(b, &e) != nil {
 		return nil, errors.New("event_json")
 	}
-	if string(key) != e.LogicalRequestID || e.ObservationID != e.LogicalRequestID {
+	if string(key) != e.ObservationID {
 		return nil, errors.New("event_id")
 	}
 	suffix := ":usage"
 	if e.EventType == "request_started" {
 		suffix = ":start"
 	}
-	if e.EventID != e.LogicalRequestID+suffix {
+	if e.EventID != e.ObservationID+suffix {
 		return nil, errors.New("event_id")
 	}
 	if !now.IsZero() {

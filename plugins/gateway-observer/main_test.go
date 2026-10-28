@@ -65,6 +65,78 @@ func TestBearerStartAndUnchangedAuthorization(t *testing.T) {
 	}
 }
 
+func TestClientRequestIDPriorityAndMissingValues(t *testing.T) {
+	for _, tc := range []struct {
+		name              string
+		headers           [][2]string
+		want              string
+		disabled, omitted bool
+	}{
+		{name: "priority", headers: [][2]string{{"request_id", "Second"}, {"x-client-request-id", "First.Case:42_abc-1"}}, want: "First.Case:42_abc-1"},
+		{name: "fallback", headers: [][2]string{{"request_id", "Second"}}, want: "Second"},
+		{name: "empty", headers: [][2]string{{"x-client-request-id", ""}, {"request_id", "Second"}}, want: "Second"},
+		{name: "invalid", headers: [][2]string{{"x-client-request-id", "bad id"}, {"request_id", "Second"}}, want: "Second"},
+		{name: "too_long", headers: [][2]string{{"x-client-request-id", strings.Repeat("a", 129)}, {"request_id", "Second"}}, want: "Second"},
+		{name: "maximum", headers: [][2]string{{"x-client-request-id", strings.Repeat("a", 128)}}, want: strings.Repeat("a", 128)},
+		{name: "duplicate", headers: [][2]string{{"x-client-request-id", "First"}, {"x-client-request-id", "Other"}, {"request_id", "Second"}}, want: "Second"},
+		{name: "duplicate_same", headers: [][2]string{{"x-client-request-id", "First"}, {"x-client-request-id", "First"}, {"request_id", "Second"}}, want: "Second"},
+		{name: "joined", headers: [][2]string{{"x-client-request-id", "First,Other"}}},
+		{name: "non_ascii", headers: [][2]string{{"x-client-request-id", "客户端"}}},
+		{name: "missing"},
+		{name: "empty_list", headers: [][2]string{{"x-client-request-id", "First"}}, disabled: true},
+		{name: "missing_setting", headers: [][2]string{{"x-client-request-id", "First"}}, omitted: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := testHostWithConfig(t, "", func(c map[string]any) {
+				c["logical_request_id_headers"] = []string{"X-Client-Request-ID", "request_id"}
+				if tc.disabled {
+					c["logical_request_id_headers"] = []string{}
+				}
+				if tc.omitted {
+					delete(c, "logical_request_id_headers")
+				}
+			})
+			id := h.InitializeHttpContext()
+			headers := append([][2]string{{":method", "POST"}, {":path", "/v1/chat/completions"}, {":authority", "model.example.invalid"}, {"x-request-id", "gateway-visible"}}, tc.headers...)
+			if h.CallOnRequestHeaders(id, headers, true) != types.ActionContinue {
+				t.Fatal("client ID extraction blocked business traffic")
+			}
+			calls := proxytest.GrpcCalls()
+			if len(calls) != 1 || len(calls[0].Messages) != 1 {
+				t.Fatal("missing Start")
+			}
+			var f pb.ObservationFrame
+			if err := proto.Unmarshal(calls[0].Messages[0], &f); err != nil || f.GetStart() == nil {
+				t.Fatal("invalid Start", err)
+			}
+			st := f.GetStart()
+			if st.GetLogicalRequestId() != tc.want || (st.LogicalRequestId == nil) != (tc.want == "") || st.GetXRequestId() != "gateway-visible" {
+				t.Fatalf("client ID=%v, gateway ID=%q", st.LogicalRequestId, st.GetXRequestId())
+			}
+			if !reflect.DeepEqual(h.GetCurrentRequestHeaders(id), headers) {
+				t.Fatal("client ID extraction changed request headers")
+			}
+		})
+	}
+}
+
+func TestResponseDoesNotExposeObservationID(t *testing.T) {
+	h := testHost(t)
+	id := h.InitializeHttpContext()
+	h.CallOnRequestHeaders(id, [][2]string{{":method", "POST"}, {":path", "/v1/chat/completions"}, {":authority", "model.example.invalid"}}, true)
+	calls := proxytest.GrpcCalls()
+	a, err := proto.Marshal(&pb.ObservationAck{ObservationId: "7f6c2a90-4b13-4b68-9d21-67283e0c5f44", AcceptedFrameSeq: 1, Reason: "accepted"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxytest.EmitGrpcReceive(proxytest.PluginContextID, calls[0].Token, a)
+	headers := [][2]string{{":status", "200"}, {"content-type", "application/json"}, {"x-business", "unchanged"}}
+	h.CallOnResponseHeaders(id, headers, true)
+	if !reflect.DeepEqual(h.GetCurrentResponseHeaders(id), headers) {
+		t.Fatal("observation injected or changed response headers")
+	}
+}
+
 func TestHostAllowlistBeforeAllocation(t *testing.T) {
 	for _, tc := range []struct {
 		name, authority              string
@@ -294,8 +366,8 @@ func TestFullRequestBoundaryAndControlReserve(t *testing.T) {
 			values = append(values, p[1])
 		}
 	}
-	if len(values) != 1 || values[0] != "7f6c2a90-4b13-4b68-9d21-67283e0c5f44" {
-		t.Fatalf("response ID not replaced: values=%v cancelled=%t", values, calls[0].Cancelled)
+	if !reflect.DeepEqual(values, []string{"forged", "second"}) {
+		t.Fatalf("upstream response headers changed: values=%v", values)
 	}
 	h.CompleteHttpContext(id)
 	if !calls[0].End[len(calls[0].End)-1] {

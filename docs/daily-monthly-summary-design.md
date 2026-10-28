@@ -15,7 +15,7 @@ flowchart LR
   usage-worker --> usage_monthly_mv
 ```
 
-`request_statistics` 是请求级逻辑投影：日期加 logical_request_id 一行，先合并开始和结果事件、判断内容/身份/名称/开始时间及持久冲突，再进行分组。一个请求计一次，同内容重放不累计，冲突整请求排除。
+`request_statistics` 是请求级逻辑投影：日期加 observation_id 一行，先合并开始和结果事件、判断内容/身份/名称/开始时间及持久冲突，再进行分组。一个请求计一次，同内容重放不累计，冲突整请求排除。
 
 两层物化视图保留 cluster_name、deployment_environment、customer_id、api_key_id、service_id、provider_id、model、usage_source 八个维度。服务、供应商、API Key 等报表从相同基础粒度再次 GROUP BY；不混存重复的总计行。
 

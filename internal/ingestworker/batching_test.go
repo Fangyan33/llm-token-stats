@@ -275,7 +275,7 @@ func TestFrozenBatchRetryAfterPartialPoll(t *testing.T) {
 }
 
 func TestOversizedAndUnknownRecordsPause(t *testing.T) {
-	for _, value := range []string{strings.Repeat("x", 32769), `{"schema_version":2}`} {
+	for _, value := range []string{strings.Repeat("x", 32769), `{"schema_version":3}`} {
 		w, store, client := batchWorker(5000, 32768), &batchStore{}, &batchClient{}
 		now := time.Now()
 		fp := fetchRecords(0, 0, 1, 0)

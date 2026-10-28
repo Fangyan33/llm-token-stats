@@ -60,8 +60,6 @@ func main() {
 		if req.TestCase == "slow_response" {
 			time.Sleep(200 * time.Millisecond)
 		}
-		out.Header().Add("x-metering-request-id", "forged")
-		out.Header().Add("x-metering-request-id", "forged-again")
 		if req.Stream {
 			if !req.Options.Include {
 				out.WriteHeader(422)

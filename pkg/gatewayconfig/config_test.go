@@ -66,6 +66,54 @@ func TestRequestHostConfiguration(t *testing.T) {
 	}
 }
 
+func TestLogicalRequestIDHeaderConfiguration(t *testing.T) {
+	data, err := os.ReadFile("../../configs/gateway-observer.example.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name          string
+		headers       any
+		omit, invalid bool
+		want          []string
+	}{
+		{name: "missing", omit: true, want: []string{}},
+		{name: "empty", headers: []string{}, want: []string{}},
+		{name: "priority_and_case", headers: []string{"X-Client-Request-Id", "request_id"}, want: []string{"x-client-request-id", "request_id"}},
+		{name: "maximum_name", headers: []string{strings.Repeat("a", 128)}, want: []string{strings.Repeat("a", 128)}},
+		{name: "maximum_list", headers: []string{"a", "b", "c", "d", "e", "f", "g", "h"}, want: []string{"a", "b", "c", "d", "e", "f", "g", "h"}},
+		{name: "null", invalid: true},
+		{name: "not_list", headers: "x-client-id", invalid: true},
+		{name: "duplicate_case", headers: []string{"X-Client-Id", "x-client-id"}, invalid: true},
+		{name: "empty_name", headers: []string{""}, invalid: true},
+		{name: "whitespace", headers: []string{" x-client-id"}, invalid: true},
+		{name: "pseudo_header", headers: []string{":path"}, invalid: true},
+		{name: "non_ascii", headers: []string{"x-K-id"}, invalid: true},
+		{name: "long_name", headers: []string{strings.Repeat("a", 129)}, invalid: true},
+		{name: "too_many", headers: []string{"a", "b", "c", "d", "e", "f", "g", "h", "i"}, invalid: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var c map[string]any
+			if err := json.Unmarshal(data, &c); err != nil {
+				t.Fatal(err)
+			}
+			if tc.omit {
+				delete(c, "logical_request_id_headers")
+			} else {
+				c["logical_request_id_headers"] = tc.headers
+			}
+			b, _ := json.Marshal(c)
+			got, err := Decode(b)
+			if (err != nil) != tc.invalid {
+				t.Fatalf("Decode=%v, want invalid=%t", err, tc.invalid)
+			}
+			if !tc.invalid && !reflect.DeepEqual(got.LogicalRequestIDHeaders, tc.want) {
+				t.Fatalf("headers=%v, want %v", got.LogicalRequestIDHeaders, tc.want)
+			}
+		})
+	}
+}
+
 func TestWildcardRouteFiltersOnlyPostAndExactPath(t *testing.T) {
 	c := Config{Enabled: true, Routes: []Route{{RouteName: "*", Enabled: true, Methods: []string{"POST"}, Paths: []string{"/v1/chat/completions"}}}}
 	for _, tc := range []struct {

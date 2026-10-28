@@ -44,7 +44,7 @@ func batch(t *testing.T) *Batch {
 		t.Fatal(err)
 	}
 	c := config.Consumer{Bytes: 4 << 20, AcceptedConfigs: []string{e.ConfigVersion}}
-	result, err := Freeze([]*kgo.Record{{Topic: "llm-metering-events", Partition: 0, Offset: 10, Key: []byte(e.LogicalRequestID), Value: b, Timestamp: time.UnixMilli(e.EventCreatedAtMs)}}, c, time.UnixMilli(e.EventCreatedAtMs))
+	result, err := Freeze([]*kgo.Record{{Topic: "llm-metering-events", Partition: 0, Offset: 10, Key: []byte(e.ObservationID), Value: b, Timestamp: time.UnixMilli(e.EventCreatedAtMs)}}, c, time.UnixMilli(e.EventCreatedAtMs))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -53,7 +53,7 @@ func batch(t *testing.T) *Batch {
 func TestCommitBarrier(t *testing.T) {
 	b := batch(t)
 	for _, fail := range []string{"events_raw", "evidence", "request_conflict_ids", "summary_dirty_notifications", "consumer_batch_receipts", ""} {
-		f := &fakeStore{fail: fail, evidence: []Evidence{{ID: b.Events[0].LogicalRequestID, Date: "2026-09-20", EventID: b.Events[0].EventID, Hash: "a", Identity: "x", Started: 1}, {ID: b.Events[0].LogicalRequestID, Date: "2026-09-21", EventID: b.Events[0].EventID, Hash: "b", Identity: "x", Started: 2}}}
+		f := &fakeStore{fail: fail, evidence: []Evidence{{ID: b.Events[0].ObservationID, Date: "2026-09-20", EventID: b.Events[0].EventID, Hash: "a", Identity: "x", Started: 1}, {ID: b.Events[0].ObservationID, Date: "2026-09-21", EventID: b.Events[0].EventID, Hash: "b", Identity: "x", Started: 2}}}
 		p := Processor{Store: f, Owns: func() bool { return true }}
 		err := p.Process(context.Background(), b)
 		if (err == nil) != (fail == "") {
@@ -70,9 +70,21 @@ func TestCommitBarrier(t *testing.T) {
 	}
 }
 
+func TestUnsupportedEventVersionPauses(t *testing.T) {
+	b := batch(t)
+	e := *b.Events[0]
+	e.SchemaVersion = 3
+	payload, _ := events.Canonical(&e)
+	c := config.Consumer{Bytes: 4 << 20, AcceptedConfigs: []string{e.ConfigVersion}}
+	got, err := Freeze([]*kgo.Record{{Topic: "unsupported-schema", Offset: 1, Key: []byte(e.ObservationID), Value: payload, Timestamp: time.UnixMilli(e.EventCreatedAtMs)}}, c, time.UnixMilli(e.EventCreatedAtMs))
+	if !errors.Is(err, ErrPause) || got != nil {
+		t.Fatal("unsupported event schema must pause without writing records")
+	}
+}
+
 func TestNamesConflictWithoutChangingIdentity(t *testing.T) {
 	b := batch(t)
-	id := b.Events[0].LogicalRequestID
+	id := b.Events[0].ObservationID
 	f := &fakeStore{evidence: []Evidence{{ID: id, Date: "2026-10-19", Started: 1, EventID: id + ":start", Hash: "a", Identity: "same", Names: "old"}, {ID: id, Date: "2026-10-19", Started: 1, EventID: id + ":usage", Hash: "b", Identity: "same", Names: "new"}}}
 	p := Processor{Store: f, Owns: func() bool { return true }}
 	if err := p.Process(context.Background(), b); err != nil {
@@ -127,7 +139,7 @@ func TestAdmissionIndependentOfDiagnosticRoute(t *testing.T) {
 			payload, _ := events.Canonical(&e)
 			c := config.Consumer{Bytes: 4 << 20, AcceptedConfigs: []string{e.ConfigVersion}}
 
-			b, err := Freeze([]*kgo.Record{{Topic: "llm-metering-events", Offset: 1, Key: []byte(e.LogicalRequestID), Value: payload, Timestamp: time.UnixMilli(e.EventCreatedAtMs)}}, c, time.UnixMilli(e.EventCreatedAtMs))
+			b, err := Freeze([]*kgo.Record{{Topic: "llm-metering-events", Offset: 1, Key: []byte(e.ObservationID), Value: payload, Timestamp: time.UnixMilli(e.EventCreatedAtMs)}}, c, time.UnixMilli(e.EventCreatedAtMs))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -153,7 +165,7 @@ func TestUnknownServiceAndSensitiveRejections(t *testing.T) {
 	payload, _ := events.Canonical(&e)
 	cfg := config.Consumer{Bytes: 4 << 20, AcceptedConfigs: []string{e.ConfigVersion}}
 	now := time.UnixMilli(e.EventCreatedAtMs)
-	record := &kgo.Record{Topic: "test", Offset: 1, Key: []byte(e.LogicalRequestID), Value: payload, Timestamp: now}
+	record := &kgo.Record{Topic: "test", Offset: 1, Key: []byte(e.ObservationID), Value: payload, Timestamp: now}
 	b, err := Freeze([]*kgo.Record{record}, cfg, now)
 	if err != nil || len(b.Events) != 1 || len(b.Rejected) != 0 || !b.Events[0].UsageEligible {
 		t.Fatal("unknown service blocked known customer usage")
@@ -183,7 +195,7 @@ func TestLegacyNullHostAndConfigRegistration(t *testing.T) {
 	e.MappingStatus = "invalid_host"
 	payload, _ := events.Canonical(&e)
 	now := time.UnixMilli(e.EventCreatedAtMs)
-	r := &kgo.Record{Topic: "legacy-host", Offset: 1, Key: []byte(e.LogicalRequestID), Value: payload, Timestamp: now}
+	r := &kgo.Record{Topic: "legacy-host", Offset: 1, Key: []byte(e.ObservationID), Value: payload, Timestamp: now}
 	for _, version := range []string{e.ConfigVersion, "other-version"} {
 		cfg := config.Consumer{Bytes: 4 << 20, AcceptedConfigs: []string{version}}
 		got, err := Freeze([]*kgo.Record{r}, cfg, now)

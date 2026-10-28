@@ -1,4 +1,4 @@
-"""Offline v1 contract checks; no gateway, Kafka or database I/O.
+"""Offline current contract checks; no gateway, Kafka or database I/O.
 
 The small schema evaluator supports only the keywords used by the two checked-in
 schemas. It is not a general JSON Schema implementation or a runtime Consumer.
@@ -19,7 +19,7 @@ MAX_EVENT_BYTES = 32768
 INT64_MAX = 9223372036854775807
 IDENTITY_FIELDS = (
     "service_id", "provider_id", "api_key_id", "customer_id", "identity_status",
-    "config_version", "gateway_instance_id", "adapter_id", "x_request_id",
+    "config_version", "gateway_instance_id", "adapter_id", "x_request_id", "logical_request_id",
     "cluster_name", "deployment_environment", "mapping_status", "mapping_version",
     "customer_mapping_status", "customer_mapping_version",
 )
@@ -201,8 +201,7 @@ def validate_event(event, kafka_key=None, now_ms=None, input_size=None):
     for name, field in schema["properties"].items():
         if isinstance(event[name], str) and "maxLength" in field:
             require(utf8_size(event[name]) <= field["maxLength"], name + ":utf8_bytes")
-    request_id = event["logical_request_id"]
-    require(event["observation_id"] == request_id, "observation_id_mismatch")
+    request_id = event["observation_id"]
     suffix = ":start" if event["event_type"] == "request_started" else ":usage"
     require(event["event_id"] == request_id + suffix, "event_id_mismatch")
     if kafka_key is not None:
@@ -304,6 +303,8 @@ def validate_config(config, release=False):
     for name, field in schema["properties"].items():
         if isinstance(config.get(name), str) and "maxLength" in field:
             require(utf8_size(config[name]) <= field["maxLength"], name + ":utf8_bytes")
+    headers = [name.lower() for name in config.get('logical_request_id_headers', [])]
+    require(len(headers) == len(set(headers)), 'duplicate_request_id_header')
     patterns = [normalize_request_host_pattern(p) for p in config.get('accepted_request_hosts', [])]
     require(len(patterns) == len(set(patterns)), 'duplicate_request_host_pattern')
     names = []
@@ -337,7 +338,7 @@ def validate_repository():
     for path in fixtures:
         data = path.read_bytes()
         event = strict_json(data.decode("utf-8"))
-        validate_event(event, event["logical_request_id"].encode("utf-8"), input_size=len(data))
+        validate_event(event, event["observation_id"].encode("utf-8"), input_size=len(data))
     doc = (ROOT / "docs/gateway-request-collection-implementation.md").read_text(encoding="utf-8")
     fence = chr(96) * 3
     proto = (ROOT / "api/observation/v1/observation.proto").read_text(encoding="utf-8")

@@ -1,5 +1,7 @@
 package events
 
+const SchemaVersion = 1
+
 type Token struct {
 	Value  *int64 `json:"value"`
 	Source string `json:"source"`
@@ -16,7 +18,7 @@ type Event struct {
 	SchemaVersion          int      `json:"schema_version"`
 	EventID                string   `json:"event_id"`
 	EventType              string   `json:"event_type"`
-	LogicalRequestID       string   `json:"logical_request_id"`
+	LogicalRequestID       *string  `json:"logical_request_id"`
 	XRequestID             *string  `json:"x_request_id"`
 	ObservationID          string   `json:"observation_id"`
 	ObservationScope       string   `json:"observation_scope"`

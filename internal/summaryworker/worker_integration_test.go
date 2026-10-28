@@ -124,7 +124,6 @@ func TestDorisNestedSummaries(t *testing.T) {
 			t.Fatal(e)
 		}
 		id := newID()
-		event.LogicalRequestID = id
 		event.ObservationID = id
 		event.EventID = id + ":usage"
 		delta := date.Add(time.Minute).UnixMilli() - event.RequestStartedAtMs
@@ -193,7 +192,7 @@ func TestDorisNestedSummaries(t *testing.T) {
 	insert("usage-known", today, false)
 	for _, view := range []string{"event_details", "requests", "usage_effective", "request_statistics"} {
 		var count int
-		if e = store.DB.QueryRowContext(ctx, "SELECT COUNT(*) FROM "+store.table(view)+" WHERE logical_request_id=?", id).Scan(&count); e != nil || count != 1 {
+		if e = store.DB.QueryRowContext(ctx, "SELECT COUNT(*) FROM "+store.table(view)+" WHERE observation_id=?", id).Scan(&count); e != nil || count != 1 {
 			t.Fatalf("%s lost the valid request: count=%d err=%v", view, count, e)
 		}
 	}
@@ -211,7 +210,7 @@ func TestDorisNestedSummaries(t *testing.T) {
 
 	// Snapshot the immutable old qualification and hash before backfill.
 	var original string
-	if e = store.DB.QueryRowContext(ctx, "SELECT event_json FROM "+store.table("events_raw")+" WHERE logical_request_id=?", id).Scan(&original); e != nil {
+	if e = store.DB.QueryRowContext(ctx, "SELECT event_json FROM "+store.table("events_raw")+" WHERE observation_id=?", id).Scan(&original); e != nil {
 		t.Fatal(e)
 	}
 	if e = worker.Run(ctx, "", ""); e != nil {
@@ -231,7 +230,7 @@ func TestDorisNestedSummaries(t *testing.T) {
 		t.Fatal("today was computed")
 	}
 	var after string
-	store.DB.QueryRowContext(ctx, "SELECT event_json FROM "+store.table("events_raw")+" WHERE logical_request_id=?", id).Scan(&after)
+	store.DB.QueryRowContext(ctx, "SELECT event_json FROM "+store.table("events_raw")+" WHERE observation_id=?", id).Scan(&after)
 	if after != original {
 		t.Fatal("historical event mutated")
 	}
@@ -328,7 +327,7 @@ func TestDorisNestedSummaries(t *testing.T) {
 		t.Fatalf("notification not acknowledged %v %v", ids, e)
 	}
 	// Withdraw every remaining request: a zero-row refresh must delete old groups.
-	if _, e = store.DB.ExecContext(ctx, "INSERT INTO "+store.table("request_conflict_ids")+" SELECT logical_request_id, NOW(3) FROM "+store.table("events_raw")+" WHERE request_date=?", yesterday.Format("2006-01-02")); e != nil {
+	if _, e = store.DB.ExecContext(ctx, "INSERT INTO "+store.table("request_conflict_ids")+" SELECT observation_id, NOW(3) FROM "+store.table("events_raw")+" WHERE request_date=?", yesterday.Format("2006-01-02")); e != nil {
 		t.Fatal(e)
 	}
 	if e = worker.Run(ctx, "", ""); e != nil {
@@ -374,7 +373,7 @@ func TestDorisNestedSummaries(t *testing.T) {
 			projection[i] = "'" + events.Hash([]byte("synthetic-variant")) + "'"
 		}
 	}
-	if _, e = store.DB.ExecContext(ctx, "INSERT INTO "+store.table("events_raw")+" SELECT "+strings.Join(projection, ",")+" FROM "+store.table("events_raw")+" WHERE logical_request_id=?", id); e != nil {
+	if _, e = store.DB.ExecContext(ctx, "INSERT INTO "+store.table("events_raw")+" SELECT "+strings.Join(projection, ",")+" FROM "+store.table("events_raw")+" WHERE observation_id=?", id); e != nil {
 		t.Fatal(e)
 	}
 	for _, test := range []struct {
@@ -382,7 +381,7 @@ func TestDorisNestedSummaries(t *testing.T) {
 		count int
 	}{{"event_conflicts", 1}, {"event_details", 0}, {"usage_effective", 0}} {
 		var count int
-		if e = store.DB.QueryRowContext(ctx, "SELECT COUNT(*) FROM "+store.table(test.view)+" WHERE logical_request_id=?", id).Scan(&count); e != nil || count != test.count {
+		if e = store.DB.QueryRowContext(ctx, "SELECT COUNT(*) FROM "+store.table(test.view)+" WHERE observation_id=?", id).Scan(&count); e != nil || count != test.count {
 			t.Fatalf("%s conflict filtering: count=%d err=%v", test.view, count, e)
 		}
 	}

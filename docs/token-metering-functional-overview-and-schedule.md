@@ -91,7 +91,7 @@
 
 一期仅观察入口直接访问的服务 A 及其最终可见响应，不还原内部 B/C 调用，也不宣称覆盖网关隐藏重试的消耗。客户端每次重新发起的请求分别记录。
 
-计量查询以 Observer 在有效 Start 后生成的 UUIDv4 `logical_request_id` 为主键；ID 不编码日期，统计日期由 `request_started_at_ms` 确定，单 ID 查询覆盖在线日期分区；客户在 ACK 及时到达时可从 `X-Metering-Request-Id` 响应头取得，迟到时此头可缺失；网关可见的 `X-Request-Id` 在事件中名为 `x_request_id`，仅作可选关联字段，可能缺失、重复或保留客户端传值，不作为唯一键或授权凭据。客户查询接口强制按已登录客户隔离，未知用量不显示为零。旁路采集允许丢失，返回了查询 ID 并不保证最终一定有计量记录。
+计量内部关联以 Observer 在有效 Start 后生成的 UUIDv4 `observation_id` 为键；统计日期由 `request_started_at_ms` 确定。客户端 `logical_request_id` 由 Wasm 按配置列表提取，未命中为 null，允许重试复用；查询须限定客户和时间窗口，并可能返回多个观察。`x_request_id` 保留网关可见的 `X-Request-Id`，仅作辅助关联。采集插件不再注入 `X-Metering-Request-Id` 响应头。客户查询强制按已登录客户隔离，未知用量不显示为零；旁路采集允许丢失，客户端 ID 不保证存在计量记录。
 
 ### 3.3 价格与计费管理
 

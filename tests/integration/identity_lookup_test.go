@@ -221,7 +221,7 @@ func TestStatisticsProjectionWithSyntheticMappings(t *testing.T) {
 		id := uuid(t)
 		ids = append(ids, id)
 		now := time.Now().UnixMilli()
-		e.LogicalRequestID, e.ObservationID, e.EventID = id, id, id+":usage"
+		e.ObservationID, e.EventID = id, id+":usage"
 		e.CustomerID = events.Ptr(customer)
 		e.RequestStartedAtMs = now
 		e.EventCreatedAtMs = now
@@ -252,7 +252,7 @@ func TestStatisticsProjectionWithSyntheticMappings(t *testing.T) {
 	where := "'" + strings.Join(ids, "','") + "'"
 	eventually(t, func() bool {
 		var n int
-		return db.QueryRow("SELECT COUNT(*) FROM metering_development.events_raw WHERE logical_request_id IN ("+where+")").Scan(&n) == nil && n == len(ids)
+		return db.QueryRow("SELECT COUNT(*) FROM metering_development.events_raw WHERE observation_id IN ("+where+")").Scan(&n) == nil && n == len(ids)
 	})
 	var count, unknownService, unknownCustomer int
 	if err := db.QueryRow("SELECT COUNT(*) FROM metering_development.request_statistics WHERE customer_id=?", customer).Scan(&count); err != nil || count != 4 {
@@ -261,7 +261,7 @@ func TestStatisticsProjectionWithSyntheticMappings(t *testing.T) {
 	if err := db.QueryRow("SELECT COUNT(*) FROM metering_development.request_statistics WHERE customer_id=? AND provider_id IS NULL AND service_id IS NULL", customer).Scan(&unknownService); err != nil || unknownService != 1 {
 		t.Fatal("unknown service attribution", unknownService, err)
 	}
-	if err := db.QueryRow("SELECT COUNT(*) FROM metering_development.request_statistics WHERE logical_request_id IN (" + where + ") AND customer_id IS NULL AND api_key_id IS NULL AND service_id IS NOT NULL AND statistics_usage_eligible=1").Scan(&unknownCustomer); err != nil || unknownCustomer != 1 {
+	if err := db.QueryRow("SELECT COUNT(*) FROM metering_development.request_statistics WHERE observation_id IN (" + where + ") AND customer_id IS NULL AND api_key_id IS NULL AND service_id IS NOT NULL AND statistics_usage_eligible=1").Scan(&unknownCustomer); err != nil || unknownCustomer != 1 {
 		t.Fatal("unknown customer excluded from service usage", unknownCustomer, err)
 	}
 	var raw []byte

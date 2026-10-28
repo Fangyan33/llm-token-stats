@@ -206,6 +206,18 @@
         "maxLength": 256,
         "pattern": "(?:\\*|(?:\\*\\.)?[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?\\.?)"
       }
+    },
+    "logical_request_id_headers": {
+      "type": "array",
+      "maxItems": 8,
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 128,
+        "pattern": "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"
+      },
+      "description": "按优先级选择首个合法客户端请求 ID；名称忽略大小写且不得重复；缺省或空列表不采集。"
     }
   }
 }

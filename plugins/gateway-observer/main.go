@@ -6,6 +6,7 @@ import (
 	"github.com/Fangyan33/llm-token-stats/pkg/gatewayconfig"
 	w "github.com/Fangyan33/llm-token-stats/pkg/observationwire"
 	"github.com/Fangyan33/llm-token-stats/pkg/requesthost"
+	"github.com/Fangyan33/llm-token-stats/pkg/requestid"
 	"github.com/Fangyan33/llm-token-stats/pkg/routeinfo"
 	"github.com/Fangyan33/llm-token-stats/pkg/strictjson"
 	"github.com/tetratelabs/proxy-wasm-go-sdk/proxywasm"
@@ -420,6 +421,17 @@ func (h *httpContext) OnHttpRequestHeaders(_ int, eos bool) types.Action {
 	if valid {
 		b = w.String(b, 15, x)
 	}
+	for _, name := range h.cfg.LogicalRequestIDHeaders {
+		// Envoy joins repeated field values with commas. Reject the candidate
+		// rather than silently selecting one of several client IDs.
+		value, err := proxywasm.GetProperty([]string{"request", "headers", name})
+		if err == nil && requestid.Valid(string(value)) {
+			b = w.Bytes(b, 18, value)
+			clear(value)
+			break
+		}
+		clear(value)
+	}
 	r.send(s, 10, b, false)
 	clear(b)
 	return action
@@ -616,15 +628,6 @@ func (h *httpContext) bodyCapacity(d, n int, eos bool) bool {
 func (h *httpContext) OnHttpResponseHeaders(_ int, eos bool) types.Action {
 	if !h.selected {
 		return types.ActionContinue
-	}
-	if err := proxywasm.RemoveHttpResponseHeader("x-metering-request-id"); err == nil {
-		if h.root.active(h.s) && w.UUID(h.s.id) {
-			if proxywasm.AddHttpResponseHeader("x-metering-request-id", h.s.id) != nil {
-				h.root.count("response_header_failed")
-			}
-		}
-	} else {
-		h.root.count("response_header_failed")
 	}
 	n, err := strconv.ParseUint(responseHeader(":status"), 10, 32)
 	if err != nil || n < 200 || n > 599 {

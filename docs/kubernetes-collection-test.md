@@ -87,7 +87,7 @@ curl --noproxy '*' -N -H 'Host: wasm-verify.local' -H 'Authorization: Bearer syn
 
 kind 到 Compose 的连接经过 SNAT，broker 记录的 HOST 可能是 Docker 网桥地址。用例通过 Kubernetes Consumer 实际停止 / 恢复与消费组成员数的对应变化核验归属，不用 broker 所见地址推断 Pod IP。
 
-结果在 `.tmp/k8s-collection/<context>/<namespace>/<run-id>/`，包括 `result.json`、请求与 logical_request_id、实际清单、config_dump、Consumer 位点、停止 / 恢复的消费组状态、`gateway-scale.result.json` 与 Doris 回执。失败时另保存 Pod、事件、describe 和容器日志；均为已忽略的本地文件。最近一次测试的清理信息保存在同级 `state.json`。
+结果在 `.tmp/k8s-collection/<context>/<namespace>/<run-id>/`，包括 `result.json`、请求与 observation_id、实际清单、config_dump、Consumer 位点、停止 / 恢复的消费组状态、`gateway-scale.result.json` 与 Doris 回执。失败时另保存 Pod、事件、describe 和容器日志；均为已忽略的本地文件。最近一次测试的清理信息保存在同级 `state.json`。
 
 ## 清理
 

@@ -3,6 +3,7 @@ package gatewayconfig
 import (
 	"errors"
 	"github.com/Fangyan33/llm-token-stats/pkg/requesthost"
+	"github.com/Fangyan33/llm-token-stats/pkg/requestid"
 	"github.com/Fangyan33/llm-token-stats/pkg/strictjson"
 	"strings"
 	"unicode"
@@ -20,10 +21,20 @@ func Decode(b []byte) (Config, error) {
 			return c, errors.New("config_request_hosts") // Explicit null is not an array.
 		}
 	}
+	if c.LogicalRequestIDHeaders == nil {
+		fields, _ := strictjson.Fields(b, 64, 100000)
+		if _, present := fields["logical_request_id_headers"]; present {
+			return c, errors.New("config_request_id_headers")
+		}
+	}
 	if c.SchemaVersion != 1 || !str(c.ConfigVersion, 128) || !str(c.ObserverCluster, 256) || len(c.Routes) > 128 {
 		return c, errors.New("config_invalid")
 	}
 	var err error
+	c.LogicalRequestIDHeaders, err = requestid.NormalizeHeaders(c.LogicalRequestIDHeaders)
+	if err != nil {
+		return c, err
+	}
 	c.AcceptedRequestHosts, err = requesthost.NormalizePatterns(c.AcceptedRequestHosts)
 	if err != nil {
 		return c, err

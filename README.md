@@ -8,6 +8,10 @@ LLM Token Stats 在网关旁路观察大模型请求和响应，提取模型返�
 
 两个归属接口支持配置 HTTP/HTTPS POST JSON 调用及 x-remote-data 认证；URI 为空时使用未实现占位。Observer 固定 prd/stg/dev 环境，在有界异步任务中取得 ID 和名称快照；service_name、provider_name、customer_name 经 Kafka 写入 Doris 独立列及 event_json。占位或失败侧的 ID、名称和版本为 null，不回源补写历史；原始 usage 保留，业务 token 不进入事件、数据库或日志。两个接口默认各缓存成功结果 30 分钟，瞬时故障时最多再沿用 15 分钟；认证或业务明确错误清除旧值，历史快照保持不变。缓存通过各自的 `cache` 配置调整，修改后重启 Observer。具体说明见[归属接口说明](docs/spec/plan/host-service-provider-implementation.md)。
 
+
+当前请求标识分为：Observer 生成的内部 `observation_id`、Wasm 从 `logical_request_id_headers` 有序列表提取的可空客户端 `logical_request_id`，以及网关可见的 `x_request_id`。候选列表缺省或为空时不采集客户端 ID；最多 8 个头，取首个非空且匹配 `[A-Za-z0-9._:-]{1,128}` 的单值，跳过缺失、非法或重复头，不截断、不补值。配置示例按 `x-client-request-id`、`request_id` 排序。客户端 ID 可重复，内部关联和计数统一使用 `observation_id`；采集插件不再注入 `X-Metering-Request-Id`。Kafka 事件保持唯一的 `schema_version=1` 契约，当前模型直接采用上述字段语义。详情见[采集标识契约](docs/gateway-request-collection-implementation.md#22-请求标识及时间)。
+
+
 ## 架构与组件职责
 
 ```mermaid

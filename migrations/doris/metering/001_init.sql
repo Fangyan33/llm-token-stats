@@ -10,13 +10,13 @@ CREATE DATABASE IF NOT EXISTS metering;
 
 CREATE TABLE IF NOT EXISTS metering.events_raw (
     request_date DATE NOT NULL COMMENT 'UTC 请求日期，由 request_started_at_ms 换算，不由事件到达时间或 UUID 推导',
-    logical_request_id VARCHAR(36) NOT NULL COMMENT 'Observer 为一次观察生成的规范 UUIDv4；请求级主标识及 Kafka key',
-    event_id VARCHAR(42) NOT NULL COMMENT '事件标识，逻辑请求 ID 加 :start 或 :usage；同 ID 不同内容属于冲突',
+    observation_id VARCHAR(36) NOT NULL COMMENT 'Observer 为一次观察生成的规范 UUIDv4；内部主标识及 Kafka key',
+    event_id VARCHAR(42) NOT NULL COMMENT '事件标识，观察 ID 加 :start 或 :usage；同 ID 不同内容属于冲突',
     payload_hash CHAR(64) NOT NULL COMMENT '当前规范事件 JSON 的 SHA-256；与事件 ID 共同保留内容变体并实现幂等',
     schema_version INT NOT NULL COMMENT '唯一事件契约版本，当前为 1；未知版本由 Consumer 暂停对应分区',
     event_type VARCHAR(32) NOT NULL COMMENT '事件类型：request_started 或 usage_observed；两者合计仍是一次请求',
     x_request_id VARCHAR(128) NULL COMMENT '网关可见的 X-Request-Id，仅辅助关联；可空、可重复，不用于授权或去重',
-    observation_id VARCHAR(36) NOT NULL COMMENT '观察标识，当前与 logical_request_id 相同',
+    logical_request_id VARCHAR(128) NULL COMMENT 'Wasm 按配置提取的客户端请求 ID；可空、可重复，不用于内部去重',
     observation_scope VARCHAR(32) NOT NULL COMMENT '观察范围，当前固定 gateway_response，不代表所有隐藏的上游尝试',
     producer_id VARCHAR(128) NOT NULL COMMENT '生成此事件的 Observer 实例标识，部署时使用实际 Pod UID',
     gateway_instance_id VARCHAR(128) NOT NULL COMMENT '观察请求的网关实例标识，新版为命名空间/Pod名称，历史值可能为Pod UID',
@@ -38,7 +38,7 @@ CREATE TABLE IF NOT EXISTS metering.events_raw (
     customer_id VARCHAR(128) NULL COMMENT '与 api_key_id 同次成功解析得到的客户 ID；未知为 NULL，不采信客户端自报 ID',
     provider_id VARCHAR(128) NULL COMMENT '服务接口返回的服务所属供应商 ID；未知为 NULL，不代表隐藏的实际执行方',
     identity_status VARCHAR(16) NOT NULL COMMENT '客户归属状态：known 或 invalid；仅完整客户解析成功为 known，不表示鉴权判定',
-    identity_hash CHAR(64) NOT NULL COMMENT '固定十五项归属与部署快照元组的规范 SHA-256，不含原始密钥或诊断路由',
+    identity_hash CHAR(64) NOT NULL COMMENT '固定十六项归属与部署快照元组的规范 SHA-256，不含原始密钥或诊断路由',
     request_started_at_ms BIGINT NOT NULL COMMENT '网关观察到请求头的 Unix 毫秒时间；决定 UTC 统计日期',
     observation_ended_at_ms BIGINT NULL COMMENT 'Observer 结束观察的 Unix 毫秒时间；start 为 NULL，不等于业务结束时间',
     request_finished_at_ms BIGINT NULL COMMENT '有效网关 End 提供的请求结束 Unix 毫秒时间；未收到有效 End 时为 NULL',
@@ -75,10 +75,10 @@ CREATE TABLE IF NOT EXISTS metering.events_raw (
     kafka_offset BIGINT NOT NULL COMMENT '消息在 Kafka 分区内的 offset，0 是有效位置',
     ingested_at DATETIME(3) NOT NULL COMMENT 'Consumer 冻结批次的入库审计时间，UTC，不作为请求统计日期'
 )
-UNIQUE KEY(request_date, logical_request_id, event_id, payload_hash)
+UNIQUE KEY(request_date, observation_id, event_id, payload_hash)
 COMMENT '规范计量事件事实表；保留同事件不同内容的变体，支撑明细、重放与冲突核验'
 PARTITION BY RANGE(request_date) ()
-DISTRIBUTED BY HASH(logical_request_id) BUCKETS 16
+DISTRIBUTED BY HASH(observation_id) BUCKETS 16
 PROPERTIES (
     "replication_num" = "1",
     "enable_unique_key_merge_on_write" = "true",
@@ -93,12 +93,12 @@ PROPERTIES (
 );
 
 CREATE TABLE IF NOT EXISTS metering.request_conflict_ids (
-    logical_request_id VARCHAR(36) NOT NULL COMMENT 'Observer 为一次观察生成的规范 UUIDv4；请求级主标识及 Kafka key',
+    observation_id VARCHAR(36) NOT NULL COMMENT 'Observer 为一次观察生成的规范 UUIDv4；内部主标识及 Kafka key',
     detected_at DATETIME(3) NOT NULL COMMENT 'Consumer 发现冲突或消费缺口的 UTC 时间'
 )
-UNIQUE KEY(logical_request_id)
+UNIQUE KEY(observation_id)
 COMMENT '请求级持久冲突标记表；证据过期后仍阻止冲突请求重新进入有效统计'
-DISTRIBUTED BY HASH(logical_request_id) BUCKETS 16
+DISTRIBUTED BY HASH(observation_id) BUCKETS 16
 PROPERTIES ("replication_num" = "1", "enable_unique_key_merge_on_write" = "true");
 
 CREATE TABLE IF NOT EXISTS metering.ingest_rejections (
@@ -128,31 +128,31 @@ PROPERTIES (
     "dynamic_partition.time_zone" = "UTC"
 );
 
--- 事件内容冲突诊断视图：从原始事件跨全部在线日期分区按逻辑请求和事件 ID 聚合，
+-- 事件内容冲突诊断视图：从原始事件跨全部在线日期分区按观察请求和事件 ID 聚合，
 -- 列出存在多个内容变体的事件及其摘要，供明细过滤和运维排查使用。
 CREATE VIEW IF NOT EXISTS metering.event_conflicts (
-    logical_request_id COMMENT 'Observer 为一次观察生成的规范 UUIDv4；请求级主标识及 Kafka key',
-    event_id COMMENT '事件标识，逻辑请求 ID 加 :start 或 :usage；同 ID 不同内容属于冲突',
-    variant_count COMMENT '同一逻辑请求和事件 ID 在在线日期分区中的内容变体行数，大于 1 才进入此视图',
+    observation_id COMMENT 'Observer 为一次观察生成的规范 UUIDv4；内部主标识及 Kafka key',
+    event_id COMMENT '事件标识，观察 ID 加 :start 或 :usage；同 ID 不同内容属于冲突',
+    variant_count COMMENT '同一观察和事件 ID 在在线日期分区中的内容变体行数，大于 1 才进入此视图',
     payload_hashes COMMENT '同一事件的内容变体摘要集合，用于排查冲突，不含原始消息'
 ) AS
-SELECT logical_request_id, event_id, COUNT(*) AS variant_count,
+SELECT observation_id, event_id, COUNT(*) AS variant_count,
        ARRAY_AGG(payload_hash) AS payload_hashes
 FROM metering.events_raw
-GROUP BY logical_request_id, event_id
+GROUP BY observation_id, event_id
 HAVING COUNT(*) > 1;
 
 -- 事件业务明细视图：直接读取原始事件，排除同一事件 ID 的内容冲突并保留请求时的归属和名称快照。
 -- 此处仅过滤事件级内容冲突；请求级时间、归属等冲突还需结合 requests.has_conflict 判断。
 CREATE VIEW IF NOT EXISTS metering.event_details (
     request_date COMMENT 'UTC 请求日期，由 request_started_at_ms 换算，不由事件到达时间或 UUID 推导',
-    logical_request_id COMMENT 'Observer 为一次观察生成的规范 UUIDv4；请求级主标识及 Kafka key',
-    event_id COMMENT '事件标识，逻辑请求 ID 加 :start 或 :usage；同 ID 不同内容属于冲突',
+    observation_id COMMENT 'Observer 为一次观察生成的规范 UUIDv4；内部主标识及 Kafka key',
+    event_id COMMENT '事件标识，观察 ID 加 :start 或 :usage；同 ID 不同内容属于冲突',
     payload_hash COMMENT '当前规范事件 JSON 的 SHA-256；与事件 ID 共同保留内容变体并实现幂等',
     schema_version COMMENT '唯一事件契约版本，当前为 1；未知版本由 Consumer 暂停对应分区',
     event_type COMMENT '事件类型：request_started 或 usage_observed；两者合计仍是一次请求',
     x_request_id COMMENT '网关可见的 X-Request-Id，仅辅助关联；可空、可重复，不用于授权或去重',
-    observation_id COMMENT '观察标识，当前与 logical_request_id 相同',
+    logical_request_id COMMENT 'Wasm 按配置提取的客户端请求 ID；可空、可重复，不用于内部去重',
     observation_scope COMMENT '观察范围，当前固定 gateway_response，不代表所有隐藏的上游尝试',
     producer_id COMMENT '生成此事件的 Observer 实例标识，部署时使用实际 Pod UID',
     gateway_instance_id COMMENT '观察请求的网关实例标识，新版为命名空间/Pod名称，历史值可能为Pod UID',
@@ -205,8 +205,8 @@ CREATE VIEW IF NOT EXISTS metering.event_details (
     raw_usage_truncated COMMENT '原始用量 JSON 是否因界限截断：1 是、0 否',
     anomaly_codes COMMENT '固定、排序且去重的异常码数组；不包含任意错误文本'
 ) AS
-SELECT v.request_date, v.logical_request_id, v.event_id, v.payload_hash,
-       v.schema_version, v.event_type, v.x_request_id, v.observation_id,
+SELECT v.request_date, v.observation_id, v.event_id, v.payload_hash,
+       v.schema_version, v.event_type, v.x_request_id, v.logical_request_id,
        v.observation_scope, v.producer_id, v.gateway_instance_id, v.config_version,
        v.adapter_id, v.route_name, v.request_host, v.cluster_name,
        v.deployment_environment, v.mapping_status, v.mapping_version, v.customer_mapping_status,
@@ -222,16 +222,17 @@ SELECT v.request_date, v.logical_request_id, v.event_id, v.payload_hash,
        v.raw_usage_json, v.raw_usage_truncated, v.anomaly_codes
 FROM metering.events_raw v
 LEFT JOIN metering.event_conflicts c
-  ON v.logical_request_id = c.logical_request_id AND v.event_id = c.event_id
+  ON v.observation_id = c.observation_id AND v.event_id = c.event_id
 WHERE c.event_id IS NULL;
 
--- 请求诊断视图：跨全部在线日期合并同一逻辑请求的开始与结果事件，一个请求一行。
+-- 请求诊断视图：跨全部在线日期合并同一观察的开始与结果事件，一个请求一行。
 -- 检查事件变体、开始时间、日期、身份及名称快照和持久冲突标记；冲突请求保留并以 has_conflict 标识。
 CREATE VIEW IF NOT EXISTS metering.requests (
     request_date COMMENT 'UTC 请求日期，由 request_started_at_ms 换算，不由事件到达时间或 UUID 推导',
-    logical_request_id COMMENT 'Observer 为一次观察生成的规范 UUIDv4；请求级主标识及 Kafka key',
-    start_variants COMMENT '该逻辑请求的开始事件内容变体数；大于 1 表示冲突，不是调用次数',
-    usage_variants COMMENT '该逻辑请求的结果事件内容变体数；0 表示未观察结果，大于 1 表示冲突',
+    observation_id COMMENT 'Observer 为一次观察生成的规范 UUIDv4；内部主标识及 Kafka key',
+    logical_request_id COMMENT 'Wasm 按配置提取的客户端请求 ID；可空、可重复，不用于内部去重',
+    start_variants COMMENT '该观察的开始事件内容变体数；大于 1 表示冲突，不是调用次数',
+    usage_variants COMMENT '该观察的结果事件内容变体数；0 表示未观察结果，大于 1 表示冲突',
     request_started_at_ms COMMENT '网关观察到请求头的 Unix 毫秒时间；决定 UTC 统计日期',
     x_request_id COMMENT '网关可见的 X-Request-Id，仅辅助关联；可空、可重复，不用于授权或去重',
     customer_id COMMENT '与 api_key_id 同次成功解析得到的客户 ID；未知为 NULL，不采信客户端自报 ID',
@@ -257,7 +258,7 @@ CREATE VIEW IF NOT EXISTS metering.requests (
     business_outcome COMMENT '有没有观察到响应完整结束？response_complete、stream_incomplete 或 unknown；start 为 NULL',
     has_conflict COMMENT '请求是否有内容、时间、日期、归属或持久冲突标记：1 是、0 否；为 1 时禁止用于有效统计'
 ) AS
-SELECT a.request_date, a.logical_request_id, a.start_variants, a.usage_variants,
+SELECT a.request_date, a.observation_id, a.logical_request_id, a.start_variants, a.usage_variants,
        a.request_started_at_ms, a.x_request_id, a.customer_id, a.service_id, a.service_name, a.provider_name, a.customer_name, a.provider_id, a.cluster_name, a.deployment_environment, a.request_host, a.mapping_status, a.mapping_version, a.customer_mapping_status, a.customer_mapping_version,
        CASE WHEN a.usage_variants = 1 THEN a.response_model END AS response_model,
        CASE WHEN a.usage_variants = 0 THEN 'not_observed'
@@ -271,14 +272,14 @@ SELECT a.request_date, a.logical_request_id, a.start_variants, a.usage_variants,
        CASE WHEN a.usage_variants = 1 THEN a.business_outcome END AS business_outcome,
        CASE WHEN a.start_variants > 1 OR a.usage_variants > 1
                  OR a.started_count > 1 OR a.date_count > 1 OR a.identity_count > 1 OR a.name_count > 1
-                 OR m.logical_request_id IS NOT NULL THEN 1 ELSE 0 END AS has_conflict
+                 OR m.observation_id IS NOT NULL THEN 1 ELSE 0 END AS has_conflict
 FROM (
-    SELECT logical_request_id, MIN(request_date) AS request_date,
+    SELECT observation_id, MAX(logical_request_id) AS logical_request_id, MIN(request_date) AS request_date,
            SUM(CASE WHEN event_type = 'request_started' THEN 1 ELSE 0 END) AS start_variants,
            SUM(CASE WHEN event_type = 'usage_observed' THEN 1 ELSE 0 END) AS usage_variants,
            COUNT(DISTINCT request_started_at_ms) AS started_count,
            COUNT(DISTINCT request_date) AS date_count,
-           COUNT(DISTINCT CAST(JSON_ARRAY(service_id, provider_id, api_key_id, customer_id, identity_status, config_version, gateway_instance_id, adapter_id, x_request_id, cluster_name, deployment_environment, mapping_status, mapping_version, customer_mapping_status, customer_mapping_version) AS STRING)) AS identity_count,
+           COUNT(DISTINCT CAST(JSON_ARRAY(service_id, provider_id, api_key_id, customer_id, identity_status, config_version, gateway_instance_id, adapter_id, x_request_id, logical_request_id, cluster_name, deployment_environment, mapping_status, mapping_version, customer_mapping_status, customer_mapping_version) AS STRING)) AS identity_count,
            COUNT(DISTINCT CAST(JSON_ARRAY(service_name, provider_name, customer_name) AS STRING)) AS name_count,
            MIN(request_started_at_ms) AS request_started_at_ms,
            MAX(x_request_id) AS x_request_id,
@@ -298,21 +299,21 @@ FROM (
            MAX(CASE WHEN event_type = 'usage_observed' THEN terminal_observed END) AS terminal_observed,
            MAX(CASE WHEN event_type = 'usage_observed' THEN business_outcome END) AS business_outcome
     FROM metering.events_raw
-    GROUP BY logical_request_id
+    GROUP BY observation_id
 ) a
-LEFT JOIN metering.request_conflict_ids m ON a.logical_request_id = m.logical_request_id;
+LEFT JOIN metering.request_conflict_ids m ON a.observation_id = m.observation_id;
 
 -- 有效用量明细视图：连接事件明细和请求诊断，筛选观察完整、终态有效、输入输出已知且无请求冲突的结果事件。
 -- 按当前质量规则判断统计资格，允许客户未知但用量有效的请求；原始未知值保持 NULL，统计资格不表示收费资格。
 CREATE VIEW IF NOT EXISTS metering.usage_effective (
     request_date COMMENT 'UTC 请求日期，由 request_started_at_ms 换算，不由事件到达时间或 UUID 推导',
-    logical_request_id COMMENT 'Observer 为一次观察生成的规范 UUIDv4；请求级主标识及 Kafka key',
-    event_id COMMENT '事件标识，逻辑请求 ID 加 :start 或 :usage；同 ID 不同内容属于冲突',
+    observation_id COMMENT 'Observer 为一次观察生成的规范 UUIDv4；内部主标识及 Kafka key',
+    event_id COMMENT '事件标识，观察 ID 加 :start 或 :usage；同 ID 不同内容属于冲突',
     payload_hash COMMENT '当前规范事件 JSON 的 SHA-256；与事件 ID 共同保留内容变体并实现幂等',
     schema_version COMMENT '唯一事件契约版本，当前为 1；未知版本由 Consumer 暂停对应分区',
     event_type COMMENT '事件类型：request_started 或 usage_observed；两者合计仍是一次请求',
     x_request_id COMMENT '网关可见的 X-Request-Id，仅辅助关联；可空、可重复，不用于授权或去重',
-    observation_id COMMENT '观察标识，当前与 logical_request_id 相同',
+    logical_request_id COMMENT 'Wasm 按配置提取的客户端请求 ID；可空、可重复，不用于内部去重',
     observation_scope COMMENT '观察范围，当前固定 gateway_response，不代表所有隐藏的上游尝试',
     producer_id COMMENT '生成此事件的 Observer 实例标识，部署时使用实际 Pod UID',
     gateway_instance_id COMMENT '观察请求的网关实例标识，新版为命名空间/Pod名称，历史值可能为Pod UID',
@@ -366,7 +367,7 @@ CREATE VIEW IF NOT EXISTS metering.usage_effective (
     anomaly_codes COMMENT '固定、排序且去重的异常码数组；不包含任意错误文本'
 ) AS
 SELECT d.* FROM metering.event_details d
-JOIN metering.requests r ON d.logical_request_id = r.logical_request_id
+JOIN metering.requests r ON d.observation_id = r.observation_id
 WHERE d.event_type = 'usage_observed' AND d.observation_status = 'complete'
   AND d.terminal_observed = 1 AND d.usage_status = 'known'
   AND d.input_tokens IS NOT NULL AND d.output_tokens IS NOT NULL

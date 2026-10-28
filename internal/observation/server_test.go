@@ -29,7 +29,7 @@ func (s *sink) Emit(e *events.Event) {
 	s.es = append(s.es, &copy)
 }
 func TestObserveEOSAndOnceFinalization(t *testing.T) {
-	for _, mode := range []string{"trailers_eos", "bad_end", "resource_limit", "missing_route", "other_route", "legacy_wildcard", "overlong_route", "unimplemented", "new_service", "legacy_invalid_host"} {
+	for _, mode := range []string{"trailers_eos", "bad_end", "resource_limit", "missing_route", "other_route", "legacy_wildcard", "overlong_route", "unimplemented", "new_service", "legacy_invalid_host", "client_id"} {
 		t.Run(mode, func(t *testing.T) {
 			badEnd, limited := mode == "bad_end", mode == "resource_limit"
 			l := bufconn.Listen(1 << 20)
@@ -66,6 +66,9 @@ func TestObserveEOSAndOnceFinalization(t *testing.T) {
 				t.Fatal(err)
 			}
 			st := &pb.Start{RequestStartedAtMs: time.Now().UnixMilli(), GatewayInstanceId: "gateway", ConfigVersion: "v1", RouteName: "chat", AdapterId: "chat_completions_v1", RequestAuthority: "Model.Example.invalid:443", ApiKey: []byte("synthetic-key"), Method: "POST", RequestContentType: "application/json"}
+			if mode == "client_id" {
+				st.LogicalRequestId = events.Ptr("Client-Correlation:42")
+			}
 			if mode == "legacy_invalid_host" {
 				st.RequestAuthority = "127.0.0.1"
 			}
@@ -113,6 +116,14 @@ func TestObserveEOSAndOnceFinalization(t *testing.T) {
 				t.Fatal("not exactly two", len(k.es))
 			}
 			e := k.es[1]
+			for _, event := range k.es {
+				if event.ObservationID != ack.ObservationId || event.EventID != event.ObservationID+map[string]string{"request_started": ":start", "usage_observed": ":usage"}[event.EventType] {
+					t.Fatal("events and ACK do not share an observation ID")
+				}
+				if (event.LogicalRequestID == nil) != (st.LogicalRequestId == nil) || event.LogicalRequestID != nil && *event.LogicalRequestID != *st.LogicalRequestId {
+					t.Fatal("client ID was replaced or not frozen across events")
+				}
+			}
 			if mode == "new_service" && (e.ServiceID == nil || *e.ServiceID != "new-service-without-registration") {
 				t.Fatal("service ID still filtered")
 			}
@@ -123,7 +134,7 @@ func TestObserveEOSAndOnceFinalization(t *testing.T) {
 				t.Fatalf("diagnostic route must be fixed across events: %q / %q", k.es[0].RouteName, e.RouteName)
 			}
 			b, _ := events.Canonical(e)
-			if _, err = events.Decode(b, []byte(e.LogicalRequestID), time.Now()); err != nil {
+			if _, err = events.Decode(b, []byte(e.ObservationID), time.Now()); err != nil {
 				t.Fatal(err)
 			}
 			if !badEnd && !limited && !e.UsageEligible {

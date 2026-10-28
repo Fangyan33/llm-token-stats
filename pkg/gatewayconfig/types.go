@@ -14,6 +14,7 @@ type Config struct {
 	ConfigVersion           string   `json:"config_version"`
 	ObserverCluster         string   `json:"observer_cluster"`
 	AcceptedRequestHosts    []string `json:"accepted_request_hosts"`
+	LogicalRequestIDHeaders []string `json:"logical_request_id_headers"`
 	Routes                  []Route  `json:"routes"`
 	ChunkBytes              int64    `json:"chunk_bytes"`
 	CallbackMaxBytes        int64    `json:"callback_max_bytes"`

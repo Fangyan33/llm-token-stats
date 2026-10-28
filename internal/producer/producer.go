@@ -68,7 +68,7 @@ func (p *Producer) Emit(e *events.Event) {
 		p.h.Count("producer_dropped")
 		return
 	}
-	r := &kgo.Record{Topic: p.cfg.Topic, Key: []byte(e.LogicalRequestID), Value: b}
+	r := &kgo.Record{Topic: p.cfg.Topic, Key: []byte(e.ObservationID), Value: b}
 	p.mu.Lock()
 	if p.closed || p.c == nil || len(p.pending) >= 256 {
 		p.mu.Unlock()

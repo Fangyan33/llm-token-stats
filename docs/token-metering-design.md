@@ -109,9 +109,9 @@ flowchart LR
 | 位置 | 职责 |
 | --- | --- |
 | ext_authz/Auth | 验证平台 API Key、状态、有效期和访问范围，返回业务访问判定，在 Wasm 读取前保留原 Bearer |
-| Wasm 请求头回调 | 先执行规则启用、方法和路径白名单（当前 `route_name: "*"` 忽略路由名）；命中后从 Authorization: Bearer 提取临时 token，并取得入口 authority，记录请求开始时间并准备请求改写和旁路观察流；logical_request_id 由 Observer 在有效 Start 后生成 UUIDv4 |
+| Wasm 请求头回调 | 先执行规则启用、方法和路径白名单（当前 `route_name: "*"` 忽略路由名）；命中后从 Authorization: Bearer 提取临时 token，并取得入口 authority，记录请求开始时间并准备请求改写和旁路观察流；observation_id 由 Observer 在有效 Start 后生成 UUIDv4 |
 | Wasm 请求正文回调 | 对目标流式 JSON 有界缓冲并设置 `stream_options.include_usage=true`，再观察最终转发正文 |
-| Wasm 响应头回调 | 若响应头回调前已收到有效 Start ACK，向白名单请求返回含 Observer ID 的 `X-Metering-Request-Id`；不等待 ACK，也不以此承诺事件已入库 |
+| Wasm 响应头回调 | 旁路发送响应元数据；不注入、删除或覆盖 `X-Metering-Request-Id`，业务响应不等待 ACK |
 | Wasm 响应正文回调 | 有界复制当前片段，附流内序号、方向及偏移，异步提交；立即返回 Continue |
 | Wasm 结束回调 | 报告可观察的终态与最后序号；不等待观察者响应，不延长业务流生命周期 |
 | Observer | 已实现有效 Start 后生成 UUIDv4 并回传 ACK，接收片段、解析 JSON/SSE、检查缺段和提取上报 usage；有界 token 估算仍是后续设计 |
@@ -185,17 +185,17 @@ Doris Consumer 是与 Observer 分开部署的 Go Deployment，不在业务请�
 | `request_started` | Observer 收到有效 Start 后立即尝试发送 | 请求 ID、固定归属快照/解析状态、网关观察到的开始时间；不含原始密钥或用量 token |
 | `usage_observed` | Observer 收到有效 End、核对片段并定稿时发送；无法继续观察而触发超时或断流定稿时也尽力发送一次 | **用量和网关终态合并在同一条记录中**：输入/输出 token 及来源、完整性、`terminal_observed`、可取得的结束时间、HTTP 结果和已知尝试数 |
 
-不再单独发送 `request_finished`。本文的“请求 ID”统一指 `logical_request_id`；两个 Kafka 事件的 `event_id` 分别为 `<logical_request_id>:start` 与 `<logical_request_id>:usage`，对应 `request_started` 与 `usage_observed`。gRPC `End` 是观察消息，`request_finished_at_ms` 是结果事件字段，均不是第三种 Kafka 事件。即使用量未知，该事件仍可记录可观察的终态或缺失原因。每个请求至多有一条定稿结果；Kafka 重放可能产生物理重复，由消费者按事件 ID 去重。
+不再单独发送 `request_finished`。本文的“请求 ID”统一指 `observation_id`；两个 Kafka 事件的 `event_id` 分别为 `<observation_id>:start` 与 `<observation_id>:usage`，对应 `request_started` 与 `usage_observed`。gRPC `End` 是观察消息，`request_finished_at_ms` 是结果事件字段，均不是第三种 Kafka 事件。即使用量未知，该事件仍可记录可观察的终态或缺失原因。每个请求至多有一条定稿结果；Kafka 重放可能产生物理重复，由消费者按事件 ID 去重。
 
 ### 4.1 流式请求的时间线
 
 兼容 OpenAI Chat Completions 的请求设置 `stream_options.include_usage=true` 后，正常流式响应会在 `data: [DONE]` 前返回一个包含整次请求 usage 的最终数据块。Observer 先解析并暂存服务上报值，再等待网关观察到流结束。Wasm 在请求结束回调发送 End；Observer 收到有效 End 后，定稿并发送一条 `usage_observed`，同时写入 token 与网关可观察终态。**最终 usage 数据块不是请求结束信号**。OpenAI 说明，流中断时可能收不到最终 usage 块。[OpenAI 流式用量说明][17]
 
 ~~~text
-logical_request_id = 7f6c2a90-4b13-4b68-9d21-67283e0c5f44
-1. 收到 Start → request_started (<logical_request_id>:start)
+observation_id = 7f6c2a90-4b13-4b68-9d21-67283e0c5f44
+1. 收到 Start → request_started (<observation_id>:start)
 2. 响应末尾解析最终 usage → 暂存 input=1000、output=500
-3. 收到有效 End → usage_observed (<logical_request_id>:usage,
+3. 收到有效 End → usage_observed (<observation_id>:usage,
    input_tokens=1000, output_tokens=500,
    terminal_observed=true, request_finished_at_ms=网关观察到的结束时间)
 ~~~
@@ -275,7 +275,7 @@ LiteLLM 的计数工具及部分流式聚合路径可作为分词兜底参考，
 | 字段组 | 核心字段 |
 | --- | --- |
 | 事件身份 | `event_id`、`event_type`、`schema_version`、`producer_id`；`event_type` 仅为 `request_started` 或 `usage_observed` |
-| 请求/观察 | `logical_request_id`、`x_request_id`、`observation_id`、`observation_scope`、`service_id`、`api_key_id`、`customer_id`、`provider_id`、`request_host`、`cluster_name`、`deployment_environment`、`mapping_status`、`mapping_version`、`customer_mapping_status`、`customer_mapping_version`、`identity_status` |
+| 请求/观察 | `observation_id`、`x_request_id`、`logical_request_id`、`observation_scope`、`service_id`、`api_key_id`、`customer_id`、`provider_id`、`request_host`、`cluster_name`、`deployment_environment`、`mapping_status`、`mapping_version`、`customer_mapping_status`、`customer_mapping_version`、`identity_status` |
 | 模型 | `request_model`、`response_model`；独立模型版本字段如计费需要，在一期后续明确并升级 schema |
 | 时间 | `request_started_at_ms`、`request_finished_at_ms`、`observation_ended_at_ms`、`event_created_at_ms`、`ingested_at`；前四项为 Unix 毫秒，最后一项为 Doris 入库时间 |
 | 结果 | `http_status`、`business_outcome`、`terminal_observed`、`observation_status`、`upstream_attempt_count`、`anomaly_codes` |
@@ -284,7 +284,7 @@ LiteLLM 的计数工具及部分流式聚合路径可作为分词兜底参考，
 | 归属准备 | 用户正常消耗、平台重试/故障消耗、待核对；一期不扣款 |
 | 扩展 | `measurement_unit`、多模态扩展项及平台元数据引用 |
 
-`X-Metering-Request-Id` 响应头在 Start ACK 及时到达时承载 Observer 生成的 UUIDv4 `logical_request_id`；该 ID 不编码时间，统计日期从 `request_started_at_ms` 计算；ACK 迟到时可缺失。可选的 `X-Request-Id` 只映射到 `x_request_id`，不能作为主键。`identity_status` 仅用 `known` 或 `invalid` 表示当前接入结果，客户 resolver 未实现/失败时标 `invalid` 并报警；`usage_eligible` 只表示有效用量统计候选，不表示收费资格。完整字段定义和类型以[采集开发方案第 6、7 节](gateway-request-collection-implementation.md#6-kafka-事件与发送)为准。
+`observation_id` 是 Observer 生成的内部 UUIDv4，用于 Kafka 分区、事件关联、去重和冲突检测；不编码时间，统计日期从 `request_started_at_ms` 计算。`logical_request_id` 由 Wasm 按 `logical_request_id_headers` 顺序从客户端请求头提取，可空、可重复，不回填内部 ID；`x_request_id` 保留网关可见的 `X-Request-Id`。采集插件不再注入 `X-Metering-Request-Id` 响应头。Kafka 事件采用唯一的 `schema_version=1` 契约；`usage_eligible` 仅表示有效用量统计候选，不表示收费资格。完整字段定义和类型以[采集开发方案第 6、7 节](gateway-request-collection-implementation.md#6-kafka-事件与发送)为准。
 
 每个观察结果不可变，不设置业务用量修订号、历史结果替换接口或后续补查任务。`schema_version` 和一期后续估算器版本只解释原记录结构及算法。
 
@@ -292,7 +292,7 @@ LiteLLM 的计数工具及部分流式聚合路径可作为分词兜底参考，
 
 消费者落库成功但提交消费位置失败后，可能重复读取事件。重放保持 event_id 和原内容不变，不能因为去掉事后变更功能就去掉幂等处理。
 
-一期使用一个原始事件 topic `llm-metering-events`，按 `logical_request_id` 选择分区；当前仅 Doris Consumer 消费并落库。一期 usage-worker 从 Doris 去重后的请求投影刷新日汇总，再从已发布日汇总刷新月汇总；归档不纳入一期。开始和结果事件分别按 event_id 去重，token 只累计去重后的结果事件。
+一期使用一个原始事件 topic `llm-metering-events`，按 `observation_id` 选择分区；当前仅 Doris Consumer 消费并落库。一期 usage-worker 从 Doris 去重后的请求投影刷新日汇总，再从已发布日汇总刷新月汇总；归档不纳入一期。开始和结果事件分别按 event_id 去重，token 只累计去重后的结果事件。
 
 同一 `event_id`、相同内容视为重复；同一 `event_id`、不同内容为事件冲突。同一 UUIDv4 的开始/结果时间或身份快照不一致属于请求冲突；两类冲突均跨日期隔离报警，不覆盖或重复相加。归一化结果也应在重放时确定一致。
 
@@ -323,7 +323,7 @@ Doris Unique Key 的 Merge-on-Write 用于同内容重放幂等，不承载多�
 提供：
 
 - 请求 ID 精确查询及对应服务 A 的观察结果。
-- 客户若收到响应头 `X-Metering-Request-Id`，可以 Observer 生成的 UUIDv4 `logical_request_id` 精确查询；查询覆盖在线日期分区，不从 ID 推导日期；该头因 ACK 迟到可能缺失。客户可选保存网关可见的 `X-Request-Id` 作辅助关联。后者可能由客户端提供或跨请求复用，须限定客户与时间窗口，不作唯一键或授权凭据。
+- 客户可使用自己传入的 `logical_request_id` 关联计量记录；查询须限定客户与时间窗口，同一客户端 ID 可能返回多个独立观察。`observation_id` 用于内部精确定位，覆盖在线日期分区；`x_request_id` 是网关可见的辅助关联值。这些 ID 均不作为授权凭据，采集插件不向响应头回写 ID。
 - 按时间、API Key、服务、模型、结果和计量来源筛选分页。
 - 日/月趋势与服务、API Key 排行；小时趋势按需采用中间汇总。
 - 上报、估算、未知、事件缺失分别展示。

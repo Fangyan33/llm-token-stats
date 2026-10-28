@@ -11,7 +11,7 @@ import json
 import math
 import re
 import sys
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -235,7 +235,7 @@ def validate_event(event, kafka_key=None, now_ms=None, input_size=None):
         require(started <= now_ms + 300000, "future_request_time")
         start_date = datetime.fromtimestamp(started // 1000, timezone.utc).date()
         today = datetime.fromtimestamp(now_ms // 1000, timezone.utc).date()
-        require(start_date >= today - timedelta(days=364), "expired_request_date")
+        require(start_date >= today.replace(year=today.year - 1, day=1), "expired_request_date")
     if event["request_finished_at_ms"] is not None and event["request_finished_at_ms"] < started:
         require("clock_anomaly" in event["anomaly_codes"], "negative_duration_without_clock_anomaly")
     if event["event_type"] == "request_started":
@@ -271,7 +271,7 @@ def validate_event(event, kafka_key=None, now_ms=None, input_size=None):
         excluded = {"invalid_usage", "usage_conflict", "missing_usage", "missing_end",
                     "protocol_error", "protocol_incomplete", "unsupported_encoding",
                     "unsupported_content_type", "parse_limit", "transport_lost",
-                    "observation_timeout", "clock_anomaly", "identity_invalid"}
+                    "observation_timeout", "clock_anomaly"}
         require(not excluded.intersection(event["anomaly_codes"]), "eligible_anomaly")
     if event["observation_status"] == "complete":
         require(event["terminal_observed"], "complete_without_terminal")
@@ -365,7 +365,7 @@ def validate_repository():
     # database projections; route diagnostics must never re-enter this key.
     identity_sql = "CAST(JSON_ARRAY(" + ", ".join(IDENTITY_FIELDS) + ") AS STRING)"
     store = (ROOT / "internal/doris/store.go").read_text(encoding="utf-8")
-    migration = (ROOT / "migrations/doris/metering/006_optional_route_identity.sql").read_text(encoding="utf-8")
+    migration = ddl + (ROOT / "migrations/doris/metering/003_usage_summaries.sql").read_text(encoding="utf-8")
     require(identity_sql in store and migration.count("COUNT(DISTINCT " + identity_sql + ")") == 2,
             "identity_comparison_field_drift")
     require("COUNT(DISTINCT identity_hash)" not in migration, "legacy_identity_hash_comparison")

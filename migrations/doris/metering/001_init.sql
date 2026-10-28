@@ -1,10 +1,13 @@
--- Phase 1: 365 UTC request dates online (today + previous 364), partitioned by day.
--- Doris dynamic partitions own creation and expiration; archive is an optional future design.
--- Apache Doris 4.1.3 schema. Set the SQL session time zone to UTC.
--- This single-BE example uses one replica. Size buckets and replicas for production.
+-- Current collection facts and diagnostic views for Apache Doris 4.1.3.
+
+-- Fresh databases only; UTC calendar retention is enforced by usage-worker.
+
+-- Single-BE development defaults: review replicas and buckets for production.
+
+SET time_zone = '+00:00';
+
 CREATE DATABASE IF NOT EXISTS metering;
 
--- Same event_id + same payload_hash is a replay. A different hash remains a variant.
 CREATE TABLE IF NOT EXISTS metering.events_raw (
     request_date DATE NOT NULL COMMENT 'UTC 请求日期，由 request_started_at_ms 换算，不由事件到达时间或 UUID 推导',
     logical_request_id VARCHAR(36) NOT NULL COMMENT 'Observer 为一次观察生成的规范 UUIDv4；请求级主标识及 Kafka key',
@@ -81,15 +84,14 @@ PROPERTIES (
     "enable_unique_key_merge_on_write" = "true",
     "dynamic_partition.enable" = "true",
     "dynamic_partition.time_unit" = "DAY",
-    "dynamic_partition.start" = "-364",
+    "dynamic_partition.start" = "-2147483648",
     "dynamic_partition.end" = "2",
     "dynamic_partition.prefix" = "p",
     "dynamic_partition.buckets" = "16",
-    "dynamic_partition.create_history_partition" = "true",
+    "dynamic_partition.create_history_partition" = "false",
     "dynamic_partition.time_zone" = "UTC"
 );
 
--- Retain conflict markers: one variant may expire before another.
 CREATE TABLE IF NOT EXISTS metering.request_conflict_ids (
     logical_request_id VARCHAR(36) NOT NULL COMMENT 'Observer 为一次观察生成的规范 UUIDv4；请求级主标识及 Kafka key',
     detected_at DATETIME(3) NOT NULL COMMENT 'Consumer 发现冲突或消费缺口的 UTC 时间'
@@ -118,84 +120,16 @@ PROPERTIES (
     "enable_unique_key_merge_on_write" = "true",
     "dynamic_partition.enable" = "true",
     "dynamic_partition.time_unit" = "DAY",
-    "dynamic_partition.start" = "-364",
+    "dynamic_partition.start" = "-2147483648",
     "dynamic_partition.end" = "2",
     "dynamic_partition.prefix" = "p",
     "dynamic_partition.buckets" = "8",
-    "dynamic_partition.create_history_partition" = "true",
+    "dynamic_partition.create_history_partition" = "false",
     "dynamic_partition.time_zone" = "UTC"
 );
 
-CREATE VIEW IF NOT EXISTS metering.event_variants (
-    request_date COMMENT 'UTC 请求日期，由 request_started_at_ms 换算，不由事件到达时间或 UUID 推导',
-    logical_request_id COMMENT 'Observer 为一次观察生成的规范 UUIDv4；请求级主标识及 Kafka key',
-    event_id COMMENT '事件标识，逻辑请求 ID 加 :start 或 :usage；同 ID 不同内容属于冲突',
-    payload_hash COMMENT '当前规范事件 JSON 的 SHA-256；与事件 ID 共同保留内容变体并实现幂等',
-    schema_version COMMENT '唯一事件契约版本，当前为 1；未知版本由 Consumer 暂停对应分区',
-    event_type COMMENT '事件类型：request_started 或 usage_observed；两者合计仍是一次请求',
-    x_request_id COMMENT '网关可见的 X-Request-Id，仅辅助关联；可空、可重复，不用于授权或去重',
-    observation_id COMMENT '观察标识，当前与 logical_request_id 相同',
-    observation_scope COMMENT '观察范围，当前固定 gateway_response，不代表所有隐藏的上游尝试',
-    producer_id COMMENT '生成此事件的 Observer 实例标识，部署时使用实际 Pod UID',
-    gateway_instance_id COMMENT '观察请求的网关实例标识，新版为命名空间/Pod名称，历史值可能为Pod UID',
-    config_version COMMENT '请求开始时冻结的采集配置版本，需在 Observer 和 Consumer 登记',
-    adapter_id COMMENT '响应协议适配器，当前为 chat_completions_v1',
-    route_name COMMENT '实际 Envoy HTTP 路由名，不可读时为 unknown；仅诊断，不代表 VirtualService 或归属',
-    request_host COMMENT '规范入口 DNS 域名；转小写并去端口及末尾根点，非法输入为 NULL',
-    cluster_name COMMENT 'Observer 配置固定的集群名称，业务请求不能覆盖',
-    deployment_environment COMMENT 'Observer 固定部署环境：prd、stg 或 dev',
-    mapping_status COMMENT '服务解析状态：mapped、unknown_host、invalid_host、lookup_not_implemented、lookup_timeout、lookup_unavailable、lookup_invalid_response、lookup_overloaded、lookup_rate_limited；空 URI 为未实现占位，配置 HTTP/HTTPS 可解析',
-    mapping_version COMMENT '成功服务解析快照的规范 SHA-256，绑定 Host、集群、环境及服务和供应商；未知为 NULL',
-    customer_mapping_status COMMENT '客户解析状态：mapped、unknown_api_key、invalid_api_key、lookup_not_implemented、lookup_timeout、lookup_unavailable、lookup_invalid_response、lookup_overloaded、lookup_rate_limited；空 URI 为未实现占位，配置 HTTP/HTTPS 可解析',
-    customer_mapping_version COMMENT '成功客户解析快照的规范 SHA-256，绑定部署上下文、API Key ID 和客户；未知为 NULL',
-    service_id COMMENT '服务接口返回的服务 ID；未实现或失败为 NULL，不使用默认服务补值',
-    service_name COMMENT '请求发生时的服务名称快照；解析未知时为 NULL，不用最新名称覆盖历史',
-    provider_name COMMENT '请求发生时的供应商名称快照；解析未知时为 NULL，不用最新名称覆盖历史',
-    customer_name COMMENT '请求发生时的客户名称快照；解析未知时为 NULL，不用最新名称覆盖历史',
-    api_key_id COMMENT '客户接口返回的稳定 API Key ID；未知为 NULL，绝不是原始 Bearer token',
-    customer_id COMMENT '与 api_key_id 同次成功解析得到的客户 ID；未知为 NULL，不采信客户端自报 ID',
-    provider_id COMMENT '服务接口返回的服务所属供应商 ID；未知为 NULL，不代表隐藏的实际执行方',
-    identity_status COMMENT '客户归属状态：known 或 invalid；仅完整客户解析成功为 known，不表示鉴权判定',
-    identity_hash COMMENT '固定十五项归属与部署快照元组的规范 SHA-256，不含原始密钥或诊断路由',
-    request_started_at_ms COMMENT '网关观察到请求头的 Unix 毫秒时间；决定 UTC 统计日期',
-    observation_ended_at_ms COMMENT 'Observer 结束观察的 Unix 毫秒时间；start 为 NULL，不等于业务结束时间',
-    request_finished_at_ms COMMENT '有效网关 End 提供的请求结束 Unix 毫秒时间；未收到有效 End 时为 NULL',
-    event_created_at_ms COMMENT 'Observer 创建此事件的 Unix 毫秒时间，不作为请求统计日期',
-    request_model COMMENT '请求正文中可靠提取的模型名或 ID；未取得或非法时为 NULL',
-    response_model COMMENT '响应上报的模型名或 ID，可能不同于请求模型；未取得或非法时为 NULL',
-    http_status COMMENT '网关可见的 HTTP 响应状态码；未知或开始事件为 NULL',
-    upstream_attempt_count COMMENT '网关可靠取得的上游尝试次数；未知为 NULL，不据此推算隐藏消耗',
-    response_flags COMMENT '白名单内的网关响应标志；未可靠取得或未登记时为 NULL',
-    response_code_details COMMENT '白名单内的网关响应诊断码；不保存任意错误文本，未知为 NULL',
-    business_outcome COMMENT '有没有观察到响应完整结束？response_complete、stream_incomplete 或 unknown；start 为 NULL',
-    terminal_observed COMMENT '是否收到有效网关 End：1 是、0 否；为 0 时请求结束时间必须为 NULL',
-    observation_status COMMENT '观察完整度：complete、partial 或 unknown；start 为 NULL，不等于 HTTP 成功',
-    usage_status COMMENT 'token 数字有没有拿到，是否齐全、是否矛盾？known、partial、unknown、conflict；start 为 not_applicable',
-    usage_eligible COMMENT '这条用量是否符合有效统计条件，可以作为统计候选？1 是、0 否；不表示可收费',
-    input_tokens COMMENT '输入 token 总量；NULL 表示未知，0 表示服务报告的有效零值；子项不与父项重复相加',
-    input_tokens_source COMMENT '输入 token 总量的来源：reported 或 unknown；开始事件为 NULL，不实现估算',
-    output_tokens COMMENT '输出 token 总量；NULL 表示未知，0 表示服务报告的有效零值；子项不与父项重复相加',
-    output_tokens_source COMMENT '输出 token 总量的来源：reported 或 unknown；开始事件为 NULL，不实现估算',
-    cached_read_tokens COMMENT '输入中的缓存读取 token 子项；NULL 表示未知，0 表示服务报告的有效零值；子项不与父项重复相加',
-    cached_read_tokens_source COMMENT '输入中的缓存读取 token 子项的来源：reported 或 unknown；开始事件为 NULL，不实现估算',
-    cached_write_tokens COMMENT '输入中的缓存写入 token 子项；NULL 表示未知，0 表示服务报告的有效零值；子项不与父项重复相加',
-    cached_write_tokens_source COMMENT '输入中的缓存写入 token 子项的来源：reported 或 unknown；开始事件为 NULL，不实现估算',
-    reasoning_tokens COMMENT '输出中的推理 token 子项；NULL 表示未知，0 表示服务报告的有效零值；子项不与父项重复相加',
-    reasoning_tokens_source COMMENT '输出中的推理 token 子项的来源：reported 或 unknown；开始事件为 NULL，不实现估算',
-    reported_total_tokens COMMENT '服务单独上报的总 token 数；NULL 表示未知，0 表示服务报告的有效零值；子项不与父项重复相加',
-    reported_total_tokens_source COMMENT '服务单独上报的总 token 数的来源：reported 或 unknown；开始事件为 NULL，不实现估算',
-    raw_usage_json COMMENT '仅含白名单数字用量字段的规范 JSON，不含正文或密钥；最多 4096 字节',
-    raw_usage_truncated COMMENT '原始用量 JSON 是否因界限截断：1 是、0 否',
-    anomaly_codes COMMENT '固定、排序且去重的异常码数组；不包含任意错误文本',
-    event_json COMMENT '通过契约校验的规范事件 JSON，用于重放和冲突核验，不含正文或原始密钥',
-    kafka_topic COMMENT '事件或处理证据所属的 Kafka topic 名称',
-    kafka_partition COMMENT 'Kafka 分区编号，offset 只在同一 topic 和分区内比较',
-    kafka_offset COMMENT '消息在 Kafka 分区内的 offset，0 是有效位置',
-    ingested_at COMMENT 'Consumer 冻结批次的入库审计时间，UTC，不作为请求统计日期'
-) AS
-SELECT * FROM metering.events_raw;
-
--- Conflict grouping spans all online date partitions.
+-- 事件内容冲突诊断视图：从原始事件跨全部在线日期分区按逻辑请求和事件 ID 聚合，
+-- 列出存在多个内容变体的事件及其摘要，供明细过滤和运维排查使用。
 CREATE VIEW IF NOT EXISTS metering.event_conflicts (
     logical_request_id COMMENT 'Observer 为一次观察生成的规范 UUIDv4；请求级主标识及 Kafka key',
     event_id COMMENT '事件标识，逻辑请求 ID 加 :start 或 :usage；同 ID 不同内容属于冲突',
@@ -204,82 +138,12 @@ CREATE VIEW IF NOT EXISTS metering.event_conflicts (
 ) AS
 SELECT logical_request_id, event_id, COUNT(*) AS variant_count,
        ARRAY_AGG(payload_hash) AS payload_hashes
-FROM metering.event_variants
+FROM metering.events_raw
 GROUP BY logical_request_id, event_id
 HAVING COUNT(*) > 1;
 
-CREATE VIEW IF NOT EXISTS metering.events_valid (
-    request_date COMMENT 'UTC 请求日期，由 request_started_at_ms 换算，不由事件到达时间或 UUID 推导',
-    logical_request_id COMMENT 'Observer 为一次观察生成的规范 UUIDv4；请求级主标识及 Kafka key',
-    event_id COMMENT '事件标识，逻辑请求 ID 加 :start 或 :usage；同 ID 不同内容属于冲突',
-    payload_hash COMMENT '当前规范事件 JSON 的 SHA-256；与事件 ID 共同保留内容变体并实现幂等',
-    schema_version COMMENT '唯一事件契约版本，当前为 1；未知版本由 Consumer 暂停对应分区',
-    event_type COMMENT '事件类型：request_started 或 usage_observed；两者合计仍是一次请求',
-    x_request_id COMMENT '网关可见的 X-Request-Id，仅辅助关联；可空、可重复，不用于授权或去重',
-    observation_id COMMENT '观察标识，当前与 logical_request_id 相同',
-    observation_scope COMMENT '观察范围，当前固定 gateway_response，不代表所有隐藏的上游尝试',
-    producer_id COMMENT '生成此事件的 Observer 实例标识，部署时使用实际 Pod UID',
-    gateway_instance_id COMMENT '观察请求的网关实例标识，新版为命名空间/Pod名称，历史值可能为Pod UID',
-    config_version COMMENT '请求开始时冻结的采集配置版本，需在 Observer 和 Consumer 登记',
-    adapter_id COMMENT '响应协议适配器，当前为 chat_completions_v1',
-    route_name COMMENT '实际 Envoy HTTP 路由名，不可读时为 unknown；仅诊断，不代表 VirtualService 或归属',
-    request_host COMMENT '规范入口 DNS 域名；转小写并去端口及末尾根点，非法输入为 NULL',
-    cluster_name COMMENT 'Observer 配置固定的集群名称，业务请求不能覆盖',
-    deployment_environment COMMENT 'Observer 固定部署环境：prd、stg 或 dev',
-    mapping_status COMMENT '服务解析状态：mapped、unknown_host、invalid_host、lookup_not_implemented、lookup_timeout、lookup_unavailable、lookup_invalid_response、lookup_overloaded、lookup_rate_limited；空 URI 为未实现占位，配置 HTTP/HTTPS 可解析',
-    mapping_version COMMENT '成功服务解析快照的规范 SHA-256，绑定 Host、集群、环境及服务和供应商；未知为 NULL',
-    customer_mapping_status COMMENT '客户解析状态：mapped、unknown_api_key、invalid_api_key、lookup_not_implemented、lookup_timeout、lookup_unavailable、lookup_invalid_response、lookup_overloaded、lookup_rate_limited；空 URI 为未实现占位，配置 HTTP/HTTPS 可解析',
-    customer_mapping_version COMMENT '成功客户解析快照的规范 SHA-256，绑定部署上下文、API Key ID 和客户；未知为 NULL',
-    service_id COMMENT '服务接口返回的服务 ID；未实现或失败为 NULL，不使用默认服务补值',
-    service_name COMMENT '请求发生时的服务名称快照；解析未知时为 NULL，不用最新名称覆盖历史',
-    provider_name COMMENT '请求发生时的供应商名称快照；解析未知时为 NULL，不用最新名称覆盖历史',
-    customer_name COMMENT '请求发生时的客户名称快照；解析未知时为 NULL，不用最新名称覆盖历史',
-    api_key_id COMMENT '客户接口返回的稳定 API Key ID；未知为 NULL，绝不是原始 Bearer token',
-    customer_id COMMENT '与 api_key_id 同次成功解析得到的客户 ID；未知为 NULL，不采信客户端自报 ID',
-    provider_id COMMENT '服务接口返回的服务所属供应商 ID；未知为 NULL，不代表隐藏的实际执行方',
-    identity_status COMMENT '客户归属状态：known 或 invalid；仅完整客户解析成功为 known，不表示鉴权判定',
-    identity_hash COMMENT '固定十五项归属与部署快照元组的规范 SHA-256，不含原始密钥或诊断路由',
-    request_started_at_ms COMMENT '网关观察到请求头的 Unix 毫秒时间；决定 UTC 统计日期',
-    observation_ended_at_ms COMMENT 'Observer 结束观察的 Unix 毫秒时间；start 为 NULL，不等于业务结束时间',
-    request_finished_at_ms COMMENT '有效网关 End 提供的请求结束 Unix 毫秒时间；未收到有效 End 时为 NULL',
-    event_created_at_ms COMMENT 'Observer 创建此事件的 Unix 毫秒时间，不作为请求统计日期',
-    request_model COMMENT '请求正文中可靠提取的模型名或 ID；未取得或非法时为 NULL',
-    response_model COMMENT '响应上报的模型名或 ID，可能不同于请求模型；未取得或非法时为 NULL',
-    http_status COMMENT '网关可见的 HTTP 响应状态码；未知或开始事件为 NULL',
-    upstream_attempt_count COMMENT '网关可靠取得的上游尝试次数；未知为 NULL，不据此推算隐藏消耗',
-    response_flags COMMENT '白名单内的网关响应标志；未可靠取得或未登记时为 NULL',
-    response_code_details COMMENT '白名单内的网关响应诊断码；不保存任意错误文本，未知为 NULL',
-    business_outcome COMMENT '有没有观察到响应完整结束？response_complete、stream_incomplete 或 unknown；start 为 NULL',
-    terminal_observed COMMENT '是否收到有效网关 End：1 是、0 否；为 0 时请求结束时间必须为 NULL',
-    observation_status COMMENT '观察完整度：complete、partial 或 unknown；start 为 NULL，不等于 HTTP 成功',
-    usage_status COMMENT 'token 数字有没有拿到，是否齐全、是否矛盾？known、partial、unknown、conflict；start 为 not_applicable',
-    usage_eligible COMMENT '这条用量是否符合有效统计条件，可以作为统计候选？1 是、0 否；不表示可收费',
-    input_tokens COMMENT '输入 token 总量；NULL 表示未知，0 表示服务报告的有效零值；子项不与父项重复相加',
-    input_tokens_source COMMENT '输入 token 总量的来源：reported 或 unknown；开始事件为 NULL，不实现估算',
-    output_tokens COMMENT '输出 token 总量；NULL 表示未知，0 表示服务报告的有效零值；子项不与父项重复相加',
-    output_tokens_source COMMENT '输出 token 总量的来源：reported 或 unknown；开始事件为 NULL，不实现估算',
-    cached_read_tokens COMMENT '输入中的缓存读取 token 子项；NULL 表示未知，0 表示服务报告的有效零值；子项不与父项重复相加',
-    cached_read_tokens_source COMMENT '输入中的缓存读取 token 子项的来源：reported 或 unknown；开始事件为 NULL，不实现估算',
-    cached_write_tokens COMMENT '输入中的缓存写入 token 子项；NULL 表示未知，0 表示服务报告的有效零值；子项不与父项重复相加',
-    cached_write_tokens_source COMMENT '输入中的缓存写入 token 子项的来源：reported 或 unknown；开始事件为 NULL，不实现估算',
-    reasoning_tokens COMMENT '输出中的推理 token 子项；NULL 表示未知，0 表示服务报告的有效零值；子项不与父项重复相加',
-    reasoning_tokens_source COMMENT '输出中的推理 token 子项的来源：reported 或 unknown；开始事件为 NULL，不实现估算',
-    reported_total_tokens COMMENT '服务单独上报的总 token 数；NULL 表示未知，0 表示服务报告的有效零值；子项不与父项重复相加',
-    reported_total_tokens_source COMMENT '服务单独上报的总 token 数的来源：reported 或 unknown；开始事件为 NULL，不实现估算',
-    raw_usage_json COMMENT '仅含白名单数字用量字段的规范 JSON，不含正文或密钥；最多 4096 字节',
-    raw_usage_truncated COMMENT '原始用量 JSON 是否因界限截断：1 是、0 否',
-    anomaly_codes COMMENT '固定、排序且去重的异常码数组；不包含任意错误文本',
-    event_json COMMENT '通过契约校验的规范事件 JSON，用于重放和冲突核验，不含正文或原始密钥',
-    kafka_topic COMMENT '事件或处理证据所属的 Kafka topic 名称',
-    kafka_partition COMMENT 'Kafka 分区编号，offset 只在同一 topic 和分区内比较',
-    kafka_offset COMMENT '消息在 Kafka 分区内的 offset，0 是有效位置',
-    ingested_at COMMENT 'Consumer 冻结批次的入库审计时间，UTC，不作为请求统计日期'
-) AS
-SELECT v.* FROM metering.event_variants v
-LEFT JOIN metering.event_conflicts c
-  ON v.logical_request_id = c.logical_request_id AND v.event_id = c.event_id
-WHERE c.event_id IS NULL;
-
+-- 事件业务明细视图：直接读取原始事件，排除同一事件 ID 的内容冲突并保留请求时的归属和名称快照。
+-- 此处仅过滤事件级内容冲突；请求级时间、归属等冲突还需结合 requests.has_conflict 判断。
 CREATE VIEW IF NOT EXISTS metering.event_details (
     request_date COMMENT 'UTC 请求日期，由 request_started_at_ms 换算，不由事件到达时间或 UUID 推导',
     logical_request_id COMMENT 'Observer 为一次观察生成的规范 UUIDv4；请求级主标识及 Kafka key',
@@ -341,23 +205,28 @@ CREATE VIEW IF NOT EXISTS metering.event_details (
     raw_usage_truncated COMMENT '原始用量 JSON 是否因界限截断：1 是、0 否',
     anomaly_codes COMMENT '固定、排序且去重的异常码数组；不包含任意错误文本'
 ) AS
-SELECT request_date, logical_request_id, event_id, payload_hash,
-       schema_version, event_type, x_request_id, observation_id,
-       observation_scope, producer_id, gateway_instance_id, config_version,
-       adapter_id, route_name, request_host, cluster_name, deployment_environment, mapping_status, mapping_version, customer_mapping_status, customer_mapping_version, service_id, service_name, provider_name, customer_name, api_key_id, customer_id,
-       provider_id, identity_status, request_started_at_ms,
-       observation_ended_at_ms, request_finished_at_ms, event_created_at_ms,
-       request_model, response_model, http_status, upstream_attempt_count,
-       response_flags, response_code_details, business_outcome,
-       terminal_observed, observation_status, usage_status, usage_eligible,
-       input_tokens, input_tokens_source, output_tokens, output_tokens_source,
-       cached_read_tokens, cached_read_tokens_source,
-       cached_write_tokens, cached_write_tokens_source,
-       reasoning_tokens, reasoning_tokens_source,
-       reported_total_tokens, reported_total_tokens_source,
-       raw_usage_json, raw_usage_truncated, anomaly_codes
-FROM metering.events_valid;
+SELECT v.request_date, v.logical_request_id, v.event_id, v.payload_hash,
+       v.schema_version, v.event_type, v.x_request_id, v.observation_id,
+       v.observation_scope, v.producer_id, v.gateway_instance_id, v.config_version,
+       v.adapter_id, v.route_name, v.request_host, v.cluster_name,
+       v.deployment_environment, v.mapping_status, v.mapping_version, v.customer_mapping_status,
+       v.customer_mapping_version, v.service_id, v.service_name, v.provider_name,
+       v.customer_name, v.api_key_id, v.customer_id, v.provider_id,
+       v.identity_status, v.request_started_at_ms, v.observation_ended_at_ms, v.request_finished_at_ms,
+       v.event_created_at_ms, v.request_model, v.response_model, v.http_status,
+       v.upstream_attempt_count, v.response_flags, v.response_code_details, v.business_outcome,
+       v.terminal_observed, v.observation_status, v.usage_status, v.usage_eligible,
+       v.input_tokens, v.input_tokens_source, v.output_tokens, v.output_tokens_source,
+       v.cached_read_tokens, v.cached_read_tokens_source, v.cached_write_tokens, v.cached_write_tokens_source,
+       v.reasoning_tokens, v.reasoning_tokens_source, v.reported_total_tokens, v.reported_total_tokens_source,
+       v.raw_usage_json, v.raw_usage_truncated, v.anomaly_codes
+FROM metering.events_raw v
+LEFT JOIN metering.event_conflicts c
+  ON v.logical_request_id = c.logical_request_id AND v.event_id = c.event_id
+WHERE c.event_id IS NULL;
 
+-- 请求诊断视图：跨全部在线日期合并同一逻辑请求的开始与结果事件，一个请求一行。
+-- 检查事件变体、开始时间、日期、身份及名称快照和持久冲突标记；冲突请求保留并以 has_conflict 标识。
 CREATE VIEW IF NOT EXISTS metering.requests (
     request_date COMMENT 'UTC 请求日期，由 request_started_at_ms 换算，不由事件到达时间或 UUID 推导',
     logical_request_id COMMENT 'Observer 为一次观察生成的规范 UUIDv4；请求级主标识及 Kafka key',
@@ -428,11 +297,13 @@ FROM (
            MAX(CASE WHEN event_type = 'usage_observed' THEN request_finished_at_ms END) AS request_finished_at_ms,
            MAX(CASE WHEN event_type = 'usage_observed' THEN terminal_observed END) AS terminal_observed,
            MAX(CASE WHEN event_type = 'usage_observed' THEN business_outcome END) AS business_outcome
-    FROM metering.event_variants
+    FROM metering.events_raw
     GROUP BY logical_request_id
 ) a
 LEFT JOIN metering.request_conflict_ids m ON a.logical_request_id = m.logical_request_id;
 
+-- 有效用量明细视图：连接事件明细和请求诊断，筛选观察完整、终态有效、输入输出已知且无请求冲突的结果事件。
+-- 按当前质量规则判断统计资格，允许客户未知但用量有效的请求；原始未知值保持 NULL，统计资格不表示收费资格。
 CREATE VIEW IF NOT EXISTS metering.usage_effective (
     request_date COMMENT 'UTC 请求日期，由 request_started_at_ms 换算，不由事件到达时间或 UUID 推导',
     logical_request_id COMMENT 'Observer 为一次观察生成的规范 UUIDv4；请求级主标识及 Kafka key',
@@ -496,4 +367,8 @@ CREATE VIEW IF NOT EXISTS metering.usage_effective (
 ) AS
 SELECT d.* FROM metering.event_details d
 JOIN metering.requests r ON d.logical_request_id = r.logical_request_id
-WHERE d.event_type = 'usage_observed' AND d.usage_eligible = 1 AND r.has_conflict = 0;
+WHERE d.event_type = 'usage_observed' AND d.observation_status = 'complete'
+  AND d.terminal_observed = 1 AND d.usage_status = 'known'
+  AND d.input_tokens IS NOT NULL AND d.output_tokens IS NOT NULL
+  AND SIZE(ARRAY_EXCEPT(d.anomaly_codes, ['invalid_model', 'identity_invalid'])) = 0
+  AND r.has_conflict = 0;

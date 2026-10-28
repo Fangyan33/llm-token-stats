@@ -1,0 +1,141 @@
+"apiVersion": "v1"
+"kind": "ConfigMap"
+"metadata":
+  "name": "metering-usage-worker"
+  "namespace": "metering"
+"data":
+  "usage-worker.json": |
+    {
+      "doris": {
+        "database": "metering",
+        "dsn_env": "DORIS_DSN"
+      },
+      "summary_worker": {
+        "collection_start_date": "2026-10-28",
+        "refresh_timeout_seconds": 1800,
+        "poll_interval_seconds": 2,
+        "max_run_seconds": 21600,
+        "lock_mode": "kubernetes",
+        "lease_name": "metering-usage-worker"
+      }
+    }
+---
+"apiVersion": "v1"
+"kind": "ServiceAccount"
+"metadata":
+  "name": "metering-usage-worker"
+  "namespace": "metering"
+---
+"apiVersion": "coordination.k8s.io/v1"
+"kind": "Lease"
+"metadata":
+  "name": "metering-usage-worker"
+  "namespace": "metering"
+"spec": {}
+---
+"apiVersion": "rbac.authorization.k8s.io/v1"
+"kind": "Role"
+"metadata":
+  "name": "metering-usage-worker"
+  "namespace": "metering"
+"rules":
+  -
+    "apiGroups":
+      - "coordination.k8s.io"
+    "resources":
+      - "leases"
+    "resourceNames":
+      - "metering-usage-worker"
+    "verbs":
+      - "get"
+      - "update"
+  -
+    "apiGroups":
+      - ""
+    "resources":
+      - "pods"
+    "verbs":
+      - "get"
+---
+"apiVersion": "rbac.authorization.k8s.io/v1"
+"kind": "RoleBinding"
+"metadata":
+  "name": "metering-usage-worker"
+  "namespace": "metering"
+"subjects":
+  -
+    "kind": "ServiceAccount"
+    "name": "metering-usage-worker"
+    "namespace": "metering"
+"roleRef":
+  "apiGroup": "rbac.authorization.k8s.io"
+  "kind": "Role"
+  "name": "metering-usage-worker"
+---
+"apiVersion": "batch/v1"
+"kind": "CronJob"
+"metadata":
+  "name": "metering-usage-worker"
+  "namespace": "metering"
+"spec":
+  "schedule": "0 1 * * *"
+  "concurrencyPolicy": "Forbid"
+  "successfulJobsHistoryLimit": 2
+  "failedJobsHistoryLimit": 3
+  "jobTemplate":
+    "spec":
+      "backoffLimit": 2
+      "activeDeadlineSeconds": 21600
+      "template":
+        "metadata":
+          "annotations":
+            "sidecar.istio.io/inject": "false"
+        "spec":
+          "containers":
+            -
+              "name": "usage-worker"
+              "image": "metering-usage-worker:local"
+              "imagePullPolicy": "IfNotPresent"
+              "args":
+                - "--config"
+                - "/config/usage-worker.json"
+                - "--once"
+              "envFrom":
+                -
+                  "secretRef":
+                    "name": "metering-consumer-credentials"
+              "env":
+                -
+                  "name": "POD_NAME"
+                  "valueFrom":
+                    "fieldRef":
+                      "fieldPath": "metadata.name"
+                -
+                  "name": "POD_UID"
+                  "valueFrom":
+                    "fieldRef":
+                      "fieldPath": "metadata.uid"
+                -
+                  "name": "POD_NAMESPACE"
+                  "valueFrom":
+                    "fieldRef":
+                      "fieldPath": "metadata.namespace"
+              "volumeMounts":
+                -
+                  "name": "config"
+                  "mountPath": "/config"
+                  "readOnly": true
+              "resources":
+                "requests":
+                  "cpu": "100m"
+                  "memory": "64Mi"
+                "limits":
+                  "cpu": "1"
+                  "memory": "512Mi"
+          "restartPolicy": "Never"
+          "serviceAccountName": "metering-usage-worker"
+          "volumes":
+            -
+              "name": "config"
+              "configMap":
+                "name": "metering-usage-worker"

@@ -147,7 +147,7 @@ func TestCollectionEndToEnd(t *testing.T) {
 				if status != "unknown" || eligible != 0 || input.Valid || output.Valid {
 					t.Fatal("unknown usage became zero or eligible")
 				}
-			} else if status != "known" || eligible != 0 || input.Int64 != 10 || output.Int64 != 4 {
+			} else if status != "known" || eligible != 1 || input.Int64 != 10 || output.Int64 != 4 {
 				t.Fatal("reported usage mismatch")
 			}
 			var count int

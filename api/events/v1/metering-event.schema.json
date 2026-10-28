@@ -595,9 +595,6 @@
           "observation_status": {
             "const": "complete"
           },
-          "identity_status": {
-            "const": "known"
-          },
           "terminal_observed": {
             "const": true
           }

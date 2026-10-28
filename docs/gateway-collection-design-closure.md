@@ -13,7 +13,7 @@
 | 插件配置 | [配置 Schema](../configs/gateway-observer.schema.json)、[默认关闭样例](../configs/gateway-observer.example.json) | 发布校验、插件配置解码 |
 | 合成事件 | [testdata/collection](../testdata/collection) | start、known、partial、unknown、零值、候选冲突的协议测试 |
 | 离线校验 | [校验脚本](../scripts/validate_collection_contracts.py)、[边界测试](../tests/test_collection_contracts.py) | 本地开发与 CI |
-| 数据与统计衔接 | [Doris 原始表](../migrations/doris/metering/001_init.sql)、[Doris 协调表](../migrations/doris/metering/004_summary_coordination.sql)、[汇总设计](daily-monthly-summary-design.md) | Consumer、usage-worker |
+| 数据与统计衔接 | [Doris 原始表](../migrations/doris/metering/001_init.sql)、[Doris 协调表](../migrations/doris/metering/002_consumer_coordination.sql)、[汇总设计](daily-monthly-summary-design.md) | Consumer、usage-worker |
 
 Schema 描述类型和固定字段集；UTF-8 字节上限、跨字段状态、Kafka key、时间窗口、原 usage 白名单和资源关系由校验脚本补充。两层校验都必须在运行时实现，不能仅凭通过 JSON Schema 验收。脚本只实现本仓库 Schema 使用的关键字，使用 Python 3.10+ 标准库；不代替通用 JSON Schema 工具、protoc、业务解析器或数据库执行。
 

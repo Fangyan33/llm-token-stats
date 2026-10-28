@@ -43,6 +43,13 @@ services:
       DORIS_PASSWORD: ''
     volumes: ['../../dist:/app:ro', './consumer.json:/config/consumer.json:ro']
     ports: ['0.0.0.0:19092:9092']
+  usage-worker:
+    image: alpine:latest
+    profiles: ['summary']
+    command: [/app/usage-worker, --config, /config/usage-worker.json, --once]
+    environment:
+      DORIS_DSN: 'root@tcp(doris:9030)/metering_development?timeout=5s&interpolateParams=true'
+    volumes: ['../../dist:/app:ro', '../../configs/usage-worker.local.json:/config/usage-worker.json:ro', '/tmp/metering-summary-locks:/tmp/metering-summary-locks']
   gateway:
     image: istio/proxyv2:1.13.5
     entrypoint: [/usr/local/bin/envoy]

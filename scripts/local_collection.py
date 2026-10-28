@@ -2,7 +2,7 @@
 import argparse,hashlib,json,os,re,socket,subprocess,time,urllib.error,urllib.request
 from pathlib import Path
 from wasm_artifact import remote_source
-from render_doris_sql import database_name,render_sql
+from render_doris_sql import MIGRATIONS,database_name,render_sql
 ROOT=Path(__file__).resolve().parents[1]
 BASE=['docker','compose','-f',str(ROOT/'deploy/local/compose.yaml')]
 def run(*args,input=None,capture_output=False):
@@ -110,34 +110,15 @@ def infra_up():
   time.sleep(2)
  else:raise RuntimeError('Doris readiness timeout')
  database=database_name(json.loads((ROOT/'deploy/local/consumer.json').read_text())['doris']['database'])
- # Never silently apply this single new contract to tables from an old checkout.
- guard="SELECT column_name FROM information_schema.columns WHERE table_schema='"+database+"' AND table_name='events_raw';"
- columns=run('exec','-T','doris','mysql','-uroot','-h127.0.0.1','-P9030','-N','-e',guard,capture_output=True).stdout.splitlines()
- if columns and ('application_id' in columns or not {'request_host','provider_id','customer_mapping_status'}<=set(columns)):
-  raise RuntimeError('Incompatible existing Doris schema; choose an isolated database, never overwrite shared tables')
- if columns:
-  missing=not {'service_name','provider_name','customer_name'}<=set(columns)
-  if missing and database!='metering_development':raise RuntimeError('Only the current development database may be upgraded in place')
-  if database=='metering_development':
-   from doris_schema import statements
-   for statement in statements((ROOT/'migrations/doris/metering/008_name_snapshots.sql').read_text()):
-    if statement.startswith('ALTER TABLE'):
-     field=statement.split('ADD COLUMN ',1)[1].split()[0]
-     if field in columns:continue
-     run('exec','-T','doris','mysql','--default-character-set=utf8mb4','-uroot','-h127.0.0.1','-P9030',input=render_sql(statement+';',database))
-     for _ in range(60):
-      current=run('exec','-T','doris','mysql','-uroot','-h127.0.0.1','-P9030','-N','-e',guard,capture_output=True).stdout.splitlines()
-      if field in current:break
-      time.sleep(1)
-     else:raise RuntimeError('Doris name column schema change timeout')
-    else:
-     run('exec','-T','doris','mysql','--default-character-set=utf8mb4','-uroot','-h127.0.0.1','-P9030',input=render_sql(statement+';',database))
- # Existing views retain their old stored SELECT * expansion. Rebuild them in
- # dependency order with 008 before applying the comment-only 007 instead of validating new lists against old views.
- initial=['001_init.sql','002_usage_summaries.sql','004_summary_coordination.sql','005_consumer_recovery.sql','006_optional_route_identity.sql','007_schema_comments.sql']
- if columns:initial=['004_summary_coordination.sql','005_consumer_recovery.sql','007_schema_comments.sql']
- for name in initial:
-  run('exec','-T','doris','mysql','--default-character-set=utf8mb4','-uroot','-h127.0.0.1','-P9030',input=render_sql((ROOT/'migrations/doris/metering'/name).read_text(),json.loads((ROOT/'deploy/local/consumer.json').read_text())['doris']['database']))
+ # Existing databases must already match the final model; initialization never upgrades or drops them.
+ from doris_schema import live_columns,schema,validate_live
+ existing=live_columns(database)
+ if existing:
+  try:validate_live(schema(),existing)
+  except ValueError as error:
+   raise RuntimeError('Existing Doris schema differs from the current model; initialize an isolated empty database') from error
+ for name in MIGRATIONS:
+  run('exec','-T','doris','mysql','--default-character-set=utf8mb4','-uroot','-h127.0.0.1','-P9030',input=render_sql((ROOT/'migrations/doris/metering'/name).read_text(),database))
  for _ in range(45):
   result=subprocess.run([*BASE,'exec','-T','kafka','/opt/kafka/bin/kafka-topics.sh','--bootstrap-server','kafka:9092','--create','--if-not-exists','--topic',json.loads((ROOT/'deploy/local/observer.json').read_text())['kafka']['topic'],'--partitions','24','--replication-factor','1','--config','retention.ms=259200000','--config','cleanup.policy=delete'],capture_output=True)
   if result.returncode==0:break

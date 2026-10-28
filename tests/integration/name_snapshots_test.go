@@ -232,7 +232,7 @@ func testNamesThroughKafkaToDoris(t *testing.T, secure, cached bool) {
 				t.Fatal("name snapshot persistence")
 			}
 			if cached && i == len(ids)-1 {
-				if c.Valid || event.CustomerName != nil || event.CustomerID != nil || event.ApiKeyID != nil || event.CustomerMappingVersion != nil || event.CustomerMappingStatus != "lookup_unavailable" || event.IdentityStatus != "invalid" || event.MappingStatus != "mapped" || event.UsageEligible {
+				if c.Valid || event.CustomerName != nil || event.CustomerID != nil || event.ApiKeyID != nil || event.CustomerMappingVersion != nil || event.CustomerMappingStatus != "lookup_unavailable" || event.IdentityStatus != "invalid" || event.MappingStatus != "mapped" || event.UsageEligible != (event.EventType == "usage_observed") {
 					t.Fatal("slow 401 preserved old customer attribution in Kafka/Doris")
 				}
 			} else if !c.Valid || c.String != "客户"+want || event.CustomerName == nil || *event.CustomerName != c.String {
@@ -258,8 +258,8 @@ func testNamesThroughKafkaToDoris(t *testing.T, secure, cached bool) {
 		for _, view := range []string{"requests", "request_statistics", "event_details", "usage_effective"} {
 			if cached && i == len(ids)-1 && view == "usage_effective" {
 				var count int
-				if err := db.QueryRow("SELECT COUNT(*) FROM metering_development.usage_effective WHERE logical_request_id=?", id).Scan(&count); err != nil || count != 0 {
-					t.Fatal("unauthorized attribution became eligible usage")
+				if err := db.QueryRow("SELECT COUNT(*) FROM metering_development.usage_effective WHERE logical_request_id=?", id).Scan(&count); err != nil || count != 1 {
+					t.Fatal("valid service usage lost because customer attribution is unknown")
 				}
 				continue
 			}

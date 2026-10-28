@@ -32,7 +32,8 @@ flowchart LR
 | Consumer | 校验事件与摘要，去重并保留冲突证据；将明细、拒绝诊断、日期通知和批次凭据写入 Doris，确认全部可见后提交 offset | 已实现；入口为 `cmd/consumer/`，多个副本使用同一 consumer group 分摊分区 |
 | Doris | 保存事件、请求视图、冲突标记和消费协调状态，支持 SQL 查询 | 已提供迁移；本地使用单 FE / BE，生产使用独立集群 |
 | Fixture | 模拟 ext_authz 访问允许和模型 JSON / SSE 响应 | 已实现；仅用于开发和测试，不提供真实鉴权或模型调用 |
-| Auth、usage-worker、平台 API / 门户 | 分别承担密钥鉴权、日/月汇总刷新、查询与管理交互 | 仓库包含相关设计或目录，尚无可部署的完整实现；采集接入需复用已有鉴权能力 |
+| usage-worker | T+1 日/月物化视图刷新、历史修正和自然月清理 | 每日单次执行，月视图嵌套读取日视图；生产验收待完成 |
+| Auth、平台 API / 门户 | 密钥鉴权、查询与管理交互 | 尚无完整部署实现；采集接入复用已有鉴权能力 |
 
 采集范围是模型入口服务 A，不重复统计 A 调用内部 B / C 的请求。观察 ACK 和响应中的计量 ID 都不能证明事件已写入 Kafka / Doris。判断采集是否完整，还需要核对独立网关请求指标、Consumer 水位和缺口记录。
 
@@ -46,7 +47,7 @@ flowchart LR
 
 ```sh
 make test       # 契约检查、Python 测试、主模块和独立插件模块的 Go 竞态测试
-make build      # 生成 dist/observer、dist/consumer、dist/fixture
+make build      # 生成 dist/observer、dist/consumer、dist/usage-worker、dist/fixture
 make wasm       # 生成 dist/gateway-observer-v1.wasm，并检查 ABI
 make manifest   # 生成 dist/collection-manifest.json，记录工具版本与文件摘要
 ```
@@ -88,7 +89,7 @@ make package PACKAGE_DIR=dist/package-with-dependencies \
   PACKAGE_ARGS='--accepted-request-host api.company.com --include-dependency-images'
 ```
 
-`make package` 编译 Wasm、构建 Observer / Consumer 镜像，再通过 `docker save` 将这两个应用镜像保存到 `dist/package/images/images.tar`，默认使用 `linux/amd64`。默认不拉取、不检查、不归档 Kafka、Doris 和 Istio proxyv2 镜像。指定 `--include-dependency-images` 后，额外归档 Kafka 3.9.2、Doris 4.1.3、Istio proxyv2 1.13.5；缺少的依赖镜像会自动拉取，已有镜像会检查平台。
+`make package` 编译 Wasm、构建 Observer / Consumer / usage-worker 镜像，再通过 `docker save` 将这三个应用镜像保存到 `dist/package/images/images.tar`，默认使用 `linux/amd64`。默认不拉取、不检查、不归档 Kafka、Doris 和 Istio proxyv2 镜像。指定 `--include-dependency-images` 后，额外归档 Kafka 3.9.2、Doris 4.1.3、Istio proxyv2 1.13.5；缺少的依赖镜像会自动拉取，已有镜像会检查平台。
 
 两种模式都保留 Kafka / Doris 的单节点部署 YAML、初始化 Job 和全部配置。默认包部署前，目标节点需能拉取 Kafka / Doris 镜像，或已预先导入对应镜像；Istio 继续复用已有网关。`manifest.json` 的 `images` 记录全部镜像引用，`archived_images` 记录实际归档内容，`external_images` 记录需要目标环境准备的镜像。
 
@@ -96,7 +97,7 @@ make package PACKAGE_DIR=dist/package-with-dependencies \
 
 镜像构建使用本仓库 Kubernetes 测试所用的 host 网络，并传入代理环境变量；需要切换网络时可指定 `--build-network default`。服务镜像版本取自当前 Git tag / commit hash，Wasm 随 Observer 镜像分发。包内还包含镜像 ID、Wasm 摘要和全包文件校验和。输出目录非空时，打包脚本会拒绝覆盖，可通过 `PACKAGE_DIR` 指定新目录。
 
-包内 `k8s/` 包含已渲染的完整 YAML：Namespace、持久化的单节点 Kafka / Doris、Observer / Consumer Deployment 与 Service、全部 ConfigMap / Secret、Kafka topic 初始化 Job，以及 Doris `001/002/004/005/006/007` 迁移和初始化 Job。
+包内 `k8s/` 包含已渲染的完整 YAML：Namespace、持久化的单节点 Kafka / Doris、Observer / Consumer Deployment 与 Service、全部 ConfigMap / Secret、Kafka topic 初始化 Job，以及 Doris `001/002/003` 迁移和初始化 Job。
 
 启用归属查询 API 时，`service_lookup.credential_env` 只填写环境变量名 `METERING_SERVICE_LOOKUP_TOKEN`，真实密钥放入 `metering-observer-lookups` Secret 的同名键；不要将密钥直接填进 `credential_env`。客户查询同理使用 `METERING_CUSTOMER_LOOKUP_TOKEN`，URI 为空时无需提供凭据。修改 ConfigMap / Secret 后重启 Observer；包内 README 提供具体命令。
 
@@ -134,7 +135,7 @@ kubectl apply -f gateway/enabled/
 
 [构建检查](.github/workflows/collection.yaml)和[发布工作流](.github/workflows/release.yaml)仅在推送 `v*` tag 时触发。普通分支推送与 PR 不触发，也不配置手动启动入口。发布工作流检出该 tag，运行 `make test` 和 `make package`，校验包内摘要，压缩后上传到该 tag 的 GitHub Release。当前发布平台为 `linux/amd64`，使用 Go 1.25.0 和 TinyGo 0.40.1；无需镜像仓库或额外 PAT，发布使用工作流自带的 `GITHUB_TOKEN` 和 `contents: write` 权限。
 
-Release 默认仅携带 Observer / Consumer 镜像和嵌入的 Wasm，保留 Kafka / Doris 部署 YAML，不携带 Kafka、Doris、Istio proxyv2 镜像。目标环境需能拉取或预先导入依赖镜像。
+Release 默认携带 Observer / Consumer / usage-worker 镜像和嵌入的 Wasm，保留 Kafka / Doris 部署 YAML，不携带 Kafka、Doris、Istio proxyv2 镜像。目标环境需能拉取或预先导入依赖镜像。
 
 GitHub Runner 无需访问目标 Kubernetes 集群，也不需要 Pod 身份；业务域名参数可按需限定，省略时匹配全部合法 DNS Host。在仓库 Settings → Secrets and variables → Actions → Variables 配置以下 Repository variables：
 
@@ -209,7 +210,9 @@ make test build wasm local-up local-test
 
 该命令依次完成检查、编译和 Wasm ABI 验证，启动 Kafka、Doris、Fixture、Observer、Consumer、Envoy，最后执行真实链路集成测试。
 
-`make local-up` 等待基础设施就绪后，应用 `001/002/004/005/006/007` Doris 迁移，在独立的 metering_development 库初始化新表，并创建 24 分区、保留 72 小时的 llm-metering-development topic。它不会编译代码，但会重新渲染下载摘要，重启使用挂载产物的 Fixture、Observer、Consumer，校验下载文件后重建网关。网关只挂载生成的配置，不挂载 Wasm。配置与编排见 [deploy/local/](deploy/local/compose.yaml)。
+`make local-up` 等待基础设施就绪后，应用 `001/002/003` Doris 迁移，在独立的 metering_development 库初始化新表，并创建 24 分区、保留 72 小时的 llm-metering-development topic。它不会编译代码，但会重新渲染下载摘要，重启使用挂载产物的 Fixture、Observer、Consumer，校验下载文件后重建网关。网关只挂载生成的配置，不挂载 Wasm。配置与编排见 [deploy/local/](deploy/local/compose.yaml)。
+
+`make summary-test` 在独立 Doris 库验证 T+1 日/月嵌套物化视图。每日任务运行前需设置真实 `collection_start_date`；运行与回填命令见[调度与恢复](docs/doris-summary-coordination.md)。离线包另包含 `k8s/50-usage-worker.yaml`，默认每天 01:00 UTC 执行，目标控制面调度时区须为 UTC。
 
 `make test` 检查代码和契约，不启动容器，也不写 Doris。`make local-test` 验证实际 Envoy → Observer → Kafka → Consumer → Doris 链路，覆盖 JSON / SSE、未知用量、重放去重、冲突、未知 schema 暂停、写入确认丢失和超时边界。测试使用合成数据，并保留诊断记录。
 
@@ -301,7 +304,7 @@ kafka-topics.sh --bootstrap-server "$KAFKA_BOOTSTRAP" \
 
 上述副本配置需要至少 3 个可用 Broker；24 分区是容量验收初值。同一采集部署周期不在线调整分区数。为 Observer 配置 topic 生产权限，为 Consumer 配置 topic 消费和 group 权限；现有 topic 的参数要另行核对，`--if-not-exists` 不会更新已有配置。
 
-Doris 新库按 `001 → 002 → 004 → 005 → 006 → 007` 的顺序执行迁移。仓库 SQL 使用开发环境的副本数 1，生产部署前需生成并审查生产用 SQL。以下示例将副本数改为 3，实际 BE 数量和存储资源必须满足要求：
+Doris 新库按 `001 → 002 → 003` 的顺序执行迁移。仓库 SQL 使用开发环境的副本数 1，生产部署前需生成并审查生产用 SQL。以下示例将副本数改为 3，实际 BE 数量和存储资源必须满足要求：
 
 ```sh
 export DEPLOY_DIR="$PWD/.private/deploy"
@@ -312,16 +315,14 @@ import re
 from pathlib import Path
 
 target = Path(os.environ['DEPLOY_DIR']) / 'doris'
-for name in ('001_init.sql', '002_usage_summaries.sql',
-             '004_summary_coordination.sql', '005_consumer_recovery.sql',
-             '006_optional_route_identity.sql', '007_schema_comments.sql'):
+for name in ('001_init.sql', '002_consumer_coordination.sql', '003_usage_summaries.sql'):
     sql = (Path('migrations/doris/metering') / name).read_text()
     sql = re.sub(r'("replication_num"\s*=\s*)"1"', r'\g<1>"3"', sql)
     (target / name).write_text(sql)
 PY
 
 # 在能够连接 FE SQL 的管理环境执行；认证配置由 Secret 安全提供。
-for migration in 001_init.sql 002_usage_summaries.sql 004_summary_coordination.sql 005_consumer_recovery.sql 006_optional_route_identity.sql 007_schema_comments.sql; do
+for migration in 001_init.sql 002_consumer_coordination.sql 003_usage_summaries.sql; do
   mysql --defaults-extra-file=/run/secrets/doris/admin.cnf --default-character-set=utf8mb4 \
     --init-command="SET time_zone = '+00:00'" < "$DEPLOY_DIR/doris/$migration" || exit 1
 done
@@ -331,9 +332,9 @@ mysql --defaults-extra-file=/run/secrets/doris/admin.cnf \
 
 直接执行上述命令会初始化 metering 库。如需使用其他库，先通过 `python3 scripts/render_doris_sql.py --database 库名 SQL文件` 渲染全部迁移，并同步修改 doris.database 与 DSN 中的数据库名。标识符必须以字母开头，只能包含字母、数字和下划线，最多 64 字符。确认所有迁移成功后，再部署 Consumer。
 
-已有库调整保留策略时，使用 [003 迁移](migrations/doris/metering/003_raw_retention_one_year.sql)，执行前先停止与之冲突的归档或分区清理任务。`CREATE TABLE IF NOT EXISTS` 不会修改已有表。所有 FE 都应持久化 `dynamic_partition_enable=true`，并确认 BE 为 Alive、当天及所需历史日期的分区已存在。副本、分桶等生产参数需逐项审查；仅修改副本数不足以完成容量验收。
+三个脚本直接定义最终模型，不提供历史补丁或旧开发库兼容迁移；已有旧结构需选择隔离空库重新初始化，工具不会自动删库。`CREATE TABLE IF NOT EXISTS` 不会转换已有表。所有 FE 都应持久化 `dynamic_partition_enable=true`，并确认 BE 为 Alive、当天及所需历史日期的分区已存在。副本、分桶等生产参数需逐项审查；仅修改副本数不足以完成容量验收。
 
-明细按 UTC 请求日期保留 365 个日期。仓库已定义日 / 月汇总表和 SQL 模板，执行这些迁移不会启动汇总刷新任务。
+明细按 UTC 请求日期分区，保留前 12 个完整自然月加当月。003 创建手动刷新的日/月嵌套物化视图；每天由 usage-worker 生成昨日统计并修正有通知的历史日期。执行迁移只建对象，实际刷新由 CronJob 或单次任务触发。
 
 ### 3. 准备服务配置与 Secret
 
@@ -477,7 +478,7 @@ kubectl apply -f "$DEPLOY_DIR/envoyfilter.disabled.yaml"
 
 采集范围统一由 Wasm 顶层 `accepted_request_hosts` 决定，支持精确域名、`*.example.com` 和 `*`。后缀通配匹配任意层级子域名，不含根域名；`*` 仅匹配合法 DNS Host。请求 `:authority` 先拒绝非 ASCII 字符，再转小写并去端口和末尾点，不使用转发头。缺失、非法或不匹配的 Host 直接透传，不读取凭据、不建立观察流、不缓存或改写正文；名单缺省或为空时全部不采集。Observer / Consumer 不维护服务或 Host 白名单；旧 `accepted_service_ids`、`accepted_routes` 等字段会被严格配置解析拒绝，配置版本、适配器和事件状态一致性仍会校验。未映射事件仍可保留质量诊断。
 
-功能尚未上线，协议、代码、配置和新开发库统一使用当前格式，不接纳旧格式消息，也不双写旧表。001/002/004/005/006/007 共同初始化同一套新模型，006 不负责兼容旧数据。旧结构库无法通过 CREATE IF NOT EXISTS 直接升级，应保留旧数据，改用隔离库和独立 topic/group。
+功能尚未上线，协议、代码、配置和新开发库统一使用当前格式，不接纳旧格式消息，也不双写旧表。001 定义明细及诊断视图，002 定义消费协调与恢复事实，003 定义日/月物化视图及刷新状态。旧结构库无法通过 CREATE IF NOT EXISTS 直接升级，使用隔离空库和独立 topic/group 重新初始化。
 
 Bearer 仅临时用于归属查询。空 URI 占位或客户查询失败时归属未知；即使用量为 known，身份也为 invalid、usage_eligible=false。启用 HTTP/HTTPS 查询并成功解析后按冻结的客户归属和名称生成事件。使用以下命令检查实际代理配置：
 

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"github.com/Fangyan33/llm-token-stats/internal/config"
 	"github.com/Fangyan33/llm-token-stats/internal/events"
+	"github.com/Fangyan33/llm-token-stats/pkg/statwindow"
 	"github.com/twmb/franz-go/pkg/kgo"
 	"sort"
 	"time"
@@ -59,7 +60,7 @@ func Freeze(rs []*kgo.Record, c config.Consumer, now time.Time) (*Batch, error) 
 				return nil, ErrPause
 			}
 			d := r.Timestamp.UTC().Format("2006-01-02")
-			if d < now.UTC().AddDate(0, 0, -364).Format("2006-01-02") || r.Timestamp.After(now.Add(5*time.Minute)) {
+			if d < statwindow.Start(now).Format("2006-01-02") || r.Timestamp.After(now.Add(5*time.Minute)) {
 				return nil, ErrPause
 			}
 			b.Rejected = append(b.Rejected, map[string]any{"kafka_record_date": d, "kafka_topic": r.Topic, "kafka_partition": r.Partition, "kafka_offset": r.Offset, "payload_hash": events.Hash(r.Value), "reason": reason, "kafka_record_at": Stamp(r.Timestamp), "ingested_at": b.At})

@@ -14,7 +14,7 @@ import urllib.request
 import uuid
 from pathlib import Path
 from image_tag import resolve_image_tag
-from render_doris_sql import render_sql, database_name
+from render_doris_sql import MIGRATIONS, render_sql, database_name
 
 ROOT = Path(__file__).resolve().parents[1]
 OWNER_KEY = 'app.kubernetes.io/part-of'
@@ -599,7 +599,7 @@ class Harness:
         self.kafka('topics', '--create', '--topic', self.topic, '--partitions', '3', '--replication-factor', '1',
                    '--config', 'retention.ms=86400000')
         try:
-            for name in ('001_init.sql','002_usage_summaries.sql','004_summary_coordination.sql','005_consumer_recovery.sql','006_optional_route_identity.sql','007_schema_comments.sql'):
+            for name in MIGRATIONS:
                 self.sql((ROOT / 'migrations/doris/metering' / name).read_text())
             manifest = self.manifest()
             write_json(self.output / 'resources.json', manifest)

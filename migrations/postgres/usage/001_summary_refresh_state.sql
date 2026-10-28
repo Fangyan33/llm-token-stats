@@ -1,5 +1,0 @@
--- RETIRED DESIGN, 2026-10-13. Intentionally contains no executable statements.
--- Collection and summary coordination now uses Doris; do not create metering_usage.
--- Replacement: migrations/doris/metering/004_summary_coordination.sql.
--- Protocol and controlled migration: docs/doris-summary-coordination.md, section 7.
--- Existing experimental databases are not dropped by this file. Auth is unchanged.

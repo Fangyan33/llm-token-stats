@@ -121,6 +121,18 @@ class CollectionContractsTest(unittest.TestCase):
         event.update(api_key_id=None, customer_id=None, customer_name=None, customer_mapping_version=None, customer_mapping_status="lookup_not_implemented", identity_status="invalid", usage_eligible=False, anomaly_codes=["identity_invalid"])
         contracts.validate_event(event)
 
+    def test_unknown_customer_can_have_eligible_usage(self):
+        event = copy.deepcopy(self.event)
+        event.update(api_key_id=None, customer_id=None, customer_name=None,
+                     customer_mapping_version=None, customer_mapping_status="lookup_not_implemented",
+                     identity_status="invalid", usage_eligible=True, anomaly_codes=["identity_invalid"])
+        contracts.validate_event(event)
+        for anomaly in ("missing_end", "usage_conflict", "parse_limit", "transport_lost"):
+            invalid = copy.deepcopy(event)
+            invalid["anomaly_codes"] = sorted(["identity_invalid", anomaly])
+            with self.assertRaises(contracts.ContractError):
+                contracts.validate_event(invalid)
+
     def test_raw_usage_does_not_allow_body_or_strings(self):
         for raw in ('{"messages":[]}', '{"prompt_tokens":"secret"}', '{"prompt_tokens_details":{"text":"secret"}}', '{"prompt_tokens":-1}'):
             self.assert_event_invalid(lambda e: e.update(raw_usage_json=raw))
@@ -147,7 +159,7 @@ class CollectionContractsTest(unittest.TestCase):
 
     def test_utc_retention_and_future_clock_boundaries(self):
         now = int(datetime(2026, 10, 13, tzinfo=timezone.utc).timestamp() * 1000)
-        for offset, allowed in ((-364 * 86400000, True), (-365 * 86400000, False), (300000, True), (300001, False)):
+        for offset, allowed in ((int((datetime(2025, 10, 1, tzinfo=timezone.utc) - datetime(2026, 10, 13, tzinfo=timezone.utc)).total_seconds() * 1000), True), (int((datetime(2025, 9, 30, 23, 59, 59, tzinfo=timezone.utc) - datetime(2026, 10, 13, tzinfo=timezone.utc)).total_seconds() * 1000), False), (300000, True), (300001, False)):
             event = copy.deepcopy(self.event)
             event.update(request_started_at_ms=now + offset, request_finished_at_ms=now + offset + 1)
             with self.subTest(offset=offset):

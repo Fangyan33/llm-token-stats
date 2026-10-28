@@ -272,9 +272,9 @@ func (s *Server) Observe(stream pb.ObservationService_ObserveServer) error {
 		if conflict || p.Conflict {
 			e.UsageStatus = "conflict"
 		}
-		eligible := observation == "complete" && e.UsageStatus == "known" && e.IdentityStatus == "known"
+		eligible := observation == "complete" && e.UsageStatus == "known"
 		for _, a := range e.AnomalyCodes {
-			if a != "invalid_model" {
+			if a != "invalid_model" && a != "identity_invalid" {
 				eligible = false
 			}
 		}

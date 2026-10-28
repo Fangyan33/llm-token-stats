@@ -37,7 +37,7 @@ class DistributionTests(unittest.TestCase):
                 self.assertFalse(args.output.exists())
 
     def images(self):
-        return {'observer': 'metering-observer:test', 'consumer': 'metering-consumer:test',
+        return {'observer': 'metering-observer:test', 'consumer': 'metering-consumer:test', 'usage-worker': 'metering-usage-worker:test',
                 **bundle.RUNTIME_IMAGES}
 
     def walk(self, value):
@@ -52,7 +52,8 @@ class DistributionTests(unittest.TestCase):
     def test_namespace_storage_and_all_pod_images_are_self_contained(self):
         args = self.args('--namespace', 'isolated', '--storage-class', 'offline-storage')
         resources = (bundle.infrastructure(args, self.images()) + bundle.configurations(args)
-                     + bundle.initialization(args, self.images()) + bundle.applications(args, self.images()))
+                     + bundle.initialization(args, self.images()) + bundle.applications(args, self.images())
+                     + bundle.summary_resources(args, self.images()))
         self.assertTrue(all(item['metadata']['namespace'] == 'isolated' for item in resources))
         pod_images = {item['image'] for item in self.walk(resources) if 'image' in item}
         self.assertEqual(pod_images, set(self.images().values()) - {self.images()['gateway']})
@@ -94,11 +95,33 @@ class DistributionTests(unittest.TestCase):
         script = jobs[1]['spec']['template']['spec']['containers'][0]['command'][2]
         positions = [script.index('/migrations/' + name) for name in bundle.MIGRATIONS]
         self.assertEqual(positions, sorted(positions))
-        self.assertIn('application_id', script)
+        self.assertIn('Existing Doris schema differs from the final model', script)
+        self.assertIn('request_statistics.statistics_usage_eligible', script)
         self.assertIn('$alive=="true"', script)
         for job in jobs:
             subprocess.run(['bash', '-n'], input=job['spec']['template']['spec']['containers'][0]['command'][2],
                            text=True, check=True, capture_output=True)
+
+    def test_summary_schedule_uses_nested_worker_and_shared_lease(self):
+        args = self.args('--collection-start-date', '2026-10-01')
+        objects = {r['kind']: r for r in bundle.summary_resources(args, self.images())}
+        cron = objects['CronJob']
+        self.assertEqual(cron['apiVersion'], 'batch/v1')
+        self.assertEqual(cron['spec']['schedule'], '0 1 * * *')
+        self.assertEqual(cron['spec']['concurrencyPolicy'], 'Forbid')
+        self.assertNotIn('timeZone', cron['spec'])
+        pod = cron['spec']['jobTemplate']['spec']['template']['spec']
+        self.assertEqual(pod['serviceAccountName'], objects['ServiceAccount']['metadata']['name'])
+        self.assertEqual(pod['containers'][0]['image'], self.images()['usage-worker'])
+        self.assertEqual(objects['Lease']['apiVersion'], 'coordination.k8s.io/v1')
+        rules = objects['Role']['rules']
+        self.assertEqual(rules[0]['resourceNames'], [objects['Lease']['metadata']['name']])
+        config = json.loads(objects['ConfigMap']['data']['usage-worker.json'])
+        self.assertEqual(config['summary_worker']['collection_start_date'], '2026-10-01')
+        self.assertEqual(config['summary_worker']['lock_mode'], 'kubernetes')
+        args.collection_start_date = '2026-02-30'
+        with self.assertRaises(ValueError):
+            bundle.summary_resources(args, self.images())
 
     def test_yaml_scalars_preserve_booleans_numeric_strings_and_multiline(self):
         text = bundle.yaml_text({'data': {'empty': '', 'bool': 'false', 'number': '9092',
@@ -228,11 +251,11 @@ class DistributionTests(unittest.TestCase):
                 manifest = json.loads((args.output / 'manifest.json').read_text())
                 self.assertEqual(manifest['accepted_request_hosts'], ['model.example.invalid', '*.example.invalid'])
                 self.assertIn(json.dumps(manifest['accepted_request_hosts']), (args.output / 'README.md').read_text())
-                expected = {'observer', 'consumer'} | (set(bundle.RUNTIME_IMAGES) if include_dependencies else set())
+                expected = {'observer', 'consumer', 'usage-worker'} | (set(bundle.RUNTIME_IMAGES) if include_dependencies else set())
                 self.assertEqual(set(manifest['archived_images']), expected)
                 self.assertEqual(set(prepare.call_args.args[1]), expected)
                 self.assertEqual(set(run.call_args.args[0][4:]), set(manifest['archived_images'].values()))
-                self.assertEqual(set(render.call_args.args[1]), {'observer', 'consumer', *bundle.RUNTIME_IMAGES})
+                self.assertEqual(set(render.call_args.args[1]), {'observer', 'consumer', 'usage-worker', *bundle.RUNTIME_IMAGES})
                 self.assertEqual(set(manifest['external_images']), set(manifest['images']) - expected)
                 sums = (args.output / 'SHA256SUMS').read_text()
                 self.assertIn(bundle.file_sha256(args.output / 'images/images.tar') + '  images/images.tar', sums)

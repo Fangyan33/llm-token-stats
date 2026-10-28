@@ -93,7 +93,7 @@ UUIDv4 不包含时间。`request_started_at_ms` 仍由网关观察并作为事�
 | `terminal_observed` | 布尔 / 否 | 是否收到有效网关 End；为 `false` 时 `request_finished_at_ms` 必须为 `null`。 |
 | `observation_status` | 字符串 / 是 | 结果事件为 `complete`（观察完整）、`partial`（缺片/截断等）或 `unknown`（只有有限元数据）；start 尚未定稿时为 `null`。 |
 | `usage_status` | 字符串 / 否 | token 数字有没有拿到，是否齐全、是否矛盾？start 为 `not_applicable`；结果事件中，`known` 表示输入、输出总量都有效；`partial` 表示输入输出尚未全部有效，但六个用量字段中至少一个有效；`unknown` 表示六字段全未知；`conflict` 表示用量存在矛盾，优先于其他状态。 |
-| `usage_eligible` | 布尔 / 否 | 这条用量是否符合有效统计条件，可以作为统计候选？一期仅在适配成功、`observation_status=complete`、`usage_status=known`、`identity_status=known`，且无用量/身份冲突及使结果失效的异常时为 `true`；否则为 `false`，start 固定为 `false`。不表示收费资格；下游仍须去重并排除事件或请求冲突。 |
+| `usage_eligible` | 布尔 / 否 | 这条用量是否符合有效统计条件，可以作为统计候选？一期仅在适配成功、`observation_status=complete`、`usage_status=known`，且无用量冲突及使结果失效的异常时为 `true`；否则为 `false`，start 固定为 `false`。不表示收费资格；下游仍须去重并排除事件或请求冲突。 |
 | `usage` | 对象 / 是 | start 固定为 `null`；结果事件为含六个 token 子字段的对象。即使用量未知，结果事件也保留各字段的 `value/source` 状态。 |
 | `raw_usage_json` | 字符串 / 否 | 白名单保留的上游 usage JSON 依据，最多 4 KiB；它是**JSON 字符串**，不是嵌套对象，也不是完整响应。无依据时为 `"{}"`。 |
 | `raw_usage_truncated` | 布尔 / 否 | usage 依据是否因过滤或大小限制丢弃内容；不表示模型回答被截断。 |
@@ -477,7 +477,7 @@ public class MeteringConsumer {
 
 **A：只有数字可靠、采集完整、身份有效，并通过相关检查，才是有效统计候选。**
 
-条件包括适配成功、`observation_status=complete`、`usage_status=known`、`identity_status=known`，以及没有用量/身份冲突和使结果失效的异常。身份有效指客户接口返回的 API Key ID、客户 ID 齐全且 customer_mapping_status=mapped。当前占位部署不产生有效客户身份。
+条件包括适配成功、`observation_status=complete`、`usage_status=known`，以及没有用量冲突和使结果失效的异常。identity_invalid 保留为归属诊断，不单独否决用量资格；客户报表仍要求客户和 API Key 归属已知。下游仍需排除请求级身份冲突。
 
 `true` 不代表收费资格；下游仍需按 `event_id` 去重，并排除事件或请求冲突。`false` 不代表没有消耗 token，也不代表调用失败，记录仍可用于异常排查和采集质量分析。开始事件固定为 `false`。
 
@@ -491,5 +491,5 @@ public class MeteringConsumer {
 | 响应完整结束，但六个用量字段全部未知 | `response_complete` | `unknown` | `false` |
 | 响应完整结束，只取得输入量 | `response_complete` | `partial` | `false` |
 | 已解析到流式终结 usage，之后观察中断，缺少完整结束信息 | `stream_incomplete` | `known` | `false` |
-| 响应和用量完整，但客户身份缺失 | `response_complete` | `known` | `false` |
+| 响应和用量完整，仅客户身份缺失 | `response_complete` | `known` | `true` |
 | 响应完整结束，但输入、输出与上报总量对不上 | `response_complete` | `conflict` | `false` |

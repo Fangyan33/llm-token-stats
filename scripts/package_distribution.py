@@ -2,6 +2,7 @@
 import argparse
 import base64
 import copy
+from datetime import datetime, timezone
 import hashlib
 import json
 import os
@@ -13,13 +14,11 @@ import tempfile
 
 from image_tag import resolve_image_tag
 from gateway_workload import filter_name, label, selector
-from render_doris_sql import database_name, render_sql
+from render_doris_sql import MIGRATIONS, database_name, render_sql
 from wasm_artifact import checksum
 from validate_collection_contracts import load, normalize_request_host_pattern, validate_config
 
 ROOT = Path(__file__).resolve().parents[1]
-MIGRATIONS = ('001_init.sql', '002_usage_summaries.sql', '004_summary_coordination.sql',
-              '005_consumer_recovery.sql', '006_optional_route_identity.sql', '007_schema_comments.sql')
 RUNTIME_IMAGES = {'kafka': 'apache/kafka:3.9.2', 'doris': 'apache/doris:all-in-one-4.1.3',
                   'gateway': 'istio/proxyv2:1.13.5'}
 
@@ -180,13 +179,15 @@ until sql -e 'SHOW BACKENDS;' | awk -F '\\t' '
   NR>1 && alive && $alive=="true" { ready=1 }
   END { exit !ready }'; do sleep 5; done
 '''
-    # 与 local_collection.py 一样，拒绝把新契约直接覆盖到旧结构的表上。
-    doris_command += f'''columns=$(sql -N -e "SELECT column_name FROM information_schema.columns WHERE table_schema='{args.database}' AND table_name='events_raw';")
-if [ -n "$columns" ]; then
-  if printf '%s\\n' "$columns" | grep -qx application_id; then exit 1; fi
-  for required in request_host provider_id customer_mapping_status; do
-    printf '%s\\n' "$columns" | grep -qx "$required" || exit 1
-  done
+    # Only an empty database or the final object/column layout can be initialized.
+    from doris_schema import schema
+    relations = schema()
+    expected = '\n'.join(name + '.' + column['name'] for name in sorted(relations)
+                         for column in relations[name]['columns'])
+    doris_command += f'''columns=$(sql -N -e "SELECT CONCAT(table_name, '.', column_name) FROM information_schema.columns WHERE table_schema='{args.database}' ORDER BY table_name, ordinal_position;")
+if [ -n "$columns" ] && [ "$columns" != '{expected}' ]; then
+  echo 'Existing Doris schema differs from the final model; initialize an isolated empty database' >&2
+  exit 1
 fi
 sql -e 'ADMIN SET FRONTEND CONFIG ("dynamic_partition_enable" = "true");'
 '''
@@ -247,6 +248,49 @@ def gateway_configuration(args):
     return config
 
 
+
+def summary_resources(args, images):
+    # The controller schedule is UTC on the supported Kubernetes 1.22 setup.
+    from datetime import date
+    start = date.fromisoformat(args.collection_start_date)
+    if start.isoformat() != args.collection_start_date or start > datetime.now(timezone.utc).date():
+        raise ValueError('collection-start-date 必须为不晚于今日的 ISO UTC 日期')
+    ns = args.namespace
+    settings = {'doris': {'database': args.database, 'dsn_env': 'DORIS_DSN'},
+                'summary_worker': {'collection_start_date': args.collection_start_date,
+                                   'refresh_timeout_seconds': 1800, 'poll_interval_seconds': 2,
+                                   'max_run_seconds': 21600, 'lock_mode': 'kubernetes',
+                                   'lease_name': 'metering-usage-worker'}}
+    container = {'name': 'usage-worker', 'image': images['usage-worker'], 'imagePullPolicy': 'IfNotPresent',
+                 'args': ['--config', '/config/usage-worker.json', '--once'],
+                 'envFrom': [{'secretRef': {'name': 'metering-consumer-credentials'}}],
+                 'env': [{'name': key, 'valueFrom': {'fieldRef': {'fieldPath': field}}}
+                         for key, field in [('POD_NAME', 'metadata.name'), ('POD_UID', 'metadata.uid'),
+                                            ('POD_NAMESPACE', 'metadata.namespace')]],
+                 'volumeMounts': [{'name': 'config', 'mountPath': '/config', 'readOnly': True}],
+                 'resources': {'requests': {'cpu': '100m', 'memory': '64Mi'},
+                               'limits': {'cpu': '1', 'memory': '512Mi'}}}
+    template = pod_spec([container], restartPolicy='Never')
+    template['spec'].update(serviceAccountName='metering-usage-worker',
+                            volumes=[{'name': 'config', 'configMap': {'name': 'metering-usage-worker'}}])
+    return [resource('ConfigMap', 'metering-usage-worker', ns,
+                     data={'usage-worker.json': json.dumps(settings, ensure_ascii=False, indent=2)+'\n'}),
+            resource('ServiceAccount', 'metering-usage-worker', ns),
+            resource('Lease', 'metering-usage-worker', ns, apiVersion='coordination.k8s.io/v1', spec={}),
+            resource('Role', 'metering-usage-worker', ns, apiVersion='rbac.authorization.k8s.io/v1', rules=[
+                {'apiGroups': ['coordination.k8s.io'], 'resources': ['leases'],
+                 'resourceNames': ['metering-usage-worker'], 'verbs': ['get', 'update']},
+                {'apiGroups': [''], 'resources': ['pods'], 'verbs': ['get']}]),
+            resource('RoleBinding', 'metering-usage-worker', ns, apiVersion='rbac.authorization.k8s.io/v1',
+                     subjects=[{'kind': 'ServiceAccount', 'name': 'metering-usage-worker', 'namespace': ns}],
+                     roleRef={'apiGroup': 'rbac.authorization.k8s.io', 'kind': 'Role', 'name': 'metering-usage-worker'}),
+            resource('CronJob', 'metering-usage-worker', ns, apiVersion='batch/v1', spec={
+                'schedule': '0 1 * * *', 'concurrencyPolicy': 'Forbid',
+                'successfulJobsHistoryLimit': 2, 'failedJobsHistoryLimit': 3,
+                'jobTemplate': {'spec': {'backoffLimit': 2, 'activeDeadlineSeconds': 21600,
+                                         'template': template}}})]
+
+
 def render_manifests(args, images, output, wasm_file=None):
     gateway_config = gateway_configuration(args)
     ns = args.namespace
@@ -256,7 +300,8 @@ def render_manifests(args, images, output, wasm_file=None):
     for filename, resources in (
             ('10-infrastructure', infrastructure(args, images)),
             ('20-config', configurations(args)), ('30-init', initialization(args, images)),
-            ('40-applications', applications(args, images))):
+            ('40-applications', applications(args, images)),
+            ('50-usage-worker', summary_resources(args, images))):
         write_yaml(output / 'k8s' / (filename + '.yaml'), resources)
     dns = f'metering-observer.{ns}.svc.cluster.local'
     config_path = output / 'gateway-observer.json'
@@ -283,7 +328,7 @@ def render_manifests(args, images, output, wasm_file=None):
 
 
 def prepare_images(args, images):
-    for name in ('observer', 'consumer'):
+    for name in ('observer', 'consumer', 'usage-worker'):
         print('构建镜像：' + images[name], flush=True)
         run(['docker', 'build', '--platform', args.platform, '--network', args.build_network,
              '--build-arg', 'HTTP_PROXY', '--build-arg', 'HTTPS_PROXY', '--build-arg', 'NO_PROXY',
@@ -320,9 +365,10 @@ def package(args):
     labels = selector(args.gateway_label)
     tag = resolve_image_tag()
     images = {'observer': 'metering-observer:' + tag, 'consumer': 'metering-consumer:' + tag,
+              'usage-worker': 'metering-usage-worker:' + tag,
               **RUNTIME_IMAGES}
     archived_images = images if args.include_dependency_images else {
-        name: images[name] for name in ('observer', 'consumer')}
+        name: images[name] for name in ('observer', 'consumer', 'usage-worker')}
     external_images = {name: image for name, image in images.items() if name not in archived_images}
     target.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix='.metering-package-', dir=target.parent) as directory:
@@ -338,6 +384,7 @@ def package(args):
         manifest = {'image_tag': tag, 'platform': args.platform, 'images': images,
                     'archived_images': archived_images, 'external_images': external_images,
                     'image_details': records, 'wasm_sha256': wasm_sha,
+                    'doris_migrations': list(MIGRATIONS),
                     'namespace': args.namespace, 'gateway_namespace': args.gateway_namespace,
                     'accepted_request_hosts': gateway_config['accepted_request_hosts'],
                     'gateway_selector': labels, 'gateway_filter_name': filter_name(labels),
@@ -353,9 +400,9 @@ def package(args):
 
 def package_readme(args):
     hosts = gateway_configuration(args)['accepted_request_hosts']
-    image_note = ('镜像归档包含 Observer、Consumer、Kafka、Doris、Istio proxyv2。'
+    image_note = ('镜像归档包含 Observer、Consumer、usage-worker、Kafka、Doris、Istio proxyv2。'
                   if args.include_dependency_images else
-                  '镜像归档仅包含 Observer、Consumer；Kafka、Doris、Istio proxyv2 镜像不随包提供。\n'
+                  '镜像归档包含 Observer、Consumer、usage-worker；Kafka、Doris、Istio proxyv2 镜像不随包提供。\n'
                   'Kafka / Doris 部署清单和初始化 Job 仍保留；部署前需保证节点能拉取这些依赖镜像，\n'
                   '或在所有可能调度相关 Pod 的节点预先导入对应镜像。已有 Istio 网关继续复用。')
     return f'''# 单节点采集分发包
@@ -440,7 +487,11 @@ EnvoyFilter 名称：{filter_name(selector(args.gateway_label))}，同样记录�
 metering_gateway_identity_unavailable_total，业务继续放行，不回退到固定值或截断名称。
 envoyfilter.yaml 与 gateway/disabled/ 内容相同，选择其中一个入口即可。
 gateway 目录中全部为最终 YAML，不含待替换字段；不要递归同时 apply disabled 和 enabled。
+usage-worker 由 k8s/50-usage-worker.yaml 每天 01:00 UTC 调度，部署前核对控制面时区。
+已有数据环境须通过 --collection-start-date 指定真实采集起点，不能把包生成日期当作历史覆盖起点。
 初始化 Job 只处理本包的单节点 Kafka / Doris；已有旧事件表会拒绝初始化，请使用隔离命名空间 / 数据卷。
+数据库只执行 001_init.sql、002_consumer_coordination.sql、003_usage_summaries.sql，
+直接创建最终明细、消费协调及日/月物化视图结构；不提供旧开发库兼容升级。
 PVC 数据在删除 StatefulSet 后仍保留；本包不自动删除 PVC、既有数据或网关资源。
 重新 apply 同一包会保留已完成的 Job；升级迁移时需审查 SQL 并单独安排初始化 Job。
 '''
@@ -459,9 +510,11 @@ def parser():
     p.add_argument('--database', type=database_name, default='metering')
     p.add_argument('--topic', default='llm-metering-events')
     p.add_argument('--group', default='llm-metering-doris-v1')
+    p.add_argument('--collection-start-date', default=datetime.now(timezone.utc).date().isoformat(),
+                   help='实际开始采集的 UTC 日期；已有环境必须显式指定，不能从空分区推断')
     p.add_argument('--platform', choices=['linux/amd64', 'linux/arm64'], default='linux/amd64')
     p.add_argument('--include-dependency-images', action='store_true',
-                   help='同时归档 Kafka、Doris、Istio proxyv2 镜像；默认仅归档 Observer、Consumer')
+                   help='同时归档 Kafka、Doris、Istio proxyv2 镜像；默认归档 Observer、Consumer、usage-worker')
     p.add_argument('--build-network', default='host', help='Docker 构建网络，默认 host；可指定 default')
     p.add_argument('--storage-class', help='省略时使用目标集群默认 StorageClass；空串表示手工绑定 PV')
     p.add_argument('--kafka-storage', default='10Gi')

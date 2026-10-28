@@ -1,5 +1,7 @@
 # 网关请求采集开发实现方案
 
+> 当前资格口径：客户身份未知不再单独否决 `usage_eligible`；`identity_invalid` 保留为归属诊断。客户/API Key 统计仍过滤未知归属。本文涉及旧资格判定的历史描述以此为准；日/月异步物化视图及每日任务见[汇总说明](daily-monthly-summary-design.md)，生产验收待完成。
+
 版本：V1.9｜日期：2026-10-15｜状态：采集组件已实现，公开旧版 Envoy/Kafka/Doris 本地联调已通过；私有环境与性能验收待执行，详见[运行说明](collection-components.md)。
 
 依据：[原技术方案](token-metering-design.md)、[功能设计概览及开发周期](token-metering-functional-overview-and-schedule.md)、[API Key Auth 服务方案](api-key-auth-service-implementation.md)。本文细化一期中“鉴权后采集到 Doris 明细入库”的采集子项；一期的估算、日/月汇总、客户查询与看板在后续子项完成；归档为后续可选项，不能以本文验收代替一期整体验收。本文的协议、配置和初始化 SQL 描述当前实现，Go 代码中明确标记的伪代码仅说明流程；汇总 Worker、估算和查询 API 的相关段落仍是待实施设计。
@@ -625,15 +627,15 @@ ACK 与 Kafka 发送完全解耦；即便两条事件只有一条成功入 Kafka
 
 `identity_hash` 对固定元组 `[service_id, provider_id, api_key_id, customer_id, identity_status, config_version, gateway_instance_id, adapter_id, x_request_id, cluster_name, deployment_environment, mapping_status, mapping_version, customer_mapping_status, customer_mapping_version]` 规范 JSON 编码后取 SHA-256。null 保留，路由和模型不是独立身份字段；mapping_version 绑定规范 Host，版本不含原始密钥。Consumer 证据、巡检及 SQL 投影使用同一顺序。
 
-006 初始化当前请求视图，按唯一新契约比较类型化身份字段；不实现旧格式/hash 兼容。旧开发数据使用独立库保留，新契约不读取旧格式消息。
+001 与 003 直接定义当前请求诊断及统计投影，按唯一契约比较类型化身份字段；旧开发结构需在隔离空库重新初始化，不提供旧格式/hash 兼容。
 
-事件表按 UTC 请求日期每日分区，拒绝诊断表按 Kafka 记录 UTC 日期每日分区，均在线保留一年：365 个 UTC 日期（当天及前 364 天）。Doris 动态分区创建与清理，time_unit=DAY、start=-364、end=2、time_zone=UTC；各 FE 须开启并持久化动态分区配置。Consumer 不接收超出在线窗口的历史事件，也不把过滤行视为成功。日/月汇总独立保留并由 usage-worker 刷新，见[一期日/月汇总设计](daily-monthly-summary-design.md)；归档为[后续可选设计](archive-optional-design.md)，一期不部署。`request_conflict_ids` 长期保留冲突 UUIDv4，不随事件分区到期删除，避免较早冲突变体过期后较晚变体恢复有效。UUIDv4 不得重用。[动态分区](https://doris.apache.org/docs/4.x/table-design/data-partitioning/dynamic-partitioning/)
+事件表按 UTC 请求日期每日分区，拒收诊断表按 Kafka 记录 UTC 日期每日分区，均保留前 12 个完整自然月加当月。Doris 预建当天及未来两日分区，usage-worker 按月首清理；各 FE 须持久开启动态分区。Consumer 拒收窗口外历史事件，也不把过滤行视为成功。日/月统计采用嵌套物化视图并使用相同自然月窗口，见[日/月汇总设计](daily-monthly-summary-design.md)。`request_conflict_ids` 长期保留冲突 UUIDv4，避免较早证据过期后较晚变体恢复有效；UUIDv4 不得重用。
 
 单 FE/BE 的 schema 仅供开发验证；生产需要确定副本数、BE 分桶数、分区数和容量。Doris 在分区和分桶间管理数据，跨日期或身份的冲突判断必须覆盖同一 `logical_request_id` 的全部在线变体。`requests` 是逻辑视图，并不预聚合；大规模查询的计划和延迟须在目标 Doris 集群验证。
 
 ### 7.2 事件与请求视图
 
-Migration 创建 `event_variants`、`event_conflicts`、`events_valid`、`event_details`、`requests` 和 `usage_effective` 六个普通视图。`event_variants` 直接读取 Unique Key 表；无需 `FINAL`。`event_conflicts` 按请求 ID 和事件 ID 跨在线日期统计不同摘要；`events_valid` 排除事件级冲突；`requests.has_conflict` 还排除多开始/结果变体、开始时间/日期不一致、稳定身份摘要不一致及持久冲突标记。普通视图不存储副本，查询成本仍由原表扫描、聚合和关联决定。[CREATE VIEW](https://doris.apache.org/docs/4.x/sql-manual/sql-statements/table-and-view/view/CREATE-VIEW/)
+迁移创建 `event_conflicts`、`event_details`、`requests`、`usage_effective` 和 `request_statistics` 五个逻辑视图。`event_conflicts` 按请求 ID 和事件 ID 跨在线日期诊断内容冲突；`event_details` 直接从原表排除这些事件冲突并投影业务字段。`requests.has_conflict` 还检查多开始/结果变体、开始时间/日期、身份与名称快照及持久冲突标记。`request_statistics` 提供按日期组织的物化视图输入。普通视图不存储副本，查询成本来自原表扫描、聚合和关联。
 
 `requests` 一行代表一个已记录请求，不能直接对事件表 `COUNT(*)` 当调用量。有开始事件而没有结果事件时，`usage_status=not_observed`，token 为 NULL，不意味着零用量。`usage_effective` 只用于当前有效用量核验；未知、部分、冲突与未观察到的状态仍需分别展示。
 
@@ -647,7 +649,7 @@ Consumer 在提交 offset 前按本批 UUID 跨全部在线分区核对事件变
 -- 按 UUIDv4 查询，覆盖全部在线分区。
 SELECT * FROM metering.requests WHERE logical_request_id = ?;
 
--- 客户精查。第二个参数为 365 日在线窗口的 Unix 毫秒下界。
+-- 客户精查。第二个参数为自然月在线窗口的 Unix 毫秒下界。
 SELECT r.logical_request_id, r.x_request_id, r.request_started_at_ms,
        r.service_id, r.response_model, r.usage_status,
        r.observation_status, r.input_tokens, r.output_tokens,
@@ -668,7 +670,7 @@ ORDER BY r.request_started_at_ms, r.logical_request_id LIMIT 100;
 
 -- 运维核验同一事件的变体。
 SELECT event_id, payload_hash, event_json
-FROM metering.event_variants
+FROM metering.events_raw
 WHERE logical_request_id = ?
 ORDER BY event_id, payload_hash;
 

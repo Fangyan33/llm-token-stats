@@ -9,6 +9,7 @@ import (
 	"github.com/Fangyan33/llm-token-stats/internal/config"
 	"github.com/Fangyan33/llm-token-stats/internal/identitylookup"
 	"github.com/Fangyan33/llm-token-stats/pkg/requesthost"
+	"github.com/Fangyan33/llm-token-stats/pkg/statwindow"
 	"github.com/Fangyan33/llm-token-stats/pkg/strictjson"
 	"math"
 	"sort"
@@ -62,7 +63,7 @@ func Decode(b, key []byte, now time.Time) (*Event, error) {
 	}
 	if !now.IsZero() {
 		date := time.UnixMilli(e.RequestStartedAtMs).UTC().Format("2006-01-02")
-		if e.RequestStartedAtMs > now.UnixMilli()+300000 || date < now.UTC().AddDate(0, 0, -364).Format("2006-01-02") {
+		if e.RequestStartedAtMs > now.UnixMilli()+300000 || date < statwindow.Start(now).Format("2006-01-02") {
 			return nil, errors.New("event_time")
 		}
 	}
@@ -103,7 +104,7 @@ func Decode(b, key []byte, now time.Time) (*Event, error) {
 		return nil, errors.New("event_missing_usage")
 	}
 	for _, a := range e.AnomalyCodes {
-		if e.UsageEligible && a != "invalid_model" {
+		if e.UsageEligible && a != "invalid_model" && a != "identity_invalid" {
 			return nil, errors.New("event_eligible")
 		}
 		if *e.ObservationStatus == "complete" && Has([]string{"missing_end", "protocol_error", "protocol_incomplete", "parse_limit", "transport_lost", "observation_timeout"}, a) {

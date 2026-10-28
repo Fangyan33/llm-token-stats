@@ -1,5 +1,7 @@
 # 通过第三方 API 解析服务、供应商与客户归属的实现计划
 
+迁移整理说明（2026-10-28）：本文保留归属功能实施记录；其中旧迁移编号、日/月实体表及补列流程已由最终初始化结构替代。当前执行顺序和对象清单以[数据库初始化说明](../../../deploy/doris/README.md)及[数据库字典](../../doris-database-schema.md)为准。
+
 修订日期：2026-10-23。状态：P0–P7 的占位链路、HTTP 查询、请求头认证、prd/stg/dev 环境枚举、名称快照持久化，以及响应包装、数值字符串错误码、responseMsg 脱敏日志和实例内结果缓存均已实现；401/403 在响应头确认时撤销旧值及未定稿候选。本地验证结果见第 8 节和验证记录。功能尚未上线，生产第三方地址、凭据及完整 G0–G5 尚待真实环境验收。
 
 Observer 在配置非空 HTTP/HTTPS URI 后启用真实 POST JSON 查询，使用独立的 x-remote-data 凭据；空 URI 继续返回 lookup_not_implemented。service_name、provider_name、customer_name 与 ID 一起冻结，经 Kafka、Consumer 写入 Doris 独立列及 event_json。环境仅接受 prd/stg/dev，不接受旧值或别名；不回填既有事件。业务 api_key 仍固定来自 Authorization: Bearer。

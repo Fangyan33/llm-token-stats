@@ -75,7 +75,7 @@ func TestBearerPrivacyAndInvalidInputs(t *testing.T) {
 				t.Fatal("read event")
 			}
 			var e events.Event
-			if json.Unmarshal([]byte(raw), &e) != nil || host != want.host || e.MappingStatus != want.serviceStatus || e.CustomerMappingStatus != want.customerStatus || e.IdentityStatus != "invalid" || e.UsageEligible || e.ApiKeyID != nil || e.CustomerID != nil || e.ServiceID != nil || e.ProviderID != nil {
+			if json.Unmarshal([]byte(raw), &e) != nil || host != want.host || e.MappingStatus != want.serviceStatus || e.CustomerMappingStatus != want.customerStatus || e.IdentityStatus != "invalid" || e.UsageEligible != (e.EventType == "usage_observed") || e.ApiKeyID != nil || e.CustomerID != nil || e.ServiceID != nil || e.ProviderID != nil {
 				t.Fatal("invalid or fabricated attribution")
 			}
 			if strings.Contains(raw, token) || strings.Contains(raw, `"api_key"`) {
@@ -196,9 +196,9 @@ func TestWasmHostAllowlist(t *testing.T) {
 	}
 }
 
-// This exercises reference SQL with synthetic Kafka identities; it does not
-// enable an application resolver, a publication Worker or a customer query API.
-func TestSummarySQLWithSyntheticMappings(t *testing.T) {
+// This exercises the shared request projection with synthetic Kafka identities.
+// Nested MV refresh is covered by the isolated summaryworker integration test.
+func TestStatisticsProjectionWithSyntheticMappings(t *testing.T) {
 	db, cl := database(t), kafka(t)
 	customer := "summary-" + uuid(t)
 	ids := []string{}
@@ -254,47 +254,21 @@ func TestSummarySQLWithSyntheticMappings(t *testing.T) {
 		var n int
 		return db.QueryRow("SELECT COUNT(*) FROM metering_development.events_raw WHERE logical_request_id IN ("+where+")").Scan(&n) == nil && n == len(ids)
 	})
-	now := time.Now().UTC()
-	month := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, time.UTC)
-	token := strings.ReplaceAll(uuid(t), "-", "")
-	values := strings.NewReplacer("metering.", "metering_development.", "{{yyyymmdd}}", now.Format("20060102"), "{{stat_date}}", now.Format("2006-01-02"), "{{next_date}}", now.AddDate(0, 0, 1).Format("2006-01-02"), "{{yyyymm}}", now.Format("200601"), "{{month_start}}", month.Format("2006-01-02"), "{{next_month}}", month.AddDate(0, 1, 0).Format("2006-01-02"), "{{refresh_token}}", token, "{{refresh_id}}", uuid(t), "{{source_watermark}}", events.Hash([]byte(token)))
-	for _, name := range []string{"refresh_usage_daily.sql", "publish_usage_daily.sql", "refresh_usage_monthly.sql", "publish_usage_monthly.sql"} {
-		data, err := os.ReadFile(filepath.Join("../../scripts/sql", name))
-		if err != nil {
-			t.Fatal(err)
-		}
-		// Strip comments before splitting the fixed reference statements.
-		var lines []string
-		for _, line := range strings.Split(values.Replace(string(data)), "\n") {
-			if !strings.HasPrefix(strings.TrimSpace(line), "--") {
-				lines = append(lines, line)
-			}
-		}
-		for _, statement := range strings.Split(strings.Join(lines, "\n"), ";") {
-			if strings.TrimSpace(statement) != "" {
-				if _, err = db.Exec(statement); err != nil {
-					t.Fatal(name, err)
-				}
-			}
-		}
+	var count, unknownService, unknownCustomer int
+	if err := db.QueryRow("SELECT COUNT(*) FROM metering_development.request_statistics WHERE customer_id=?", customer).Scan(&count); err != nil || count != 4 {
+		t.Fatal("customer projection count", count, err)
 	}
-	for _, table := range []string{"usage_daily", "usage_monthly"} {
-		var count, unknownService, unknownCustomer int
-		if db.QueryRow("SELECT COUNT(*) FROM metering_development."+table+" WHERE customer_id=?", customer).Scan(&count) != nil || count != 4 {
-			t.Fatal("customer summary count", table, count)
-		}
-		if db.QueryRow("SELECT COUNT(*) FROM metering_development."+table+" WHERE customer_id=? AND provider_id='' AND service_id=''", customer).Scan(&unknownService) != nil || unknownService != 1 {
-			t.Fatal("unknown service bucket", table)
-		}
-		if db.QueryRow("SELECT COUNT(*) FROM metering_development."+table+" WHERE customer_id=? AND model='unknown_customer'", customer).Scan(&unknownCustomer) != nil || unknownCustomer != 0 {
-			t.Fatal("unknown customer attributed", table)
-		}
-		var raw []byte
-		if db.QueryRow("SELECT CAST(input_tokens AS STRING) FROM metering_development."+table+" WHERE customer_id=? AND model='unknown_usage'", customer).Scan(&raw) != nil || raw != nil {
-			t.Fatal("unknown usage became zero", table)
-		}
-		if db.QueryRow("SELECT CAST(input_tokens AS STRING) FROM metering_development."+table+" WHERE customer_id=? AND model='reported_zero'", customer).Scan(&raw) != nil || !bytes.Equal(raw, []byte("0")) {
-			t.Fatal("reported zero lost", table)
-		}
+	if err := db.QueryRow("SELECT COUNT(*) FROM metering_development.request_statistics WHERE customer_id=? AND provider_id IS NULL AND service_id IS NULL", customer).Scan(&unknownService); err != nil || unknownService != 1 {
+		t.Fatal("unknown service attribution", unknownService, err)
+	}
+	if err := db.QueryRow("SELECT COUNT(*) FROM metering_development.request_statistics WHERE logical_request_id IN (" + where + ") AND customer_id IS NULL AND api_key_id IS NULL AND service_id IS NOT NULL AND statistics_usage_eligible=1").Scan(&unknownCustomer); err != nil || unknownCustomer != 1 {
+		t.Fatal("unknown customer excluded from service usage", unknownCustomer, err)
+	}
+	var raw []byte
+	if err := db.QueryRow("SELECT CAST(input_tokens AS STRING) FROM metering_development.request_statistics WHERE customer_id=? AND model='unknown_usage'", customer).Scan(&raw); err != nil || raw != nil {
+		t.Fatal("unknown usage became zero", err)
+	}
+	if err := db.QueryRow("SELECT CAST(input_tokens AS STRING) FROM metering_development.request_statistics WHERE customer_id=? AND model='reported_zero'", customer).Scan(&raw); err != nil || !bytes.Equal(raw, []byte("0")) {
+		t.Fatal("reported zero lost", err)
 	}
 }

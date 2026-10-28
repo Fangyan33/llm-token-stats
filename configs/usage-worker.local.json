@@ -1,0 +1,11 @@
+{
+  "doris": {"database": "metering_development", "dsn_env": "DORIS_DSN"},
+  "summary_worker": {
+    "collection_start_date": "2026-10-28",
+    "refresh_timeout_seconds": 1800,
+    "poll_interval_seconds": 2,
+    "max_run_seconds": 21600,
+    "lock_mode": "local",
+    "lock_file": "/tmp/metering-summary-locks/metering-development.lock"
+  }
+}

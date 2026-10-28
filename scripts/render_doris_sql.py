@@ -3,6 +3,8 @@ import argparse
 from pathlib import Path
 import re
 
+MIGRATIONS = ('001_init.sql', '002_consumer_coordination.sql', '003_usage_summaries.sql')
+
 
 def database_name(value):
     if not re.fullmatch(r'[A-Za-z][A-Za-z0-9_]{0,63}', value):

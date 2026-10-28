@@ -3,6 +3,7 @@ import contextlib
 import html
 import io
 from pathlib import Path
+import re
 import shutil
 import sys
 import tempfile
@@ -44,37 +45,32 @@ class DorisSchemaTests(unittest.TestCase):
     def test_all_current_objects_and_columns_have_annotations(self):
         tables = [r for r in self.relations.values() if r['kind'] == 'TABLE']
         views = [r for r in self.relations.values() if r['kind'] == 'VIEW']
-        self.assertEqual((len(tables), sum(len(r['columns']) for r in tables)), (12, 214))
-        self.assertEqual((len(views), sum(len(r['columns']) for r in views)), (7, 318))
+        self.assertEqual((len(tables), sum(len(r['columns']) for r in tables)), (10, 122))
+        self.assertEqual((len(views), sum(len(r['columns']) for r in views)), (5, 189))
+        materialized = [r for r in self.relations.values() if r['kind'] == 'MATERIALIZED VIEW']
+        self.assertEqual([r['name'] for r in materialized], ['usage_daily_mv', 'usage_monthly_mv'])
         for relation in self.relations.values():
             self.assertTrue(relation['purpose'].strip())
             self.assertTrue(all(col['comment'].strip() for col in relation['columns']))
 
-    def test_migration_is_reproducible_and_metadata_only(self):
-        actual = (schema.DDL / schema.COMMENT_MIGRATION).read_text()
-        self.assertEqual(actual, schema.migration(self.relations))
-        changes = list(schema.statements(actual))
-        self.assertEqual(len(changes), 12 + 214 + 7)
-        for change in changes:
-            self.assertTrue(change.startswith(('ALTER TABLE metering.', 'ALTER VIEW metering.')))
-            if change.startswith('ALTER TABLE'):
-                self.assertRegex(change, r'^ALTER TABLE metering\.\w+ MODIFY (?:COLUMN \w+ )?COMMENT ')
-            else:
-                name = change.split(' ', 3)[2].split('.', 1)[1]
-                self.assertEqual(change.split(') AS\n', 1)[1], self.relations[name]['query'])
-
-    def test_name_migration_preserves_records_and_rebuilds_current_projections(self):
-        source = (schema.DDL / '008_name_snapshots.sql').read_text()
-        self.assertEqual(source, schema.name_migration(self.relations))
-        changes = list(schema.statements(source))
-        self.assertEqual(len(changes), 10)
-        for change in changes[:3]:
-            self.assertRegex(change, r'^ALTER TABLE metering.events_raw ADD COLUMN \w+ VARCHAR\(512\) NULL COMMENT ')
-        for change in changes[3:]:
-            relation = schema.parse_relation(change, '008_name_snapshots.sql')
-            expected = self.relations[relation['name']]
-            self.assertEqual(relation['columns'], expected['columns'])
-            self.assertEqual(relation['query'], expected['query'])
+    def test_only_final_objects_are_created_in_dependency_order(self):
+        retired = {'usage_daily', 'usage_monthly', 'summary_refresh_inputs',
+                   'summary_refresh_runs', 'summary_refresh_state',
+                   'event_variants', 'events_valid', 'request_statistics_mv'}
+        self.assertFalse(retired.intersection(self.relations))
+        created = set()
+        for name in schema.INITIALIZATIONS:
+            for statement in schema.statements((schema.DDL / name).read_text()):
+                self.assertFalse(statement.startswith(('ALTER ', 'DROP ', 'CREATE OR REPLACE ')))
+                if not statement.startswith(('CREATE TABLE ', 'CREATE VIEW ', 'CREATE MATERIALIZED VIEW ')):
+                    continue
+                relation = schema.parse_relation(statement, name)
+                if 'query' in relation:
+                    dependencies = set(re.findall(r'(?:FROM|JOIN) metering\.(\w+)', relation['query']))
+                    self.assertTrue(dependencies <= created, (relation['name'], dependencies - created))
+                self.assertNotIn(relation['name'], created)
+                created.add(relation['name'])
+        self.assertEqual(created, set(self.relations))
 
     def test_document_inventory_meanings_and_table_types_match_ddl(self):
         document, live = self.document_metadata()
@@ -105,15 +101,19 @@ class DorisSchemaTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 schema.validate_live(self.relations, live)
 
-    def test_existing_projection_override_cannot_drop_annotations(self):
+    def test_duplicate_or_unlisted_initialization_is_rejected(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             for name in schema.INITIALIZATIONS:
                 shutil.copyfile(schema.DDL / name, root / name)
-            path = root / '006_optional_route_identity.sql'
-            text = path.read_text().replace("request_date COMMENT '", "request_date COMMENT '漂移", 1)
-            path.write_text(text)
-            with self.assertRaisesRegex(ValueError, 'annotation drift'):
+            path = root / schema.INITIALIZATIONS[-1]
+            duplicate = next(q for q in schema.statements((root / schema.INITIALIZATIONS[0]).read_text())
+                             if q.startswith('CREATE VIEW '))
+            path.write_text(path.read_text() + duplicate + ';\n')
+            with self.assertRaisesRegex(ValueError, 'duplicate relation'):
+                schema.schema(root)
+            (root / '999_unlisted.sql').write_text('SELECT 1;')
+            with self.assertRaisesRegex(ValueError, 'file inventory drift'):
                 schema.schema(root)
 
     def test_sql_strings_decimal_arrays_and_empty_comments(self):
@@ -143,18 +143,22 @@ COMMENT '测试表';
                 schema.live_columns("metering'; DROP DATABASE metering")
         command.assert_not_called()
 
-    def test_migration_cli_honors_explicit_database(self):
+    def test_document_cli_reads_explicit_database(self):
+        _, live = self.document_metadata()
         output = io.StringIO()
-        with patch.object(sys, 'argv', ['doris_schema.py', 'migration', '--database', 'metering_notes_test']), \
+        with patch.object(sys, 'argv', ['doris_schema.py', 'document', '--database', 'metering_notes_test']), \
+                patch.object(schema, 'live_columns', return_value=live) as metadata, \
                 contextlib.redirect_stdout(output):
             schema.main()
-        for statement in schema.statements(output.getvalue()):
-            self.assertTrue(statement.startswith(('ALTER TABLE metering_notes_test.',
-                                                  'ALTER VIEW metering_notes_test.')))
+        metadata.assert_called_once_with('metering_notes_test')
+        self.assertEqual(output.getvalue().strip(), schema.document(self.relations, live).strip())
 
-    def test_initialization_harnesses_apply_comment_update(self):
-        for name in ('scripts/local_collection.py', 'scripts/k8s_collection.py'):
-            self.assertIn(schema.COMMENT_MIGRATION, (schema.ROOT / name).read_text())
+    def test_packaging_and_initialization_share_the_same_migrations(self):
+        import package_distribution
+        import local_collection
+        import k8s_collection
+        for module in (package_distribution, local_collection, k8s_collection):
+            self.assertEqual(module.MIGRATIONS, schema.INITIALIZATIONS)
 
 
 if __name__ == '__main__':

@@ -49,7 +49,7 @@ KAFKA_EXTERNAL_HOST=192.168.227.128 make local-up
 
 Kafka 容器内客户端仍使用 `kafka:9092`。重建容器时 Kafka 日志及 Doris FE/BE 数据由命名卷保留；首次从旧版无持久卷配置启动时，脚本先停栈，将原数据备份到 `.tmp/local-storage-*` 并迁移到卷，再重建容器。已有不匹配的目标卷会使迁移停止，避免覆盖或合并历史。不要使用 `docker compose down -v` 删除数据卷。
 
-`make local-up` 在 `dist/envoy.remote.json` 渲染实际 Wasm 摘要，重启 Fixture/Observer/Consumer，核对下载内容后重建网关。网关只挂载配置，插件来自 Observer HTTP 下载。更新本地产物后运行 `make build wasm local-up`，再运行 `GOFLAGS='-count=1' make local-test`，不能仅重启旧网关而沿用旧摘要。脚本只初始化该 Compose 栈，应用 001/002/004/005/006/007 migration，在独立 metering_development 库执行新初始化，并创建 24 分区、72 小时保留、delete 策略的 llm-metering-development topic。明文 Kafka、合成鉴权、副本数 1 与 Doris root 空密码仅用于开发联调；生产按原方案配置认证、副本、min ISR 和最小权限账号。
+`make local-up` 在 `dist/envoy.remote.json` 渲染实际 Wasm 摘要，重启 Fixture/Observer/Consumer，核对下载内容后重建网关。网关只挂载配置，插件来自 Observer HTTP 下载。更新本地产物后运行 `make build wasm local-up`，再运行 `GOFLAGS='-count=1' make local-test`，不能仅重启旧网关而沿用旧摘要。脚本只初始化该 Compose 栈，应用 001/002/003 migration，在独立 metering_development 库执行新初始化，并创建 24 分区、72 小时保留、delete 策略的 llm-metering-development topic。明文 Kafka、合成鉴权、副本数 1 与 Doris root 空密码仅用于开发联调；生产按原方案配置认证、副本、min ISR 和最小权限账号。
 
 普通 JSON / SSE 合成请求：
 
@@ -96,7 +96,7 @@ FROM metering_development.requests
 WHERE logical_request_id = '<logical_request_id>' AND has_conflict = 0;
 ```
 
-新库初始化定义已包含名称；已有当前开发库先通过 `008_name_snapshots.sql` 添加缺失列并重建视图，再执行 `007_schema_comments.sql` 更新注释。本地脚本自动检查并补当前 `metering_development`，不修改 legacy `metering` 或历史 Kubernetes 库；旧行保持名称 NULL，不根据最新目录回填。不要把 CREATE TABLE IF NOT EXISTS 或仅更新 007 当作实体列已增加。
+新库初始化直接包含名称列及最终视图；名称只作为请求快照保存。迁移不再提供补列、重建旧视图或补注释脚本，本地入口要求已有库与当前模型一致，否则应选择隔离空库重新初始化。工具不会自动删除旧开发数据。
 
 ## 协议生成与版本
 
@@ -191,11 +191,11 @@ Consumer 按 Kafka 分区跨多次拉取攒批：达到 `max_batch_rows`（默�
 
 即使没有后续消息，未满批次到期也会写入。攒批期间保留 Kafka poll 的 rebalance 保护；一个攒批窗口到期时也会写入其他分区的未满批次，然后允许分区移交，避免持续流量无限推迟 rebalance。写库或巡检耗时可能延长实际可见延迟，15000 ms 是默认攒批等待预算。失败时回退到冻结批次的首 offset、沿用原内容及 label；分区撤销清除未提交缓冲，后续 owner 从 Kafka 已提交位置重放。
 
-新增 [005 migration](../migrations/doris/metering/005_consumer_recovery.sql) 保存消费起点和保留期缺口；这些表及凭据/通知本轮不自动清理。新组持久登记 Kafka earliest；已有组缺少起点时通过 `initial_offsets` 明确接管。多份不兼容起点阻塞分区。已保存的恢复位置落后于 earliest 时登记缺口并暂停；经人工处置后，`gap_resume_offsets` 必须填写该分区当时的 earliest，不能填 latest。恢复新流量不会抹掉缺口或把历史覆盖改为可信。
+[消费协调初始化](../migrations/doris/metering/002_consumer_coordination.sql)保存消费起点和保留期缺口；这些表及凭据/通知本轮不自动清理。新组持久登记 Kafka earliest；已有组缺少起点时通过 `initial_offsets` 明确接管。多份不兼容起点阻塞分区。已保存的恢复位置落后于 earliest 时登记缺口并暂停；经人工处置后，`gap_resume_offsets` 必须填写该分区当时的 earliest，不能填 latest。恢复新流量不会抹掉缺口或把历史覆盖改为可信。
 
 未知正整数 schema_version 暂停分区且不提交；格式错误及永久非法消息只保存坐标、摘要和固定原因，不持久化原始非法正文。每分钟巡检永久冲突与连续水位：由持久起点、区间凭据和 Kafka committed offset 推导，不使用 MAX(offset) 跨越空洞。存在缺口、缺凭据或巡检失败会使 Consumer `/readyz` 为 503。单次证据/凭据扫描有 100000 行保护，达限即停止确认并计数；生产扩展需验证巡检容量。
 
-本轮没有实现统计/查询 API 或 usage-worker，因此尚无对外有效统计发布。后续 Worker 必须独立核对上述持久证据、通知、Kafka offset 和冲突维护状态并停止不可信发布；不能把 Consumer 健康探针当作持久发布凭据。
+统计/查询 HTTP API 尚未实现。usage-worker 已实现基于日期通知的 T+1 日/月物化视图刷新和恢复；成功状态说明对应日期的已观察数据完成计算，不代表 Kafka 已消费到最新或不存在历史缺口。需同时核对消费凭据、offset 和 consumer_partition_gaps，不能把 Consumer 健康探针当作完整性证明。运行及回填见[Doris 调度与恢复](doris-summary-coordination.md)。
 
 固定指标不携带 UUID、身份或正文标签。Wasm 暴露选择/忽略、改写/取消原因与 active_streams/inflight_bytes/inflight_messages/active_rewrites/rewrite_reserved_bytes；Observer 暴露 active_streams/parser_reserved_bytes、定稿与发送结果；Consumer 暴露 batch_committed/batch_failure、partition_paused、audit/watermark 状态。服务均有 `/livez`、`/readyz`、`/metrics`。资源预算是记账上限，尚需加上 Go/VM heap、HTTP2/native buffer 及存活代数，不能等同于 RSS 承诺。
 
@@ -213,8 +213,8 @@ G0–G5 仍须独立完成：私有镜像/真实 Auth、HTTP2 慢上传与断开
 
 ## 归属配置与隔离库
 
-Observer 必填 cluster_name、deployment_environment，service_lookup/customer_lookup 各有可空 uri。非空 URI 使用 HTTP/HTTPS 和独立 x-remote-data 凭据，空 URI 使用 lookup_not_implemented 占位；未启用接口时不要求第三方 Secret。Wasm 先按 Host 筛选，非法 Host 不建立观察；invalid_host 仍为历史诊断契约保留。两事件复用快照，客户失败使 identity_status=invalid、usage_eligible=false，不清除原始已观察 usage。
+Observer 必填 cluster_name、deployment_environment，service_lookup/customer_lookup 各有可空 uri。非空 URI 使用 HTTP/HTTPS 和独立 x-remote-data 凭据，空 URI 使用 lookup_not_implemented 占位；未启用接口时不要求第三方 Secret。Wasm 先按 Host 筛选，非法 Host 不建立观察；invalid_host 仍为历史诊断契约保留。两事件复用快照，客户失败使 identity_status=invalid，但不单独影响 usage_eligible；用量资格由观察完整度、用量状态和质量异常决定。客户/API Key 报表仍需过滤未知归属。
 
 Consumer 的 doris.database、DSN、Stream Load 和证据/巡检 SQL 使用同一经过校验的库名。初始化使用 `python3 scripts/render_doris_sql.py --database 数据库 migrations/doris/metering/001_init.sql`，对其余初始化 SQL 同样渲染。本地默认 metering_development，新 Kubernetes 测试每次用 metering_k8s_<run-id>；不修改旧 metering 库及其消息，清理保留测试库作为证据。普通 Docker 联调使用合成 token 和隔离明文网络；生产/真实密钥只允许已验证的网格 mTLS/TLS。
 
-数据库字段及每张表的作用见[数据库表与字段文档](doris-database-schema.md)。007_schema_comments.sql 为已有当前模型库补齐注释，不更改数据类型、键或分区；旧 metering 库不在本次更新范围。
+数据库字段及每张表的作用见[数据库表与字段文档](doris-database-schema.md)。全部表和字段注释直接随初始化脚本创建，数据库字典通过隔离库的实际元数据校验后生成。

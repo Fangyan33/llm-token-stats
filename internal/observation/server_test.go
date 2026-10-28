@@ -126,10 +126,10 @@ func TestObserveEOSAndOnceFinalization(t *testing.T) {
 			if _, err = events.Decode(b, []byte(e.LogicalRequestID), time.Now()); err != nil {
 				t.Fatal(err)
 			}
-			if !badEnd && !limited && mode != "unimplemented" && !e.UsageEligible {
+			if !badEnd && !limited && !e.UsageEligible {
 				t.Fatal("not eligible", e.AnomalyCodes)
 			}
-			if mode == "unimplemented" && (e.UsageEligible || e.MappingStatus != "lookup_not_implemented" || e.CustomerMappingStatus != "lookup_not_implemented" || e.IdentityStatus != "invalid" || e.UsageStatus != "known") {
+			if mode == "unimplemented" && (e.MappingStatus != "lookup_not_implemented" || e.CustomerMappingStatus != "lookup_not_implemented" || e.IdentityStatus != "invalid" || e.UsageStatus != "known") {
 				t.Fatal("stub changed usage or invented identity")
 			}
 			if (badEnd || limited) && (e.TerminalObserved || e.UsageEligible) {

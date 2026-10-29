@@ -126,7 +126,9 @@ Host 无效或不匹配时，在提取凭据、建立观察流、缓存或改写
 ## 已确认的旧版网关处理
 
 - 请求头 Continue；符合条件的正文在非 EOS 回调 Pause，EOS 时只修改 `stream_options.include_usage`。请求头可先到上游。这是用户在真实旧版 ext_authz PoC 后确认的调整：暂停头会延迟已缓冲正文回调直到改写超时。
-- 改写预算与观察预算独立；Observer 不可用仍可补充参数。超限、超时或 JSON 无效时恢复原文，响应正文一直 Continue。旧版真实慢上传 PoC 中，Root 异步 Resume 后尾片可能不再完整经过 Wasm 回调，因此超时恢复会在有界前缀后取消观察，结果保留 partial/unknown，不宣称完整用量。JSON 校验限制深度 64、元素 100000、单对象键 8192；超限取消解析/原文放行。这些额外保护可能使复杂合法 JSON 降级，不能宣称所有请求均能改写。
+- 改写从请求头开始计时，默认/最大 450 ms，tick 默认/最大 10 ms，目标在 500 ms 内原文放行；允许调度拥塞或恢复调用暂时失败时短暂超出。正文回调及解析结束均检查截止时间。旧合法配置中的 2000 ms/100 ms 在运行时收紧，新发布配置须通过更严格校验。
+- 超时优先恢复业务，不复制缓冲前缀、不等待旁路清理；恢复失败保留状态并在后续 tick 重试，下一次正文回调直接透传。改写恢复队列独立于观察超时，指标失败不会 panic。配置更新先恢复存量请求；取消的观察保持 partial/unknown。VM 或 Envoy 自身失效仍不能由插件定时器保证恢复。
+- 改写预算与观察预算独立；Observer 不可用仍可补充参数。超限、超时或 JSON 无效时恢复原文，响应正文一直 Continue。旧版真实慢上传 PoC 中，Root 异步 Resume 后尾片可能不再完整经过 Wasm 回调，因此超时恢复会取消观察且不再复制缓冲前缀，结果保留 partial/unknown，不宣称完整用量。JSON 校验限制深度 64、元素 100000、单对象键 8192；超限取消解析/原文放行。这些额外保护可能使复杂合法 JSON 降级，不能宣称所有请求均能改写。
 - 当前 Wasm 配置资源整数还限制在有符号 32 位正值范围，防止 TinyGo wasm32 的长度转换溢出；给出的初值全部满足。预发布仍必须运行 Schema 与关系校验。
 - 当前默认规则为 `route_name: "*"`，忽略路由名，采集匹配顶层 `accepted_request_hosts` 的 `POST /v1/chat/completions`；路由属性或 metadata 缺失也可命中。路径去掉查询串后精确匹配，其它方法、尾斜杠、子路径和不同路径均忽略。精确路由规则仍支持：先读取可信 `route_name`，缺失时读取 `route_metadata.filter_metadata.metering.route_name`，都不可读时该精确规则不命中。规则按配置顺序选择，不读取客户端提供的路由或身份头。
 服务及供应商由 Observer 的服务查询接口解析，客户/API Key ID 由客户接口解析；空 URI 为占位，启用 HTTP/HTTPS 适配后同时保存名称。route_name 仅诊断，不参与身份摘要；旧 accepted_routes、身份元数据配置及规则 service_id 已删除。同一事件不同内容仍冲突。
@@ -209,7 +211,7 @@ Consumer 按 Kafka 分区跨多次拉取攒批：达到 `max_batch_rows`（默�
 
 已通过契约/文档/表字段一致性检查、25 项 Python 测试（含本地地址配置、迁移覆盖保护和备份失败恢复）、Go 单元和竞态测试、SDK internal/proxytest 测试、TinyGo 编译与 ABI 检查。事件规范编码与摘要同六份 Python golden 对照；标准/手工 Protobuf 互操作、非法帧、逐字节 JSON/SSE 分片、usage 候选冲突、提交屏障故障及撤销 owner 由自动测试覆盖。
 
-真实本地集成覆盖普通 JSON、SSE/响应 trailers、Start ACK 关联、unknown 保留 NULL、非白名单请求、相同事件重放去重、不同变体冲突隔离、日期通知/凭据、未知版本暂停；HTTP1 chunked 中途停顿超过 2 秒、256 KiB 边界/边界加一/1 MiB 请求的上游正文摘要保持原样，超时观察降为 partial/unknown，正常延迟响应中的计量 ID 与事件一致；真实 BE 写入后断开 HTTP 确认，仍确认原 label 与行键；独立 TCP Kafka 黑洞验证发送不阻塞及有界超时/watchdog。测试及失败诊断由 `make local-test` 重现。
+真实本地集成覆盖普通 JSON、SSE/响应 trailers、Start ACK 关联、unknown 保留 NULL、非白名单请求、相同事件重放去重、不同变体冲突隔离、日期通知/凭据、未知版本暂停；HTTP1 chunked 中途停顿超过 500 ms、256 KiB 边界/边界加一/1 MiB 请求的上游正文摘要保持原样，超时观察降为 partial/unknown，正常延迟响应中的计量 ID 与事件一致；真实 BE 写入后断开 HTTP 确认，仍确认原 label 与行键；独立 TCP Kafka 黑洞验证发送不阻塞及有界超时/watchdog。测试及失败诊断由 `make local-test` 重现。
 
 G0–G5 仍须独立完成：私有镜像/真实 Auth、HTTP2 慢上传与断开/热更新故障交叉、真实 Pod 崩溃及 rebalance 压测、Kafka 保留期丢失后运维恢复、峰值两倍/24 小时/10 分钟 SSE、首包/明细/查询延迟、灰度回退与旧代释放。已有本地证据不等于这些门槛全部通过。
 

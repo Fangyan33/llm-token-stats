@@ -437,3 +437,13 @@ Observer 的服务与客户查询分别增加实例内 LRU 成功缓存，默认
 - 独立 Kubernetes 用例 `make k8s-test K8S_TEST_ARGS='--namespace metering-wasm-pod-name'` 通过，run-id `a5407427a99d`，继续覆盖部署隔离、1→2 网关扩容及 18 条事件入库。
 - 随后运行 `.tmp/verify_long_pod_name.py`，在同一隔离命名空间创建真实 Pod（名称为 64 个 a），经同一 EnvoyFilter 自动安装插件。JSON/SSE/unknown 三类请求分别保存完整实例名称（87 字节），新增 6 条事件进入独立 Doris 库，累计 24 条提交完成；原有 istio-system 网关未变。该长名 Pod 已删除。
 - 证据：`.tmp/k8s-collection/kind-kind/metering-wasm-pod-name/a5407427a99d/long-pod-name.result.json`、`requests.long-pod-name.json`、`result.json`。新包 `dist/package-pod-name-fix` 的 Wasm 摘要与真实长名 Pod 验证一致：`3795ee822b8a13c5a12763cf7d79b34871b82931a7c3c72622de7514942c71e6`。
+
+## 2026-10-29：保留 usage 改写，缩短暂停并加强失败恢复
+
+- 保留 `stream=true` 时自动添加或覆盖 `stream_options.include_usage=true`。从请求头开始计时，默认/最大改写截止时间 450 ms，tick 默认/最大 10 ms；旧合法配置的 2000 ms/100 ms 在运行时收紧。500 ms 为暂停目标，调度或恢复 hostcall 暂时失败时允许短暂超出。
+- 改写恢复使用独立优先队列；正文回调和 JSON 解析结束均检查截止时间，超时不提交改写。超时恢复先调用 Resume，再清理旁路，不复制缓冲前缀；恢复失败保留状态并重试，下次正文回调直接透传。SDK 指标新增非 panic 调用，指标故障不打断恢复。
+- `GOFLAGS='-count=1 -p=1' make test` 通过：90 项 Python 测试及主模块/插件 Go 竞态测试。新增用例覆盖读取/替换失败、恢复/上下文切换暂时失败、下一正文回调自恢复、配置更新、上下文删除、观察超时堆积、指标失败、旧配置兼容及 Observer 失联后仍成功补充参数。最后补充用例后的插件竞态测试也通过。
+- SDK 独立执行 `go test -race -count=1 ./proxywasm ./proxywasm/proxytest` 通过；`make build`、`make wasm` 与 ABI 检查通过。Wasm SHA-256：`c1c7027d9e8ee53131c478d3ed967f9650237cfcbfa19b77a6b946ed5ba47ae1`。
+- `GOFLAGS='-count=1 -p=1 -run=^TestWasmRewriteFailOpen$' make local-test` 通过。测试使用隔离的 `istio/proxyv2:1.13.5`、合成上游及不可达 Observer，分别覆盖 HTTP/1.1 与 HTTP/2 的成功改写、非法 JSON、超限、trailers 和慢上传。trailers 测试显式启用 Envoy 两端 HTTP/1 trailers，避免将默认丢弃行为误判为插件行为。
+- 慢上传故意不发送尾片，等待上游收到原始前缀后才继续上传；最后一次实测分别为 HTTP/1.1 466.9 ms、HTTP/2 455.3 ms，最终响应 200、上游正文与原文逐字节一致。测试使用 1200 ms 失败阈值以容忍调度抖动，同时记录实测延迟；这不是对 500 ms 硬上限的证明。
+- 完整 Kafka/Doris 联调未完成：`make local-up` 在既有开发库关系清单校验处退出，错误为 `Existing Doris schema differs from the current model; initialize an isolated empty database`。未更改既有表或数据，测试启动的 Compose 服务已停止，数据卷保留。没有执行生产 G0–G5 或 VM trap/OOM 验收；插件定时器无法替代宿主/进程级故障保障。

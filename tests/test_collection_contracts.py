@@ -262,8 +262,8 @@ class CollectionContractsTest(unittest.TestCase):
             ("root_rewrite_budget_bytes", 1048576),
             ("rewrite_reservation_bytes", 262144),
             ("request_body_max_bytes", 262145),
-            ("rewrite_timeout_ms", 2001),
-            ("tick_ms", 2001),
+            ("rewrite_timeout_ms", 451),
+            ("tick_ms", 11),
             ("chunk_bytes", 0),
         ]
         for name, value in changes:

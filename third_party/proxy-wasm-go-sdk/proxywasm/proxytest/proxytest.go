@@ -166,7 +166,8 @@ func NewHostEmulator(opt *EmulatorOption) (host HostEmulator, reset func()) {
 		emulator.properties[key] = value
 	}
 
-	release := internal.RegisterMockWasmHost(emulator)
+	hostFailures = map[string]int{}
+	release := internal.RegisterMockWasmHost(faultHost{emulator})
 
 	// set up state
 	proxywasm.SetVMContext(opt.vmContext)

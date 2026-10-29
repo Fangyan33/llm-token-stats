@@ -10,6 +10,11 @@ import (
 	"unicode/utf8"
 )
 
+// Leave scheduling headroom below the 500ms business pause target. Legacy
+// valid configurations remain readable, but cannot extend these runtime caps.
+const MaxRewriteTimeoutMS int64 = 450
+const MaxTickMS int64 = 10
+
 func Decode(b []byte) (Config, error) {
 	var c Config
 	if len(b) > 65536 || strictjson.Decode(b, &c) != nil {
@@ -70,6 +75,8 @@ func Decode(b []byte) (Config, error) {
 	if c.ChunkBytes > 16384 || c.RequestBodyMaxBytes > 262144 || c.ResponseBodyMaxBytes > 8388608 || c.RewriteTimeoutMS > 2000 || c.ObservationMaxMS > 600000 || c.AckMaxBytes > 1024 || c.MetadataMaxBytes < 6144 || c.MetadataMaxBytes > 6144 || c.CallbackMaxBytes > c.ChunkBytes*c.CallbackMaxChunks || c.StreamInflightBytes < c.RequestBodyMaxBytes+chunks*256+8192 || c.StreamInflightMessages < chunks+4 || c.RootInflightBytes < c.StreamInflightBytes || c.RootInflightMessages < c.StreamInflightMessages || c.RewriteReservationBytes < c.RequestBodyMaxBytes*4 || c.RootRewriteBudgetBytes < c.RewriteReservationBytes*c.RootMaxRewrites || c.TickMS > c.AckTimeoutMS || c.ObserverCluster == "" {
 		return c, errors.New("config_budget")
 	}
+	c.RewriteTimeoutMS = min(c.RewriteTimeoutMS, MaxRewriteTimeoutMS)
+	c.TickMS = min(c.TickMS, MaxTickMS, c.RewriteTimeoutMS)
 	return c, nil
 }
 func str(s string, max int) bool { return len(s) > 0 && len(s) <= max && utf8.ValidString(s) }

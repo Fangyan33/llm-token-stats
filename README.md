@@ -168,6 +168,8 @@ git push origin v0.1.0
 
 工作流先创建草稿并上传全部附件，上传成功才发布；含短横线的 tag（如 `v0.1.0-rc.1`）标记为预发布。已有 Release 时拒绝覆盖。上传失败可能留下草稿，删除该草稿后可以重跑；已发布版本的变更使用新 tag。构建失败时查看 Actions 日志，发布成功不代表生产部署验收完成。
 
+采集插件对受支持的流式 JSON 请求自动添加 `stream_options.include_usage=true`。改写默认最多等待 450 ms，每 10 ms 检查超时；失败或超时原文转发，调度拥塞或恢复调用短暂失败时可能超过 500 ms。旧合法配置的较大超时在运行时收紧。详见[请求改写与故障恢复](docs/gateway-request-collection-implementation.md#43-请求-usage-参数补充与回调伪代码)。
+
 ### Wasm 打包、下载与摘要
 
 Observer 镜像将同一份 `dist/gateway-observer-v1.wasm` 放在 `/usr/share/metering/wasm/gateway-observer-v1.wasm`。根目录 `.dockerignore` 只放行这份 Wasm，不将其他构建产物送入镜像。网关复用已有 Istio 镜像，通过 Observer 下载插件；插件随 Observer 镜像发布，无需独立 Deployment。

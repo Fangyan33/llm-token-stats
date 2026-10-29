@@ -116,7 +116,7 @@
     "rewrite_timeout_ms": {
       "type": "integer",
       "minimum": 1,
-      "maximum": 2000
+      "maximum": 450
     },
     "rewrite_reservation_bytes": {
       "type": "integer",
@@ -181,7 +181,7 @@
     "tick_ms": {
       "type": "integer",
       "minimum": 1,
-      "maximum": 4294967295
+      "maximum": 10
     },
     "metadata_max_bytes": {
       "type": "integer",

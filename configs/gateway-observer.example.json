@@ -20,7 +20,7 @@
   "callback_max_bytes": 65536,
   "callback_max_chunks": 4,
   "request_body_max_bytes": 262144,
-  "rewrite_timeout_ms": 2000,
+  "rewrite_timeout_ms": 450,
   "rewrite_reservation_bytes": 1048576,
   "root_rewrite_budget_bytes": 16777216,
   "root_max_rewrites": 16,
@@ -33,7 +33,7 @@
   "ack_timeout_ms": 2000,
   "end_ack_timeout_ms": 2000,
   "observation_max_ms": 600000,
-  "tick_ms": 100,
+  "tick_ms": 10,
   "metadata_max_bytes": 6144,
   "ack_max_bytes": 1024,
   "accepted_request_hosts": [

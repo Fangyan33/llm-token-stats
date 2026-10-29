@@ -2,6 +2,7 @@ package main
 
 import (
 	"container/heap"
+	"errors"
 	"github.com/Fangyan33/llm-token-stats/pkg/credentials"
 	"github.com/Fangyan33/llm-token-stats/pkg/gatewayconfig"
 	w "github.com/Fangyan33/llm-token-stats/pkg/observationwire"
@@ -27,10 +28,9 @@ func (*vm) NewPluginContext(id uint32) types.PluginContext {
 }
 
 type deadline struct {
-	at      time.Time
-	id      uint32
-	rewrite bool
-	idx     int
+	at  time.Time
+	id  uint32
+	idx int
 }
 type deadlines []*deadline
 
@@ -76,6 +76,7 @@ type root struct {
 	rewrites     int64
 	rewriteBytes int64
 	q            deadlines
+	rewriteQ     deadlines
 	metrics      map[string]proxywasm.MetricCounter
 	gauges       map[string]proxywasm.MetricGauge
 	gaugeValues  [5]int64
@@ -90,12 +91,17 @@ func (r *root) resourceMetrics() {
 		value := values[i]
 		g, ok := r.gauges[name]
 		if !ok {
-			g = proxywasm.DefineGaugeMetric("metering_" + name)
+			var err error
+			g, err = proxywasm.TryDefineGaugeMetric("metering_" + name)
+			if err != nil {
+				continue
+			}
 			r.gauges[name] = g
 		}
 		if value != r.gaugeValues[i] {
-			g.Add(value - r.gaugeValues[i])
-			r.gaugeValues[i] = value
+			if g.TryAdd(value-r.gaugeValues[i]) == nil {
+				r.gaugeValues[i] = value
+			}
 		}
 	}
 }
@@ -103,10 +109,14 @@ func (r *root) resourceMetrics() {
 func (r *root) count(name string) {
 	m, ok := r.metrics[name]
 	if !ok {
-		m = proxywasm.DefineCounterMetric("metering_" + name + "_total")
+		var err error
+		m, err = proxywasm.TryDefineCounterMetric("metering_" + name + "_total")
+		if err != nil {
+			return
+		}
 		r.metrics[name] = m
 	}
-	m.Increment(1)
+	_ = m.TryIncrement(1)
 }
 func (r *root) OnPluginStart(_ int) types.OnPluginStartStatus {
 	r.cleanup()
@@ -265,30 +275,35 @@ func (r *root) OnReceive(token uint32, size int) {
 }
 func (r *root) OnClose(token, status uint32) { r.drop(r.states[token], "transport_lost") }
 func (r *root) OnTick() {
+	// Business resumes have their own queue: a backlog of observation ACK
+	// timeouts must not consume their processing budget.
+	for i := 0; i < 256 && len(r.rewriteQ) > 0 && !r.rewriteQ[0].at.After(time.Now()); i++ {
+		d := heap.Pop(&r.rewriteQ).(*deadline)
+		if h := r.requests[d.id]; h != nil {
+			h.downgrade(true)
+		}
+	}
 	for i := 0; i < 256 && len(r.q) > 0 && !r.q[0].at.After(time.Now()); i++ {
 		d := heap.Pop(&r.q).(*deadline)
-		if d.rewrite {
-			if h := r.requests[d.id]; h != nil {
-				h.downgrade(true)
-			}
-		} else {
-			r.drop(r.states[d.id], "timeout")
-		}
+		r.drop(r.states[d.id], "timeout")
 	}
 }
 
 type httpContext struct {
 	types.DefaultHttpContext
-	root       *root
-	id         uint32
-	selected   bool
-	cfg        gatewayconfig.Config
-	instanceID string
-	s          *state
-	rewrite    bool
-	timer      *deadline
-	status     uint64
-	closed     bool
+	root         *root
+	id           uint32
+	selected     bool
+	cfg          gatewayconfig.Config
+	instanceID   string
+	s            *state
+	rewrite      bool
+	paused       bool
+	passthrough  bool
+	rewriteUntil time.Time
+	timer        *deadline
+	status       uint64
+	closed       bool
 }
 
 func header(k string) string         { v, _ := proxywasm.GetHttpRequestHeader(k); return v }
@@ -365,8 +380,9 @@ func (h *httpContext) OnHttpRequestHeaders(_ int, eos bool) types.Action {
 			r.resourceMetrics()
 			h.rewrite = true
 			r.requests[h.id] = h
-			h.timer = &deadline{at: now.Add(time.Duration(h.cfg.RewriteTimeoutMS) * time.Millisecond), id: h.id, rewrite: true, idx: -1}
-			heap.Push(&r.q, h.timer)
+			h.rewriteUntil = now.Add(time.Duration(h.cfg.RewriteTimeoutMS) * time.Millisecond)
+			h.timer = &deadline{at: h.rewriteUntil, id: h.id, idx: -1}
+			heap.Push(&r.rewriteQ, h.timer)
 			if err := proxywasm.RemoveHttpRequestHeader("content-length"); err == nil {
 				action = types.ActionContinue
 			} else {
@@ -453,44 +469,68 @@ func (h *httpContext) releaseRewrite() {
 		return
 	}
 	h.rewrite = false
+	h.paused = false
 	delete(h.root.requests, h.id)
 	h.root.rewrites--
 	h.root.rewriteBytes -= h.cfg.RewriteReservationBytes
-	h.root.resourceMetrics()
 	if h.timer != nil && h.timer.idx >= 0 {
-		heap.Remove(&h.root.q, h.timer.idx)
+		heap.Remove(&h.root.rewriteQ, h.timer.idx)
+	}
+	h.root.resourceMetrics()
+}
+
+func (h *httpContext) retryResume() {
+	// Preserve the reservation and request until Resume succeeds or the HTTP
+	// context is deleted. Once passthrough is set, no callback may pause again.
+	h.timer.at = time.Now().Add(time.Duration(gatewayconfig.MaxTickMS) * time.Millisecond)
+	if h.timer.idx < 0 {
+		heap.Push(&h.root.rewriteQ, h.timer)
+	} else {
+		heap.Fix(&h.root.rewriteQ, h.timer.idx)
 	}
 }
+
 func (h *httpContext) downgrade(resume bool) {
 	if !h.rewrite {
 		return
 	}
-	old := proxywasm.CurrentEffectiveContext()
-	defer proxywasm.SetEffectiveContext(old)
-	if proxywasm.SetEffectiveContext(h.id) != nil {
-		h.releaseRewrite()
-		h.root.drop(h.s, "context_lost")
-		return
-	}
-	b, err := proxywasm.GetHttpRequestBody(0, int(h.cfg.RequestBodyMaxBytes)+1)
-	if err == nil && len(b) <= int(h.cfg.RequestBodyMaxBytes) {
-		h.observeBytes(0, b, false, true)
-	} else {
-		h.root.drop(h.s, "body_limit")
+	h.passthrough = true
+	if resume && h.paused {
+		old := proxywasm.CurrentEffectiveContext()
+		defer proxywasm.SetEffectiveContext(old)
+		if err := proxywasm.SetEffectiveContext(h.id); err != nil {
+			if errors.Is(err, types.ErrorStatusNotFound) {
+				h.releaseRewrite() // The request no longer exists in the host.
+			} else {
+				h.retryResume()
+			}
+			h.root.count("rewrite_context_failed")
+			h.root.drop(h.s, "context_lost")
+			return
+		}
+		// Resume before reading/copying buffers, observation I/O or metrics.
+		// Envoy owns the original buffer; no replacement is needed to pass it on.
+		if err := proxywasm.ResumeHttpRequest(); err != nil {
+			h.retryResume()
+			h.root.count("rewrite_resume_failed")
+			h.root.drop(h.s, "rewrite_timeout_boundary")
+			return
+		}
 	}
 	h.releaseRewrite()
 	h.root.count("rewrite_passthrough")
-	if resume {
-		// Async resume in the fixed Envoy may bypass later body callbacks.
-		// Stop after the bounded prefix when tail boundaries cannot be proven.
-		h.root.drop(h.s, "rewrite_timeout_boundary")
-		if proxywasm.ResumeHttpRequest() != nil {
-			h.root.count("rewrite_resume_failed")
-		}
-	}
+	// Async resume may bypass later body callbacks in the pinned Envoy. Do not
+	// delay business resume to copy the buffered prefix or claim completeness.
+	h.root.drop(h.s, "rewrite_timeout_boundary")
 }
 func (h *httpContext) OnHttpRequestBody(n int, eos bool) types.Action {
 	if !h.selected {
+		return types.ActionContinue
+	}
+	// This callback can release any existing pause by returning Continue.
+	h.paused = false
+	if h.rewrite && (h.passthrough || !time.Now().Before(h.rewriteUntil)) {
+		h.downgrade(false)
 		return types.ActionContinue
 	}
 	h.root.count("request_body_callbacks")
@@ -510,12 +550,8 @@ func (h *httpContext) OnHttpRequestBody(n int, eos bool) types.Action {
 			return types.ActionContinue
 		}
 		if !eos {
+			h.paused = true
 			return types.ActionPause
-		}
-		// Include conservative growth for the usage field before reading the
-		// final buffer; rewrite itself remains independent of observation.
-		if h.root.active(h.s) {
-			h.bodyCapacity(0, min(n+128, int(h.cfg.RequestBodyMaxBytes)), eos)
 		}
 		b, err := proxywasm.GetHttpRequestBody(0, n)
 		if err != nil {
@@ -524,6 +560,12 @@ func (h *httpContext) OnHttpRequestBody(n int, eos bool) types.Action {
 			return types.ActionContinue
 		}
 		out, err := strictjson.RewriteUsage(b, int(h.cfg.RequestBodyMaxBytes))
+		// Parsing/serialization also consumes the same absolute budget. Never
+		// commit a late rewrite, even when the timer could not run in between.
+		if !time.Now().Before(h.rewriteUntil) {
+			h.downgrade(false)
+			return types.ActionContinue
+		}
 		if err != nil {
 			out = b
 			h.root.count("rewrite_invalid_json")
@@ -535,8 +577,8 @@ func (h *httpContext) OnHttpRequestBody(n int, eos bool) types.Action {
 				return types.ActionContinue
 			}
 		}
-		h.observeBytes(0, out, eos, true)
 		h.releaseRewrite()
+		h.observeBytes(0, out, eos, true)
 		return types.ActionContinue
 	}
 	h.observeBuffer(0, n, eos)

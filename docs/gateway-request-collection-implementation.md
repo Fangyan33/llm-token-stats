@@ -260,7 +260,9 @@ WASM 中不引入 gRPC-Go、网络 goroutine、完整 Envoy protobuf 类型或�
 2. 请求体以 Envoy 累积缓冲为准，未 EOS 返回 Pause，不将每次累计 buffer 重复追加。原始请求上限 256 KiB，改写结果也必须不超过 256 KiB；每个待改写请求预留 1 MiB，覆盖 host buffer、WASM 读取副本、输出和解析索引，Root 总预算 16 MiB、最多 16 个并发。超过预算直接原样放行并记 `rewrite_resource_limit`；不等待额度。host 超限回调的额外字节及 native buffer 另计入网关预算。
 3. 完整 JSON 有界校验后，仅对顶层布尔 `stream=true` 改写：没有 stream_options 或值为 null 时创建对象；已有对象时保留其他字段，把 include_usage 添加或替换为 true；原本为 true 时幂等。`stream=false` 或未设置 stream 的普通请求不添加该字段。stream_options 为其他类型、重复键、非法 JSON、深度超过 64、元素超过 100000 或单对象键超过 8192 时保持原文并记 `rewrite_invalid_json`。采用 token 位置编辑，避免重新编码 messages/tools、改变数值精度或其他业务字段。
 4. 在最终 body 回调内调用 `ReplaceHttpRequestBody`，成功后返回 Continue。改写后的请求是唯一请求观察来源：从 offset=0 分片，只发送一次；按 16 KiB 拆片、在途不足时放弃旁路，不等待 ACK。这个有界完整请求路径不套用流式响应的 64 KiB/4 片回调限制。替换失败只在已验证 host 未修改原 buffer 时原文放行，不能转发部分改写内容。
-5. 改写在请求头回调后 2000 ms 判到期，实际恢复还受 tick/Worker 调度影响，必须实测到期恢复延迟。Root tick 在 HTTP context 仍存活时切换有效上下文，超时则 `ResumeHttpRequest` 原文放行并转入永久透传状态；后续片段不再次缓冲或改写。超限、客户端断开、context 删除和热更新都释放改写预算；降级时只观察已缓冲原文一次；只有可证明尾片缓冲边界时才接续观察，超出正文上限或无法取得一致缓冲时直接取消旁路。固定旧版 Envoy 的 Root 异步恢复 PoC 显示尾片可能不完整经过 Wasm，因此当前超时恢复原文后取消观察，结果为 partial/unknown，详见闭环清单第 4 节；暂停期间的 trailers 结束路径须在真实 Envoy 验证正文改写 hostcall 是否可用，若不可用则原文恢复并记 `rewrite_trailers_unsupported`，不能无限 Pause。任何旁路网络操作不得延长暂停期限。
+5. 改写从请求头回调开始使用一次性绝对截止时间，默认且运行时最多 450 ms，tick 默认且最多 10 ms，为 500 ms 暂停目标留出调度余量；正文回调进入时及 JSON 改写后再次检查截止时间，到期即放弃修改、原文 Continue，后续片段不重新计时或暂停。新发布配置限制在上述范围；旧版合法的 2000 ms/100 ms 配置在运行时自动收紧，不因升级停止采集。改写恢复使用独立优先队列，每 tick 最多处理 256 项，然后才处理观察超时；观察 ACK 堆积不得占用改写恢复额度。
+6. Root 超时恢复只对已返回 Pause 的请求切换有效上下文并调用 ResumeHttpRequest，优先于读取正文、旁路发送、清理和指标；未暂停的请求只退出改写状态。超时路径不再复制或观察缓冲前缀，直接取消边界不可信的观察流，保留 partial/unknown。Resume 或上下文切换暂时失败时保留改写预算与待恢复状态，按 10 ms 重试；下次正文回调直接 Continue，禁止再次改写或暂停。上下文已删除则释放状态，配置更新先恢复存量请求。所有采集指标使用非 panic 接口，指标失败不阻断业务恢复。
+7. 调度拥塞或恢复 hostcall 暂时失败可使实际暂停短暂超过 500 ms，需在真实 Envoy 下测量；450 ms 是放弃改写的截止时间，不是硬实时承诺。Wasm VM trap、Envoy 线程停摆或进程故障不受插件内定时器保障，仍需独立故障验收。正文超限、读取/替换失败及不支持的 trailers 路径均原文放行；客户端断开或 HTTP context 删除时清理预算。
 
 改写状态为 BYPASS / BUFFERING / REWRITTEN / PASSTHROUGH，与观察状态机独立。上述失败路径遵循业务 fail-open，但意味着 include_usage 未保证注入，必须单独统计 `rewrite_failed`（固定原因码），纳入采集完整率告警和灰度验收，不能静默宣称成功。压缩、非法 JSON、超限等不支持场景不承诺 usage 完整；正常支持范围内的缺字段/false 请求必须补充成功。
 
@@ -351,7 +353,7 @@ func (p *PluginContext) OnTick() {
 | callback_max_bytes | uint32/字节 | 65536 | 复制前取消旁路 |
 | callback_max_chunks | uint32/个 | 4 | 取消旁路 |
 | request_body_max_bytes | uint64/字节 | 262144 | 取消旁路，Observer 以已见内容定稿 |
-| rewrite_timeout_ms | uint32/毫秒 | 2000 | 原文恢复、永久透传 |
+| rewrite_timeout_ms | uint32/毫秒 | 450 | 原文恢复、永久透传 |
 | rewrite_reservation_bytes | uint32/字节 | 1048576 | 单次改写固定预留 |
 | root_rewrite_budget_bytes | uint64/字节 | 16777216 | 无额度原文透传并计数 |
 | root_max_rewrites | uint32/个 | 16 | 同上 |
@@ -364,7 +366,7 @@ func (p *PluginContext) OnTick() {
 | ack_timeout_ms | uint32/毫秒 | 2000 | 按最早未确认帧取消旁路 |
 | end_ack_timeout_ms | uint32/毫秒 | 2000 | End 发送后清理旁路 |
 | observation_max_ms | uint32/毫秒 | 600000 | 10 分钟后停止观察，业务继续 |
-| tick_ms | uint32/毫秒 | 100 | 有界处理到期项 |
+| tick_ms | uint32/毫秒 | 10 | 优先恢复请求，再有界处理观察到期项 |
 | metadata_max_bytes | uint32/字节 | 6144 | 无效元数据跳过/取消 |
 | ack_max_bytes | uint32/字节 | 1024 | 取消旁路 |
 
@@ -718,7 +720,7 @@ Consumer/Doris 故障可以依赖 Kafka 72 小时保留恢复，与禁止采集�
   "callback_max_bytes": 65536,
   "callback_max_chunks": 4,
   "request_body_max_bytes": 262144,
-  "rewrite_timeout_ms": 2000,
+  "rewrite_timeout_ms": 450,
   "rewrite_reservation_bytes": 1048576,
   "root_rewrite_budget_bytes": 16777216,
   "root_max_rewrites": 16,
@@ -731,7 +733,7 @@ Consumer/Doris 故障可以依赖 Kafka 72 小时保留恢复，与禁止采集�
   "ack_timeout_ms": 2000,
   "end_ack_timeout_ms": 2000,
   "observation_max_ms": 600000,
-  "tick_ms": 100,
+  "tick_ms": 10,
   "metadata_max_bytes": 6144,
   "ack_max_bytes": 1024,
   "accepted_request_hosts": [
@@ -1073,7 +1075,7 @@ SDK 单元测试验证 hostcall 签名和回调注册/清理；标准 Protobuf �
 
 | 专项样本 | 固定测试口径 | 必须验证 |
 | --- | --- | --- |
-| 慢上传 | HTTP/1.1 chunked 与 HTTP/2；64 KiB、256 KiB JSON；分别按 32 KiB/s 匀速上传及正文中途停顿超过 2 秒 | 改写等待到 2000 ms 后按有界 tick 恢复原文透传，不无限 Pause；报告额外首包延迟、`rewrite_failed`、内存和上游收到的实际正文 |
+| 慢上传 | HTTP/1.1 chunked 与 HTTP/2；64 KiB、256 KiB JSON；分别按 32 KiB/s 匀速上传及正文中途停顿超过 500 ms | 改写等待到 450 ms 后按 10 ms tick 优先恢复原文透传，不无限 Pause；报告额外首包延迟、`rewrite_failed`、内存和上游收到的实际正文 |
 | 大请求 | 256 KiB 边界、256 KiB + 1 字节和 1 MiB JSON；覆盖 `stream=true`、`stream=false` 以及 `include_usage` 缺失/false/true | 界内合法请求只改目标字段；超限原文透传且计数；不截断、不重复发送正文，释放改写预算 |
 | 故障交叉 | 慢上传和大请求分别叠加 Observer 不可用、客户端断开与网关热更新 | 业务不因旁路网络等待；超时、断开和热更新后预算按期限释放，业务内容和状态与基线一致（允许约定的 usage 块及计量响应头差异），或明确记录已有业务失败 |
 

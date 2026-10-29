@@ -411,7 +411,7 @@ func (r *stalledBody) Read(b []byte) (int, error) {
 	}
 	if !r.wait {
 		r.wait = true
-		time.Sleep(2200 * time.Millisecond)
+		time.Sleep(650 * time.Millisecond)
 	}
 	if len(r.tail) > 0 {
 		n := copy(b, r.tail)

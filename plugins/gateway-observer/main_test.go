@@ -229,6 +229,21 @@ func testHostWithConfig(t *testing.T, route string, change func(map[string]any))
 }
 
 func testHostWithIdentity(t *testing.T, route string, change func(map[string]any), namespace, name string) proxytest.HostEmulator {
+	h, _ := testHostAndRoot(t, route, change, namespace, name)
+	return h
+}
+
+type capturedVM struct {
+	vm
+	root *root
+}
+
+func (v *capturedVM) NewPluginContext(id uint32) types.PluginContext {
+	v.root = v.vm.NewPluginContext(id).(*root)
+	return v.root
+}
+
+func testHostAndRoot(t *testing.T, route string, change func(map[string]any), namespace, name string) (proxytest.HostEmulator, *root) {
 	t.Helper()
 	proxytest.ResetGrpc()
 	b, err := os.ReadFile("../../configs/gateway-observer.example.json")
@@ -242,7 +257,8 @@ func testHostWithIdentity(t *testing.T, route string, change func(map[string]any
 		change(c)
 	}
 	b, _ = json.Marshal(c)
-	option := proxytest.NewEmulatorOption().WithVMContext(&vm{}).WithPluginConfiguration(b)
+	v := &capturedVM{}
+	option := proxytest.NewEmulatorOption().WithVMContext(v).WithPluginConfiguration(b)
 	if namespace != "" {
 		option = option.WithProperty([]string{"node", "metadata", "NAMESPACE"}, []byte(namespace))
 	}
@@ -257,7 +273,7 @@ func testHostWithIdentity(t *testing.T, route string, change func(map[string]any
 	if host.StartVM() != types.OnVMStartStatusOK || host.StartPlugin() != types.OnPluginStartStatusOK {
 		t.Fatal("start")
 	}
-	return host
+	return host, v.root
 }
 
 func TestWildcardSelectsWithoutRouteMetadata(t *testing.T) {
@@ -316,7 +332,7 @@ func TestRewriteTimeoutResumesAndStopsAmbiguousObservation(t *testing.T) {
 	if h.CallOnRequestBody(id, prefix, false) != types.ActionPause {
 		t.Fatal("body did not pause")
 	}
-	time.Sleep(2100 * time.Millisecond)
+	time.Sleep(470 * time.Millisecond)
 	h.Tick()
 	if h.GetCurrentHttpStreamAction(id) != types.ActionContinue {
 		t.Fatal("timeout did not resume")
@@ -335,8 +351,8 @@ func TestRewriteTimeoutResumesAndStopsAmbiguousObservation(t *testing.T) {
 			seen = append(seen, c.Data...)
 		}
 	}
-	if string(seen) != string(prefix) || !calls[0].Cancelled {
-		t.Fatalf("prefix duplicated or lost: bytes=%d cancelled=%t", len(seen), calls[0].Cancelled)
+	if len(seen) != 0 || !calls[0].Cancelled {
+		t.Fatalf("timeout resume must not copy prefix or retain observation: bytes=%d cancelled=%t", len(seen), calls[0].Cancelled)
 	}
 }
 func TestFullRequestBoundaryAndControlReserve(t *testing.T) {

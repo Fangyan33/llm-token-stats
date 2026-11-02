@@ -1,4 +1,4 @@
-"""清理本地 Kubernetes 采集测试资源，保留共享 Kafka/Doris 数据卷。"""
+"""清理本地 Kubernetes 采集测试资源，删除命名空间内 Kafka/Doris，保留本地诊断。"""
 import sys
 from k8s_collection import main
 

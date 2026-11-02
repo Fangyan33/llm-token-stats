@@ -10,7 +10,7 @@
 
 ## 构建、测试与本地开发
 
-使用 Go 1.25.0、TinyGo 0.40.1、Python 3.10+；集成测试需要 Docker Compose。以下命令均在仓库根目录执行：
+使用 Go 1.25.0、TinyGo 0.40.1、Python 3.10+；E2E 测试需要本地 kind Kubernetes 1.22.17、Istio 1.13.5 和 Docker（构建并导入镜像）。以下命令均在仓库根目录执行：
 
 | 命令 | 用途 |
 | --- | --- |
@@ -18,7 +18,8 @@
 | `make wasm` | 构建 Wasm 并检查 ABI |
 | `make test` | 契约校验、Python 测试及主模块和插件的 Go 竞态测试 |
 | `make local-up` | 构建完成后启动 Envoy、Kafka、Doris 联调栈 |
-| `make local-test` | 执行真实链路集成测试 |
+| `make k8s-test` | 在隔离 Kubernetes 命名空间执行部署验收和完整 E2E 故障回归 |
+| `make k8s-clean` | 清理测试命名空间及其中的 Kafka、Doris 和临时数据，保留本地诊断 |
 | `make generate` | 从 Protobuf 重新生成 Go 代码 |
 | `python3 scripts/local_collection.py stop` | 停止联调栈并保留数据 |
 
@@ -30,7 +31,7 @@ Go 使用 `gofmt` 和标准 Tab 缩进，包名保持小写。新 Python 文件�
 
 ## 测试要求
 
-Go 使用标准 `testing`，文件命名为 `*_test.go`、函数命名为 `TestXxx`；Python 使用 `unittest`。根目录 `go test ./...` 不覆盖独立插件模块，优先运行 `make test`。当前没有固定覆盖率门槛；行为变更应覆盖对应边界、故障或重放场景。协议变更同步更新 Schema、配置、迁移、合成样例及相关文档。网关链路变更另运行 `make wasm` 和 `make local-test`；本地通过不代表生产 G0–G5 验收完成。
+Go 使用标准 `testing`，文件命名为 `*_test.go`、函数命名为 `TestXxx`；Python 使用 `unittest`。根目录 `go test ./...` 不覆盖独立插件模块，优先运行 `make test`。当前没有固定覆盖率门槛；行为变更应覆盖对应边界、故障或重放场景。协议变更同步更新 Schema、配置、迁移、合成样例及相关文档。网关链路变更另运行 `make wasm` 和 `make k8s-test`；本地通过不代表生产 G0–G5 验收完成。
 
 ## 提交与 Pull Request
 

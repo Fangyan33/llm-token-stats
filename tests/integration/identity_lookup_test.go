@@ -9,7 +9,6 @@ import (
 	"io"
 	"net/http"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -26,7 +25,7 @@ func TestBearerPrivacyAndInvalidInputs(t *testing.T) {
 	var requests []expected
 	for _, mode := range []string{"valid", "duplicate", "joined", "missing", "other_scheme"} {
 		id := uuid(t)
-		req, _ := http.NewRequest("POST", "http://127.0.0.1:18080/v1/chat/completions", strings.NewReader(`{"model":"fixture","stream":false}`))
+		req, _ := http.NewRequest("POST", "http://e2e-gateway:8080/v1/chat/completions", strings.NewReader(`{"model":"fixture","stream":false}`))
 		req.Host = "MODEL.Example.invalid:443"
 		req.Header.Set("content-type", "application/json")
 		req.Header.Set("x-request-id", id)
@@ -92,7 +91,7 @@ func TestBearerPrivacyAndInvalidInputs(t *testing.T) {
 	for partition := int32(0); partition < 24; partition++ {
 		partitions[partition] = kgo.NewOffset().AtStart()
 	}
-	reader, err := kgo.NewClient(kgo.SeedBrokers("127.0.0.1:29092"),
+	reader, err := kgo.NewClient(kgo.SeedBrokers("kafka:9092"),
 		kgo.ConsumePartitions(map[string]map[int32]kgo.Offset{"llm-metering-development": partitions}))
 	if err != nil {
 		t.Fatal("independent Kafka reader")
@@ -119,9 +118,8 @@ func TestBearerPrivacyAndInvalidInputs(t *testing.T) {
 	if len(seen) != 2*len(requests) {
 		t.Fatal("Kafka privacy check did not cover every request event")
 	}
-	logs, err := exec.Command("docker", "compose", "-f", "../../deploy/local/compose.yaml", "logs",
-		"--no-color", "observer", "consumer", "gateway", "fixture").Output()
-	if err != nil || bytes.Contains(logs, []byte(token)) {
+	logs := componentLogs(t)
+	if bytes.Contains(logs, []byte(token)) {
 		t.Fatal("component log privacy check failed")
 	}
 }
@@ -152,7 +150,7 @@ func TestWasmHostAllowlist(t *testing.T) {
 			// preserve its original 422 response instead of being rewritten to 200.
 			wantStatus = http.StatusUnprocessableEntity
 		}
-		req, _ := http.NewRequest("POST", "http://127.0.0.1:18080/v1/chat/completions", bytes.NewReader(body))
+		req, _ := http.NewRequest("POST", "http://e2e-gateway:8080/v1/chat/completions", bytes.NewReader(body))
 		req.Host = tc.host
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("x-request-id", id)

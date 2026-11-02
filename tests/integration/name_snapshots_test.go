@@ -130,7 +130,7 @@ func testNamesThroughKafkaToDoris(t *testing.T, secure, cached bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 	h := &health.State{}
-	sink, err := producer.New(ctx, config.Kafka{Brokers: []string{"127.0.0.1:29092"}, Topic: "llm-metering-development"}, h, func() { t.Error("producer watchdog") })
+	sink, err := producer.New(ctx, config.Kafka{Brokers: []string{"kafka:9092"}, Topic: "llm-metering-development"}, h, func() { t.Error("producer watchdog") })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -243,7 +243,7 @@ func testNamesThroughKafkaToDoris(t *testing.T, secure, cached bool) {
 					t.Fatal("remote response envelope persisted in event")
 				}
 			}
-			reader, err := kgo.NewClient(kgo.SeedBrokers("127.0.0.1:29092"), kgo.ConsumePartitions(map[string]map[int32]kgo.Offset{"llm-metering-development": {part: kgo.NewOffset().At(offset)}}))
+			reader, err := kgo.NewClient(kgo.SeedBrokers("kafka:9092"), kgo.ConsumePartitions(map[string]map[int32]kgo.Offset{"llm-metering-development": {part: kgo.NewOffset().At(offset)}}))
 			if err != nil {
 				t.Fatal(err)
 			}

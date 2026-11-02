@@ -18,11 +18,14 @@ class KubernetesCollectionTests(unittest.TestCase):
                 harness = self.harness(directory)
                 harness.run_id = 'unrelated-random-run-id'
                 with patch.object(k8s, 'resolve_image_tag', return_value=version), \
-                        patch.object(k8s, 'run') as run:
+                        patch.object(k8s, 'run') as run, \
+                        patch.object(k8s.k8s_integration, 'prepare_suite'):
                     harness.build_images()
-                expected = ['metering-' + name + ':' + version for name in ('observer', 'consumer', 'fixture')]
+                expected = ['metering-' + name + ':' + version for name in ('observer', 'consumer', 'fixture', 'integration')]
                 builds = [call.args[0] for call in run.call_args_list if call.args[0][:2] == ['docker', 'build']]
                 self.assertEqual([cmd[cmd.index('-t') + 1] for cmd in builds], expected)
+                self.assertEqual(run.call_args_list[-2].args[0], ['kind', 'load', 'docker-image',
+                                                                 *k8s.k8s_integration.IMAGES, '--name', 'kind'])
                 self.assertEqual(run.call_args_list[-1].args[0], ['kind', 'load', 'docker-image',
                                                                  *expected, '--name', 'kind'])
                 saved = json.loads((Path(directory) / 'images.json').read_text())
@@ -91,18 +94,15 @@ class KubernetesCollectionTests(unittest.TestCase):
             topic, group = k8s.isolated_names(run_id)
             k8s.write_json(harness.state_file, {'context': 'kind-kind', 'namespace': harness.namespace,
                                                'run_id': run_id})
-            with patch.object(harness, 'kubectl', return_value=''), \
-                    patch.object(harness, 'kafka', side_effect=[group, '', topic, '', '']) as kafka:
-                harness.cleanup()
-            self.assertEqual(kafka.call_args_list[1].args, ('consumer-groups', '--delete', '--group', group))
-            self.assertEqual(kafka.call_args_list[3].args, ('topics', '--delete', '--topic', topic))
             with patch.object(harness, 'kubectl', return_value=''), patch.object(harness, 'kafka') as kafka:
                 harness.cleanup()
+                harness.cleanup()
             kafka.assert_not_called()
+            self.assertTrue(json.loads(harness.state_file.read_text())['cleaned'])
 
     def test_kubernetes_consumer_and_observer_share_isolated_topic(self):
         topic, group = k8s.isolated_names('0123456789ab')
-        observer, consumer, credentials = k8s.local_configs('192.0.2.10', topic, group)
+        observer, consumer, credentials = k8s.cluster_configs(topic, group)
         source = json.loads((k8s.ROOT / 'configs/observer.production.example.json').read_text())
         for kind in ('service_lookup', 'customer_lookup'):
             self.assertEqual(observer['observer'][kind]['cache'], source['observer'][kind]['cache'])
@@ -112,10 +112,8 @@ class KubernetesCollectionTests(unittest.TestCase):
         self.assertEqual(observer['kafka']['topic'], consumer['kafka']['topic'])
         self.assertNotEqual(topic, 'llm-metering-events')
         self.assertNotEqual(consumer['consumer']['group_id'], 'llm-metering-doris-v1')
-        self.assertIn('192.0.2.10:19030', credentials['DORIS_DSN'])
-        for host in ('127.0.0.1', 'localhost', '0.0.0.0'):
-            with self.assertRaisesRegex(RuntimeError, '不能是回环地址'):
-                k8s.local_configs(host, topic, group)
+        self.assertIn('doris:9030', credentials['DORIS_DSN'])
+        self.assertEqual(observer['kafka']['bootstrap_servers'], ['kafka:9092'])
 
     def test_acceptance_rejects_compose_producer_wrong_topic_and_unknown_zero(self):
         results = [{'scenario': 'unknown', 'x_request_id': 'request'}]
@@ -130,11 +128,71 @@ class KubernetesCollectionTests(unittest.TestCase):
         for row in missing:
             row[11] = 'unknown'
         k8s.validate_events(copy.deepcopy(results), missing, 'gateway-test/gateway-pod', {'observer-pod-uid'}, 'test-topic')
+        known = copy.deepcopy(rows)
+        known[1][3:6] = ['known', '10', '4']
+        known[1][7] = '1'
+        k8s.validate_events([{'scenario': 'json', 'x_request_id': 'request'}], known,
+                            'gateway-test/gateway-pod', {'observer-pod-uid'}, 'test-topic')
         for column, value in ((9, 'compose-observer'), (10, 'llm-metering-events'), (4, '0'), (11, '*'), (11, 'llm-chat')):
             invalid = copy.deepcopy(rows)
             invalid[1][column] = value
             with self.assertRaises(RuntimeError):
                 k8s.validate_events(copy.deepcopy(results), invalid, 'gateway-test/gateway-pod', {'observer-pod-uid'}, 'test-topic')
+
+    def test_entire_e2e_runs_in_namespace_without_host_dependencies(self):
+        integration = k8s.k8s_integration
+        infra = integration.infrastructure('metering-wasm-unit')
+        names = {item['metadata']['name'] for item in infra['items']}
+        self.assertEqual(names, {'kafka', 'doris'})
+        job = integration.job_resources('metering-wasm-unit', 'metering-integration:test')
+        encoded = json.dumps(job)
+        for forbidden in ('hostPath', 'hostNetwork', 'docker.sock', 'cluster-admin'):
+            self.assertNotIn(forbidden, encoded)
+        roles = [item for item in job['items'] if item['kind'] == 'Role']
+        self.assertEqual(len(roles), 1)
+        self.assertTrue(all(rule['apiGroups'] == [''] for rule in roles[0]['rules']))
+        workload = next(item for item in job['items'] if item['kind'] == 'Job')
+        self.assertEqual(workload['spec']['backoffLimit'], 0)
+        self.assertEqual(workload['spec']['template']['metadata']['annotations']['sidecar.istio.io/inject'], 'false')
+
+    def test_successful_job_must_not_hide_missing_or_skipped_scenarios(self):
+        validate = k8s.k8s_integration.validate_test_log
+        self.assertEqual(validate('--- PASS: TestA (1s)\n--- PASS: TestB (2s)\nPASS\n', {'TestA', 'TestB'}),
+                         {'TestA', 'TestB'})
+        for logs in ('PASS\n', '--- PASS: TestA (1s)\nPASS\n',
+                     '--- PASS: TestA (1s)\n--- PASS: TestB (1s)\n    --- SKIP: TestB/edge (0s)\n'):
+            with self.assertRaises(RuntimeError):
+                validate(logs, {'TestA', 'TestB'})
+
+    def test_normal_gateway_waits_for_download_service_before_start(self):
+        with tempfile.TemporaryDirectory() as directory:
+            harness = self.harness(directory)
+            harness.images = {'integration': 'metering-integration:test'}
+            gateway = {'kind': 'Pod', 'metadata': {'name': 'e2e-gateway'}}
+            manifests = {'apiVersion': 'v1', 'kind': 'List', 'items': [gateway, {'kind': 'Service'}]}
+            events = []
+            with patch.object(harness, 'sql'), patch.object(harness, 'kafka'), \
+                    patch.object(k8s.k8s_integration, 'suite_resources', return_value=manifests), \
+                    patch.object(harness, 'apply', side_effect=lambda v: events.append(('apply', v))), \
+                    patch.object(harness, 'kubectl', side_effect=lambda *a, **k: events.append(('wait', a))), \
+                    patch.object(harness, 'get', side_effect=RuntimeError('stop after setup')):
+                with self.assertRaisesRegex(RuntimeError, 'stop after setup'):
+                    k8s.k8s_integration.run_suite(harness, k8s.ROOT, (), k8s.render_sql)
+            deployment_waits = [i for i, e in enumerate(events) if e[0] == 'wait' and 'rollout' in e[1]]
+            gateway_start = next(i for i, e in enumerate(events) if e == ('apply', gateway))
+            self.assertEqual(len(deployment_waits), 3)
+            self.assertGreater(gateway_start, max(deployment_waits))
+            self.assertNotIn(gateway, events[0][1]['items'])
+
+    def test_infrastructure_restart_cannot_be_reported_as_e2e_success(self):
+        with tempfile.TemporaryDirectory() as directory:
+            harness = self.harness(directory)
+            def pod(name, restarts):
+                return {'metadata': {'name': name}, 'status': {'containerStatuses': [
+                    {'ready': True, 'restartCount': restarts}]}}
+            with patch.object(harness, 'pods', side_effect=[[pod('kafka', 0)], [pod('doris', 1)]]):
+                with self.assertRaisesRegex(RuntimeError, '重启'):
+                    harness.verify_infrastructure()
 
     def test_warming_configuration_is_not_accepted_as_active_wasm(self):
         wasm = {'name': 'envoy.filters.http.wasm', 'typed_config': {'config': {'name': 'gateway-observer'}}}

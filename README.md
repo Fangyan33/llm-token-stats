@@ -208,19 +208,21 @@ Kafka、Doris 使用基础设施镜像；Fixture 由本地 Compose 挂载编译�
 
 ## 开发环境一键启动与测试
 
-工具安装完成、Docker 可用后，执行：
+工具安装完成，且本地 kind 集群已安装 Kubernetes 1.22.17、Istio 1.13.5 后，执行：
 
 ```sh
-make test build wasm local-up local-test
+make test k8s-test
 ```
 
-该命令依次完成检查、编译和 Wasm ABI 验证，启动 Kafka、Doris、Fixture、Observer、Consumer、Envoy，最后执行真实链路集成测试。
+该命令完成代码检查、编译和 Wasm ABI 验证，将 Kafka、Doris、Fixture、Observer、Consumer、Envoy 及测试 Job 部署到隔离命名空间，执行真实链路及故障回归。E2E 统一使用 `make k8s-test`，已移除 `make local-test`。详细依赖和断言见[测试说明](docs/kubernetes-collection-test.md)。
+
+以下 Compose 命令仅用于手工联调，E2E 不依赖这些服务。
 
 `make local-up` 等待基础设施就绪后，应用 `001/002/003` Doris 迁移，在独立的 metering_development 库初始化新表，并创建 24 分区、保留 72 小时的 llm-metering-development topic。它不会编译代码，但会重新渲染下载摘要，重启使用挂载产物的 Fixture、Observer、Consumer，校验下载文件后重建网关。网关只挂载生成的配置，不挂载 Wasm。配置与编排见 [deploy/local/](deploy/local/compose.yaml)。
 
 `make summary-test` 在独立 Doris 库验证 T+1 日/月嵌套物化视图。每日任务运行前需设置真实 `collection_start_date`；运行与回填命令见[调度与恢复](docs/doris-summary-coordination.md)。离线包另包含 `k8s/50-usage-worker.yaml`，默认每天 01:00 UTC 执行，目标控制面调度时区须为 UTC。
 
-`make test` 检查代码和契约，不启动容器，也不写 Doris。`make local-test` 验证实际 Envoy → Observer → Kafka → Consumer → Doris 链路，覆盖 JSON / SSE、未知用量、重放去重、冲突、未知 schema 暂停、写入确认丢失和超时边界。测试使用合成数据，并保留诊断记录。
+`make test` 检查代码和契约，不启动容器，也不写 Doris。`make k8s-test` 验证实际 Envoy → Observer → Kafka → Consumer → Doris 链路，覆盖 JSON / SSE、未知用量、重放去重、冲突、未知 schema 暂停、写入确认丢失和超时边界。测试使用合成数据，并保留诊断记录。
 
 本地发布端口绑定 `0.0.0.0`，用于受控开发网络：
 
@@ -265,7 +267,7 @@ docker compose -f deploy/local/compose.yaml logs --tail=100 observer consumer ga
 
 # 修改代码后重新构建；local-up 重算下载摘要并重启相关进程
 make build wasm local-up
-GOFLAGS='-count=1' make local-test
+make k8s-test
 
 # 停止全部联调组件，保留数据
 python3 scripts/local_collection.py stop
@@ -538,16 +540,14 @@ kubectl delete -f "$DEPLOY_DIR/envoyfilter.disabled.yaml"
 
 ## 本地 Kubernetes / Istio 部署验证
 
-项目已在 Kubernetes 1.22.17 + Istio 1.13.5 上完成实际部署验证，并整理为 K8S-WASM-001 用例。测试将 2 个 Observer 副本、Consumer、独立测试网关和合成鉴权 / 模型 fixture 部署到 Kubernetes，Kafka、Doris 复用本地 Compose。每次测试使用独立的 Doris 库、Kafka topic 和消费组，不依赖 Compose Consumer，也不发布到原 `istio-system` 网关。
+项目已在 Kubernetes 1.22.17 + Istio 1.13.5 上完成实际部署验证，并整理为 K8S-WASM-001 用例。测试将 Kafka、Doris、2 个 Observer 副本、Consumer、独立测试网关和合成鉴权 / 模型 fixture 全部部署到隔离 Kubernetes 命名空间。随后通过 Kubernetes Job 执行迁移后的 Go 集成测试，临时 Envoy 也使用独立 Pod。每次测试使用独立命名空间内的数据，不发布到原 `istio-system` 网关。
 
 ```sh
-# 仅启动 Kafka / Doris 并初始化本地迁移；已就绪可跳过。
-make local-infra-up
-# 构建并实际部署，验证 JSON、SSE、unknown、mTLS 下载及独立 Consumer 入库。
+# 构建并部署完整测试环境，执行部署验收及故障回归。
 make k8s-test
 ```
 
-默认 context 为 `kind-kind`，测试命名空间为 `metering-wasm-verify`。Observer、Consumer、fixture 镜像统一使用 Git tag 或 commit 短 hash 作为版本，测试 topic、消费组和诊断目录则使用随机 run-id。
+默认 context 为 `kind-kind`，测试命名空间为 `metering-wasm-verify`。Observer、Consumer、fixture、integration 镜像统一使用 Git tag 或 commit 短 hash 作为版本，测试 topic、消费组和诊断目录则使用随机 run-id。
 
 测试结束后会保留资源和 `.tmp/k8s-collection/` 下的结果；再次执行时，会先清理归属于本测试的旧环境。网关使用原始 `istio/proxyv2:1.13.5`，不挂载或打包 Wasm。完整前置条件、断言和自定义参数见[测试用例](docs/kubernetes-collection-test.md)，实际结果见[验证记录](docs/spec/plan/gateway-collection-verification.md)。
 
@@ -564,7 +564,7 @@ curl --noproxy '*' -N -H 'Host: wasm-verify.local' -H 'Authorization: Bearer syn
   http://127.0.0.1:28080/v1/chat/completions
 ```
 
-该入口只用于合成验证，不提供真实 API Key 鉴权或模型调用。清理脚本删除本次测试命名空间及独立 Kafka topic / 消费组，保留共享 Compose 数据卷、Doris 历史测试记录和原网关：
+该入口只用于合成验证，不提供真实 API Key 鉴权或模型调用。清理脚本删除本次测试命名空间及其中的 Kafka、Doris、测试数据和临时 Pod；本地诊断及原网关保留：
 
 ```sh
 make k8s-clean

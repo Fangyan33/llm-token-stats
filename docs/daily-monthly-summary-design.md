@@ -57,4 +57,4 @@ Observer 的 `usage_eligible` 不再依赖客户身份。观察完整、终态�
 
 ## 验证边界
 
-`make test` 验证契约和单元/竞态测试；`make summary-test` 使用独立 Doris 库验证日/月嵌套、历史资格、NULL/零、冲突撤回、空结果替换、自然月清理及任务恢复。`make local-test` 验证采集真实链路。生产资源、执行预算和 G0–G5 验收仍需在目标环境完成。
+`make test` 验证契约和单元/竞态测试；`make summary-test` 使用独立 Doris 库验证日/月嵌套、历史资格、NULL/零、冲突撤回、空结果替换、自然月清理及任务恢复。`make k8s-test` 在 Kubernetes 验证采集真实链路及故障回归。生产资源、执行预算和 G0–G5 验收仍需在目标环境完成。

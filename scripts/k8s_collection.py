@@ -1,4 +1,4 @@
-"""本地 Kubernetes 1.22.17 + Istio 1.13.5 部署用例；仅复用 Compose Kafka/Doris。"""
+"""Kubernetes 1.22.17 + Istio 1.13.5 完整部署与故障回归测试。"""
 import argparse
 import contextlib
 import copy
@@ -14,13 +14,13 @@ import urllib.request
 import uuid
 from pathlib import Path
 from image_tag import resolve_image_tag
+import k8s_integration
 from render_doris_sql import MIGRATIONS, render_sql, database_name
 
 ROOT = Path(__file__).resolve().parents[1]
 OWNER_KEY = 'app.kubernetes.io/part-of'
 OWNER = 'llm-token-stats-verification'
 RUN_KEY = 'llm-token-stats/test-run-id'
-COMPOSE = ['docker', 'compose', '-f', str(ROOT / 'deploy/local/compose.yaml')]
 
 
 def run(command, *, input=None, timeout=45, check=True, capture=True):
@@ -86,12 +86,9 @@ def wasm_configs(dump):
             and v.get('typed_config', {}).get('config', {}).get('name') == 'gateway-observer']
 
 
-def local_configs(host, topic, group, database="metering_development"):
+def cluster_configs(topic, group, database="metering_development"):
     database_name(database)
-    require(bool(re.fullmatch(r'[A-Za-z0-9_.-]+', host))
-            and host not in ('localhost', '0.0.0.0') and not host.startswith('127.'),
-            'Compose Kafka 的 EXTERNAL 地址必须能从 Pod 访问，不能是回环地址')
-    kafka = {'bootstrap_servers': [host + ':29092'], 'topic': topic}
+    kafka = {'bootstrap_servers': ['kafka:9092'], 'topic': topic}
     observer = json.loads((ROOT / 'configs/observer.production.example.json').read_text())
     observer['kafka'] = kafka
     consumer = json.loads((ROOT / 'configs/consumer.production.example.json').read_text())
@@ -99,11 +96,11 @@ def local_configs(host, topic, group, database="metering_development"):
     consumer['consumer'].update(group_id=group, flush_interval_ms=1000)
     consumer['doris']['database'] = database
     observer['observer'].update(cluster_name='kind', deployment_environment='stg')
-    # 本地 all-in-one 的 FE 重定向到容器内 127.0.0.1；使用已发布的 BE 直连。
-    consumer['doris']['fe_url'] = 'http://' + host + ':18040'
-    consumer['doris']['allowed_load_hosts'] = [host + ':18040']
+    # all-in-one 直接访问 BE，避免 FE 重定向到容器内回环地址。
+    consumer['doris']['fe_url'] = 'http://doris:8040'
+    consumer['doris']['allowed_load_hosts'] = ['doris:8040']
     credentials = {
-        'DORIS_DSN': ('root@tcp(' + host + ':19030)/' + database + '?timeout=5s&readTimeout=30s'
+        'DORIS_DSN': ('root@tcp(doris:9030)/' + database + '?timeout=5s&readTimeout=30s'
                       '&writeTimeout=10s&interpolateParams=true&time_zone=%27%2B00%3A00%27'),
         'DORIS_USER': 'root', 'DORIS_PASSWORD': '',
     }
@@ -126,7 +123,7 @@ def validate_events(results, rows, gateway_instance_id, producer_ids, topic):
         usage = next(row for row in matches if row[1] == 'usage_observed')
         require(usage[6] == 'complete', '观察结果不完整')
         expected = ['unknown', 'NULL', 'NULL'] if result['scenario'] == 'unknown' else ['known', '10', '4']
-        require(usage[3:6] == expected and usage[7] == '0',
+        require(usage[3:6] == expected and usage[7] == ('0' if result['scenario'] == 'unknown' else '1'),
                 '用量或 unknown/NULL 语义不符合预期')
         result.update(observation_id=usage[2], usage_status=usage[3],
                       input_tokens=None if usage[4] == 'NULL' else int(usage[4]),
@@ -174,13 +171,15 @@ class Harness:
         self.kubectl('apply', '-f', '-', input=json.dumps(value))
 
     def kafka(self, tool, *args):
-        return run([*COMPOSE, 'exec', '-T', 'kafka', '/opt/kafka/bin/kafka-' + tool + '.sh',
-                    '--bootstrap-server', 'kafka:9092', *args]).stdout
+        return self.kubectl('-n', self.namespace, 'exec', 'deployment/kafka', '--',
+                            '/opt/kafka/bin/kafka-' + tool + '.sh',
+                            '--bootstrap-server', 'kafka:9092', *args)
 
     def sql(self, sql):
         sql = render_sql(sql, getattr(self, 'database', 'metering_development'))
-        return run([*COMPOSE, 'exec', '-T', 'doris', 'mysql', '--default-character-set=utf8mb4', '-uroot', '-h127.0.0.1',
-                    '-P9030', '-N', '-e', sql]).stdout
+        return self.kubectl('-n', self.namespace, 'exec', 'deployment/doris', '--',
+                            'mysql', '--default-character-set=utf8mb4', '-uroot', '-h127.0.0.1',
+                            '-P9030', '-N', '-e', sql)
 
     def cleanup(self):
         raw = self.kubectl('get', 'namespace', self.namespace, '--ignore-not-found', '-o', 'json')
@@ -194,27 +193,18 @@ class Harness:
             require(not saved or (saved.get('context') == self.args.context
                                   and saved.get('namespace') == self.namespace), '本地清理记录不匹配')
             run_id = None if saved.get('cleaned') else saved.get('run_id')
-        topic_group = isolated_names(run_id) if run_id else None
-        # 删除命名空间前留存记录；即使中途失败，下次仍能清理本测试的 topic/group。
+        if run_id:
+            isolated_names(run_id)  # Validate the recorded run before any deletion.
+        # 删除命名空间前留存记录，便于中断后继续清理。
         if run_id:
             saved = {'context': self.args.context, 'namespace': self.namespace, 'run_id': run_id}
             write_json(self.state_file, saved)
         if namespace:
             print('清理测试命名空间：' + self.namespace, flush=True)
             self.kubectl('delete', 'namespace', self.namespace, '--wait=true', '--timeout=120s', timeout=135)
-        if topic_group:
-            topic, group = topic_group
-            groups = self.kafka('consumer-groups', '--list').splitlines()
-            if group in groups:
-                # Namespace 删除完成后 Consumer 已退出，才删除该测试消费组。
-                self.kafka('consumer-groups', '--delete', '--group', group)
-            if topic in self.kafka('topics', '--list').splitlines():
-                self.kafka('topics', '--delete', '--topic', topic)
-            wait_for('测试 topic 删除', lambda: topic not in self.kafka('topics', '--list').splitlines(), 45)
-            print('已删除本次独立 Kafka topic / 消费组：' + topic, flush=True)
         if saved:
             write_json(self.state_file, {**saved, 'cleaned': True})
-        print('清理完成；保留 Compose 服务、数据卷、Doris 验证记录和本地诊断文件。', flush=True)
+        print('清理完成；测试命名空间内 Kafka/Doris 与临时数据一并删除，本地诊断文件保留。', flush=True)
 
     def preflight(self):
         nodes = self.get('get', 'nodes')['items']
@@ -224,38 +214,53 @@ class Harness:
         require(versions['meshVersion'] and all(v['Info']['version'] == '1.13.5' for v in versions['meshVersion']),
                 '本用例固定验证 Istio 1.13.5')
         write_json(self.output / 'versions.json', {'nodes': nodes, 'istio': versions})
-        services = run([*COMPOSE, 'ps', '--status', 'running', '--services']).stdout.splitlines()
-        require({'kafka', 'doris'} <= set(services), '请先执行 make local-infra-up 启动 Compose Kafka/Doris')
-        config = json.loads(run([*COMPOSE, 'config', '--format', 'json']).stdout)
-        listeners = config['services']['kafka']['environment']['KAFKA_ADVERTISED_LISTENERS']
-        endpoint = listeners.split('EXTERNAL://', 1)[1].split(',', 1)[0]
-        host, port = endpoint.rsplit(':', 1)
-        require(port == '29092', '本地用例要求 Kafka EXTERNAL 发布在 29092')
-        local_configs(host, 'preflight', 'preflight')
-        for name in ('observer', 'consumer', 'fixture', 'gateway-observer-v1.wasm'):
-            require((ROOT / 'dist' / name).is_file(), '请先执行 make build wasm')
-        self.sql('SELECT 1;')
-        self.host = host
+        for name in ('observer', 'consumer', 'fixture', 'integration.test', 'gateway-observer-v1.wasm'):
+            require((ROOT / 'dist' / name).is_file(), '请先执行 make build wasm k8s-test-build')
+
+    def start_infrastructure(self):
+        manifest = k8s_integration.infrastructure(self.namespace)
+        write_json(self.output / 'infrastructure.json', manifest)
+        self.apply(manifest)
+        for name in ('kafka', 'doris'):
+            self.kubectl('-n', self.namespace, 'rollout', 'status', 'deployment/' + name,
+                         '--timeout=240s', timeout=255)
+        def ready():
+            try:
+                raw = self.sql('SHOW BACKENDS;')
+                return any(len(fields) > 9 and fields[9] == 'true'
+                           for fields in (row.split('\t') for row in raw.splitlines()))
+            except subprocess.CalledProcessError:
+                return False
+        wait_for('Doris BE 就绪', ready, 180)
+        def kafka_ready():
+            try:
+                self.kafka('topics', '--list')
+                return True
+            except subprocess.CalledProcessError:
+                return False
+        wait_for('Kafka 就绪', kafka_ready, 60)
 
     def build_images(self):
         self.image_tag = resolve_image_tag(ROOT)
         self.images = {name: 'metering-' + name + ':' + self.image_tag
-                       for name in ('observer', 'consumer', 'fixture')}
+                       for name in ('observer', 'consumer', 'fixture', 'integration')}
         write_json(self.output / 'images.json', {'image_tag': self.image_tag, 'images': self.images})
+        k8s_integration.prepare_suite(ROOT, self.namespace)
         for name, image in self.images.items():
             print('构建测试镜像：' + image, flush=True)
-            dockerfile = ROOT / ('deploy/k8s-test/fixture.Dockerfile' if name == 'fixture'
-                                 else 'deploy/' + name + '/Dockerfile')
-            context = ROOT / 'dist' if name == 'fixture' else ROOT
-            run(['docker', 'build', '--network=host', '--build-arg', 'HTTP_PROXY', '--build-arg', 'HTTPS_PROXY',
-                 '--build-arg', 'NO_PROXY', '-f', str(dockerfile), '-t', image, str(context)],
+            dockerfile = ROOT / ('deploy/k8s-test/' + (name + '.Dockerfile' if name in ('fixture', 'integration') else 'binary.Dockerfile'))
+            run(['docker', 'build', '--network=host', '--build-arg', 'COMPONENT=' + name,
+                 '-f', str(dockerfile), '-t', image, str(ROOT / 'dist')],
                 timeout=600, capture=False)
-        run(['kind', 'load', 'docker-image', *self.images.values(), '--name', self.args.kind_cluster],
-            timeout=180, capture=False)
+        # Import dependencies separately: kind otherwise exports the large Doris
+        # image again whenever only one small test image changes.
+        for images in (k8s_integration.IMAGES, self.images.values()):
+            run(['kind', 'load', 'docker-image', *images, '--name', self.args.kind_cluster],
+                timeout=600, capture=False)
 
     def manifest(self):
         resources = []
-        observer, consumer, credentials = local_configs(self.host, self.topic, self.group, self.database)
+        observer, consumer, credentials = cluster_configs(self.topic, self.group, self.database)
         observer['observer']['cluster_name'] = self.args.kind_cluster
         for name, config in (('observer', observer), ('consumer', consumer)):
             raw = self.kubectl('create', '--dry-run=client', '-f', 'deploy/' + name + '/' + name + '.yaml', '-o', 'json')
@@ -267,6 +272,8 @@ class Harness:
                     spec = template['spec']
                     container = spec['containers'][0]
                     container.update(image=self.images[name], imagePullPolicy='IfNotPresent')
+                    container['resources'] = {'requests': {'cpu': '50m', 'memory': '64Mi'},
+                                              'limits': {'cpu': '1', 'memory': '256Mi'}}
                     container['env'] = [e for e in container.get('env', []) if e['name'] == 'POD_UID']
                     container['volumeMounts'] = [v for v in container['volumeMounts'] if v['name'] == 'config']
                     spec['volumes'] = [v for v in spec['volumes'] if v['name'] == 'config']
@@ -543,7 +550,9 @@ class Harness:
                 'members_with_k8s_consumer_stopped': 0, 'members_after_restore': 1}
 
     def verify_pods(self, gateway_replicas=1):
-        pods = self.get('-n', self.namespace, 'get', 'pods')['items']
+        pods = [p for p in self.get('-n', self.namespace, 'get', 'pods')['items']
+                if p['metadata'].get('labels', {}).get('app') in
+                ('metering-observer', 'metering-consumer', 'collection-fixture', 'metering-wasm-gateway')]
         require(len(pods) == 4 + gateway_replicas, '测试 Pod 数量与 Observer/Consumer/fixture/网关副本数不符')
         for pod in pods:
             statuses = pod['status'].get('containerStatuses', [])
@@ -567,13 +576,23 @@ class Harness:
         require(hashlib.sha256(data).hexdigest() == self.sha, '通过 mTLS 下载的 Wasm 摘要不一致')
         write_json(self.output / 'pods.result.json', pods)
 
+    def verify_infrastructure(self):
+        pods = self.pods('kafka') + self.pods('doris')
+        require(len(pods) == 2, 'Kafka / Doris Pod 数量错误')
+        for pod in pods:
+            statuses = pod['status'].get('containerStatuses', [])
+            require(statuses and all(s['ready'] and s['restartCount'] == 0 for s in statuses),
+                    'Kafka / Doris 在测试期间重启或未就绪：' + pod['metadata']['name'])
+        write_json(self.output / 'infrastructure.result.json', pods)
+
     def diagnostics(self):
         commands = {'pods.json': ['get', 'pods', '-o', 'json'], 'events.txt': ['get', 'events'],
                     'describe.txt': ['describe', 'pods']}
         for filename, command in commands.items():
             with contextlib.suppress(Exception):
                 (self.output / filename).write_text(self.kubectl('-n', self.namespace, *command))
-        for name in ('metering-observer', 'metering-consumer', 'collection-fixture', 'wasm-gateway'):
+        for name in ('metering-observer', 'metering-consumer', 'collection-fixture', 'wasm-gateway',
+                     'kafka', 'doris', 'e2e-observer', 'e2e-consumer', 'e2e-fixture'):
             with contextlib.suppress(Exception):
                 (self.output / (name + '.log')).write_text(self.kubectl(
                     '-n', self.namespace, 'logs', 'deployment/' + name, '--all-containers=true', '--tail=100'))
@@ -596,9 +615,10 @@ class Harness:
             'annotations': {RUN_KEY: self.run_id}}})
         write_json(self.state_file, {'context': self.args.context, 'namespace': self.namespace,
                                      'run_id': self.run_id})
-        self.kafka('topics', '--create', '--topic', self.topic, '--partitions', '3', '--replication-factor', '1',
-                   '--config', 'retention.ms=86400000')
         try:
+            self.start_infrastructure()
+            self.kafka('topics', '--create', '--topic', self.topic, '--partitions', '3', '--replication-factor', '1',
+                       '--config', 'retention.ms=86400000')
             for name in MIGRATIONS:
                 self.sql((ROOT / 'migrations/doris/metering' / name).read_text())
             manifest = self.manifest()
@@ -620,6 +640,8 @@ class Harness:
             print('验证同一 EnvoyFilter 自动覆盖扩容后的网关副本', flush=True)
             gateway_scaling = self.check_gateway_scale()
             self.verify_pods(gateway_replicas=2)
+            integration = k8s_integration.run_suite(self, ROOT, MIGRATIONS, render_sql)
+            self.verify_infrastructure()
             after = self.gateway_snapshot()
             write_json(self.output / 'existing-gateway-after.json', after)
             require(before == after, '既有 istio-system 网关身份或重启次数发生变化')
@@ -627,12 +649,12 @@ class Harness:
                        'image_tag': self.image_tag, 'images': self.images,
                        'wasm_sha256': self.sha, 'kafka_topic': self.topic, 'doris_database': self.database,
                        'cluster_name':self.args.kind_cluster,'deployment_environment':'stg',
-                       'lookup_implementation':'unimplemented','consumer': consumer,
+                       'lookup_implementation':'synthetic','consumer': consumer, 'integration': integration,
                        'requests': results, 'ignored_requests': ignored, 'gateway_scaling': gateway_scaling,
                        'existing_gateway_unchanged': True}
             write_json(self.output / 'result.json', summary)
             print(json.dumps(summary, ensure_ascii=False, indent=2), flush=True)
-            print('PASS：Kubernetes 网关 → Observer → Compose Kafka → Kubernetes Consumer → Compose Doris', flush=True)
+            print('PASS：Kubernetes 部署验收与 Go 集成故障回归全部通过', flush=True)
             print('测试资源已保留；清理：make k8s-clean', flush=True)
         except BaseException:
             self.diagnostics()

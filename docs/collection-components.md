@@ -1,6 +1,6 @@
 # 网关采集组件运行说明
 
-更新日期：2026-10-21。[实现计划](spec/plan/gateway-collection-implementation.md)已落地到三个可构建组件。业务仍直接经过网关到模型服务；Wasm 旁路发送有界片段，Observer 解析后使用原生 Producer 写 Kafka，Consumer 确认 Doris 可见性后提交 offset。仅产生 `request_started`、`usage_observed`，未知值保留 null/unknown。
+更新日期：2026-11-02。[实现计划](spec/plan/gateway-collection-implementation.md)已落地到三个可构建组件。业务仍直接经过网关到模型服务；Wasm 旁路发送有界片段，Observer 解析后使用原生 Producer 写 Kafka，Consumer 确认 Doris 可见性后提交 offset。仅产生 `request_started`、`usage_observed`，未知值保留 null/unknown。
 
 本轮命令、故障处理及资源归零证据见[本地验证记录](spec/plan/gateway-collection-verification.md)，实际镜像 digest 见[镜像记录](../deploy/local/images.lock.json)。
 
@@ -10,20 +10,19 @@
 
 ## 构建与本地运行
 
-需要 Go 1.25.0、TinyGo 0.40.1、Python 3.10+、Docker Compose。插件使用独立模块及仓库内 SDK v0.24.0 扩展副本，依赖由 go.mod/go.sum 锁定。
+需要 Go 1.25.0、TinyGo 0.40.1、Python 3.10+、Docker、kind、kubectl、istioctl。插件使用独立模块及仓库内 SDK v0.24.0 扩展副本，依赖由 go.mod/go.sum 锁定。
 
-已安装 Kubernetes 1.22.17 / Istio 1.13.5 的 kind 环境可执行 `make local-infra-up k8s-test`：仅复用 Compose Kafka / Doris，Observer、Consumer、fixture 和测试网关均在 Kubernetes 中运行，使用独立 topic / 消费组验证 JSON、SSE、unknown 和真实消费提交。`make k8s-clean` 或 `python3 scripts/cleanup_k8s_collection.py` 清理测试命名空间及本次 topic / 消费组，保留共享基础设施和 Doris 历史测试记录。前置条件、断言和参数见[本地 Kubernetes 测试用例](kubernetes-collection-test.md)。
+已安装 Kubernetes 1.22.17 / Istio 1.13.5 的 kind 环境执行 `make k8s-test`：Kafka、Doris、Observer、Consumer、fixture、测试网关及集成测试 Job 全部在隔离命名空间内运行。原有本地 E2E 的下载故障、改写 fail-open、批量/rebalance、写入确认丢失、请求 ID、归属和名称缓存场景均由该入口执行。前置条件和断言见[本地 Kubernetes 测试用例](kubernetes-collection-test.md)。
 
 ```sh
-make test build wasm
-make local-up
-make local-test
+make test k8s-test
 make manifest
-# 停止本次联调栈，保留容器数据：
-python3 scripts/local_collection.py stop
+# 删除隔离测试环境及临时数据，保留本地诊断：
+make k8s-clean
 ```
 
-产物在 `dist/`：`observer`、`consumer`、`fixture`、`gateway-observer-v1.wasm` 和摘要清单。构建与发布工作流仅在推送 `v*` tag 时触发，普通分支推送与 PR 不触发，也不配置手动启动入口。CI 运行契约检查、Go 竞态测试、服务构建及固定 TinyGo 镜像构建/ABI 检查；真实集成测试需单独启动 Docker 栈。
+Compose 的 `make local-up` 仅保留手工联调用途，原 `make local-test` 已移除。
+产物在 `dist/`：`observer`、`consumer`、`fixture`、`gateway-observer-v1.wasm` 和摘要清单。构建与发布工作流仅在推送 `v*` tag 时触发，普通分支推送与 PR 不触发，也不配置手动启动入口。CI 运行契约检查、Go 竞态测试、服务构建及固定 TinyGo 镜像构建/ABI 检查；E2E 需在准备好的本地 kind 集群另行执行 `make k8s-test`。
 
 CI 中的 TinyGo 容器使用 Runner 的 UID/GID，并将容器内的 HOME 设置为 `/tmp`，使 Git 能读取同一用户拥有的检出目录，构建缓存和 Wasm 输出也可写。`collection` 与 Release 工作流采用相同设置；若出现 `error obtaining VCS status: exit status 128`，可先检查容器与挂载仓库的用户身份是否一致。修复后需推送包含新提交的 `v*` tag 触发构建；重跑旧工作流会继续使用旧提交中的配置。
 
@@ -51,7 +50,7 @@ KAFKA_EXTERNAL_HOST=192.168.227.128 make local-up
 
 Kafka 容器内客户端仍使用 `kafka:9092`。重建容器时 Kafka 日志及 Doris FE/BE 数据由命名卷保留；首次从旧版无持久卷配置启动时，脚本先停栈，将原数据备份到 `.tmp/local-storage-*` 并迁移到卷，再重建容器。已有不匹配的目标卷会使迁移停止，避免覆盖或合并历史。不要使用 `docker compose down -v` 删除数据卷。
 
-`make local-up` 在 `dist/envoy.remote.json` 渲染实际 Wasm 摘要，重启 Fixture/Observer/Consumer，核对下载内容后重建网关。网关只挂载配置，插件来自 Observer HTTP 下载。更新本地产物后运行 `make build wasm local-up`，再运行 `GOFLAGS='-count=1' make local-test`，不能仅重启旧网关而沿用旧摘要。脚本只初始化该 Compose 栈，应用 001/002/003 migration，在独立 metering_development 库执行新初始化，并创建 24 分区、72 小时保留、delete 策略的 llm-metering-development topic。明文 Kafka、合成鉴权、副本数 1 与 Doris root 空密码仅用于开发联调；生产按原方案配置认证、副本、min ISR 和最小权限账号。
+`make local-up` 在 `dist/envoy.remote.json` 渲染实际 Wasm 摘要，重启 Fixture/Observer/Consumer，核对下载内容后重建网关。网关只挂载配置，插件来自 Observer HTTP 下载。更新本地产物后运行 `make build wasm local-up`，自动回归则使用独立的 `make k8s-test`，不能仅重启旧网关而沿用旧摘要。脚本只初始化该 Compose 栈，应用 001/002/003 migration，在独立 metering_development 库执行新初始化，并创建 24 分区、72 小时保留、delete 策略的 llm-metering-development topic。明文 Kafka、合成鉴权、副本数 1 与 Doris root 空密码仅用于开发联调；生产按原方案配置认证、副本、min ISR 和最小权限账号。
 
 普通 JSON / SSE 合成请求：
 
@@ -211,7 +210,7 @@ Consumer 按 Kafka 分区跨多次拉取攒批：达到 `max_batch_rows`（默�
 
 已通过契约/文档/表字段一致性检查、25 项 Python 测试（含本地地址配置、迁移覆盖保护和备份失败恢复）、Go 单元和竞态测试、SDK internal/proxytest 测试、TinyGo 编译与 ABI 检查。事件规范编码与摘要同六份 Python golden 对照；标准/手工 Protobuf 互操作、非法帧、逐字节 JSON/SSE 分片、usage 候选冲突、提交屏障故障及撤销 owner 由自动测试覆盖。
 
-真实本地集成覆盖普通 JSON、SSE/响应 trailers、Start ACK 关联、unknown 保留 NULL、非白名单请求、相同事件重放去重、不同变体冲突隔离、日期通知/凭据、未知版本暂停；HTTP1 chunked 中途停顿超过 500 ms、256 KiB 边界/边界加一/1 MiB 请求的上游正文摘要保持原样，超时观察降为 partial/unknown，正常延迟响应中的计量 ID 与事件一致；真实 BE 写入后断开 HTTP 确认，仍确认原 label 与行键；独立 TCP Kafka 黑洞验证发送不阻塞及有界超时/watchdog。测试及失败诊断由 `make local-test` 重现。
+真实本地集成覆盖普通 JSON、SSE/响应 trailers、Start ACK 关联、unknown 保留 NULL、非白名单请求、相同事件重放去重、不同变体冲突隔离、日期通知/凭据、未知版本暂停；HTTP1 chunked 中途停顿超过 500 ms、256 KiB 边界/边界加一/1 MiB 请求的上游正文摘要保持原样，超时观察降为 partial/unknown，正常延迟响应中的计量 ID 与事件一致；真实 BE 写入后断开 HTTP 确认，仍确认原 label 与行键；独立 TCP Kafka 黑洞验证发送不阻塞及有界超时/watchdog。上述场景现已迁入 Kubernetes Job，由 `make k8s-test` 重现，结果保存在 `.tmp/k8s-collection/`。
 
 G0–G5 仍须独立完成：私有镜像/真实 Auth、HTTP2 慢上传与断开/热更新故障交叉、真实 Pod 崩溃及 rebalance 压测、Kafka 保留期丢失后运维恢复、峰值两倍/24 小时/10 分钟 SSE、首包/明细/查询延迟、灰度回退与旧代释放。已有本地证据不等于这些门槛全部通过。
 

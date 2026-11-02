@@ -1,6 +1,6 @@
 //go:build integration
 
-// These tests write synthetic data only to the isolated deploy/local stack.
+// These tests write synthetic data only inside an isolated Kubernetes namespace.
 package integration
 
 import (
@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -33,7 +34,7 @@ import (
 	"github.com/twmb/franz-go/pkg/kmsg"
 )
 
-const dsn = "root@tcp(127.0.0.1:19030)/metering_development?timeout=5s&readTimeout=5s&writeTimeout=5s&interpolateParams=true&time_zone=%27%2B00%3A00%27"
+const dsn = "root@tcp(doris:9030)/metering_development?timeout=5s&readTimeout=5s&writeTimeout=5s&interpolateParams=true&time_zone=%27%2B00%3A00%27"
 
 func uuid(t *testing.T) string {
 	t.Helper()
@@ -52,7 +53,7 @@ func database(t *testing.T) *sql.DB {
 		t.Fatal(err)
 	}
 	if err = db.Ping(); err != nil {
-		t.Fatalf("run make build wasm local-up first: %v", err)
+		t.Fatalf("run make k8s-test: %v", err)
 	}
 	t.Cleanup(func() { db.Close() })
 	return db
@@ -70,7 +71,7 @@ func eventually(t *testing.T, f func() bool) {
 }
 func kafka(t *testing.T) *kgo.Client {
 	t.Helper()
-	c, err := kgo.NewClient(kgo.SeedBrokers("127.0.0.1:29092"), kgo.RequiredAcks(kgo.AllISRAcks()), kgo.DisableIdempotentWrite(), kgo.RecordRetries(1), kgo.RecordPartitioner(kgo.ManualPartitioner()))
+	c, err := kgo.NewClient(kgo.SeedBrokers("kafka:9092"), kgo.RequiredAcks(kgo.AllISRAcks()), kgo.DisableIdempotentWrite(), kgo.RecordRetries(1), kgo.RecordPartitioner(kgo.ManualPartitioner()))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -101,7 +102,7 @@ func TestCollectionEndToEnd(t *testing.T) {
 				body["test_case"] = "missing_usage"
 			}
 			b, _ := json.Marshal(body)
-			req, _ := http.NewRequest("POST", "http://127.0.0.1:18080/v1/chat/completions", bytes.NewReader(b))
+			req, _ := http.NewRequest("POST", "http://e2e-gateway:8080/v1/chat/completions", bytes.NewReader(b))
 			req.Header.Set("Content-Type", "application/json")
 			req.Header.Set("x-request-id", xid)
 			req.Header.Set("Authorization", "Bearer synthetic-sentinel-key")
@@ -132,7 +133,7 @@ func TestCollectionEndToEnd(t *testing.T) {
 			if err = json.Unmarshal([]byte(raw), &event); err != nil || event.RouteName != "unknown" {
 				t.Fatal("unnamed Envoy route must be recorded as unknown")
 			}
-			if event.GatewayInstanceID != "local/gateway-test" {
+			if event.GatewayInstanceID != os.Getenv("METERING_TEST_NAMESPACE")+"/e2e-gateway" {
 				t.Fatalf("runtime gateway identity = %q", event.GatewayInstanceID)
 			}
 			if event.MappingStatus != "lookup_not_implemented" || event.CustomerMappingStatus != "lookup_not_implemented" || event.IdentityStatus != "invalid" || event.ServiceID != nil || event.ProviderID != nil || event.ApiKeyID != nil || event.CustomerID != nil || strings.Contains(raw, "synthetic-sentinel-key") {
@@ -191,7 +192,7 @@ func TestCollectionEndToEnd(t *testing.T) {
 		} {
 			id := uuid(t)
 			ids = append(ids, id)
-			req, _ := http.NewRequest(tc.method, "http://127.0.0.1:18080"+tc.path, strings.NewReader(`{"model":"fixture","stream":false}`))
+			req, _ := http.NewRequest(tc.method, "http://e2e-gateway:8080"+tc.path, strings.NewReader(`{"model":"fixture","stream":false}`))
 			req.Host = "model.example.invalid"
 			req.Header.Set("content-type", "application/json")
 			req.Header.Set("x-request-id", id)
@@ -215,7 +216,7 @@ func TestCollectionEndToEnd(t *testing.T) {
 
 func gatewaySelectedRequests(t *testing.T) uint64 {
 	t.Helper()
-	res, err := (&http.Client{Timeout: 5 * time.Second}).Get("http://127.0.0.1:19000/stats?filter=metering_requests_selected_total")
+	res, err := (&http.Client{Timeout: 5 * time.Second}).Get("http://e2e-gateway:9901/stats?filter=metering_requests_selected_total")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -266,7 +267,7 @@ func TestStreamLoadConfirmationLoss(t *testing.T) {
 			t.Error(err)
 			return
 		}
-		req, err := http.NewRequestWithContext(r.Context(), r.Method, "http://127.0.0.1:18040"+r.URL.RequestURI(), bytes.NewReader(body))
+		req, err := http.NewRequestWithContext(r.Context(), r.Method, "http://doris:8040"+r.URL.RequestURI(), bytes.NewReader(body))
 		if err != nil {
 			t.Error(err)
 			return
@@ -317,8 +318,8 @@ func TestUnknownSchemaPausesPartition(t *testing.T) {
 	if err != nil || len(resp.Topics) != 1 || resp.Topics[0].ErrorCode != 0 {
 		t.Fatalf("create local test topic: %v", err)
 	}
-	s := localStore(t, "http://127.0.0.1:18040")
-	c := config.Config{Kafka: config.Kafka{Brokers: []string{"127.0.0.1:29092"}, Topic: topic}, Consumer: config.Consumer{Group: group, AcceptedConfigs: []string{"collection-v1"}}, Doris: s.Cfg}
+	s := localStore(t, "http://doris:8040")
+	c := config.Config{Kafka: config.Kafka{Brokers: []string{"kafka:9092"}, Topic: topic}, Consumer: config.Consumer{Group: group, AcceptedConfigs: []string{"collection-v1"}}, Doris: s.Cfg}
 	if err = c.ConsumerDefaults(); err != nil {
 		t.Fatal(err)
 	}
@@ -439,7 +440,7 @@ func TestHTTPRewriteBoundariesAndTimeout(t *testing.T) {
 				reader = &stalledBody{first: body[:40], tail: body[40:]}
 			}
 			xid := uuid(t)
-			req, _ := http.NewRequest("POST", "http://127.0.0.1:18080/v1/chat/completions", reader)
+			req, _ := http.NewRequest("POST", "http://e2e-gateway:8080/v1/chat/completions", reader)
 			req.Header.Set("Content-Type", "application/json")
 			req.Header.Set("x-request-id", xid)
 			req.Header.Set("Authorization", "Bearer synthetic-sentinel-key")

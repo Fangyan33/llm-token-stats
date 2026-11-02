@@ -4,7 +4,7 @@ GOPATH ?= /tmp/metering-go
 export GOCACHE GOMODCACHE GOPATH
 PROTOC ?= protoc
 PACKAGE_DIR ?= dist/package
-.PHONY: build wasm test generate local-infra-up local-up local-test k8s-test k8s-clean manifest package summary-test local-summary
+.PHONY: build wasm test generate local-infra-up local-up k8s-test-build k8s-test k8s-clean manifest package summary-test local-summary
 build:
 	mkdir -p dist
 	CGO_ENABLED=0 go build -trimpath -o dist/observer ./cmd/observer
@@ -30,9 +30,10 @@ summary-test:
 	go test -tags=integration -count=1 -v ./internal/summaryworker
 local-summary: build
 	./dist/usage-worker --config configs/usage-worker.local.json --once
-local-test:
-	go test -tags=integration -v ./tests/integration
-k8s-test: build wasm
+k8s-test-build:
+	mkdir -p dist
+	CGO_ENABLED=0 go test -tags=integration -c -o dist/integration.test ./tests/integration
+k8s-test: build wasm k8s-test-build
 	python3 scripts/k8s_collection.py test $(K8S_TEST_ARGS)
 k8s-clean:
 	python3 scripts/cleanup_k8s_collection.py $(K8S_TEST_ARGS)

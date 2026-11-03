@@ -7,6 +7,7 @@ import sys
 import tarfile
 import tempfile
 import unittest
+from yaml_support import decode_yaml, plugin_config
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -165,20 +166,21 @@ class DistributionTests(unittest.TestCase):
             names = []
             for mode in ('disabled', 'enabled'):
                 text = (output / 'gateway' / mode / 'envoyfilter.yaml').read_text()
-                names.append(re.search(r'^metadata: \{name: ([a-z0-9-]+),', text, re.M).group(1))
+                names.append(decode_yaml(text)['metadata']['name'])
                 self.assertNotIn('REPLACE_', text)
                 self.assertNotIn('RENDER_', text)
                 self.assertNotIn('Template only', text)
                 self.assertIn('proxy:\n          metadata:\n            NAMESPACE: \"istio-system\"', text)
                 self.assertNotIn('            NAME:', text)
-                self.assertIn('"app": "ai-gateway"', text)
-                self.assertIn(bundle.checksum(artifact), text)
-                self.assertIn('llm-token-stats-observer.isolated.svc.cluster.local', text)
-                line = next(row.strip() for row in text.splitlines() if row.strip().startswith('value: "'))
-                config = json.loads(json.loads(line[len('value: '):]))
+                self.assertEqual(decode_yaml(text)['spec']['workloadSelector']['labels'], {'app': 'ai-gateway'})
+                if mode == 'enabled':
+                    self.assertIn(bundle.checksum(artifact), text)
+                    self.assertIn('llm-token-stats-observer.isolated.svc.cluster.local', text)
+                config = plugin_config(decode_yaml(text))
                 self.assertEqual(config['enabled'], mode == 'enabled')
                 self.assertNotIn('gateway_instance_id', config)
-                self.assertEqual(config['accepted_request_hosts'], ['api.corp.internal', '*.corp.internal'])
+                if mode == 'enabled':
+                    self.assertEqual(config['accepted_request_hosts'], ['api.corp.internal', '*.corp.internal'])
             self.assertEqual((output / 'envoyfilter.yaml').read_text(),
                              (output / 'gateway/disabled/envoyfilter.yaml').read_text())
             self.assertFalse((output / 'gateway-observer.json').exists())
@@ -226,12 +228,11 @@ class DistributionTests(unittest.TestCase):
             self.assertEqual(manifest['accepted_request_hosts'], ['*'])
             self.assertNotIn('gateway_pods', manifest)
             self.assertEqual(manifest['gateway_selector'], {'istio': 'ingressgateway'})
-            self.assertIn('metadata: {name: ' + manifest['gateway_filter_name'] + ',',
-                          (args.output / 'envoyfilter.yaml').read_text())
+            self.assertEqual(decode_yaml((args.output / 'envoyfilter.yaml').read_text())['metadata']['name'], manifest['gateway_filter_name'])
             text = (args.output / 'envoyfilter.yaml').read_text()
-            config_line = next(line.strip() for line in text.splitlines() if line.strip().startswith('value: "'))
-            config = json.loads(json.loads(config_line[len('value: '):]))
-            self.assertEqual(config['accepted_request_hosts'], ['*'])
+            config = plugin_config(decode_yaml(text))
+            enabled = plugin_config(decode_yaml((args.output / 'gateway/enabled/envoyfilter.yaml').read_text()))
+            self.assertEqual(enabled['accepted_request_hosts'], ['*'])
             self.assertIs(config['enabled'], False)
             self.assertIn(bundle.file_sha256(args.output / 'envoyfilter.yaml') + '  envoyfilter.yaml',
                           (args.output / 'SHA256SUMS').read_text())

@@ -47,7 +47,7 @@ flowchart LR
 
 主模块使用 Go 1.25.0，插件使用 TinyGo 0.40.1 和仓库内固定的 Proxy-Wasm SDK，Python 脚本需要 3.10+。`make test` 包含 Go 竞态测试，需要可用的 C 编译器；开发联调还需要 Docker Engine 和 Docker Compose v2。以下命令均在仓库根目录执行。
 
-本地网关使用 Istio proxyv2 1.13.5，Kafka 和 Doris 分别使用 3.9.2、4.1.3。替换网关或 SDK 版本后，需要重新验证 ABI、hostcall 和过滤器行为。
+Compose 直接加载联调使用 proxyv2 1.13.5；ECDS 隔离评估使用 proxyv2 1.14.6 数据平面，保留原 1.13.5 控制面。Kafka 和 Doris 分别使用 3.9.2、4.1.3。替换网关或 SDK 版本后，需要重新验证 ABI、hostcall 和过滤器行为。
 
 ```sh
 make test       # 契约检查、Python 测试、主模块和独立插件模块的 Go 竞态测试
@@ -97,7 +97,7 @@ make package PACKAGE_DIR=dist/package-with-dependencies \
   PACKAGE_ARGS='--accepted-request-host api.company.com --include-dependency-images'
 ```
 
-`make package` 编译 Wasm、构建 Observer / Consumer / usage-worker 镜像，再通过 `docker save` 将这三个应用镜像保存到 `dist/package/images/images.tar`，默认使用 `linux/amd64`。默认不拉取、不检查、不归档 Kafka、Doris 和 Istio proxyv2 镜像。指定 `--include-dependency-images` 后，额外归档 Kafka 3.9.2、Doris 4.1.3、Istio proxyv2 1.13.5；缺少的依赖镜像会自动拉取，已有镜像会检查平台。
+`make package` 编译 Wasm、构建 Observer / Consumer / usage-worker 镜像，再通过 `docker save` 将这三个应用镜像保存到 `dist/package/images/images.tar`，默认使用 `linux/amd64`。默认不拉取、不检查、不归档 Kafka、Doris 和 Istio proxyv2 镜像。指定 `--include-dependency-images` 后，额外归档 Kafka 3.9.2、Doris 4.1.3、ECDS 候选评估镜像 Istio proxyv2 1.14.6；缺少的依赖镜像会自动拉取，已有镜像会检查平台。
 
 两种模式都保留 Kafka / Doris 的单节点部署 YAML、初始化 Job 和全部配置。默认包部署前，目标节点需能拉取 Kafka / Doris 镜像，或已预先导入对应镜像；Istio 继续复用已有网关。`manifest.json` 的 `images` 记录全部镜像引用，`archived_images` 记录实际归档内容，`external_images` 记录需要目标环境准备的镜像。
 
@@ -111,9 +111,9 @@ make package PACKAGE_DIR=dist/package-with-dependencies \
 
 Kafka 默认使用 24 分区、单副本，数据保留 72 小时。存储默认使用集群 StorageClass，可通过 `--storage-class` 和 `--kafka-storage`、`--doris-fe-storage`、`--doris-be-storage` 调整。分发配置使用明文 Kafka、Doris root 空密码和 `dev` 环境标识，适用于受控开发环境。生产环境的独立基础设施和认证配置见下文。
 
-部署复用目标集群已有的 Istio 和网关。打包不访问 Kubernetes，也不读取当前 context，不绑定 Pod 名称、UID 或副本数。通过 `--gateway-namespace` 和可重复的 `--gateway-label KEY=VALUE` 指定目标工作负载，默认 `istio-system`、`istio=ingressgateway`；显式标签替换默认选择器，多个标签同时匹配。无需更改已有网关 Pod 模板。
+部署复用目标集群已有的 Istio 和网关。打包不访问 Kubernetes，也不读取当前 context，不绑定 Pod 名称、UID 或副本数。通过 `--gateway-namespace` 和可重复的 `--gateway-label KEY=VALUE` 指定目标工作负载，默认 `istio-system`、`istio=ingressgateway`；显式标签替换默认选择器，多个标签同时匹配。目标网关需显式设置 `ISTIO_AGENT_ENABLE_WASM_REMOTE_LOAD_CONVERSION=false` 并完成一次滚动，保留 Envoy outbound 集群的 mTLS 下载；此开关影响该网关上的所有 ECDS 远程 Wasm，部署前核对其他插件。
 
-包根目录的 `envoyfilter.yaml` 提供关闭态 EnvoyFilter；`gateway/disabled/envoyfilter.yaml`、`gateway/enabled/envoyfilter.yaml` 提供同一工作负载的两种状态。根文件与 disabled 文件相同，选择一个入口即可。先部署 `k8s/` 中的采集组件，等待 Observer 就绪后再应用 EnvoyFilter。扩容后的匹配副本自动获得插件，无需重新打包。输出 YAML 不含待替换字段，可直接 apply。
+包根目录的 `envoyfilter.yaml` 提供关闭态 EnvoyFilter；`gateway/disabled/envoyfilter.yaml`、`gateway/enabled/envoyfilter.yaml` 提供同一工作负载的两种状态。根文件与 disabled 文件相同，选择一个入口即可。先部署 `k8s/` 中的采集组件，等待 Observer 就绪后再应用 EnvoyFilter。扩容后的匹配副本先使用透传默认过滤器，再执行显式重推激活采集，无需重新打包。输出 YAML 不含待替换字段，可直接 apply。
 
 分发后进入包目录执行：
 
@@ -137,7 +137,7 @@ kubectl apply -f envoyfilter.yaml
 kubectl apply -f gateway/enabled/
 ```
 
-目标集群需事先安装 Istio 1.13.5，配置好业务路由和鉴权，并准备足够的 PV / StorageClass。包内 `README.md` 会按打包参数生成完整部署命令，打包过程不会自动部署到集群。打包成功、清单校验通过后，仍需完成生产 G0 至 G5 验收。
+目标集群需事先安装兼容的 Istio 控制面与采集网关数据面（ECDS 启用补丁排除 1.13.x），配置好业务路由和鉴权，并准备足够的 PV / StorageClass。包内 `README.md` 会按打包参数生成完整部署命令，打包过程不会自动部署到集群。打包成功、清单校验通过后，仍需完成生产 G0 至 G5 验收。
 
 ### GitHub Release 下载包
 
@@ -200,7 +200,7 @@ sha256sum dist/gateway-observer-v1.wasm dist/gateway-observer.download.wasm
 
 两份摘要必须相同。渲染器读取打包时使用的同一份 Wasm，计算 `code.remote.sha256`，并配置 HTTP 下载集群和 5 秒下载超时，不额外重试。
 
-Wasm 使用固定版本 Envoy 的原生远程加载，现有 EnvoyFilter 不依赖 Istio agent 将其重写为文件路径。下载只在插件加载时发生，首次加载需要等待下载完成，逐请求的业务转发不触发下载。
+Wasm 使用固定版本 Envoy 的 ECDS 原生远程加载；目标网关关闭 Agent 下载转换后使用现有 outbound 集群。首次下载时监听器直接使用 Lua 默认配置透传，缓存缺失 NACK 后需显式重推激活插件；逐请求转发不触发下载。
 
 推送完成后记录两个服务镜像的仓库 digest，部署时使用完整的 `仓库地址@sha256:摘要`：
 
@@ -472,7 +472,7 @@ kubectl apply -f "$DEPLOY_DIR/envoyfilter.disabled.yaml"
 
 渲染器验证配置和 Wasm 产物，计算文件 SHA-256，默认使用固定名称 `llm-token-stats-envoyfilter-wasm`，不自动追加摘要。渲染和打包均可通过 `--envoyfilter-name` 指定名称；同一命名空间多网关需要独立配置时，须显式使用不同名称，例如 `llm-token-stats-envoyfilter-wasm-canary`。名称必须以 `llm-token-stats-` 开头并符合不超过 63 字符的 DNS 标签规则。启用态、关闭态与版本更新使用同一名称，修改选择器会更新同名对象。过滤器保留代理 `metadata.NAMESPACE` 匹配，即使资源位于 Istio 根配置命名空间，也只作用于目标命名空间；上例的 `app=istio-ingressgateway-canary` 必须替换为已有灰度工作负载的实际启动标签。
 
-`gateway_instance_id` 由 Wasm 在插件启动时读取 Envoy 的 `node.metadata.NAMESPACE` 和 `node.metadata.NAME`，组合为 `namespace/pod-name`；配置 JSON 不再接受此字段。Istio 1.13.5 默认提供这两项元数据，无需修改网关 Pod 模板。多个副本共享同一 EnvoyFilter，各自读取实例名称，扩容或重建后无需重新渲染。标识不包含 Pod UID，同名 Pod 重建后标识不变；跨集群分析需结合 `cluster_name`。身份缺失、非法或组合后超过现有协议的 128 字节上限时停止该插件采集，增加 `metering_gateway_identity_unavailable_total`，业务继续放行；不截断名称、不回退到固定值，也不读取客户端请求头。
+`gateway_instance_id` 由 Wasm 在插件启动时读取 Envoy 的 `node.metadata.NAMESPACE` 和 `node.metadata.NAME`，组合为 `namespace/pod-name`；配置 JSON 不再接受此字段。Istio 1.13.5 默认提供这两项元数据，身份读取无需额外修改网关 Pod 模板；ECDS 下载转换开关仍须按部署要求设置。多个副本共享同一 EnvoyFilter，各自读取实例名称，扩容或重建后无需重新渲染。标识不包含 Pod UID，同名 Pod 重建后标识不变；跨集群分析需结合 `cluster_name`。身份缺失、非法或组合后超过现有协议的 128 字节上限时停止该插件采集，增加 `metering_gateway_identity_unavailable_total`，业务继续放行；不截断名称、不回退到固定值，也不读取客户端请求头。
 
 请先渲染 [EnvoyFilter 模板](deploy/gateway/envoyfilter.yaml) 再发布，不要直接 apply 仓库模板；分发包中的 YAML 已完成渲染。
 
@@ -523,6 +523,32 @@ python3 scripts/render_gateway_filter.py \
 kubectl apply -f "$DEPLOY_DIR/envoyfilter.enabled.yaml"
 ```
 
+[ECDS 验证记录](docs/spec/plan/envoyfilter-ecds-verification.md)记录了运行时调整及完整验收结果。ECDS 启用补丁排除已复现崩溃的 Istio 1.13.x，旧代理保留业务转发、不安装采集。候选验收数据平面为 `istio/proxyv2:1.14.6` / Envoy 1.22.7-dev；该历史版本仅用于隔离评估，生产需选择受支持的完整版本组合完成验收。
+
+目标网关需在 Pod 注解中保留 ECDS 指标，合并到既有 `proxy.istio.io/config`，不要覆盖其他代理设置：
+
+```yaml
+proxy.istio.io/config: |
+  proxyStatsMatcher:
+    inclusionRegexps:
+      - ".*extension_config_discovery.*"
+```
+
+目标网关首次迁移时，先仅调整相应 Deployment 并等待滚动完成（替换 CONTEXT 和目标 Deployment 名称）：
+
+```sh
+kubectl --context CONTEXT -n istio-system set env deployment/目标网关 \
+  ISTIO_AGENT_ENABLE_WASM_REMOTE_LOAD_CONVERSION=false
+kubectl --context CONTEXT -n istio-system rollout status deployment/目标网关
+python3 scripts/reload_gateway_filter.py --context CONTEXT \
+  --gateway-namespace istio-system \
+  --envoyfilter-name llm-token-stats-envoyfilter-wasm-canary
+```
+
+启用清单使用 ECDS、`nack_on_code_cache_miss: true` 和 Lua 透传默认配置，监听器不等待下载。首次缓存缺失先 NACK 并后台下载；旧版 Istiod 不会因此自动重推。命令最多等待 120 秒、每 15 秒重推一次，覆盖下载失败后的 10 秒负缓存；不会重启网关。命令只原子更新指定过滤器的扩展名称和订阅名称，不改 Wasm 参数或 VM 初始化配置，并用 resourceVersion 防止覆盖并发修改。ECDS 内部名称与配置/重推 revision 隔离；Kubernetes EnvoyFilter 名称保持固定，以规避旧 Envoy 复用已失效监听器上下文的问题。超时或配置错误返回非零，保留旧有效配置或透传状态。更新被拒绝时不会自动将已激活的旧 Wasm 切换为 Lua。
+
+EnvoyFilter 全部使用块式 YAML，插件参数位于 `google.protobuf.Struct.value` 内，也是 YAML。渲染器的独立 `--config` 输入仍使用 JSON；新 Wasm 支持严格 JSON 和有界 Protobuf Struct，保持 `schema_version=1`。YAML 语法由清单解析与准入检查；VM 内不运行依赖 panic/recover 的 YAML 解析器。Struct 解码无反射、有深度和节点界限，拒绝重复键、非法 UTF-8、非整数/非有限数及错误字段类型，保留 64 KiB 配置上限。先更新 Observer 中的新 Wasm 和匹配摘要，再发布 YAML 参数清单。构建使用 TinyGo `-buildmode=wasi-legacy`，保留 Proxy-Wasm 回调生命周期，禁止命令入口返回时调用 `proc_exit`；CI 使用相同参数。
+
 通过灰度入口发送已授权的 JSON / SSE 测试请求，检查业务响应、Observer / Consumer 的 `/metrics`、Kafka group lag，以及 Doris 中对应的 `events_raw`、`requests` 和 `consumer_batch_receipts`。
 
 Observer 健康端口为 `9091`，Consumer 为 `9092`，均提供 `/livez`、`/readyz`、`/metrics`，可从受控终端通过 `kubectl port-forward` 访问。`readyz` 成功后，还需确认真实请求已经入库。
@@ -531,9 +557,9 @@ Consumer 按分区攒批，默认达到 5000 条、4 MiB 或等待 15 秒时写�
 
 Observer 只提供当前镜像内的一个 Wasm 版本。升级时，先发布 Observer，等待所有副本的下载摘要一致，再更新网关的 URL 和摘要配置。滚动升级期间，按旧摘要下载可能失败，采集允许暂时缺失；已加载的插件可以继续运行，但旧网关重启后不保证还能下载到旧文件。
 
-下载服务恢复后，需要触发插件重新安装或重启网关，并核对其工作负载仍匹配过滤器。原样重复 apply 同一配置不一定触发下载，不能依赖它自动恢复。版本回退时，先恢复对应的 Observer 镜像，再恢复对应的网关配置。
+首次启用、下载服务恢复、网关重启或扩容后，执行上述显式重推命令并核对采集效果。原样重复 apply 同一配置不保证触发 ECDS 重推；本项目不安装自动恢复控制器。版本回退时，先恢复对应的 Observer 镜像，再恢复对应的网关配置。
 
-需要立即停止采集时，先重新应用同一工作负载的关闭配置；若模块加载或 ABI 错误导致配置无法生效，再移除该工作负载的过滤器：
+需要立即停止采集时，重新应用同一工作负载的关闭配置。关闭态直接使用 Lua 透传，不依赖 Wasm 下载、摘要或初始化：
 
 ```sh
 kubectl apply -f "$DEPLOY_DIR/envoyfilter.disabled.yaml"
@@ -541,7 +567,7 @@ kubectl apply -f "$DEPLOY_DIR/envoyfilter.disabled.yaml"
 kubectl delete -f "$DEPLOY_DIR/envoyfilter.disabled.yaml"
 ```
 
-同一命名空间中匹配标签的网关副本共用一个 EnvoyFilter，实例身份由各自运行时读取。升级旧包时先删除旧包 `gateway/disabled/` 中按 UID 命名或固定名 `gateway-observer` 的过滤器，再安装新版，避免重复采集；这会有短暂采集中断。修改选择器会生成新资源，需先移除旧清单对应的过滤器；正式与灰度网关应使用互斥标签。旧 JSON 中的 `gateway_instance_id` 已移除，配置必须与新版 Wasm 配套发布。关闭配置用于停止采集；底层模块加载失败时，即使配置了 `fail_open`，也不能保证网关成功启动。
+同一命名空间中匹配标签的网关副本共用一个 EnvoyFilter，实例身份由各自运行时读取。升级旧包时先删除旧包 `gateway/disabled/` 中按 UID 命名或固定名 `gateway-observer` 的过滤器，再安装新版，避免重复采集；这会有短暂采集中断。修改选择器会生成新资源，需先移除旧清单对应的过滤器；正式与灰度网关应使用互斥标签。旧 JSON 中的 `gateway_instance_id` 已移除，配置必须与新版 Wasm 配套发布。关闭配置直接透传。启用态通过 ECDS 与 Lua 默认配置隔离加载等待和配置拒绝，但不承诺 Envoy 进程崩溃、OOM 等宿主故障下仍可转发。
 
 本地集成结果仅覆盖本地环境。扩大灰度前，需在真实环境验证改写、解析和故障恢复；生产验收还包括性能、数据质量和回退检查。完整 G0 至 G5 要求见[闭环与验收清单](docs/gateway-collection-design-closure.md)，已有本地证据见[验证记录](docs/spec/plan/gateway-collection-verification.md)。
 
@@ -556,7 +582,7 @@ make k8s-test
 
 默认 context 为 `kind-kind`，测试命名空间为 `metering-wasm-verify`。Observer、Consumer、fixture、integration 镜像统一使用 Git tag 或 commit 短 hash 作为版本，测试 topic、消费组和诊断目录则使用随机 run-id。
 
-测试结束后会保留资源和 `.tmp/k8s-collection/` 下的结果；再次执行时，会先清理归属于本测试的旧环境。网关使用原始 `istio/proxyv2:1.13.5`，不挂载或打包 Wasm。完整前置条件、断言和自定义参数见[测试用例](docs/kubernetes-collection-test.md)，实际结果见[验证记录](docs/spec/plan/gateway-collection-verification.md)。
+测试结束后会保留资源和 `.tmp/k8s-collection/` 下的结果；再次执行时，会先清理归属于本测试的旧环境。隔离采集网关及临时 Envoy 使用原始 `istio/proxyv2:1.14.6`，不挂载或打包 Wasm 到采集网关。完整前置条件、断言和自定义参数见[测试用例](docs/kubernetes-collection-test.md)，实际结果见[验证记录](docs/spec/plan/gateway-collection-verification.md)。
 
 ```sh
 kubectl --context kind-kind -n metering-wasm-verify get deployment,pod,svc

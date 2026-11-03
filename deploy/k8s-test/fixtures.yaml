@@ -36,11 +36,18 @@ spec:
       labels: {app: llm-token-stats-wasm-gateway, istio: TEST_NAMESPACE}
       annotations:
         inject.istio.io/templates: gateway
-        proxy.istio.io/config: '{"concurrency":2}'
+        proxy.istio.io/config: |
+          concurrency: 2
+          proxyStatsMatcher:
+            inclusionRegexps:
+              - ".*extension_config_discovery.*"
     spec:
       containers:
         - name: istio-proxy
-          image: auto
+          image: docker.io/istio/proxyv2:1.14.6
+          env:
+            - name: ISTIO_AGENT_ENABLE_WASM_REMOTE_LOAD_CONVERSION
+              value: "false"
           imagePullPolicy: IfNotPresent
           ports: [{name: http, containerPort: 8080}, {name: status, containerPort: 15021}]
           resources: {requests: {cpu: 100m, memory: 128Mi}, limits: {cpu: '2', memory: 1Gi}}

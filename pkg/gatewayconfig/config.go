@@ -18,7 +18,9 @@ const MaxTickMS int64 = 10
 
 func Decode(b []byte) (Config, error) {
 	c := Config{UserIDHeader: []string{"user-id"}}
-	if len(b) > 65536 || strictjson.Decode(b, &c) != nil {
+	var err error
+	b, err = configurationJSON(b)
+	if err != nil || strictjson.Decode(b, &c) != nil {
 		return c, errors.New("config_invalid")
 	}
 	if c.AcceptedRequestHosts == nil {
@@ -51,7 +53,6 @@ func Decode(b []byte) (Config, error) {
 	if c.SchemaVersion != 1 || !str(c.ConfigVersion, 128) || !str(c.ObserverCluster, 256) || len(c.Routes) > 128 {
 		return c, errors.New("config_invalid")
 	}
-	var err error
 	c.LogicalRequestIDHeaders, err = requestid.NormalizeHeaders(c.LogicalRequestIDHeaders)
 	if err != nil {
 		return c, err

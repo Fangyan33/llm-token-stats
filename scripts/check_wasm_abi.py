@@ -26,8 +26,9 @@ while i<len(b):
    elif t==1:p+=1;flags,p=var(section,p);_,p=var(section,p);p=var(section,p)[1] if flags&1 else p
    elif t==2:flags,p=var(section,p);_,p=var(section,p);p=var(section,p)[1] if flags&1 else p
    elif t==3:p+=2
-required={'proxy_abi_version_0_2_0','proxy_on_grpc_receive','proxy_on_grpc_close','proxy_on_grpc_receive_initial_metadata','proxy_on_grpc_receive_trailing_metadata','proxy_on_request_body','proxy_on_tick'}
+required={'_start','proxy_abi_version_0_2_0','proxy_on_grpc_receive','proxy_on_grpc_close','proxy_on_grpc_receive_initial_metadata','proxy_on_grpc_receive_trailing_metadata','proxy_on_request_body','proxy_on_tick'}
 assert required<=exports, required-exports
 assert {'proxy_grpc_stream','proxy_grpc_send','proxy_grpc_cancel'}<=imports
 assert not any('sock_' in x for x in imports)
-print('PASS: Wasm ABI marker, gRPC callbacks/hostcalls, no socket imports')
+assert not imports & {'path_open', 'fd_read', 'fd_seek', 'fd_filestat_get', 'fd_prestat_get', 'fd_readdir', 'proc_exit'}, 'filesystem imports are forbidden in the gateway VM'
+print('PASS: Wasm ABI marker, gRPC callbacks/hostcalls, no socket/filesystem/process-exit imports')

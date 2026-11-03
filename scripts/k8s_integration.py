@@ -5,7 +5,7 @@ import re
 import shutil
 import time
 
-IMAGES = ('apache/kafka:3.9.2', 'apache/doris:all-in-one-4.1.3', 'istio/proxyv2:1.13.5')
+IMAGES = ('apache/kafka:3.9.2', 'apache/doris:all-in-one-4.1.3', 'istio/proxyv2:1.14.6')
 
 
 def resource(kind, name, namespace, **fields):
@@ -86,7 +86,7 @@ def prepare_suite(root, namespace):
     return cfg
 
 
-def suite_resources(root, namespace, images):
+def suite_resources(root, namespace, images, proxy_image=IMAGES[2]):
     items = []
     for component in ('observer', 'consumer', 'fixture'):
         name = 'llm-token-stats-e2e-' + component
@@ -127,7 +127,7 @@ def suite_resources(root, namespace, images):
     items.append(resource('ConfigMap', 'llm-token-stats-e2e-gateway', namespace, data={'envoy.json': json.dumps(bootstrap(root, namespace))}))
     gateway = resource('Pod', 'llm-token-stats-e2e-gateway', namespace, spec={
         'automountServiceAccountToken': False, 'containers': [{
-            'name': 'envoy', 'image': IMAGES[2], 'imagePullPolicy': 'IfNotPresent',
+            'name': 'envoy', 'image': proxy_image, 'imagePullPolicy': 'IfNotPresent',
             'command': ['/usr/local/bin/envoy'], 'args': ['-c', '/config/envoy.json', '--concurrency', '1', '--log-level', 'warning'],
             'readinessProbe': {'httpGet': {'path': '/ready', 'port': 9901}, 'periodSeconds': 2},
             'resources': {'requests': {'cpu': '50m', 'memory': '64Mi'}, 'limits': {'cpu': '1', 'memory': '512Mi'}},
@@ -140,7 +140,7 @@ def suite_resources(root, namespace, images):
     return {'apiVersion': 'v1', 'kind': 'List', 'items': items}
 
 
-def job_resources(namespace, image, consumer_image):
+def job_resources(namespace, image, consumer_image, proxy_image=IMAGES[2]):
     name = 'llm-token-stats-collection-integration'
     account = resource('ServiceAccount', name, namespace)
     role = resource('Role', name, namespace, rules=[
@@ -159,6 +159,7 @@ def job_resources(namespace, image, consumer_image):
                                                           'env': [{'name': 'METERING_TEST_NAMESPACE', 'value': namespace},
                                                                   {'name': 'METERING_TEST_IMAGE', 'value': image},
                                                                   {'name': 'METERING_CONSUMER_IMAGE', 'value': consumer_image},
+                                                                  {'name': 'METERING_ENVOY_IMAGE', 'value': proxy_image},
                                                                   {'name': 'POD_IP', 'valueFrom': {'fieldRef': {'fieldPath': 'status.podIP'}}}],
                                                           'resources': {'requests': {'cpu': '100m', 'memory': '128Mi'},
                                                                         'limits': {'cpu': '2', 'memory': '512Mi'}}}]}}}}
@@ -171,7 +172,7 @@ def run_suite(harness, root, migrations, render_sql):
     for name in migrations:
         harness.sql(render_sql((root / 'migrations/doris/metering' / name).read_text(), 'metering_development'))
     harness.kafka('topics', '--create', '--topic', 'llm-metering-development', '--partitions', '24', '--replication-factor', '1')
-    manifest = suite_resources(root, harness.namespace, harness.images)
+    manifest = suite_resources(root, harness.namespace, harness.images, harness.proxy_image)
     (harness.output / 'integration-resources.json').write_text(json.dumps(manifest, indent=2))
     # Native remote Wasm loading is intentionally bounded and does not retry.
     # Start the normal gateway only after its download service is ready; the
@@ -182,7 +183,7 @@ def run_suite(harness, root, migrations, render_sql):
         harness.kubectl('-n', harness.namespace, 'rollout', 'status', 'deployment/' + name, '--timeout=180s', timeout=195)
     harness.apply(gateway)
     harness.kubectl('-n', harness.namespace, 'wait', '--for=condition=Ready', 'pod/llm-token-stats-e2e-gateway', '--timeout=120s', timeout=135)
-    manifest = job_resources(harness.namespace, harness.images['integration'], harness.images['consumer'])
+    manifest = job_resources(harness.namespace, harness.images['integration'], harness.images['consumer'], harness.proxy_image)
     (harness.output / 'integration-job.json').write_text(json.dumps(manifest, indent=2))
     harness.apply(manifest)
     deadline = time.monotonic() + 1350

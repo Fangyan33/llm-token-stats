@@ -20,7 +20,7 @@ from validate_collection_contracts import load, normalize_request_host_pattern, 
 
 ROOT = Path(__file__).resolve().parents[1]
 RUNTIME_IMAGES = {'kafka': 'apache/kafka:3.9.2', 'doris': 'apache/doris:all-in-one-4.1.3',
-                  'gateway': 'istio/proxyv2:1.13.5'}
+                  'gateway': 'istio/proxyv2:1.14.6'}
 
 
 def run(command, capture=True):
@@ -319,13 +319,13 @@ def render_manifests(args, images, output, wasm_file=None):
         if mode == 'enabled':
             command.append('--enable')
         run(command)
-        text = target.read_text().replace(
-            '# Template only: the JSON is default-disabled and must be rendered/validated.',
-            '# 已渲染，可直接 kubectl apply；实例身份在 Wasm 运行时读取。')
-        target.write_text(text)
+        text = target.read_text()
         if mode == 'disabled':
             (output / 'envoyfilter.yaml').write_text(text, encoding='utf-8')
     config_path.unlink()
+    (output / "scripts").mkdir(exist_ok=True)
+    for name in ("reload_gateway_filter.py", "gateway_workload.py"):
+        (output / "scripts" / name).write_bytes((ROOT / "scripts" / name).read_bytes())
 
 
 def prepare_images(args, images):
@@ -411,7 +411,7 @@ def package_readme(args):
 运行平台：{args.platform}；采集命名空间：{args.namespace}。
 Kafka 3.9.2（24 分区、单副本、保留 72 小时），Doris 4.1.3（单 FE / BE）。
 本包使用明文 Kafka 和 Doris root 空密码，仅用于受控开发环境；不代表生产 G0–G5 验收。
-目标集群需已有 Istio 1.13.5、网关业务路由和鉴权，以及可用的 StorageClass / PV。
+采集网关数据平面使用已评估的 Istio proxyv2:1.14.6（Envoy 1.22.7-dev），目标集群需已有兼容的 Istio 控制面、网关业务路由和鉴权，以及可用的 StorageClass / PV。
 本包不安装 Istio、不修改已有网关的 Deployment、路由和鉴权。
 {image_note}
 Wasm 已嵌入 Observer 镜像。manifest.json 的 images 记录全部镜像引用，
@@ -469,12 +469,13 @@ kubectl -n {args.namespace} get pods,svc,pvc
 不要同时保留新旧过滤器。旧配置中的 gateway_instance_id 已移除，必须使用与新 Wasm 配套的配置。
 
 确认 Wasm 下载内容与 manifest.json 的 wasm_sha256 一致、过滤器顺序为 ext_authz → Wasm → router 后，
-对已存在的网关应用插件。先应用包根目录汇总的关闭态配置，再按验证结果启用采集：
+对已存在的网关应用插件。先应用包根目录汇总的关闭态配置，再启用并重推。关闭态不加载 Wasm，实际加载和采集检查在启用后完成：
 
 ```sh
 kubectl apply -f envoyfilter.yaml
-# 完成加载与顺序检查后启用采集
+# 目标网关先关闭 Agent 下载转换并完成滚动（见下文），然后启用采集
 kubectl apply -f gateway/enabled/
+python3 scripts/reload_gateway_filter.py --context CONTEXT --gateway-namespace {args.gateway_namespace} --envoyfilter-name {args.envoyfilter_name}
 # 需要关闭采集时
 kubectl apply -f envoyfilter.yaml
 ```
@@ -485,7 +486,30 @@ EnvoyFilter 名称：{args.envoyfilter_name}，同样记录于 manifest.json 的
 默认名称固定为 llm-token-stats-envoyfilter-wasm，不自动添加摘要；启用态、关闭态和版本更新保持名称一致。
 同一命名空间多网关需要独立配置时，通过 --envoyfilter-name 显式指定不同名称，例如 llm-token-stats-envoyfilter-wasm-canary。
 同名资源变更选择器会更新原对象；正式与灰度网关应使用互斥的标签。
-网关 Pod 扩容、重建后自动应用同一过滤器，不需要重新打包；无需修改网关 Pod 模板。
+目标网关先设置 ISTIO_AGENT_ENABLE_WASM_REMOTE_LOAD_CONVERSION=false 并完成一次滚动，
+以保留 Envoy outbound 下载和 mTLS；此开关影响该代理上的所有 ECDS 远程 Wasm，须核对其他插件。
+同时在目标网关 Pod 的 proxy.istio.io/config 注解中合并以下规则，保留既有其他设置；缺少指标时重推命令会拒绝报告加载成功：
+
+```yaml
+proxy.istio.io/config: |
+  proxyStatsMatcher:
+    inclusionRegexps:
+      - ".*extension_config_discovery.*"
+```
+
+完成注解配置后再设置开关并滚动：
+
+```sh
+kubectl --context CONTEXT -n {args.gateway_namespace} set env deployment/目标网关 ISTIO_AGENT_ENABLE_WASM_REMOTE_LOAD_CONVERSION=false
+kubectl --context CONTEXT -n {args.gateway_namespace} rollout status deployment/目标网关
+```
+
+网关 Pod 扩容、重建后自动匹配同一过滤器，但先透传，需要再次运行上述重推命令激活采集，无需重新打包。
+重推默认最多 120 秒、每 15 秒重试，不启动常驻控制器，不重启网关；超时非零，保留旧有效配置或透传。
+命令只修改 ECDS 订阅 revision，用 resourceVersion 防止覆盖并发变更；ECDS 加载后仍需验证真实 SSE 改写与入库。
+启用补丁排除已复现崩溃的 Istio 1.13.x；旧代理继续业务转发、不安装采集。1.14.6 仅为候选评估版本，生产需选择受支持的完整版本组合验收。
+关闭态直接使用 Lua，无需 Wasm 下载；启用态有透传默认配置，更新被拒绝时保留旧有效配置。
+插件参数采用 google.protobuf.Struct 的 YAML 字段，须与支持有界 Struct 解码的新 Wasm 配套；schema_version 仍为 1。
 同名 Pod 重建后实例标识相同，不能用于区分 Pod 生命周期。跨集群查询需结合 cluster_name。
 若运行时身份字段缺失、非法或 namespace/pod-name 超过 128 字节，插件停止采集并计数
 metering_gateway_identity_unavailable_total，业务继续放行，不回退到固定值或截断名称。

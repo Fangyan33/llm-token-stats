@@ -154,7 +154,7 @@ python3 scripts/render_gateway_filter.py \
 # G0/G1 通过后，为该工作负载使用显式 --enable。
 ```
 
-`gateway_instance_id` 由 Wasm 在插件启动时读取 Envoy 的 `node.metadata.NAMESPACE` 和 `node.metadata.NAME`，组合为 `namespace/pod-name`；配置 JSON 不再接受此字段。Istio 1.13.5 默认提供这两项元数据，无需修改网关 Pod 模板。多个副本共享同一 EnvoyFilter，各自读取实例名称，扩容或重建后无需重新渲染。标识不包含 Pod UID，同名 Pod 重建后标识不变；跨集群分析需结合 `cluster_name`。命名空间按 DNS label 校验（最多 63 字节），Pod 名称按 Kubernetes DNS subdomain 校验（总长最多 253 字节，不另限每段 63 字节）；身份缺失、非法或组合后超过现有协议的 128 字节上限时停止该插件采集，增加 `metering_gateway_identity_unavailable_total`，业务继续放行；不截断名称、不回退到固定值，也不读取客户端请求头。
+`gateway_instance_id` 由 Wasm 在插件启动时读取 Envoy 的 `node.metadata.NAMESPACE` 和 `node.metadata.NAME`，组合为 `namespace/pod-name`；配置 JSON 不再接受此字段。Istio 1.13.5 默认提供这两项元数据，身份读取无需额外修改 Pod 模板；ECDS 下载转换开关仍须按下文设置。多个副本共享同一 EnvoyFilter，各自读取实例名称，扩容或重建后无需重新渲染。标识不包含 Pod UID，同名 Pod 重建后标识不变；跨集群分析需结合 `cluster_name`。命名空间按 DNS label 校验（最多 63 字节），Pod 名称按 Kubernetes DNS subdomain 校验（总长最多 253 字节，不另限每段 63 字节）；身份缺失、非法或组合后超过现有协议的 128 字节上限时停止该插件采集，增加 `metering_gateway_identity_unavailable_total`，业务继续放行；不截断名称、不回退到固定值，也不读取客户端请求头。
 
 过滤器通过代理 `metadata.NAMESPACE` 与工作负载启动标签共同匹配，根配置命名空间中的资源也不会跨命名空间生效。资源默认名称为 `llm-token-stats-envoyfilter-wasm`，不自动追加摘要；同一命名空间多网关需要独立配置时，渲染和打包须通过 `--envoyfilter-name` 显式指定不同名称。自定义名称必须以 `llm-token-stats-` 开头且为不超过 63 字符的 DNS 标签；启用态和关闭态名称相同，选择器变更会更新同名对象。默认 `istio-system`、`istio=ingressgateway`，通过 `--gateway-label` 可替换默认标签。Wasm 使用远程 URL、HTTP 集群和实际文件 SHA-256 加载；模板插在 router 前，要求 ext_authz 已在它之前，以真实 config_dump 核验。每 Worker 一份 Root；生产热更新及回退仍需完成灰度验收。从旧版迁移先移除按 UID 命名或固定名 `gateway-observer` 的过滤器，避免新旧重复安装。
 
@@ -182,9 +182,19 @@ curl --noproxy '*' --fail --output dist/gateway-observer.download.wasm \
 sha256sum dist/gateway-observer-v1.wasm dist/gateway-observer.download.wasm
 ```
 
-网关使用原生 `code.remote` 加载，下载超时 5 秒、额外重试 0 次、`fail_open: true`。保留 HTTP_FILTER 直接插入方式，不依赖 Istio agent 的 ECDS 文件重写。下载 HTTP 集群默认是 `outbound|9093||llm-token-stats-observer.metering.svc.cluster.local`；采集 gRPC 仍使用 9090 的 HTTP/2 集群，不能混用。生产须核对实际集群存在，NetworkPolicy、网格 mTLS 与授权允许相应流量；下载端口默认 ClusterIP 内网访问，Observer 本身不终止 TLS、不提供下载鉴权。首次加载有下载等待，已运行的业务请求不会逐次下载。
+网关通过 ECDS 使用原生 `code.remote` 加载，下载超时 5 秒、额外重试 0 次，设置 `fail_open: true` 和 `nack_on_code_cache_miss: true`。HTTP 过滤器配置 Lua 透传默认值及 `apply_default_config_without_warming: true`，首次下载不会阻塞监听器；后续 ECDS 更新被拒绝则保留上一份有效配置。关闭态直接安装 Lua，不依赖 Wasm。
 
-仅保留当前镜像的单个文件。先更新所有 Observer 副本并核对下载摘要，再更新网关配置。滚动期间旧摘要可能校验失败，允许暂时缺少采集；已加载实例可继续运行，但旧网关重启后不保证取得旧文件。下载服务恢复后需要触发插件重新安装或重启网关；新 Pod 自动匹配工作负载过滤器。原样重复 apply 同一配置不保证触发下载，不承诺自动恢复。版本回退先恢复对应 Observer 镜像，再恢复其匹配的网关配置。需要立即停采时关闭或删除对应工作负载的采集过滤器；`fail_open` 不覆盖任意初始化、ABI 或资源故障。
+当前 ECDS 候选验收网关使用原始 `istio/proxyv2:1.14.6`（Envoy 1.22.7-dev）；1.13.x 已复现宿主崩溃，不作为 ECDS 启用版本。启用补丁以 `proxyVersion` 排除 1.13.x，旧代理继续业务转发但不安装采集；关闭态 Lua 适用于旧代理。本地控制面仍为 1.13.5，仅是隔离兼容性评估，不代表生产混合版本受支持。生产应选择受支持的完整 Istio 版本组合并完成 G0–G5。
+
+目标网关需设置 `ISTIO_AGENT_ENABLE_WASM_REMOTE_LOAD_CONVERSION=false` 并完成滚动，否则 Istio 1.13.5 默认由 Agent 下载并重写为本地文件，不能据 YAML 中的 outbound 集群推断实际下载路径。开关影响同一网关上的所有 ECDS 远程 Wasm，须核对其他插件。为使重推命令能确认加载，在 Pod 的 `proxy.istio.io/config` 中将 `.*extension_config_discovery.*` 合并到 `proxyStatsMatcher.inclusionRegexps`，保留既有设置并完成滚动；旧版默认统计匹配规则不导出这些指标。下载集群默认是 `outbound|9093||llm-token-stats-observer.metering.svc.cluster.local`，保留网格 mTLS；采集 gRPC 仍使用 9090 的 HTTP/2 集群。下载端口默认 ClusterIP，Observer 本身不终止 TLS、不提供下载鉴权。
+
+ECDS 内部名称按配置摘要隔离；Kubernetes EnvoyFilter 名称仍固定。重推时原子更新 EXTENSION_CONFIG 和 HTTP_FILTER 的订阅名称，保留 Wasm 参数与 VM 初始化配置，避免反复复用旧监听器上下文。固定旧版 Envoy 存在 [ECDS 上下文生命周期问题](https://github.com/envoyproxy/envoy/issues/14930#issuecomment-1240343729)，本地曾复现，不能仅凭 fail_open 或缓存开关认定更新安全；本次回归要求无意外重启。
+
+首次缓存缺失会 NACK 并后台下载。旧版控制面不因 NACK 自动重推；首次安装、下载恢复、网关重启或扩容后运行 `python3 scripts/reload_gateway_filter.py --context CONTEXT --gateway-namespace NAMESPACE --envoyfilter-name NAME`。命令默认等待 120 秒，每 15 秒重试，不重启 Pod，随分发包携带。使用目标 ECDS 加载计数及配置/身份错误增量确认加载；实际激活仍需用 SSE 改写与 Kafka/Doris 事件验证，普通 `config_dump` 中的订阅或业务 200 都不足以证明采集已工作。
+
+清单使用块式 YAML，插件参数通过 `Struct` YAML 映射传入；旧版 Envoy 将 Struct 作为 Protobuf 二进制传递，新 Wasm 已支持该格式；既有独立 JSON 输入继续支持。新 Wasm 支持有界 Protobuf Struct 和严格 JSON，并复用字段、Host、身份与预算校验；解析失败只禁用采集，保持业务透传。Struct 解码无反射并有深度/节点界限，拒绝重复键、非法 UTF-8、非整数/非有限数，维持 64 KiB 上限及 `schema_version=1`。VM 内不使用依赖 panic/recover 的 YAML 解析器。TinyGo 构建固定 `-buildmode=wasi-legacy`，避免命令式 WASI 入口调用 `proc_exit`；ABI 检查同时拒绝套接字、文件系统和进程退出导入。
+
+仅保留当前镜像的单个文件。先更新所有 Observer 副本并核对摘要，再更新匹配的新清单并重推；滚动期间允许缺少采集。回退先恢复对应 Observer 镜像，再恢复匹配清单。停采使用关闭清单或删除过滤器。ECDS 兜底不覆盖 Envoy/节点崩溃或 OOM 等宿主故障。
 
 ## Consumer 恢复与统计边界
 

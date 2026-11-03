@@ -10,7 +10,7 @@
 
 ## 构建、测试与本地开发
 
-使用 Go 1.25.0、TinyGo 0.40.1、Python 3.10+；E2E 测试需要本地 kind Kubernetes 1.22.17、Istio 1.13.5 和 Docker（构建并导入镜像）。以下命令均在仓库根目录执行：
+使用 Go 1.25.0、TinyGo 0.40.1、Python 3.10+；E2E 测试需要本地 kind Kubernetes 1.22.17、Istio 1.13.5 控制面、隔离采集网关及临时 Envoy 使用 proxyv2:1.14.6（Envoy 1.22.7-dev）和 Docker（构建并导入镜像）。以下命令均在仓库根目录执行：
 
 | 命令 | 用途 |
 | --- | --- |

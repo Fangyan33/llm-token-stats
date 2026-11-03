@@ -10,6 +10,8 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'scripts'))
 from wasm_artifact import remote_source
+from yaml_support import decode_yaml, plugin_config
+from yaml_block import yaml_block
 
 
 class WasmDistributionTests(unittest.TestCase):
@@ -22,7 +24,7 @@ class WasmDistributionTests(unittest.TestCase):
             url = 'http://observer.example:9093/wasm/gateway-observer-v1.wasm'
             namespace = 'gateway-test'
             command = [sys.executable, str(ROOT / 'scripts/render_gateway_filter.py'),
-                       '--gateway-label', 'app=ai-gateway',
+                       '--enable', '--gateway-label', 'app=ai-gateway',
                        '--gateway-namespace', namespace, '--wasm-file', str(artifact),
                        '--wasm-url', url, '--wasm-cluster', 'download-http', '--output', str(output)]
             subprocess.run(command, cwd=ROOT, check=True, capture_output=True)
@@ -32,15 +34,20 @@ class WasmDistributionTests(unittest.TestCase):
             self.assertIn('cluster: "download-http"', text)
             self.assertIn('proxy:\n          metadata:\n            NAMESPACE: ' + json.dumps(namespace), text)
             self.assertNotIn('            NAME:', text)
-            self.assertIn('labels: {"app": "ai-gateway"}', text)
+            self.assertEqual(decode_yaml(text)['spec']['workloadSelector']['labels'], {'app': 'ai-gateway'})
             self.assertIn('namespace: ' + json.dumps(namespace), text)
             self.assertNotIn('metering-instance', text)
-            self.assertIn('metadata: {name: llm-token-stats-envoyfilter-wasm,', text)
+            self.assertEqual(decode_yaml(text)['metadata']['name'], 'llm-token-stats-envoyfilter-wasm')
             self.assertNotIn('gateway_instance_id', text)
             self.assertNotIn('filename:', text)
             self.assertNotIn('REPLACE_', text)
-            value = next(line.strip()[len('value: '):] for line in text.splitlines() if line.strip().startswith('value: "'))
-            self.assertFalse(json.loads(json.loads(value))['enabled'])
+            self.assertTrue(plugin_config(decode_yaml(text))['enabled'])
+            self.assertTrue(all('proxyVersion' in p['match']['proxy'] for p in decode_yaml(text)['spec']['configPatches']))
+            self.assertIn('type.googleapis.com/google.protobuf.Struct', text)
+            self.assertNotIn('StringValue', text)
+            self.assertNotIn('labels: {', text)
+            self.assertIn('nack_on_code_cache_miss: true', text)
+            self.assertIn('apply_default_config_without_warming: true', text)
             artifact.write_bytes(b'not wasm')
             output.unlink()
             result = subprocess.run(command, cwd=ROOT, capture_output=True)
@@ -66,7 +73,7 @@ class WasmDistributionTests(unittest.TestCase):
                     command += ['--envoyfilter-name', name]
                 subprocess.run(command, cwd=ROOT, check=True, capture_output=True)
                 text = output.read_text()
-                name = re.search(r'^metadata: \{name: ([a-z0-9-]+),', text, re.M).group(1)
+                name = decode_yaml(text)['metadata']['name']
                 self.assertIn('proxy:\n          metadata:\n            NAMESPACE: ' + json.dumps(namespace), text)
                 self.assertNotIn('            NAME:', text)
                 return name, text
@@ -105,6 +112,10 @@ class WasmDistributionTests(unittest.TestCase):
                 result = subprocess.run([*command, *args], cwd=ROOT, capture_output=True)
                 self.assertNotEqual(result.returncode, 0)
             self.assertFalse((Path(directory) / 'filter.yaml').exists())
+
+    def test_yaml_strings_and_keys_round_trip_without_implicit_coercion(self):
+        value = {'null': 'true', 'on': 'off', 'unicode': '中文\u0085\u2028\u2029end', 'items': []}
+        self.assertEqual(decode_yaml(yaml_block(value)), value)
 
     def test_unsafe_urls_and_invalid_artifacts_are_rejected(self):
         with tempfile.TemporaryDirectory() as directory:

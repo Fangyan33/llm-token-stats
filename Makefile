@@ -13,7 +13,7 @@ build:
 	CGO_ENABLED=0 go build -trimpath -o dist/fixture ./tests/integration/fixture
 wasm:
 	mkdir -p dist
-	cd plugins/gateway-observer && tinygo build -target=wasi -scheduler=none -o ../../dist/gateway-observer-v1.wasm .
+	cd plugins/gateway-observer && tinygo build -target=wasi -buildmode=wasi-legacy -scheduler=none -o ../../dist/gateway-observer-v1.wasm .
 	python3 scripts/check_wasm_abi.py dist/gateway-observer-v1.wasm
 test:
 	python3 scripts/validate_collection_contracts.py

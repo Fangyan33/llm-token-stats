@@ -20,6 +20,6 @@ jobs:
       - run: |
           docker run --rm --user "$(id -u):$(id -g)" --env HOME=/tmp \
             -v "$PWD:/src" -w /src/plugins/gateway-observer \
-            tinygo/tinygo:0.40.1 tinygo build -target=wasi -scheduler=none \
+            tinygo/tinygo:0.40.1 tinygo build -target=wasi -buildmode=wasi-legacy -scheduler=none \
             -o ../../dist/gateway-observer-v1.wasm .
       - run: python3 scripts/check_wasm_abi.py dist/gateway-observer-v1.wasm

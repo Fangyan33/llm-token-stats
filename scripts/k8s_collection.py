@@ -15,7 +15,9 @@ import uuid
 from pathlib import Path
 from image_tag import resolve_image_tag
 import k8s_integration
+from reload_gateway_filter import Reloader
 from render_doris_sql import MIGRATIONS, render_sql, database_name
+from yaml_block import yaml_block
 
 ROOT = Path(__file__).resolve().parents[1]
 OWNER_KEY = 'app.kubernetes.io/part-of'
@@ -79,11 +81,22 @@ def walk(value):
 
 
 def wasm_configs(dump):
-    # 只检查已激活的监听器，不能把 warming 中的配置当成加载成功。
+    # 这里只验证激活监听器中的订阅；实际加载由 ECDS 指标与业务采集共同验证。
     active = [v['active_state'] for v in walk(dump) if 'active_state' in v]
-    return [v['typed_config']['config'] for v in walk(active)
-            if v.get('name') == 'envoy.filters.http.wasm'
-            and v.get('typed_config', {}).get('config', {}).get('name') == 'gateway-observer']
+    return [v for v in walk(active)
+            if 'config_discovery' in v and v.get('name', '').startswith('llm-token-stats-')]
+
+
+def doris_backend_ready(raw):
+    # Alive precedes the first disk report; schema creation needs usable storage too.
+    for row in raw.splitlines():
+        fields = row.split('\t')
+        try:
+            if len(fields) > 15 and fields[9] == 'true' and float(fields[14].split()[0]) > 0 and float(fields[15].split()[0]) > 0:
+                return True
+        except (ValueError, IndexError):
+            pass
+    return False
 
 
 def cluster_configs(topic, group, database="metering_development"):
@@ -155,6 +168,8 @@ class Harness:
     def __init__(self, args):
         self.args = args
         self.namespace = args.namespace
+        self.proxy_version = getattr(args, 'proxy_version', '1.14.6')
+        self.proxy_image = 'istio/proxyv2:' + self.proxy_version
         self.kube = ['kubectl', '--context', args.context]
         self.base = ROOT / '.tmp/k8s-collection' / args.context / args.namespace
         self.state_file = self.base / 'state.json'
@@ -212,7 +227,8 @@ class Harness:
         versions = json.loads(run(['istioctl', '--context', self.args.context, 'version', '-o', 'json']).stdout)
         require(versions['meshVersion'] and all(v['Info']['version'] == '1.13.5' for v in versions['meshVersion']),
                 '本用例固定验证 Istio 1.13.5')
-        write_json(self.output / 'versions.json', {'nodes': nodes, 'istio': versions})
+        write_json(self.output / 'versions.json', {'nodes': nodes, 'istio': versions,
+                                                  'test_proxy_image': self.proxy_image})
         for name in ('observer', 'consumer', 'fixture', 'integration.test', 'gateway-observer-v1.wasm'):
             require((ROOT / 'dist' / name).is_file(), '请先执行 make build wasm k8s-test-build')
 
@@ -226,8 +242,7 @@ class Harness:
         def ready():
             try:
                 raw = self.sql('SHOW BACKENDS;')
-                return any(len(fields) > 9 and fields[9] == 'true'
-                           for fields in (row.split('\t') for row in raw.splitlines()))
+                return doris_backend_ready(raw)
             except subprocess.CalledProcessError:
                 return False
         wait_for('Doris BE 就绪', ready, 180)
@@ -253,7 +268,7 @@ class Harness:
                 timeout=600, capture=False)
         # Import dependencies separately: kind otherwise exports the large Doris
         # image again whenever only one small test image changes.
-        for images in (k8s_integration.IMAGES, self.images.values()):
+        for images in ((*k8s_integration.IMAGES[:2], self.proxy_image), self.images.values()):
             run(['kind', 'load', 'docker-image', *images, '--name', self.args.kind_cluster],
                 timeout=600, capture=False)
 
@@ -285,6 +300,7 @@ class Harness:
                           'stringData': credentials})
         text = (ROOT / 'deploy/k8s-test/fixtures.yaml').read_text()
         text = text.replace('TEST_NAMESPACE', self.namespace).replace('TEST_FIXTURE_IMAGE', self.images['fixture'])
+        text = text.replace('docker.io/istio/proxyv2:1.14.6', 'docker.io/' + self.proxy_image)
         resources.extend(decode_resources(self.kubectl('create', '--dry-run=client', '-f', '-',
                                                        '-o', 'json', input=text)))
         for resource in resources:
@@ -321,6 +337,11 @@ class Harness:
         self.filter_name = resource['metadata']['name']
         resource['metadata'].setdefault('labels', {})[OWNER_KEY] = OWNER
         resource['spec']['workloadSelector']['labels'] = {'istio': self.namespace}
+        # Only this owned test resource may override the production version guard.
+        # Otherwise a 1.13.5 test would silently exercise a gateway without Wasm.
+        for patch in resource['spec']['configPatches']:
+            patch['match'].setdefault('proxy', {})['proxyVersion'] = '^' + re.escape(self.proxy_version) + '(-|$)'
+        output.write_text(yaml_block(resource))
         write_json(self.output / 'envoyfilter.json', resource)
         self.apply(resource)
         return resource
@@ -333,13 +354,12 @@ class Harness:
         def probe():
             dump = self.dump(pod_name)
             configs = wasm_configs(dump)
-            if not present:
-                return dump if not configs else None
-            if configs and all(c['vm_config']['code']['remote']['sha256'] == self.sha
-                               and json.loads(c['configuration']['value'])['enabled'] for c in configs):
-                return dump
-            return None
-        return wait_for('网关已激活的 Wasm 配置收敛', probe)
+            return dump if bool(configs) == present else None
+        dump = wait_for('网关已激活的 ECDS 订阅收敛', probe)
+        if present:
+            result = Reloader(self.args.context, self.namespace, self.filter_name).reload()
+            write_json(self.output / 'ecds-loaded.json', result)
+        return dump
 
     @contextlib.contextmanager
     def forwarding(self, pod_name=None):
@@ -381,7 +401,8 @@ class Harness:
         wrong_selector = copy.deepcopy(resource)
         wrong_selector['spec']['workloadSelector']['labels'] = {'istio': 'no-such-verification-workload'}
         wrong_namespace = copy.deepcopy(resource)
-        wrong_namespace['spec']['configPatches'][0]['match']['proxy']['metadata']['NAMESPACE'] = 'no-such-verification-namespace'
+        for patch in wrong_namespace['spec']['configPatches']:
+            patch['match']['proxy']['metadata']['NAMESPACE'] = 'no-such-verification-namespace'
         for other in (wrong_selector, wrong_namespace):
             try:
                 self.apply(other)
@@ -460,19 +481,20 @@ class Harness:
         pods = self.pods('llm-token-stats-wasm-gateway')
         require(len(pods) == 2 and self.gateway['metadata']['uid'] in {p['metadata']['uid'] for p in pods},
                 '扩容必须保留原网关并增加一个新副本')
+        self.wait_wasm()
         results = []
         for pod in pods:
             name = pod['metadata']['name']
-            self.wait_wasm(pod_name=name)
             with self.forwarding(pod_name=name):
                 requests = self.requests(self.namespace + '/' + name, 'requests.' + name + '.json')
             results.append({'pod': name, 'instance_id': self.namespace + '/' + name, 'requests': requests})
         after = self.get('-n', self.namespace, 'get', 'envoyfilter', self.filter_name)
-        require(before['metadata']['resourceVersion'] == after['metadata']['resourceVersion']
-                and before['spec'] == after['spec'], '扩容期间不得重新渲染或修改 EnvoyFilter')
+        require(before['metadata']['name'] == after['metadata']['name']
+                and before['spec']['workloadSelector'] == after['spec']['workloadSelector'],
+                '扩容重推不得改变资源名称或工作负载选择器')
         wait_for('扩容后 18 条事件消费完成', lambda: offsets_caught_up(
             self.kafka('consumer-groups', '--describe', '--group', self.group), self.topic, 18), 90)
-        summary = {'replicas_before': 1, 'replicas_after': 2, 'envoyfilter_unchanged': True,
+        summary = {'replicas_before': 1, 'replicas_after': 2, 'explicit_ecds_reload': True,
                    'committed_events': 18, 'gateways': results}
         write_json(self.output / 'gateway-scale.result.json', summary)
         return summary
@@ -560,8 +582,8 @@ class Harness:
                     '测试 Pod 未 Ready 或曾重启：' + pod['metadata']['name'])
             spec = pod['spec']
             if pod['metadata']['labels'].get('app') == 'llm-token-stats-wasm-gateway':
-                require(len(spec['containers']) == 1 and spec['containers'][0]['image'] == 'docker.io/istio/proxyv2:1.13.5',
-                        '网关必须使用原始 Istio 1.13.5 镜像')
+                require(len(spec['containers']) == 1 and spec['containers'][0]['image'] == 'docker.io/' + self.proxy_image,
+                        '采集网关必须使用指定的原始 ' + self.proxy_image + ' 镜像')
                 require('wasm' not in json.dumps(spec.get('volumes', [])), '网关不得挂载 Wasm')
             if pod['metadata']['labels'].get('app') == 'llm-token-stats-observer':
                 digest = self.kubectl('-n', self.namespace, 'exec', pod['metadata']['name'], '-c', 'observer',
@@ -639,6 +661,8 @@ class Harness:
             consumer = self.check_consumer()
             print('验证同一 EnvoyFilter 自动覆盖扩容后的网关副本', flush=True)
             gateway_scaling = self.check_gateway_scale()
+            from k8s_ecds import checks
+            ecds_faults = checks(self, resource)
             self.verify_pods(gateway_replicas=2)
             integration = k8s_integration.run_suite(self, ROOT, MIGRATIONS, render_sql)
             self.verify_infrastructure()
@@ -646,12 +670,13 @@ class Harness:
             write_json(self.output / 'existing-gateway-after.json', after)
             require(before == after, '既有 istio-system 网关身份或重启次数发生变化')
             summary = {'status': 'passed', 'context': self.args.context, 'namespace': self.namespace,
+                       'test_proxy_image': self.proxy_image,
                        'image_tag': self.image_tag, 'images': self.images,
                        'wasm_sha256': self.sha, 'kafka_topic': self.topic, 'doris_database': self.database,
                        'cluster_name':self.args.kind_cluster,'deployment_environment':'stg',
                        'lookup_implementation':'synthetic','consumer': consumer, 'integration': integration,
                        'requests': results, 'ignored_requests': ignored, 'gateway_scaling': gateway_scaling,
-                       'existing_gateway_unchanged': True}
+                       'existing_gateway_unchanged': True, 'ecds_faults': ecds_faults}
             write_json(self.output / 'result.json', summary)
             print(json.dumps(summary, ensure_ascii=False, indent=2), flush=True)
             print('PASS：Kubernetes 部署验收与 Go 集成故障回归全部通过', flush=True)
@@ -672,6 +697,8 @@ def main(argv=None, *, action=None):
     parser.add_argument('--context', default='kind-kind')
     parser.add_argument('--kind-cluster', default='kind')
     parser.add_argument('--namespace', type=namespace_name, default='metering-wasm-verify')
+    parser.add_argument('--proxy-version', choices=['1.13.5', '1.14.6'], default='1.14.6',
+                        help='仅指定隔离测试的数据平面版本，不修改控制面和既有网关')
     args = parser.parse_args(argv)
     if not re.fullmatch(r'[a-zA-Z0-9_-]+', args.kind_cluster) or args.context != 'kind-' + args.kind_cluster:
         parser.error('本用例只操作指定 kind 集群，--context 必须为 kind-<kind-cluster>')

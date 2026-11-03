@@ -1,6 +1,6 @@
 # Kubernetes 采集端到端测试
 
-统一入口为 `make k8s-test`，环境固定为 Kubernetes 1.22.17 + Istio 1.13.5。该入口依次执行原 K8S-WASM-001 部署验收和原本地 Go 集成测试；`make local-test` 已移除。测试全部使用合成流量，不代表生产 G0–G5 验收。
+统一入口为 `make k8s-test`，环境固定为 Kubernetes 1.22.17 + Istio 1.13.5 控制面，测试数据面默认 1.14.6，可通过 `--proxy-version 1.13.5` 回测当前集群版本。该入口依次执行原 K8S-WASM-001 部署验收和原本地 Go 集成测试；`make local-test` 已移除。测试全部使用合成流量，不代表生产 G0–G5 验收。
 
 ## 环境与拓扑
 
@@ -26,11 +26,15 @@ Kafka、Doris 也在本次命名空间内启动，不连接宿主机端口，不
 
 ```sh
 make test k8s-test
+# 在当前 1.13.5 集群中回测相同版本的数据面：
+make k8s-test K8S_TEST_ARGS='--context kind-kind --namespace metering-wasm-ecds-1135 --proxy-version 1.13.5'
 # 使用另一个已安装相同版本 Istio 的 kind 集群：
 make k8s-test K8S_TEST_ARGS='--context kind-dev --kind-cluster dev --namespace metering-wasm-dev'
 ```
 
 脚本编译服务、Wasm 和 Go 测试二进制，构建 Observer、Consumer、fixture、integration 四个测试镜像，将这些镜像及 Kafka、Doris、Istio proxyv2 导入 kind，再启动测试环境。镜像版本取当前 HEAD 的 Git tag，无 tag 时取至少 12 位 commit 短 hash；相同提交的本地修改会重新构建并导入。
+
+`--proxy-version` 同时约束隔离 Istio 网关、集成网关和 Go 测试创建的所有临时 Envoy。测试器仅在其拥有的隔离 EnvoyFilter 中覆盖版本匹配，使 1.13.5 实际运行 ECDS；生产模板的版本限制保持原值。结果记录指定镜像，并检查实际 Pod 镜像、加载指标、SSE 改写及事件入库，避免把插件未加载时的业务 200 判为验收通过。
 
 命名空间必须以 `metering-wasm-` 开头。重复执行只清理带有本测试归属标签的同名环境；没有归属标签时拒绝删除。原 `istio-system` 网关不参与发布，测试前后核对其 Pod UID、名称和重启次数。
 
@@ -40,10 +44,11 @@ Job 的 ServiceAccount 只有本命名空间内 Pod、ConfigMap 的创建、读�
 
 | 场景 | 断言 |
 | --- | --- |
-| Istio 部署与下载 | 两个 Observer，远程下载摘要与构建一致；STRICT mTLS 下旁路及入库；只接受激活监听器中的 Wasm |
-| EnvoyFilter 与扩容 | 错误 selector / NAMESPACE 不安装插件且健康请求正常；工作负载隔离；1→2 副本共享原过滤器，18 条事件入库、消费追平；原网关不变 |
+| Istio 部署与下载 | 两个 Observer，远程下载摘要与构建一致；STRICT mTLS 下旁路及入库；结合激活监听器中的 ECDS 订阅、加载指标及实际事件验证激活 |
+| EnvoyFilter 与扩容 | 错误 selector / NAMESPACE 不安装插件且健康请求正常；工作负载隔离；1→2 副本共享原过滤器，显式重推后 18 条事件入库、消费追平；原网关不变 |
 | 正常采集 | JSON、SSE、缺失 usage；改写、事件来源、实际路由名、独立 topic、Doris 可见回执及 offset 正确 |
 | 下载故障及恢复 | 不可用、404、超时、摘要不符时业务 200、正文摘要不变且无采集；修复配置、重建测试 Envoy Pod 后恢复采集 |
+| ECDS 透传与原地恢复 | 下载延迟、404、超时、摘要错误、不可用、损坏模块和非法 Struct 字段类型；业务正文不变且无事件；显式重推后同一 Pod 恢复 SSE 改写和入库；热更新拒绝保留旧配置，关闭态不依赖下载 |
 | 改写 fail-open | HTTP/1、HTTP/2 下正常改写、非法 JSON、超限、trailers、正文停顿；原始正文和 trailer 保留，尾部未发送时上游已收到原始前缀 |
 | 正文边界与超时 | 256 KiB、边界加一、1 MiB、慢正文、延迟响应；业务正文摘要不变，未知用量为 NULL |
 | Kafka / Doris 故障 | Producer 黑洞下 Emit 有界；未知 schema 不推进 offset；真实 BE 已写入但确认丢失时按可见 label 恢复 |
@@ -91,3 +96,5 @@ make k8s-clean K8S_TEST_ARGS='--context kind-dev --kind-cluster dev --namespace 
 清理校验命名空间前缀、归属标签和本地状态，删除整个测试命名空间，包括 Kafka、Doris、Job、临时 Envoy 和全部测试数据。其他命名空间、既有 Compose 环境及本地诊断文件保留。脚本创建的端口转发在成功、失败或中断时关闭，手工 port-forward 由调用终端停止。
 
 VM / Envoy 自身崩溃、节点故障、生产第三方归属服务、生产容量和长期稳定性不在本组本地合成测试的验收范围内。
+
+修复版本评估仅更新隔离测试网关及临时 Envoy，不修改原控制面或业务网关。旧 1.13.x 已复现 ECDS 宿主崩溃，不能以本次结果宣称其更新安全；生产版本组合需另行验收。

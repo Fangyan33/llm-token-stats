@@ -11,6 +11,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"os"
 	"time"
 )
 
@@ -38,6 +39,42 @@ func main() {
 	s := grpc.NewServer(grpc.ForceServerCodec(codec{}))
 	s.RegisterService(&grpc.ServiceDesc{ServiceName: "envoy.service.auth.v3.Authorization", HandlerType: (*auth)(nil), Methods: []grpc.MethodDesc{{MethodName: "Check", Handler: check}}}, struct{}{})
 	go s.Serve(l)
+	http.HandleFunc("/wasm/e2e", func(out http.ResponseWriter, r *http.Request) {
+		scenario := r.URL.Query().Get("scenario")
+		if scenario == "not_found" {
+			out.WriteHeader(404)
+			return
+		}
+		if scenario == "timeout" {
+			<-r.Context().Done()
+			return
+		}
+		if scenario == "slow" {
+			select {
+			case <-time.After(3 * time.Second):
+			case <-r.Context().Done():
+				return
+			}
+		}
+		if scenario == "corrupt" {
+			out.Write([]byte("corrupt-wasm-" + r.URL.Query().Get("nonce")))
+			return
+		}
+		b, err := os.ReadFile("/testdata/gateway-observer-v1.wasm")
+		if err != nil {
+			out.WriteHeader(503)
+			return
+		}
+		// Valid custom section gives each cold-load probe an uncached digest.
+		name := "ecds-v1-" + r.URL.Query().Get("nonce")
+		if len(name) > 126 {
+			out.WriteHeader(400)
+			return
+		}
+		b = append(b, 0, byte(len(name)+1), byte(len(name)))
+		b = append(b, []byte(name)...)
+		out.Write(b)
+	})
 	http.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) { fmt.Fprint(w, "ok") })
 	http.HandleFunc("/v1/chat/completions", func(out http.ResponseWriter, r *http.Request) {
 		b, err := io.ReadAll(io.LimitReader(r.Body, 2<<20))

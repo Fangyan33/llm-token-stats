@@ -13,9 +13,9 @@ import k8s_collection as k8s
 
 class KubernetesCollectionTests(unittest.TestCase):
     def test_builds_and_kind_import_use_git_version_for_all_images(self):
-        for version in ('v1.2.3', '0123456789ab'):
+        for version, proxy_version in (('v1.2.3', '1.13.5'), ('0123456789ab', '1.14.6')):
             with self.subTest(version=version), tempfile.TemporaryDirectory() as directory:
-                harness = self.harness(directory)
+                harness = self.harness(directory, proxy_version)
                 harness.run_id = 'unrelated-random-run-id'
                 with patch.object(k8s, 'resolve_image_tag', return_value=version), \
                         patch.object(k8s, 'run') as run, \
@@ -25,7 +25,8 @@ class KubernetesCollectionTests(unittest.TestCase):
                 builds = [call.args[0] for call in run.call_args_list if call.args[0][:2] == ['docker', 'build']]
                 self.assertEqual([cmd[cmd.index('-t') + 1] for cmd in builds], expected)
                 self.assertEqual(run.call_args_list[-2].args[0], ['kind', 'load', 'docker-image',
-                                                                 *k8s.k8s_integration.IMAGES, '--name', 'kind'])
+                                                                 *k8s.k8s_integration.IMAGES[:2],
+                                                                 'istio/proxyv2:' + proxy_version, '--name', 'kind'])
                 self.assertEqual(run.call_args_list[-1].args[0], ['kind', 'load', 'docker-image',
                                                                  *expected, '--name', 'kind'])
                 saved = json.loads((Path(directory) / 'images.json').read_text())
@@ -59,12 +60,35 @@ class KubernetesCollectionTests(unittest.TestCase):
             with self.assertRaises(argparse.ArgumentTypeError):
                 k8s.namespace_name(name)
 
-    def harness(self, directory):
+    def harness(self, directory, proxy_version='1.14.6'):
         harness = k8s.Harness(argparse.Namespace(context='kind-kind', kind_cluster='kind',
-                                                 namespace='metering-wasm-verify'))
+                                                 namespace='metering-wasm-verify', proxy_version=proxy_version))
         harness.base = harness.output = Path(directory)
         harness.state_file = harness.base / 'state.json'
         return harness
+
+    def test_1135_uses_real_ecds_and_same_version_for_integration_envoys(self):
+        with tempfile.TemporaryDirectory() as directory:
+            harness = self.harness(directory, '1.13.5')
+            resource = {'metadata': {'name': 'llm-token-stats-envoyfilter-wasm'}, 'spec': {
+                'workloadSelector': {'labels': {}}, 'configPatches': [
+                    {'applyTo': kind, 'match': {'proxy': {'proxyVersion': '^1\\.14\\.'}}}
+                    for kind in ('EXTENSION_CONFIG', 'HTTP_FILTER')]}}
+            with patch.object(harness, 'pods', return_value=[{'metadata': {'name': 'gateway'}}]), \
+                    patch.object(k8s, 'run'), patch.object(harness, 'kubectl', return_value=json.dumps(resource)), \
+                    patch.object(harness, 'apply'):
+                actual = harness.render_filter()
+            for item in actual['spec']['configPatches']:
+                self.assertEqual(item['match']['proxy']['proxyVersion'], r'^1\.13\.5(-|$)')
+            images = {c: 'llm-token-stats-' + c + ':test' for c in ('observer', 'consumer', 'fixture')}
+            with patch.object(k8s.k8s_integration, 'bootstrap', return_value={}):
+                suite = k8s.k8s_integration.suite_resources(k8s.ROOT, harness.namespace, images, harness.proxy_image)
+            gateway = next(item for item in suite['items'] if item['kind'] == 'Pod')
+            self.assertEqual(gateway['spec']['containers'][0]['image'], 'istio/proxyv2:1.13.5')
+            job = k8s.k8s_integration.job_resources(harness.namespace, 'integration:test', 'consumer:test', harness.proxy_image)
+            tests = next(item for item in job['items'] if item['kind'] == 'Job')
+            env = tests['spec']['template']['spec']['containers'][0]['env']
+            self.assertIn({'name': 'METERING_ENVOY_IMAGE', 'value': 'istio/proxyv2:1.13.5'}, env)
 
     def test_cleanup_refuses_namespace_without_owner_before_mutation(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -225,7 +249,7 @@ class KubernetesCollectionTests(unittest.TestCase):
                     harness.verify_infrastructure()
 
     def test_warming_configuration_is_not_accepted_as_active_wasm(self):
-        wasm = {'name': 'envoy.filters.http.wasm', 'typed_config': {'config': {'name': 'gateway-observer'}}}
+        wasm = {'name': 'llm-token-stats-envoyfilter-wasm', 'config_discovery': {'config_source': {'ads': {}}}}
         dump = {'dynamic_listeners': [{'warming_state': {'listener': {'http_filters': [wasm]}}}]}
         self.assertEqual(k8s.wasm_configs(dump), [])
         dump['dynamic_listeners'][0]['active_state'] = {'listener': {'http_filters': [wasm]}}
@@ -247,3 +271,11 @@ class KubernetesCollectionTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+    def test_doris_alive_without_first_disk_report_is_not_ready(self):
+        fields = [''] * 16
+        fields[9] = 'true'
+        fields[14:16] = ['0.000 ', '0.000 ']
+        self.assertFalse(k8s.doris_backend_ready('\t'.join(fields)))
+        fields[14:16] = ['29.620 GB', '115.961 GB']
+        self.assertTrue(k8s.doris_backend_ready('\t'.join(fields)))

@@ -19,7 +19,7 @@ import (
 )
 
 func TestMain(m *testing.M) {
-	if os.Getenv("METERING_TEST_NAMESPACE") == "" || os.Getenv("POD_IP") == "" {
+	if os.Getenv("METERING_TEST_NAMESPACE") == "" || os.Getenv("POD_IP") == "" || os.Getenv("METERING_ENVOY_IMAGE") == "" {
 		fmt.Fprintln(os.Stderr, "集成测试必须在隔离 Kubernetes Job 内运行，请执行 make k8s-test")
 		os.Exit(1)
 	}
@@ -114,7 +114,7 @@ func startEnvoy(t *testing.T, config map[string]any, localWasm bool) (base, admi
 	}
 	t.Cleanup(stop)
 	meta["annotations"] = map[string]string{"sidecar.istio.io/inject": "false"}
-	container := map[string]any{"name": "envoy", "image": "istio/proxyv2:1.13.5", "imagePullPolicy": "IfNotPresent",
+	container := map[string]any{"name": "envoy", "image": os.Getenv("METERING_ENVOY_IMAGE"), "imagePullPolicy": "IfNotPresent",
 		"command": []string{"/usr/local/bin/envoy"}, "args": []string{"-c", "/config/envoy.json", "--concurrency", "1", "--log-level", "warning"},
 		"volumeMounts": []any{map[string]any{"name": "config", "mountPath": "/config", "readOnly": true}},
 		"resources":    map[string]any{"requests": map[string]string{"cpu": "50m", "memory": "64Mi"}, "limits": map[string]string{"cpu": "1", "memory": "512Mi"}}}

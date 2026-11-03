@@ -29,6 +29,13 @@
 
 Go 使用 `gofmt` 和标准 Tab 缩进，包名保持小写。新 Python 文件采用四空格缩进，修改已有文件时保持原风格。配置字段沿用 `snake_case`，迁移使用 `NNN_description.sql`。修改 `.proto` 后重新生成，避免手改 `gen/`；SDK 修改须记录在 `PATCHES.md` 并保留许可证。
 
+### 镜像与 Kubernetes 对象命名
+
+- 项目构建的镜像仓库名最后一段必须以 `llm-token-stats-` 开头，例如 `registry/team/llm-token-stats-observer:<tag>`；版本沿用现有 Git tag/commit 规则。官方依赖镜像保留原名。
+- 项目声明的 Kubernetes 对象（包括 Kafka/Doris、ConfigMap、Secret、Job、CronJob、RBAC、Lease、测试辅助对象和 PVC 模板）必须以 `llm-token-stats-` 开头；同步维护选择器、Service DNS、挂载和其他资源引用，确保派生的 Pod/PVC 名称也符合规范。
+- EnvoyFilter 默认名称固定为 `llm-token-stats-envoyfilter-wasm`，不自动添加摘要。同一命名空间多网关独立配置时，渲染和打包通过 `--envoyfilter-name` 显式指定不同名称；自定义名称必须符合前缀规范且为不超过 63 字符的 DNS 标签。启用态、关闭态和版本更新使用相同名称。
+- Namespace、用户指定命名空间、已有外部 Istio 资源及 Kubernetes 自动提供的系统对象保留名称。现有源代码目录、文件、二进制及 Wasm 文件名无需改名；协议、topic/group、数据库和指标不因命名规范改名。
+
 ## 测试要求
 
 Go 使用标准 `testing`，文件命名为 `*_test.go`、函数命名为 `TestXxx`；Python 使用 `unittest`。根目录 `go test ./...` 不覆盖独立插件模块，优先运行 `make test`。当前没有固定覆盖率门槛；行为变更应覆盖对应边界、故障或重放场景。协议变更同步更新 Schema、配置、迁移、合成样例及相关文档。网关链路变更另运行 `make wasm` 和 `make k8s-test`；本地通过不代表生产 G0–G5 验收完成。

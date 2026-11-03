@@ -91,14 +91,14 @@ func reachableServer(t *testing.T, handler http.Handler) *httptest.Server {
 // access nor a host mount is available to the Job.
 func startEnvoy(t *testing.T, config map[string]any, localWasm bool) (base, admin string, stop func()) {
 	t.Helper()
-	name := "e2e-envoy-" + uuid(t)
+	name := "llm-token-stats-e2e-envoy-" + uuid(t)
 	config["node"] = map[string]any{"id": name, "cluster": "integration", "metadata": map[string]string{
 		"NAMESPACE": os.Getenv("METERING_TEST_NAMESPACE"), "NAME": name}}
 	data, err := json.Marshal(config)
 	if err != nil {
 		t.Fatal(err)
 	}
-	meta := map[string]any{"name": name, "labels": map[string]string{"app": "e2e-envoy", "app.kubernetes.io/part-of": "llm-token-stats-verification"}}
+	meta := map[string]any{"name": name, "labels": map[string]string{"app": "llm-token-stats-e2e-envoy", "app.kubernetes.io/part-of": "llm-token-stats-verification"}}
 	kubeRequest(t, "POST", "configmaps", map[string]any{"apiVersion": "v1", "kind": "ConfigMap", "metadata": meta, "data": map[string]string{"envoy.json": string(data)}})
 	stopped := false
 	stop = func() {

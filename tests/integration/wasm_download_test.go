@@ -37,7 +37,7 @@ func TestWasmDownloadArtifact(t *testing.T) {
 	}
 	client := &http.Client{Transport: &http.Transport{Proxy: nil}, Timeout: 5 * time.Second}
 	defer client.CloseIdleConnections()
-	res, err := client.Get("http://e2e-observer:9093/wasm/gateway-observer-v1.wasm")
+	res, err := client.Get("http://llm-token-stats-e2e-observer:9093/wasm/gateway-observer-v1.wasm")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -134,7 +134,7 @@ func TestRemoteWasmFailureAndRecovery(t *testing.T) {
 			if scenario != "unavailable" && requests.Load() != 1 {
 				t.Fatalf("unexpected download retries: %d", requests.Load())
 			}
-			setDownload("http://e2e-observer:9093/wasm/gateway-observer-v1.wasm", digest)
+			setDownload("http://llm-token-stats-e2e-observer:9093/wasm/gateway-observer-v1.wasm", digest)
 			stop()
 			base, _, _ = startEnvoy(t, cfg, false)
 			id = request()

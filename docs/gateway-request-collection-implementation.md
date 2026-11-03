@@ -702,7 +702,7 @@ Consumer/Doris 故障可以依赖 Kafka 72 小时保留恢复，与禁止采集�
   "schema_version": 1,
   "enabled": false,
   "config_version": "collection-v1",
-  "observer_cluster": "outbound|9090||metering-observer.metering.svc.cluster.local",
+  "observer_cluster": "outbound|9090||llm-token-stats-observer.metering.svc.cluster.local",
   "routes": [
     {
       "route_name": "*",
@@ -862,7 +862,7 @@ Secret 只通过挂载/环境引用，不写入配置。Observer 的 adapter/con
 apiVersion: networking.istio.io/v1alpha3
 kind: EnvoyFilter
 metadata:
-  name: llm-request-observer
+  name: llm-token-stats-envoyfilter-wasm
   namespace: istio-system
 spec:
   workloadSelector:
@@ -901,11 +901,11 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: metering-observer
+  name: llm-token-stats-observer
   namespace: metering
 spec:
   selector:
-    app: metering-observer
+    app: llm-token-stats-observer
   ports:
     - name: grpc-observation
       port: 9090

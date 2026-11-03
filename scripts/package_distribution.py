@@ -13,7 +13,7 @@ import sys
 import tempfile
 
 from image_tag import resolve_image_tag
-from gateway_workload import filter_name, label, selector
+from gateway_workload import DEFAULT_FILTER_NAME, filter_name, label, selector
 from render_doris_sql import MIGRATIONS, database_name, render_sql
 from wasm_artifact import checksum
 from validate_collection_contracts import load, normalize_request_host_pattern, validate_config
@@ -89,7 +89,7 @@ def service(name, namespace, ports, headless=False):
 
 def infrastructure(args, images):
     ns = args.namespace
-    kafka_dns = f'kafka-0.kafka.{ns}.svc.cluster.local'
+    kafka_dns = f'llm-token-stats-kafka-0.llm-token-stats-kafka.{ns}.svc.cluster.local'
     environment = {
         'CLUSTER_ID': 'MkU3OEVBNTcwNTJENDM2Qk', 'KAFKA_NODE_ID': '1',
         'KAFKA_PROCESS_ROLES': 'broker,controller',
@@ -108,72 +108,73 @@ def infrastructure(args, images):
              'readinessProbe': {'tcpSocket': {'port': 'kafka'}, 'periodSeconds': 5},
              'resources': {'requests': {'cpu': '250m', 'memory': '1Gi'},
                            'limits': {'cpu': '2', 'memory': '2Gi'}},
-             'volumeMounts': [{'name': 'data', 'mountPath': '/var/lib/kafka/data'}]}
+             'volumeMounts': [{'name': 'llm-token-stats-data', 'mountPath': '/var/lib/kafka/data'}]}
     doris_ports = {'mysql': 9030, 'fe-http': 8030, 'be-http': 8040}
     doris = {'name': 'doris', 'image': images['doris'], 'imagePullPolicy': 'IfNotPresent',
              'ports': [{'name': key, 'containerPort': port} for key, port in doris_ports.items()],
              'startupProbe': {'httpGet': {'path': '/api/health', 'port': 'fe-http'},
                               'periodSeconds': 5, 'failureThreshold': 120},
              'readinessProbe': {'httpGet': {'path': '/api/health', 'port': 'fe-http'}, 'periodSeconds': 5},
-             'volumeMounts': [{'name': 'fe-meta', 'mountPath': '/opt/apache-doris/fe/doris-meta'},
-                              {'name': 'be-storage', 'mountPath': '/opt/apache-doris/be/storage'}]}
-    resources = [service('kafka', ns, {'kafka': 9092, 'controller': 9093}, headless=True),
-                 service('doris', ns, doris_ports, headless=True)]
+             'volumeMounts': [{'name': 'llm-token-stats-fe-meta', 'mountPath': '/opt/apache-doris/fe/doris-meta'},
+                              {'name': 'llm-token-stats-be-storage', 'mountPath': '/opt/apache-doris/be/storage'}]}
+    resources = [service('llm-token-stats-kafka', ns, {'kafka': 9092, 'controller': 9093}, headless=True),
+                 service('llm-token-stats-doris', ns, doris_ports, headless=True)]
     for name, container, claims in (
-            ('kafka', kafka, [volume_claim('data', args.kafka_storage, args.storage_class)]),
-            ('doris', doris, [volume_claim('fe-meta', args.doris_fe_storage, args.storage_class),
-                              volume_claim('be-storage', args.doris_be_storage, args.storage_class)])):
+            ('kafka', kafka, [volume_claim('llm-token-stats-data', args.kafka_storage, args.storage_class)]),
+            ('doris', doris, [volume_claim('llm-token-stats-fe-meta', args.doris_fe_storage, args.storage_class),
+                              volume_claim('llm-token-stats-be-storage', args.doris_be_storage, args.storage_class)])):
         template = pod_spec([container], terminationGracePeriodSeconds=120)
-        template['metadata']['labels'] = {'app': name}
+        app = 'llm-token-stats-' + name
+        template['metadata']['labels'] = {'app': app}
         if name == 'kafka':
             template['spec']['securityContext'] = {'fsGroup': 1000}
-        resources.append(resource('StatefulSet', name, ns, spec={
-            'serviceName': name, 'replicas': 1, 'selector': {'matchLabels': {'app': name}},
+        resources.append(resource('StatefulSet', app, ns, spec={
+            'serviceName': app, 'replicas': 1, 'selector': {'matchLabels': {'app': app}},
             'template': template, 'volumeClaimTemplates': claims}))
     return resources
 
 
 def configurations(args):
     ns = args.namespace
-    kafka = {'bootstrap_servers': [f'kafka.{ns}.svc.cluster.local:9092'], 'topic': args.topic}
+    kafka = {'bootstrap_servers': [f'llm-token-stats-kafka.{ns}.svc.cluster.local:9092'], 'topic': args.topic}
     observer = json.loads((ROOT / 'configs/observer.production.example.json').read_text())
     observer['kafka'] = kafka
     observer['observer'].update(cluster_name=args.cluster_name, deployment_environment='dev')
     consumer = json.loads((ROOT / 'configs/consumer.production.example.json').read_text())
     consumer['kafka'] = copy.deepcopy(kafka)
     consumer['consumer']['group_id'] = args.group
-    consumer['doris'].update(database=args.database, fe_url=f'http://doris.{ns}.svc.cluster.local:8040',
-                             allowed_load_hosts=[f'doris.{ns}.svc.cluster.local:8040'])
+    consumer['doris'].update(database=args.database, fe_url=f'http://llm-token-stats-doris.{ns}.svc.cluster.local:8040',
+                             allowed_load_hosts=[f'llm-token-stats-doris.{ns}.svc.cluster.local:8040'])
     # all-in-one 的 FE 会重定向到容器回环地址，因此直接访问 BE 的 Stream Load 端口。
     credentials = {
-        'DORIS_DSN': (f'root@tcp(doris.{ns}.svc.cluster.local:9030)/{args.database}'
+        'DORIS_DSN': (f'root@tcp(llm-token-stats-doris.{ns}.svc.cluster.local:9030)/{args.database}'
                       '?timeout=5s&readTimeout=30s&writeTimeout=10s&interpolateParams=true'
                       '&time_zone=%27%2B00%3A00%27'),
         'DORIS_USER': 'root', 'DORIS_PASSWORD': '',
     }
-    resources = [resource('ConfigMap', 'metering-' + name, ns,
+    resources = [resource('ConfigMap', 'llm-token-stats-' + name, ns,
                           data={name + '.json': json.dumps(config, ensure_ascii=False, indent=2) + '\n'})
                  for name, config in (('observer', observer), ('consumer', consumer))]
-    resources.append(resource('Secret', 'metering-consumer-credentials', ns, type='Opaque',
+    resources.append(resource('Secret', 'llm-token-stats-consumer-credentials', ns, type='Opaque',
                               data={key: base64.b64encode(value.encode()).decode()
                                     for key, value in credentials.items()}))
     # Empty until real HTTP/HTTPS endpoints are configured; never package a lookup token.
-    resources.append(resource('Secret', 'metering-observer-lookups', ns, type='Opaque', data={}))
+    resources.append(resource('Secret', 'llm-token-stats-observer-lookups', ns, type='Opaque', data={}))
     sql = {name: render_sql((ROOT / 'migrations/doris/metering' / name).read_text(), args.database)
            for name in MIGRATIONS}
-    resources.append(resource('ConfigMap', 'metering-doris-migrations', ns, data=sql))
+    resources.append(resource('ConfigMap', 'llm-token-stats-doris-migrations', ns, data=sql))
     return resources
 
 
 def initialization(args, images):
     ns = args.namespace
-    kafka_command = f'''until /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 \\
+    kafka_command = f'''until /opt/kafka/bin/kafka-topics.sh --bootstrap-server llm-token-stats-kafka:9092 \\
   --create --if-not-exists --topic {args.topic} --partitions 24 --replication-factor 1 \\
   --config min.insync.replicas=1 --config retention.ms=259200000 --config cleanup.policy=delete; do
   sleep 5
 done
 '''
-    doris_command = '''sql() { mysql --default-character-set=utf8mb4 -uroot -hdoris -P9030 "$@"; }
+    doris_command = '''sql() { mysql --default-character-set=utf8mb4 -uroot -hllm-token-stats-doris -P9030 "$@"; }
 until sql -e 'SHOW BACKENDS;' | awk -F '\\t' '
   NR==1 { for(i=1;i<=NF;i++) if($i=="Alive") alive=i }
   NR>1 && alive && $alive=="true" { ready=1 }
@@ -201,8 +202,8 @@ sql -e 'ADMIN SET FRONTEND CONFIG ("dynamic_partition_enable" = "true");'
         if name == 'doris':
             container['volumeMounts'] = [{'name': 'migrations', 'mountPath': '/migrations', 'readOnly': True}]
             template['spec']['volumes'] = [{'name': 'migrations',
-                                            'configMap': {'name': 'metering-doris-migrations'}}]
-        resources.append(resource('Job', 'metering-' + name + '-init', ns, spec={
+                                            'configMap': {'name': 'llm-token-stats-doris-migrations'}}]
+        resources.append(resource('Job', 'llm-token-stats-' + name + '-init', ns, spec={
             'backoffLimit': 6, 'activeDeadlineSeconds': 1200, 'template': template}))
     return resources
 
@@ -212,7 +213,7 @@ def applications(args, images):
     for name, replicas, ports, cpu, memory in (
             ('observer', 2, {'grpc': 9090, 'health': 9091, 'http-wasm': 9093}, '500m', '256Mi'),
             ('consumer', 1, {'health': 9092}, '250m', '128Mi')):
-        app = 'metering-' + name
+        app = 'llm-token-stats-' + name
         container = {'name': name, 'image': images[name], 'imagePullPolicy': 'IfNotPresent',
                      'args': ['--config', '/config/' + name + '.json'],
                      'ports': [{'name': key, 'containerPort': port} for key, port in ports.items()],
@@ -224,9 +225,9 @@ def applications(args, images):
                      'volumeMounts': [{'name': 'config', 'mountPath': '/config', 'readOnly': True}]}
         if name == 'observer':
             container['env'] = [{'name': 'POD_UID', 'valueFrom': {'fieldRef': {'fieldPath': 'metadata.uid'}}}]
-            container['envFrom'] = [{'secretRef': {'name': 'metering-observer-lookups', 'optional': True}}]
+            container['envFrom'] = [{'secretRef': {'name': 'llm-token-stats-observer-lookups', 'optional': True}}]
         else:
-            container['envFrom'] = [{'secretRef': {'name': 'metering-consumer-credentials'}}]
+            container['envFrom'] = [{'secretRef': {'name': 'llm-token-stats-consumer-credentials'}}]
         template = pod_spec([container], volumes=[{'name': 'config', 'configMap': {'name': app}}])
         template['metadata']['labels'] = {'app': app}
         resources.append(resource('Deployment', app, args.namespace, spec={
@@ -243,7 +244,7 @@ def gateway_configuration(args):
     config = load(ROOT / 'configs/gateway-observer.example.json')
     config['accepted_request_hosts'] = [normalize_request_host_pattern(host)
                                         for host in hosts]
-    config['observer_cluster'] = 'outbound|9090||metering-observer.' + args.namespace + '.svc.cluster.local'
+    config['observer_cluster'] = 'outbound|9090||llm-token-stats-observer.' + args.namespace + '.svc.cluster.local'
     validate_config(config)
     return config
 
@@ -260,10 +261,10 @@ def summary_resources(args, images):
                 'summary_worker': {'collection_start_date': args.collection_start_date,
                                    'refresh_timeout_seconds': 1800, 'poll_interval_seconds': 2,
                                    'max_run_seconds': 21600, 'lock_mode': 'kubernetes',
-                                   'lease_name': 'metering-usage-worker'}}
+                                   'lease_name': 'llm-token-stats-usage-worker'}}
     container = {'name': 'usage-worker', 'image': images['usage-worker'], 'imagePullPolicy': 'IfNotPresent',
                  'args': ['--config', '/config/usage-worker.json', '--once'],
-                 'envFrom': [{'secretRef': {'name': 'metering-consumer-credentials'}}],
+                 'envFrom': [{'secretRef': {'name': 'llm-token-stats-consumer-credentials'}}],
                  'env': [{'name': key, 'valueFrom': {'fieldRef': {'fieldPath': field}}}
                          for key, field in [('POD_NAME', 'metadata.name'), ('POD_UID', 'metadata.uid'),
                                             ('POD_NAMESPACE', 'metadata.namespace')]],
@@ -271,20 +272,20 @@ def summary_resources(args, images):
                  'resources': {'requests': {'cpu': '100m', 'memory': '64Mi'},
                                'limits': {'cpu': '1', 'memory': '512Mi'}}}
     template = pod_spec([container], restartPolicy='Never')
-    template['spec'].update(serviceAccountName='metering-usage-worker',
-                            volumes=[{'name': 'config', 'configMap': {'name': 'metering-usage-worker'}}])
-    return [resource('ConfigMap', 'metering-usage-worker', ns,
+    template['spec'].update(serviceAccountName='llm-token-stats-usage-worker',
+                            volumes=[{'name': 'config', 'configMap': {'name': 'llm-token-stats-usage-worker'}}])
+    return [resource('ConfigMap', 'llm-token-stats-usage-worker', ns,
                      data={'usage-worker.json': json.dumps(settings, ensure_ascii=False, indent=2)+'\n'}),
-            resource('ServiceAccount', 'metering-usage-worker', ns),
-            resource('Lease', 'metering-usage-worker', ns, apiVersion='coordination.k8s.io/v1', spec={}),
-            resource('Role', 'metering-usage-worker', ns, apiVersion='rbac.authorization.k8s.io/v1', rules=[
+            resource('ServiceAccount', 'llm-token-stats-usage-worker', ns),
+            resource('Lease', 'llm-token-stats-usage-worker', ns, apiVersion='coordination.k8s.io/v1', spec={}),
+            resource('Role', 'llm-token-stats-usage-worker', ns, apiVersion='rbac.authorization.k8s.io/v1', rules=[
                 {'apiGroups': ['coordination.k8s.io'], 'resources': ['leases'],
-                 'resourceNames': ['metering-usage-worker'], 'verbs': ['get', 'update']},
+                 'resourceNames': ['llm-token-stats-usage-worker'], 'verbs': ['get', 'update']},
                 {'apiGroups': [''], 'resources': ['pods'], 'verbs': ['get']}]),
-            resource('RoleBinding', 'metering-usage-worker', ns, apiVersion='rbac.authorization.k8s.io/v1',
-                     subjects=[{'kind': 'ServiceAccount', 'name': 'metering-usage-worker', 'namespace': ns}],
-                     roleRef={'apiGroup': 'rbac.authorization.k8s.io', 'kind': 'Role', 'name': 'metering-usage-worker'}),
-            resource('CronJob', 'metering-usage-worker', ns, apiVersion='batch/v1', spec={
+            resource('RoleBinding', 'llm-token-stats-usage-worker', ns, apiVersion='rbac.authorization.k8s.io/v1',
+                     subjects=[{'kind': 'ServiceAccount', 'name': 'llm-token-stats-usage-worker', 'namespace': ns}],
+                     roleRef={'apiGroup': 'rbac.authorization.k8s.io', 'kind': 'Role', 'name': 'llm-token-stats-usage-worker'}),
+            resource('CronJob', 'llm-token-stats-usage-worker', ns, apiVersion='batch/v1', spec={
                 'schedule': '0 1 * * *', 'concurrencyPolicy': 'Forbid',
                 'successfulJobsHistoryLimit': 2, 'failedJobsHistoryLimit': 3,
                 'jobTemplate': {'spec': {'backoffLimit': 2, 'activeDeadlineSeconds': 21600,
@@ -303,13 +304,14 @@ def render_manifests(args, images, output, wasm_file=None):
             ('40-applications', applications(args, images)),
             ('50-usage-worker', summary_resources(args, images))):
         write_yaml(output / 'k8s' / (filename + '.yaml'), resources)
-    dns = f'metering-observer.{ns}.svc.cluster.local'
+    dns = f'llm-token-stats-observer.{ns}.svc.cluster.local'
     config_path = output / 'gateway-observer.json'
     config_path.write_text(json.dumps(gateway_config, indent=2) + '\n')
     for mode in ('disabled', 'enabled'):
         target = output / 'gateway' / mode / 'envoyfilter.yaml'
         command = [sys.executable, str(ROOT / 'scripts/render_gateway_filter.py'),
-                   '--gateway-namespace', args.gateway_namespace, '--config', str(config_path),
+                   '--gateway-namespace', args.gateway_namespace,
+                   '--envoyfilter-name', args.envoyfilter_name, '--config', str(config_path),
                    '--wasm-file', str(wasm_file or ROOT / 'dist/gateway-observer-v1.wasm'),
                    '--wasm-url', 'http://' + dns + ':9093/wasm/gateway-observer-v1.wasm',
                    '--wasm-cluster', 'outbound|9093||' + dns, '--output', str(target)]
@@ -364,8 +366,8 @@ def package(args):
     wasm_sha = checksum(ROOT / 'dist/gateway-observer-v1.wasm')
     labels = selector(args.gateway_label)
     tag = resolve_image_tag()
-    images = {'observer': 'metering-observer:' + tag, 'consumer': 'metering-consumer:' + tag,
-              'usage-worker': 'metering-usage-worker:' + tag,
+    images = {'observer': 'llm-token-stats-observer:' + tag, 'consumer': 'llm-token-stats-consumer:' + tag,
+              'usage-worker': 'llm-token-stats-usage-worker:' + tag,
               **RUNTIME_IMAGES}
     archived_images = images if args.include_dependency_images else {
         name: images[name] for name in ('observer', 'consumer', 'usage-worker')}
@@ -387,7 +389,7 @@ def package(args):
                     'doris_migrations': list(MIGRATIONS),
                     'namespace': args.namespace, 'gateway_namespace': args.gateway_namespace,
                     'accepted_request_hosts': gateway_config['accepted_request_hosts'],
-                    'gateway_selector': labels, 'gateway_filter_name': filter_name(labels),
+                    'gateway_selector': labels, 'gateway_filter_name': args.envoyfilter_name,
                     'gateway_identity_source': 'node.metadata.NAMESPACE/NAME'}
         (output / 'manifest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + '\n')
         (output / 'README.md').write_text(package_readme(args), encoding='utf-8')
@@ -425,16 +427,16 @@ gateway/disabled/ 和 gateway/enabled/ 分别提供同一工作负载的关闭�
 归属 API 默认 URI 为空，使用占位实现。启用服务查询时，在 `k8s/20-config.yaml` 的
 `observer.json` 中保留实际 `service_lookup.uri`，将 `service_lookup.credential_env` 设为
 `METERING_SERVICE_LOOKUP_TOKEN`。`credential_env` 只能填写环境变量名，不能填写密钥；
-密钥通过 `metering-observer-lookups` Secret 的同名键注入，现有 Deployment 已配置 `envFrom`。
+密钥通过 `llm-token-stats-observer-lookups` Secret 的同名键注入，现有 Deployment 已配置 `envFrom`。
 客户查询 URI 为空时无需配置客户查询密钥；启用后同理使用 `METERING_CUSTOMER_LOOKUP_TOKEN`。
 
-已部署环境可先用 `kubectl -n {args.namespace} edit configmap metering-observer` 修正变量名，
+已部署环境可先用 `kubectl -n {args.namespace} edit configmap llm-token-stats-observer` 修正变量名，
 再从无额外换行的密钥文件更新 Secret，并重启 Observer：
 
 ```sh
-kubectl -n {args.namespace} create secret generic metering-observer-lookups --from-file=METERING_SERVICE_LOOKUP_TOKEN=/安全目录/service-lookup-token --dry-run=client -o yaml | kubectl apply -f -
-kubectl -n {args.namespace} rollout restart deployment/metering-observer
-kubectl -n {args.namespace} rollout status deployment/metering-observer --timeout=5m
+kubectl -n {args.namespace} create secret generic llm-token-stats-observer-lookups --from-file=METERING_SERVICE_LOOKUP_TOKEN=/安全目录/service-lookup-token --dry-run=client -o yaml | kubectl apply -f -
+kubectl -n {args.namespace} rollout restart deployment/llm-token-stats-observer
+kubectl -n {args.namespace} rollout status deployment/llm-token-stats-observer --timeout=5m
 ```
 
 `config_lookup` 表示归属查询参数或凭据变量名校验失败；变量名合法但对应密钥缺失时，报 `lookup_credential`。
@@ -456,13 +458,15 @@ kind 环境可用 `kind load image-archive images/images.tar --name 集群名`�
 
 ```sh
 kubectl apply -f k8s/
-kubectl -n {args.namespace} wait --for=condition=complete job/metering-kafka-init job/metering-doris-init --timeout=20m
-kubectl -n {args.namespace} rollout status deployment/metering-consumer --timeout=5m
-kubectl -n {args.namespace} rollout status deployment/metering-observer --timeout=5m
+kubectl -n {args.namespace} wait --for=condition=complete job/llm-token-stats-kafka-init job/llm-token-stats-doris-init --timeout=20m
+kubectl -n {args.namespace} rollout status deployment/llm-token-stats-consumer --timeout=5m
+kubectl -n {args.namespace} rollout status deployment/llm-token-stats-observer --timeout=5m
 kubectl -n {args.namespace} get pods,svc,pvc
 ```
 
-从旧包升级时先删除旧包 gateway/disabled/ 中按 UID 命名或固定名 gateway-observer 的 EnvoyFilter，避免重复安装；
+本包对象统一使用 llm-token-stats- 前缀，改名会创建新资源；已有 Kafka/Doris 数据与 PVC 不自动迁移或删除。
+升级须先停用旧 Consumer 和 usage-worker，安排数据迁移；再启动对应新工作负载。
+从旧包升级时先按旧清单移除旧 EnvoyFilter（包括按 UID、标签摘要或固定名 gateway-observer 命名的资源），避免重复安装；
 不要同时保留新旧过滤器。旧配置中的 gateway_instance_id 已移除，必须使用与新 Wasm 配套的配置。
 
 确认 Wasm 下载内容与 manifest.json 的 wasm_sha256 一致、过滤器顺序为 ext_authz → Wasm → router 后，
@@ -477,10 +481,11 @@ kubectl apply -f envoyfilter.yaml
 ```
 
 网关命名空间：{args.gateway_namespace}；工作负载标签：{json.dumps(selector(args.gateway_label), ensure_ascii=False)}。
-EnvoyFilter 名称：{filter_name(selector(args.gateway_label))}，同样记录于 manifest.json 的 gateway_filter_name。
+EnvoyFilter 名称：{args.envoyfilter_name}，同样记录于 manifest.json 的 gateway_filter_name。
 代理 NAMESPACE 匹配将作用范围固定在上述命名空间，即使该命名空间是 Istio 根配置命名空间。
-名称由排序后的标签生成；不同工作负载使用独立名称，同一标签的启用态、关闭态和版本更新保持名称一致。
-变更选择器会产生新资源，需先移除旧清单对应的过滤器；正式与灰度网关应使用互斥的标签。
+默认名称固定为 llm-token-stats-envoyfilter-wasm，不自动添加摘要；启用态、关闭态和版本更新保持名称一致。
+同一命名空间多网关需要独立配置时，通过 --envoyfilter-name 显式指定不同名称，例如 llm-token-stats-envoyfilter-wasm-canary。
+同名资源变更选择器会更新原对象；正式与灰度网关应使用互斥的标签。
 网关 Pod 扩容、重建后自动应用同一过滤器，不需要重新打包；无需修改网关 Pod 模板。
 同名 Pod 重建后实例标识相同，不能用于区分 Pod 生命周期。跨集群查询需结合 cluster_name。
 若运行时身份字段缺失、非法或 namespace/pod-name 超过 128 字节，插件停止采集并计数
@@ -502,6 +507,7 @@ def parser():
     p.add_argument('--output', type=Path, default=ROOT / 'dist/package')
     p.add_argument('--namespace', type=dns_name, default='metering')
     p.add_argument('--gateway-namespace', type=dns_name, default='istio-system')
+    p.add_argument('--envoyfilter-name', type=filter_name, default=DEFAULT_FILTER_NAME)
     p.add_argument('--accepted-request-host', action='append', metavar='HOST',
                    help='目标业务 Host 白名单，可重复；省略时默认 *，显式传参完整覆盖默认值')
     p.add_argument('--gateway-label', type=label, action='append', metavar='KEY=VALUE',

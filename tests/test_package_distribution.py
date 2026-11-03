@@ -37,7 +37,7 @@ class DistributionTests(unittest.TestCase):
                 self.assertFalse(args.output.exists())
 
     def images(self):
-        return {'observer': 'metering-observer:test', 'consumer': 'metering-consumer:test', 'usage-worker': 'metering-usage-worker:test',
+        return {'observer': 'llm-token-stats-observer:test', 'consumer': 'llm-token-stats-consumer:test', 'usage-worker': 'llm-token-stats-usage-worker:test',
                 **bundle.RUNTIME_IMAGES}
 
     def walk(self, value):
@@ -58,6 +58,7 @@ class DistributionTests(unittest.TestCase):
         pod_images = {item['image'] for item in self.walk(resources) if 'image' in item}
         self.assertEqual(pod_images, set(self.images().values()) - {self.images()['gateway']})
         objects = {(item['kind'], item['metadata']['name']) for item in resources}
+        self.assertTrue(all(name.startswith('llm-token-stats-') for _, name in objects))
         for item in self.walk(resources):
             for key, kind in (('configMap', 'ConfigMap'), ('secretRef', 'Secret')):
                 if key in item:
@@ -70,14 +71,30 @@ class DistributionTests(unittest.TestCase):
         claims = [item for item in self.walk(resources) if 'storageClassName' in item]
         self.assertEqual(len(claims), 3)
         self.assertTrue(all(item['storageClassName'] == 'offline-storage' for item in claims))
+        for sts in (r for r in resources if r['kind'] == 'StatefulSet'):
+            spec = sts['spec']
+            self.assertIn(('Service', spec['serviceName']), objects)
+            labels = spec['template']['metadata']['labels']
+            self.assertEqual(spec['selector']['matchLabels'], labels)
+            claim_names = {c['metadata']['name'] for c in spec['volumeClaimTemplates']}
+            mounted = {m['name'] for c in spec['template']['spec']['containers'] for m in c['volumeMounts']}
+            self.assertEqual(mounted, claim_names)
+            for name in claim_names:
+                self.assertTrue((name + '-' + sts['metadata']['name'] + '-0').startswith('llm-token-stats-'))
+            service = next(r for r in resources if r['kind'] == 'Service' and r['metadata']['name'] == spec['serviceName'])
+            self.assertEqual(service['spec']['selector'], labels)
+        kafka = next(r for r in resources if r['kind'] == 'StatefulSet' and r['metadata']['name'] == 'llm-token-stats-kafka')
+        env = {v['name']: v['value'] for v in kafka['spec']['template']['spec']['containers'][0]['env']}
+        self.assertEqual(env['KAFKA_ADVERTISED_LISTENERS'],
+                         'PLAINTEXT://llm-token-stats-kafka-0.llm-token-stats-kafka.isolated.svc.cluster.local:9092')
 
     def test_configs_share_topic_database_and_migrations_in_required_order(self):
         args = self.args('--namespace', 'isolated', '--database', 'offline_data', '--topic', 'offline-events')
         objects = {r['metadata']['name']: r for r in bundle.configurations(args)}
-        observer = json.loads(objects['metering-observer']['data']['observer.json'])
-        consumer = json.loads(objects['metering-consumer']['data']['consumer.json'])
+        observer = json.loads(objects['llm-token-stats-observer']['data']['observer.json'])
+        consumer = json.loads(objects['llm-token-stats-consumer']['data']['consumer.json'])
         self.assertEqual(observer['kafka'], consumer['kafka'])
-        self.assertEqual(observer['kafka'], {'bootstrap_servers': ['kafka.isolated.svc.cluster.local:9092'],
+        self.assertEqual(observer['kafka'], {'bootstrap_servers': ['llm-token-stats-kafka.isolated.svc.cluster.local:9092'],
                                             'topic': 'offline-events'})
         self.assertEqual(observer['observer']['deployment_environment'], 'dev')
         source = json.loads((bundle.ROOT / 'configs/observer.production.example.json').read_text())
@@ -87,8 +104,8 @@ class DistributionTests(unittest.TestCase):
             self.assertNotIn('accepted_service_ids', settings)
             self.assertNotIn('accepted_request_hosts', settings)
         self.assertEqual(consumer['doris']['database'], 'offline_data')
-        self.assertEqual(consumer['doris']['fe_url'], 'http://doris.isolated.svc.cluster.local:8040')
-        sql = objects['metering-doris-migrations']['data']
+        self.assertEqual(consumer['doris']['fe_url'], 'http://llm-token-stats-doris.isolated.svc.cluster.local:8040')
+        sql = objects['llm-token-stats-doris-migrations']['data']
         self.assertEqual(list(sql), list(bundle.MIGRATIONS))
         self.assertIn('CREATE DATABASE IF NOT EXISTS offline_data;', sql['001_init.sql'])
         jobs = bundle.initialization(args, self.images())
@@ -134,6 +151,7 @@ class DistributionTests(unittest.TestCase):
 
     def test_gateway_outputs_use_workload_selector_without_static_identity(self):
         args = self.args('--namespace', 'isolated', '--gateway-label', 'app=ai-gateway',
+                         '--envoyfilter-name', 'llm-token-stats-envoyfilter-wasm-canary',
                          '--accepted-request-host', 'API.Corp.internal.',
                          '--accepted-request-host', '*.Corp.internal.')
         with tempfile.TemporaryDirectory() as directory:
@@ -152,7 +170,7 @@ class DistributionTests(unittest.TestCase):
                 self.assertNotIn('            NAME:', text)
                 self.assertIn('"app": "ai-gateway"', text)
                 self.assertIn(bundle.checksum(artifact), text)
-                self.assertIn('metering-observer.isolated.svc.cluster.local', text)
+                self.assertIn('llm-token-stats-observer.isolated.svc.cluster.local', text)
                 line = next(row.strip() for row in text.splitlines() if row.strip().startswith('value: "'))
                 config = json.loads(json.loads(line[len('value: '):]))
                 self.assertEqual(config['enabled'], mode == 'enabled')
@@ -162,9 +180,11 @@ class DistributionTests(unittest.TestCase):
                              (output / 'gateway/disabled/envoyfilter.yaml').read_text())
             self.assertFalse((output / 'gateway-observer.json').exists())
             self.assertEqual(names[0], names[1])
+            self.assertEqual(names[0], args.envoyfilter_name)
 
     def test_omitted_hosts_default_all_and_explicit_hosts_replace_default(self):
         args = bundle.parser().parse_args([])
+        self.assertEqual(args.envoyfilter_name, 'llm-token-stats-envoyfilter-wasm')
         self.assertEqual(bundle.gateway_configuration(args)['accepted_request_hosts'], ['*'])
         args = bundle.parser().parse_args(['--accepted-request-host', 'API.Corp.internal.'])
         self.assertEqual(bundle.gateway_configuration(args)['accepted_request_hosts'], ['api.corp.internal'])
@@ -197,6 +217,9 @@ class DistributionTests(unittest.TestCase):
                     patch.object(bundle, 'run', side_effect=run):
                 bundle.package(args)
             manifest = json.loads((args.output / 'manifest.json').read_text())
+            self.assertEqual(manifest['gateway_filter_name'], 'llm-token-stats-envoyfilter-wasm')
+            self.assertEqual(manifest['archived_images'], {
+                c: 'llm-token-stats-' + c + ':version' for c in ('observer', 'consumer', 'usage-worker')})
             self.assertEqual(manifest['accepted_request_hosts'], ['*'])
             self.assertNotIn('gateway_pods', manifest)
             self.assertEqual(manifest['gateway_selector'], {'istio': 'ingressgateway'})

@@ -28,7 +28,7 @@ CI 中的 TinyGo 容器使用 Runner 的 UID/GID，并将容器内的 HOME 设�
 
 镜像版本使用 `python3 scripts/image_tag.py` 解析：当前 HEAD 有 Git tag 时取该 tag，无 tag 时取至少 12 位 commit 短 hash；多个 tag 按 Git 版本排序取最高项，历史 tag 不沿用，不兼容 Docker tag 的名称会报错。README 的服务镜像构建与 `make k8s-test` 使用同一规则；Kubernetes 测试的 topic / 消费组仍通过随机 run-id 隔离。
 
-`make package` 另构建 Observer / Consumer 镜像，并默认仅将这两个镜像保存到 `dist/package/images/images.tar`。指定 `--include-dependency-images` 后才额外归档 Kafka、Doris、Istio proxyv2；默认部署前需保证目标节点能拉取或已导入依赖镜像。分发包始终提供单节点 Kafka / Doris 的持久化部署、topic / 数据库初始化 Job、采集服务、全部 ConfigMap / Secret，以及针对网关工作负载渲染的关闭态 / 启用态 EnvoyFilter；全部为可直接 `kubectl apply` 的 YAML。包根目录的 `envoyfilter.yaml` 提供工作负载的关闭态配置，`gateway/disabled/` 与 `gateway/enabled/` 保留两种状态；Observer 就绪后再单独应用 EnvoyFilter。`manifest.json` 分别记录全部镜像引用、归档镜像和需外部准备的镜像。省略 `--accepted-request-host` 时，打包写入 `["*"]`，匹配全部合法 DNS Host；显式提供时完整覆盖默认值，可重复传入目标域名、后缀通配或 `*`，并写入两种状态的 EnvoyFilter、manifest 和包内说明。显式空名单或非法名单在镜像构建前失败。打包不访问集群，也不绑定 Pod；可通过 `PACKAGE_ARGS` 的 `--gateway-namespace`、`--gateway-label KEY=VALUE` 选择目标工作负载。指定输出目录使用 `PACKAGE_DIR`，完整命令、镜像导入和部署顺序见 [README 分发说明](../README.md#分发镜像与完整-kubernetes-清单)。该包采用开发环境的单节点、明文 Kafka 与 Doris root 空密码，生产仍使用下文的独立基础设施和认证配置。
+`make package` 另构建 Observer / Consumer / usage-worker 镜像，并默认将这三个镜像保存到 `dist/package/images/images.tar`。指定 `--include-dependency-images` 后才额外归档 Kafka、Doris、Istio proxyv2；默认部署前需保证目标节点能拉取或已导入依赖镜像。分发包始终提供单节点 Kafka / Doris 的持久化部署、topic / 数据库初始化 Job、采集服务、全部 ConfigMap / Secret，以及针对网关工作负载渲染的关闭态 / 启用态 EnvoyFilter；全部为可直接 `kubectl apply` 的 YAML。包根目录的 `envoyfilter.yaml` 提供工作负载的关闭态配置，`gateway/disabled/` 与 `gateway/enabled/` 保留两种状态；Observer 就绪后再单独应用 EnvoyFilter。`manifest.json` 分别记录全部镜像引用、归档镜像和需外部准备的镜像。省略 `--accepted-request-host` 时，打包写入 `["*"]`，匹配全部合法 DNS Host；显式提供时完整覆盖默认值，可重复传入目标域名、后缀通配或 `*`，并写入两种状态的 EnvoyFilter、manifest 和包内说明。显式空名单或非法名单在镜像构建前失败。打包不访问集群，也不绑定 Pod；可通过 `PACKAGE_ARGS` 的 `--gateway-namespace`、`--gateway-label KEY=VALUE` 选择目标工作负载。指定输出目录使用 `PACKAGE_DIR`，完整命令、镜像导入和部署顺序见 [README 分发说明](../README.md#分发镜像与完整-kubernetes-清单)。该包采用开发环境的单节点、明文 Kafka 与 Doris root 空密码，生产仍使用下文的独立基础设施和认证配置。
 
 本地栈的已发布端口统一绑定 `0.0.0.0`，可使用服务器 IP 从远端访问：
 
@@ -66,9 +66,9 @@ fixture 只模拟 ext_authz 访问允许与模型 usage，不实现真实密钥�
 
 ## 归属 API 配置与名称查询
 
-Observer 环境仅接受 `prd`、`stg`、`dev`。分别设置 `observer.service_lookup.uri` 和 `observer.customer_lookup.uri` 为完整 HTTP/HTTPS 端点；每项通过 `credential_env` 指定提供 `x-remote-data` 值的环境变量，默认示例分别为 `METERING_SERVICE_LOOKUP_TOKEN`、`METERING_CUSTOMER_LOOKUP_TOKEN`。URI 为空时不要求凭据并继续占位；非空但凭据缺失时启动报固定配置错误。HTTPS 私有 CA 可通过各项 `ca_file` 指定挂载文件，证书验证始终启用。Kubernetes 模板可从可选 Secret `metering-observer-lookups` 注入同名环境变量，Compose 从启动环境传入，均不提交真实凭据。
+Observer 环境仅接受 `prd`、`stg`、`dev`。分别设置 `observer.service_lookup.uri` 和 `observer.customer_lookup.uri` 为完整 HTTP/HTTPS 端点；每项通过 `credential_env` 指定提供 `x-remote-data` 值的环境变量，默认示例分别为 `METERING_SERVICE_LOOKUP_TOKEN`、`METERING_CUSTOMER_LOOKUP_TOKEN`。URI 为空时不要求凭据并继续占位；非空但凭据缺失时启动报固定配置错误。HTTPS 私有 CA 可通过各项 `ca_file` 指定挂载文件，证书验证始终启用。Kubernetes 模板可从可选 Secret `llm-token-stats-observer-lookups` 注入同名环境变量，Compose 从启动环境传入，均不提交真实凭据。
 
-`credential_env` 只能填写环境变量名，不能直接填写密钥。服务查询应设置 `"credential_env": "METERING_SERVICE_LOOKUP_TOKEN"`，将真实密钥放入 `metering-observer-lookups` Secret 的 `METERING_SERVICE_LOOKUP_TOKEN` 键；Deployment 已通过 `envFrom` 注入该 Secret。客户查询同理使用 `METERING_CUSTOMER_LOOKUP_TOKEN`，其 URI 为空时无需提供该密钥。变量名为空或格式非法会触发 `config_lookup`；变量名合法但对应凭据缺失或不适合请求头时会触发 `lookup_credential`。更新 ConfigMap 和 Secret 后重启 Observer；离线包的操作命令见包内 README。
+`credential_env` 只能填写环境变量名，不能直接填写密钥。服务查询应设置 `"credential_env": "METERING_SERVICE_LOOKUP_TOKEN"`，将真实密钥放入 `llm-token-stats-observer-lookups` Secret 的 `METERING_SERVICE_LOOKUP_TOKEN` 键；Deployment 已通过 `envFrom` 注入该 Secret。客户查询同理使用 `METERING_CUSTOMER_LOOKUP_TOKEN`，其 URI 为空时无需提供该密钥。变量名为空或格式非法会触发 `config_lookup`；变量名合法但对应凭据缺失或不适合请求头时会触发 `lookup_credential`。更新 ConfigMap 和 Secret 后重启 Observer；离线包的操作命令见包内 README。
 
 两个接口的 HTTP 200 响应使用 `responseCode`、`responseMsg`、`success`、`data` 包装。成功要求 `responseCode="000000"`、`success=true`，原有 ID 与名称位于 `data`。未查询到数据或查询出多条数据使用 HTTP 200、`responseCode="650013"`，统一映射为 `lookup_invalid_response`，不能推断为未登记；第三方入参检查不合法使用 HTTP 200、`responseCode="100001"`，映射为 `lookup_unavailable`。两者 `success=false`，`data` 为 null 或缺省。认证失败使用 HTTP 401、`responseCode="401"`、`success=false`、`responseMsg="Unauthorized"`，映射为 `lookup_unavailable`，合法认证响应的消息同样记录脱敏日志。HTTP 400、429、5xx 保持原故障处理，不兼容旧英文业务码。不接受旧扁平成功响应，详细映射见[归属接口契约](spec/plan/host-service-provider-implementation.md#48-错误契约与-observer-映射)。
 
@@ -148,15 +148,15 @@ python3 scripts/render_gateway_filter.py \
   --gateway-label istio=ingressgateway \
   --gateway-namespace istio-system \
   --wasm-file dist/gateway-observer-v1.wasm \
-  --wasm-url http://metering-observer.metering.svc.cluster.local:9093/wasm/gateway-observer-v1.wasm \
-  --wasm-cluster 'outbound|9093||metering-observer.metering.svc.cluster.local' \
+  --wasm-url http://llm-token-stats-observer.metering.svc.cluster.local:9093/wasm/gateway-observer-v1.wasm \
+  --wasm-cluster 'outbound|9093||llm-token-stats-observer.metering.svc.cluster.local' \
   --output dist/envoyfilter.disabled.yaml
 # G0/G1 通过后，为该工作负载使用显式 --enable。
 ```
 
 `gateway_instance_id` 由 Wasm 在插件启动时读取 Envoy 的 `node.metadata.NAMESPACE` 和 `node.metadata.NAME`，组合为 `namespace/pod-name`；配置 JSON 不再接受此字段。Istio 1.13.5 默认提供这两项元数据，无需修改网关 Pod 模板。多个副本共享同一 EnvoyFilter，各自读取实例名称，扩容或重建后无需重新渲染。标识不包含 Pod UID，同名 Pod 重建后标识不变；跨集群分析需结合 `cluster_name`。命名空间按 DNS label 校验（最多 63 字节），Pod 名称按 Kubernetes DNS subdomain 校验（总长最多 253 字节，不另限每段 63 字节）；身份缺失、非法或组合后超过现有协议的 128 字节上限时停止该插件采集，增加 `metering_gateway_identity_unavailable_total`，业务继续放行；不截断名称、不回退到固定值，也不读取客户端请求头。
 
-过滤器通过代理 `metadata.NAMESPACE` 与工作负载启动标签共同匹配，根配置命名空间中的资源也不会跨命名空间生效。资源名称由排序后的标签生成稳定摘要，不同工作负载独立，同一工作负载的启用态和关闭态名称相同；选择器变更需先删除旧清单对应的资源。默认 `istio-system`、`istio=ingressgateway`，通过 `--gateway-label` 可替换默认标签。Wasm 使用远程 URL、HTTP 集群和实际文件 SHA-256 加载；模板插在 router 前，要求 ext_authz 已在它之前，以真实 config_dump 核验。每 Worker 一份 Root；生产热更新及回退仍需完成灰度验收。从旧版迁移先移除按 UID 命名或固定名 `gateway-observer` 的过滤器，避免新旧重复安装。
+过滤器通过代理 `metadata.NAMESPACE` 与工作负载启动标签共同匹配，根配置命名空间中的资源也不会跨命名空间生效。资源默认名称为 `llm-token-stats-envoyfilter-wasm`，不自动追加摘要；同一命名空间多网关需要独立配置时，渲染和打包须通过 `--envoyfilter-name` 显式指定不同名称。自定义名称必须以 `llm-token-stats-` 开头且为不超过 63 字符的 DNS 标签；启用态和关闭态名称相同，选择器变更会更新同名对象。默认 `istio-system`、`istio=ingressgateway`，通过 `--gateway-label` 可替换默认标签。Wasm 使用远程 URL、HTTP 集群和实际文件 SHA-256 加载；模板插在 router 前，要求 ext_authz 已在它之前，以真实 config_dump 核验。每 Worker 一份 Root；生产热更新及回退仍需完成灰度验收。从旧版迁移先移除按 UID 命名或固定名 `gateway-observer` 的过滤器，避免新旧重复安装。
 
 Istio 的 `outbound|端口|子集|服务DNS` 是路由集群名，不能原样作为 Go gRPC 服务的 HTTP/2 `:authority`。插件保持 `cluster_name` 不变，自动将这类集群的 authority 设置为 `服务DNS:端口`；普通本地集群名保持原值，不改变集群 TLS/SNI。自定义 ext_authz 若同样使用 Istio 集群名，必须在其 `grpc_service.envoy_grpc.authority` 显式填写有效服务 DNS。
 
@@ -176,13 +176,13 @@ Observer 镜像复制 `make wasm` 的 `dist/gateway-observer-v1.wasm` 到 `/usr/
 字段位于 `observer` 中。省略该对象即关闭服务；启用后 `file` 必填，`listen` 缺省为 `:9093`，文件不可读、文件头非法或端口绑定失败会阻止启动。服务启动时打开固定文件，只有重启才切换产物。仅接受 `GET/HEAD /wasm/gateway-observer-v1.wasm`，返回 `application/wasm`、文件 SHA-256 ETag 与 `Cache-Control: no-store`；其他路径为 404、其他方法为 405。最多 8 个并发下载，超限 503；读头超时 3 秒、写超时 30 秒。处理下载不等待 Kafka，也不经过 gRPC 解析预算；指标为 `metering_wasm_download_requests_total`、`metering_wasm_download_busy_total`，没有动态标签。
 
 ```sh
-# 本地联调；生产可另开终端执行 kubectl -n metering port-forward service/metering-observer 19093:9093
+# 本地联调；生产可另开终端执行 kubectl -n metering port-forward service/llm-token-stats-observer 19093:9093
 curl --noproxy '*' --fail --output dist/gateway-observer.download.wasm \
   http://127.0.0.1:19093/wasm/gateway-observer-v1.wasm
 sha256sum dist/gateway-observer-v1.wasm dist/gateway-observer.download.wasm
 ```
 
-网关使用原生 `code.remote` 加载，下载超时 5 秒、额外重试 0 次、`fail_open: true`。保留 HTTP_FILTER 直接插入方式，不依赖 Istio agent 的 ECDS 文件重写。下载 HTTP 集群默认是 `outbound|9093||metering-observer.metering.svc.cluster.local`；采集 gRPC 仍使用 9090 的 HTTP/2 集群，不能混用。生产须核对实际集群存在，NetworkPolicy、网格 mTLS 与授权允许相应流量；下载端口默认 ClusterIP 内网访问，Observer 本身不终止 TLS、不提供下载鉴权。首次加载有下载等待，已运行的业务请求不会逐次下载。
+网关使用原生 `code.remote` 加载，下载超时 5 秒、额外重试 0 次、`fail_open: true`。保留 HTTP_FILTER 直接插入方式，不依赖 Istio agent 的 ECDS 文件重写。下载 HTTP 集群默认是 `outbound|9093||llm-token-stats-observer.metering.svc.cluster.local`；采集 gRPC 仍使用 9090 的 HTTP/2 集群，不能混用。生产须核对实际集群存在，NetworkPolicy、网格 mTLS 与授权允许相应流量；下载端口默认 ClusterIP 内网访问，Observer 本身不终止 TLS、不提供下载鉴权。首次加载有下载等待，已运行的业务请求不会逐次下载。
 
 仅保留当前镜像的单个文件。先更新所有 Observer 副本并核对下载摘要，再更新网关配置。滚动期间旧摘要可能校验失败，允许暂时缺少采集；已加载实例可继续运行，但旧网关重启后不保证取得旧文件。下载服务恢复后需要触发插件重新安装或重启网关；新 Pod 自动匹配工作负载过滤器。原样重复 apply 同一配置不保证触发下载，不承诺自动恢复。版本回退先恢复对应 Observer 镜像，再恢复其匹配的网关配置。需要立即停采时关闭或删除对应工作负载的采集过滤器；`fail_open` 不覆盖任意初始化、ABI 或资源故障。
 

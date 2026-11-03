@@ -35,7 +35,7 @@ class WasmDistributionTests(unittest.TestCase):
             self.assertIn('labels: {"app": "ai-gateway"}', text)
             self.assertIn('namespace: ' + json.dumps(namespace), text)
             self.assertNotIn('metering-instance', text)
-            self.assertRegex(text, r'metadata: \{name: gateway-observer-[0-9a-f]{16},')
+            self.assertIn('metadata: {name: llm-token-stats-envoyfilter-wasm,', text)
             self.assertNotIn('gateway_instance_id', text)
             self.assertNotIn('filename:', text)
             self.assertNotIn('REPLACE_', text)
@@ -54,7 +54,7 @@ class WasmDistributionTests(unittest.TestCase):
             artifact.write_bytes(b'\x00asm\x01\x00\x00\x00synthetic')
             output = root / 'filter.yaml'
 
-            def render(namespace, labels, enabled=False):
+            def render(namespace, labels, enabled=False, name=None):
                 command = [sys.executable, str(ROOT / 'scripts/render_gateway_filter.py'),
                            '--gateway-namespace', namespace, '--wasm-file', str(artifact),
                            '--output', str(output)]
@@ -62,6 +62,8 @@ class WasmDistributionTests(unittest.TestCase):
                     command += ['--gateway-label', label]
                 if enabled:
                     command += ['--enable']
+                if name is not None:
+                    command += ['--envoyfilter-name', name]
                 subprocess.run(command, cwd=ROOT, check=True, capture_output=True)
                 text = output.read_text()
                 name = re.search(r'^metadata: \{name: ([a-z0-9-]+),', text, re.M).group(1)
@@ -71,13 +73,20 @@ class WasmDistributionTests(unittest.TestCase):
 
             # Root-namespace filters must still restrict proxy NAMESPACE.
             production, disabled = render('istio-system', ['app=production', 'example.com/env=prd'])
-            canary, _ = render('istio-system', ['app=canary', 'example.com/env=prd'])
+            default_canary, _ = render('istio-system', ['app=canary'])
+            self.assertEqual(production, 'llm-token-stats-envoyfilter-wasm')
+            self.assertEqual(production, default_canary)
+            canary, _ = render('istio-system', ['app=canary', 'example.com/env=prd'],
+                               name='llm-token-stats-envoyfilter-wasm-canary')
             self.assertNotEqual(production, canary)
             # Enabling, label argument order and a new Wasm version update one resource.
             artifact.write_bytes(b'\x00asm\x01\x00\x00\x00new-version')
             enabled, text = render('istio-system', ['example.com/env=prd', 'app=production'], True)
             self.assertEqual(production, enabled)
             self.assertNotEqual(disabled, text)
+            enabled_canary, _ = render('istio-system', ['app=canary', 'example.com/env=prd'], True,
+                                       name=canary)
+            self.assertEqual(canary, enabled_canary)
             render('gateway-test', ['app=production'])
 
     def test_renderer_rejects_invalid_namespace_or_selector(self):
@@ -88,7 +97,11 @@ class WasmDistributionTests(unittest.TestCase):
                        '--wasm-file', str(artifact), '--output', str(Path(directory) / 'filter.yaml')]
             for args in [['--gateway-label', 'bad/key/name=value'],
                          ['--gateway-label', 'app=a', '--gateway-label', 'app=b'],
-                         ['--gateway-namespace', 'a.b']]:
+                         ['--gateway-namespace', 'a.b'],
+                         *[['--envoyfilter-name', name] for name in (
+                             'other-filter', 'llm-token-stats-', 'llm-token-stats-a.b',
+                             'llm-token-stats-UPPER', 'llm-token-stats-' + 'a' * 49,
+                             'llm-token-stats-$(id)')]]:
                 result = subprocess.run([*command, *args], cwd=ROOT, capture_output=True)
                 self.assertNotEqual(result.returncode, 0)
             self.assertFalse((Path(directory) / 'filter.yaml').exists())

@@ -1,8 +1,8 @@
 """Validate explicit workload labels without consulting a Kubernetes cluster."""
 import argparse
-import hashlib
-import json
 import re
+
+DEFAULT_FILTER_NAME = 'llm-token-stats-envoyfilter-wasm'
 
 
 def label(value):
@@ -29,7 +29,9 @@ def selector(labels):
     return result
 
 
-def filter_name(labels):
-    """Keep one resource per selector, independent of label order or filter state."""
-    canonical = json.dumps(labels, sort_keys=True, separators=(',', ':')).encode('utf-8')
-    return 'gateway-observer-' + hashlib.sha256(canonical).hexdigest()[:16]
+def filter_name(value):
+    """Validate an explicit resource name; never derive it from workload labels."""
+    if (len(value) > 63 or not value.startswith('llm-token-stats-')
+            or not re.fullmatch(r'[a-z0-9](?:[a-z0-9-]*[a-z0-9])?', value)):
+        raise argparse.ArgumentTypeError('EnvoyFilter 名称必须是 llm-token-stats- 开头且不超过 63 字符的 DNS 标签')
+    return value

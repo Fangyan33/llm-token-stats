@@ -21,7 +21,7 @@ class KubernetesCollectionTests(unittest.TestCase):
                         patch.object(k8s, 'run') as run, \
                         patch.object(k8s.k8s_integration, 'prepare_suite'):
                     harness.build_images()
-                expected = ['metering-' + name + ':' + version for name in ('observer', 'consumer', 'fixture', 'integration')]
+                expected = ['llm-token-stats-' + name + ':' + version for name in ('observer', 'consumer', 'fixture', 'integration')]
                 builds = [call.args[0] for call in run.call_args_list if call.args[0][:2] == ['docker', 'build']]
                 self.assertEqual([cmd[cmd.index('-t') + 1] for cmd in builds], expected)
                 self.assertEqual(run.call_args_list[-2].args[0], ['kind', 'load', 'docker-image',
@@ -112,8 +112,8 @@ class KubernetesCollectionTests(unittest.TestCase):
         self.assertEqual(observer['kafka']['topic'], consumer['kafka']['topic'])
         self.assertNotEqual(topic, 'llm-metering-events')
         self.assertNotEqual(consumer['consumer']['group_id'], 'llm-metering-doris-v1')
-        self.assertIn('doris:9030', credentials['DORIS_DSN'])
-        self.assertEqual(observer['kafka']['bootstrap_servers'], ['kafka:9092'])
+        self.assertIn('llm-token-stats-doris:9030', credentials['DORIS_DSN'])
+        self.assertEqual(observer['kafka']['bootstrap_servers'], ['llm-token-stats-kafka:9092'])
 
     def test_acceptance_rejects_compose_producer_wrong_topic_and_unknown_zero(self):
         results = [{'scenario': 'unknown', 'x_request_id': 'request'}]
@@ -143,8 +143,10 @@ class KubernetesCollectionTests(unittest.TestCase):
         integration = k8s.k8s_integration
         infra = integration.infrastructure('metering-wasm-unit')
         names = {item['metadata']['name'] for item in infra['items']}
-        self.assertEqual(names, {'kafka', 'doris'})
-        job = integration.job_resources('metering-wasm-unit', 'metering-integration:test')
+        self.assertEqual(names, {'llm-token-stats-kafka', 'llm-token-stats-doris'})
+        job = integration.job_resources('metering-wasm-unit', 'llm-token-stats-integration:test')
+        for item in infra['items'] + job['items']:
+            self.assertTrue(item['metadata']['name'].startswith('llm-token-stats-'))
         encoded = json.dumps(job)
         for forbidden in ('hostPath', 'hostNetwork', 'docker.sock', 'cluster-admin'):
             self.assertNotIn(forbidden, encoded)
@@ -154,6 +156,30 @@ class KubernetesCollectionTests(unittest.TestCase):
         workload = next(item for item in job['items'] if item['kind'] == 'Job')
         self.assertEqual(workload['spec']['backoffLimit'], 0)
         self.assertEqual(workload['spec']['template']['metadata']['annotations']['sidecar.istio.io/inject'], 'false')
+
+    def test_suite_uses_prefixed_resources_and_dns_without_changing_local_configs(self):
+        integration = k8s.k8s_integration
+        local_paths = [k8s.ROOT / 'deploy/local' / (c + '.json') for c in ('observer', 'consumer')]
+        originals = [p.read_bytes() for p in local_paths]
+        images = {c: 'llm-token-stats-' + c + ':test' for c in ('observer', 'consumer', 'fixture')}
+        with patch.object(integration, 'bootstrap', return_value={}):
+            items = integration.suite_resources(k8s.ROOT, 'metering-wasm-unit', images)['items']
+        objects = {(r['kind'], r['metadata']['name']) for r in items}
+        self.assertTrue(all(name.startswith('llm-token-stats-') for _, name in objects))
+        for item in items:
+            if item['kind'] != 'Deployment':
+                continue
+            spec = item['spec']['template']['spec']
+            for volume in spec.get('volumes', []):
+                self.assertIn(('ConfigMap', volume['configMap']['name']), objects)
+            for env in spec['containers'][0].get('envFrom', []):
+                self.assertIn(('Secret', env['secretRef']['name']), objects)
+        configs = [json.loads(r['data'][c + '.json']) for c in ('observer', 'consumer')
+                   for r in items if r['kind'] == 'ConfigMap' and r['metadata']['name'] == 'llm-token-stats-e2e-' + c]
+        self.assertEqual(len(configs), 2)
+        self.assertTrue(all(c['kafka']['bootstrap_servers'] == ['llm-token-stats-kafka:9092'] for c in configs))
+        self.assertEqual(configs[1]['doris']['allowed_load_hosts'], ['llm-token-stats-doris:8040'])
+        self.assertEqual(originals, [p.read_bytes() for p in local_paths])
 
     def test_successful_job_must_not_hide_missing_or_skipped_scenarios(self):
         validate = k8s.k8s_integration.validate_test_log
@@ -167,8 +193,8 @@ class KubernetesCollectionTests(unittest.TestCase):
     def test_normal_gateway_waits_for_download_service_before_start(self):
         with tempfile.TemporaryDirectory() as directory:
             harness = self.harness(directory)
-            harness.images = {'integration': 'metering-integration:test'}
-            gateway = {'kind': 'Pod', 'metadata': {'name': 'e2e-gateway'}}
+            harness.images = {'integration': 'llm-token-stats-integration:test'}
+            gateway = {'kind': 'Pod', 'metadata': {'name': 'llm-token-stats-e2e-gateway'}}
             manifests = {'apiVersion': 'v1', 'kind': 'List', 'items': [gateway, {'kind': 'Service'}]}
             events = []
             with patch.object(harness, 'sql'), patch.object(harness, 'kafka'), \

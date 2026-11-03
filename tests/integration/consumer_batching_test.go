@@ -59,9 +59,9 @@ type runningBatchConsumer struct {
 
 func startBatchingConsumer(t *testing.T, topic, group string, rows, bytes int) *runningBatchConsumer {
 	t.Helper()
-	s := localStore(t, "http://doris:8040")
+	s := localStore(t, "http://llm-token-stats-doris:8040")
 	c := config.Config{
-		Kafka: config.Kafka{Brokers: []string{"kafka:9092"}, Topic: topic},
+		Kafka: config.Kafka{Brokers: []string{"llm-token-stats-kafka:9092"}, Topic: topic},
 		Consumer: config.Consumer{Group: group, Rows: rows, Bytes: bytes, FlushMS: 500,
 			AcceptedConfigs: []string{"collection-v1"}},
 		Doris: s.Cfg,

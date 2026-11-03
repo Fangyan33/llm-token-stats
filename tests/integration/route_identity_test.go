@@ -18,7 +18,7 @@ import (
 // Exercise the single contract, real Doris projections and startup audit.
 // Diagnostic route changes must not turn into identity conflicts.
 func TestDiagnosticRouteIdentityAndSnapshotConflicts(t *testing.T) {
-	s := localStore(t, "http://doris:8040")
+	s := localStore(t, "http://llm-token-stats-doris:8040")
 	cl := kafka(t)
 	topic, group := batchingTopic(t, cl)
 	for _, mode := range []string{"diagnostic_route", "tenant_conflict", "provider_conflict", "environment_conflict", "name_conflict", "client_id_conflict"} {

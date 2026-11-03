@@ -25,7 +25,7 @@ func TestBearerPrivacyAndInvalidInputs(t *testing.T) {
 	var requests []expected
 	for _, mode := range []string{"valid", "duplicate", "joined", "missing", "other_scheme"} {
 		id := uuid(t)
-		req, _ := http.NewRequest("POST", "http://e2e-gateway:8080/v1/chat/completions", strings.NewReader(`{"model":"fixture","stream":false}`))
+		req, _ := http.NewRequest("POST", "http://llm-token-stats-e2e-gateway:8080/v1/chat/completions", strings.NewReader(`{"model":"fixture","stream":false}`))
 		req.Host = "MODEL.Example.invalid:443"
 		req.Header.Set("content-type", "application/json")
 		req.Header.Set("x-request-id", id)
@@ -91,7 +91,7 @@ func TestBearerPrivacyAndInvalidInputs(t *testing.T) {
 	for partition := int32(0); partition < 24; partition++ {
 		partitions[partition] = kgo.NewOffset().AtStart()
 	}
-	reader, err := kgo.NewClient(kgo.SeedBrokers("kafka:9092"),
+	reader, err := kgo.NewClient(kgo.SeedBrokers("llm-token-stats-kafka:9092"),
 		kgo.ConsumePartitions(map[string]map[int32]kgo.Offset{"llm-metering-development": partitions}))
 	if err != nil {
 		t.Fatal("independent Kafka reader")
@@ -150,7 +150,7 @@ func TestWasmHostAllowlist(t *testing.T) {
 			// preserve its original 422 response instead of being rewritten to 200.
 			wantStatus = http.StatusUnprocessableEntity
 		}
-		req, _ := http.NewRequest("POST", "http://e2e-gateway:8080/v1/chat/completions", bytes.NewReader(body))
+		req, _ := http.NewRequest("POST", "http://llm-token-stats-e2e-gateway:8080/v1/chat/completions", bytes.NewReader(body))
 		req.Host = tc.host
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("x-request-id", id)

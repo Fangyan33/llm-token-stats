@@ -43,6 +43,8 @@ def package_options(environment):
     namespace = bundle.dns_name(environment.get('RELEASE_NAMESPACE') or 'metering')
     gateway_namespace = bundle.dns_name(environment.get('RELEASE_GATEWAY_NAMESPACE') or 'istio-system')
     options = ['--namespace', namespace, '--gateway-namespace', gateway_namespace]
+    options += ['--envoyfilter-name', bundle.filter_name(
+        environment.get('RELEASE_ENVOYFILTER_NAME') or bundle.DEFAULT_FILTER_NAME)]
     for host in hosts:
         options += ['--accepted-request-host', bundle.normalize_request_host_pattern(host)]
     if environment.get('RELEASE_GATEWAY_LABELS', '').strip():

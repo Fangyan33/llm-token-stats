@@ -35,17 +35,17 @@ def infrastructure(namespace):
            'KAFKA_CONTROLLER_LISTENER_NAMES': 'CONTROLLER',
            'KAFKA_LISTENER_SECURITY_PROTOCOL_MAP': 'CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT',
            'KAFKA_LISTENERS': 'PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093',
-           'KAFKA_ADVERTISED_LISTENERS': 'PLAINTEXT://kafka:9092',
+           'KAFKA_ADVERTISED_LISTENERS': 'PLAINTEXT://llm-token-stats-kafka:9092',
            'KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR': '1',
            'KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR': '1',
            'KAFKA_TRANSACTION_STATE_LOG_MIN_ISR': '1',
            'KAFKA_AUTO_CREATE_TOPICS_ENABLE': 'false', 'KAFKA_HEAP_OPTS': '-Xms128m -Xmx256m'}
-    items = workload('kafka', namespace, IMAGES[0], [9092],
+    items = workload('llm-token-stats-kafka', namespace, IMAGES[0], [9092],
                      env=[{'name': k, 'value': v} for k, v in env.items()],
                      resources={'requests': {'cpu': '100m', 'memory': '384Mi'},
                                 'limits': {'cpu': '1', 'memory': '768Mi'}},
                      readinessProbe={'tcpSocket': {'port': 9092}, 'periodSeconds': 2})
-    items += workload('doris', namespace, IMAGES[1], [9030, 8040],
+    items += workload('llm-token-stats-doris', namespace, IMAGES[1], [9030, 8040],
                       env=[{'name': 'FE_HEAP', 'value': '512m'},
                            {'name': 'BE_HEAP', 'value': '256m'},
                            {'name': 'BE_CONFIG_EXTRA',
@@ -58,15 +58,15 @@ def infrastructure(namespace):
 
 def bootstrap(root, namespace):
     cfg = json.loads((root / 'deploy/local/envoy.json').read_text())
-    cfg['node']['metadata'] = {'NAMESPACE': namespace, 'NAME': 'e2e-gateway'}
-    cfg['node']['id'] = namespace + '/e2e-gateway'
+    cfg['node']['metadata'] = {'NAMESPACE': namespace, 'NAME': 'llm-token-stats-e2e-gateway'}
+    cfg['node']['id'] = namespace + '/llm-token-stats-e2e-gateway'
     res = cfg['static_resources']
     for cluster in res['clusters']:
         address = cluster['load_assignment']['endpoints'][0]['lb_endpoints'][0]['endpoint']['address']['socket_address']
-        address['address'] = 'e2e-fixture' if cluster['name'] in ('fixture', 'auth') else 'e2e-observer'
+        address['address'] = 'llm-token-stats-e2e-fixture' if cluster['name'] in ('fixture', 'auth') else 'llm-token-stats-e2e-observer'
     plugin = res['listeners'][0]['filter_chains'][0]['filters'][0]['typed_config']['http_filters'][1]['typed_config']['config']
     remote = plugin['vm_config']['code']['remote']
-    remote['http_uri']['uri'] = 'http://e2e-observer:9093/wasm/gateway-observer-v1.wasm'
+    remote['http_uri']['uri'] = 'http://llm-token-stats-e2e-observer:9093/wasm/gateway-observer-v1.wasm'
     remote['sha256'] = hashlib.sha256((root / 'dist/gateway-observer-v1.wasm').read_bytes()).hexdigest()
     return cfg
 
@@ -89,13 +89,16 @@ def prepare_suite(root, namespace):
 def suite_resources(root, namespace, images):
     items = []
     for component in ('observer', 'consumer', 'fixture'):
-        name = 'e2e-' + component
+        name = 'llm-token-stats-e2e-' + component
         config = None
         if component != 'fixture':
             config = json.loads((root / ('deploy/local/' + component + '.json')).read_text())
+            config['kafka']['bootstrap_servers'] = ['llm-token-stats-kafka:9092']
             if component == 'observer':
                 config['observer']['wasm_download']['file'] = '/usr/share/metering/wasm/gateway-observer-v1.wasm'
             else:
+                config['doris']['fe_url'] = 'http://llm-token-stats-doris:8040'
+                config['doris']['allowed_load_hosts'] = ['llm-token-stats-doris:8040']
                 # Dedicated batching tests set their own row/byte/time limits.
                 config['consumer']['flush_interval_ms'] = 1000
             args = ['--config', '/config/' + component + '.json']
@@ -117,29 +120,29 @@ def suite_resources(root, namespace, images):
             container['volumeMounts'] = [{'name': 'config', 'mountPath': '/config', 'readOnly': True}]
             spec['volumes'] = [{'name': 'config', 'configMap': {'name': name}}]
         if component == 'consumer':
-            container['envFrom'] = [{'secretRef': {'name': 'e2e-credentials'}}]
+            container['envFrom'] = [{'secretRef': {'name': 'llm-token-stats-e2e-credentials'}}]
         items += group
-    items.append(resource('Secret', 'e2e-credentials', namespace, stringData={
-        'DORIS_DSN': 'root@tcp(doris:9030)/metering_development?timeout=5s&readTimeout=30s&writeTimeout=10s&interpolateParams=true&time_zone=%27%2B00%3A00%27',
+    items.append(resource('Secret', 'llm-token-stats-e2e-credentials', namespace, stringData={
+        'DORIS_DSN': 'root@tcp(llm-token-stats-doris:9030)/metering_development?timeout=5s&readTimeout=30s&writeTimeout=10s&interpolateParams=true&time_zone=%27%2B00%3A00%27',
         'DORIS_USER': 'root', 'DORIS_PASSWORD': ''}))
-    items.append(resource('ConfigMap', 'e2e-gateway', namespace, data={'envoy.json': json.dumps(bootstrap(root, namespace))}))
-    gateway = resource('Pod', 'e2e-gateway', namespace, spec={
+    items.append(resource('ConfigMap', 'llm-token-stats-e2e-gateway', namespace, data={'envoy.json': json.dumps(bootstrap(root, namespace))}))
+    gateway = resource('Pod', 'llm-token-stats-e2e-gateway', namespace, spec={
         'automountServiceAccountToken': False, 'containers': [{
             'name': 'envoy', 'image': IMAGES[2], 'imagePullPolicy': 'IfNotPresent',
             'command': ['/usr/local/bin/envoy'], 'args': ['-c', '/config/envoy.json', '--concurrency', '1', '--log-level', 'warning'],
             'readinessProbe': {'httpGet': {'path': '/ready', 'port': 9901}, 'periodSeconds': 2},
             'resources': {'requests': {'cpu': '50m', 'memory': '64Mi'}, 'limits': {'cpu': '1', 'memory': '512Mi'}},
             'volumeMounts': [{'name': 'config', 'mountPath': '/config', 'readOnly': True}]}],
-        'volumes': [{'name': 'config', 'configMap': {'name': 'e2e-gateway'}}]})
-    gateway['metadata'].update(labels={'app': 'e2e-gateway', 'e2e-component': 'true'},
+        'volumes': [{'name': 'config', 'configMap': {'name': 'llm-token-stats-e2e-gateway'}}]})
+    gateway['metadata'].update(labels={'app': 'llm-token-stats-e2e-gateway', 'e2e-component': 'true'},
                                annotations={'sidecar.istio.io/inject': 'false'})
-    items += [gateway, resource('Service', 'e2e-gateway', namespace,
-                               spec={'selector': {'app': 'e2e-gateway'}, 'ports': [{'name': 'http', 'port': 8080}, {'name': 'admin', 'port': 9901}]})]
+    items += [gateway, resource('Service', 'llm-token-stats-e2e-gateway', namespace,
+                               spec={'selector': {'app': 'llm-token-stats-e2e-gateway'}, 'ports': [{'name': 'http', 'port': 8080}, {'name': 'admin', 'port': 9901}]})]
     return {'apiVersion': 'v1', 'kind': 'List', 'items': items}
 
 
 def job_resources(namespace, image):
-    name = 'collection-integration'
+    name = 'llm-token-stats-collection-integration'
     account = resource('ServiceAccount', name, namespace)
     role = resource('Role', name, namespace, rules=[
         {'apiGroups': [''], 'resources': ['pods', 'configmaps'], 'verbs': ['create', 'get', 'list', 'delete']},
@@ -175,19 +178,19 @@ def run_suite(harness, root, migrations, render_sql):
     # explicit fault probes test an unavailable download service separately.
     gateway = next(item for item in manifest['items'] if item['kind'] == 'Pod')
     harness.apply({**manifest, 'items': [item for item in manifest['items'] if item is not gateway]})
-    for name in ('e2e-observer', 'e2e-consumer', 'e2e-fixture'):
+    for name in ('llm-token-stats-e2e-observer', 'llm-token-stats-e2e-consumer', 'llm-token-stats-e2e-fixture'):
         harness.kubectl('-n', harness.namespace, 'rollout', 'status', 'deployment/' + name, '--timeout=180s', timeout=195)
     harness.apply(gateway)
-    harness.kubectl('-n', harness.namespace, 'wait', '--for=condition=Ready', 'pod/e2e-gateway', '--timeout=120s', timeout=135)
+    harness.kubectl('-n', harness.namespace, 'wait', '--for=condition=Ready', 'pod/llm-token-stats-e2e-gateway', '--timeout=120s', timeout=135)
     manifest = job_resources(harness.namespace, harness.images['integration'])
     (harness.output / 'integration-job.json').write_text(json.dumps(manifest, indent=2))
     harness.apply(manifest)
     deadline = time.monotonic() + 1350
     while time.monotonic() < deadline:
-        job = harness.get('-n', harness.namespace, 'get', 'job', 'collection-integration')
+        job = harness.get('-n', harness.namespace, 'get', 'job', 'llm-token-stats-collection-integration')
         status = job.get('status', {})
         if status.get('succeeded') or status.get('failed'):
-            logs = harness.kubectl('-n', harness.namespace, 'logs', 'job/collection-integration', '--all-containers=true')
+            logs = harness.kubectl('-n', harness.namespace, 'logs', 'job/llm-token-stats-collection-integration', '--all-containers=true')
             (harness.output / 'integration.log').write_text(logs)
             print(logs, flush=True)
             if not status.get('succeeded'):
@@ -196,7 +199,7 @@ def run_suite(harness, root, migrations, render_sql):
             for path in (root / 'tests/integration').glob('*_test.go'):
                 expected.update(re.findall(r'^func (Test\w+)\(t \*testing.T\)', path.read_text(), re.M))
             passed = validate_test_log(logs, expected)
-            return {'status': 'passed', 'job': 'collection-integration', 'log': 'integration.log',
+            return {'status': 'passed', 'job': 'llm-token-stats-collection-integration', 'log': 'integration.log',
                     'passed_tests': len(passed), 'test_names': sorted(passed)}
         time.sleep(2)
     raise RuntimeError('Kubernetes 集成测试 Job 超时')

@@ -2,11 +2,11 @@
 apiVersion: v1
 kind: Service
 metadata:
-  name: doris
+  name: llm-token-stats-doris
 spec:
   clusterIP: None
   selector:
-    app: doris
+    app: llm-token-stats-doris
   ports:
     - name: mysql
       port: 9030
@@ -21,17 +21,17 @@ spec:
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
-  name: doris
+  name: llm-token-stats-doris
 spec:
-  serviceName: doris
+  serviceName: llm-token-stats-doris
   replicas: 1
   selector:
     matchLabels:
-      app: doris
+      app: llm-token-stats-doris
   template:
     metadata:
       labels:
-        app: doris
+        app: llm-token-stats-doris
     spec:
       terminationGracePeriodSeconds: 120
       containers:
@@ -57,20 +57,20 @@ spec:
               port: fe-http
             periodSeconds: 5
           volumeMounts:
-            - name: fe-meta
+            - name: llm-token-stats-fe-meta
               mountPath: /opt/apache-doris/fe/doris-meta
-            - name: be-storage
+            - name: llm-token-stats-be-storage
               mountPath: /opt/apache-doris/be/storage
   volumeClaimTemplates:
     - metadata:
-        name: fe-meta
+        name: llm-token-stats-fe-meta
       spec:
         accessModes: [ReadWriteOnce]
         resources:
           requests:
             storage: 10Gi
     - metadata:
-        name: be-storage
+        name: llm-token-stats-be-storage
       spec:
         accessModes: [ReadWriteOnce]
         resources:

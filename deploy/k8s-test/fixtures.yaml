@@ -1,13 +1,13 @@
 # Synthetic authentication/model and an isolated gateway. Render via k8s_collection.py.
 apiVersion: apps/v1
 kind: Deployment
-metadata: {name: collection-fixture, namespace: TEST_NAMESPACE}
+metadata: {name: llm-token-stats-collection-fixture, namespace: TEST_NAMESPACE}
 spec:
   replicas: 1
-  selector: {matchLabels: {app: collection-fixture}}
+  selector: {matchLabels: {app: llm-token-stats-collection-fixture}}
   template:
     metadata:
-      labels: {app: collection-fixture}
+      labels: {app: llm-token-stats-collection-fixture}
       annotations: {proxy.istio.io/config: '{"concurrency":2}'}
     spec:
       containers:
@@ -20,20 +20,20 @@ spec:
 ---
 apiVersion: v1
 kind: Service
-metadata: {name: collection-fixture, namespace: TEST_NAMESPACE}
+metadata: {name: llm-token-stats-collection-fixture, namespace: TEST_NAMESPACE}
 spec:
-  selector: {app: collection-fixture}
+  selector: {app: llm-token-stats-collection-fixture}
   ports: [{name: http-model, port: 8081, targetPort: http-model}, {name: grpc-auth, port: 9002, targetPort: grpc-auth}]
 ---
 apiVersion: apps/v1
 kind: Deployment
-metadata: {name: wasm-gateway, namespace: TEST_NAMESPACE}
+metadata: {name: llm-token-stats-wasm-gateway, namespace: TEST_NAMESPACE}
 spec:
   replicas: 1
-  selector: {matchLabels: {app: metering-wasm-gateway, istio: TEST_NAMESPACE}}
+  selector: {matchLabels: {app: llm-token-stats-wasm-gateway, istio: TEST_NAMESPACE}}
   template:
     metadata:
-      labels: {app: metering-wasm-gateway, istio: TEST_NAMESPACE}
+      labels: {app: llm-token-stats-wasm-gateway, istio: TEST_NAMESPACE}
       annotations:
         inject.istio.io/templates: gateway
         proxy.istio.io/config: '{"concurrency":2}'
@@ -47,14 +47,14 @@ spec:
 ---
 apiVersion: v1
 kind: Service
-metadata: {name: wasm-gateway, namespace: TEST_NAMESPACE}
+metadata: {name: llm-token-stats-wasm-gateway, namespace: TEST_NAMESPACE}
 spec:
-  selector: {app: metering-wasm-gateway, istio: TEST_NAMESPACE}
+  selector: {app: llm-token-stats-wasm-gateway, istio: TEST_NAMESPACE}
   ports: [{name: http, port: 8080, targetPort: http}, {name: status, port: 15021, targetPort: status}]
 ---
 apiVersion: networking.istio.io/v1alpha3
 kind: Gateway
-metadata: {name: wasm-gateway, namespace: TEST_NAMESPACE}
+metadata: {name: llm-token-stats-wasm-gateway, namespace: TEST_NAMESPACE}
 spec:
   selector: {istio: TEST_NAMESPACE}
   servers:
@@ -63,28 +63,28 @@ spec:
 ---
 apiVersion: networking.istio.io/v1alpha3
 kind: VirtualService
-metadata: {name: wasm-model, namespace: TEST_NAMESPACE}
+metadata: {name: llm-token-stats-wasm-model, namespace: TEST_NAMESPACE}
 spec:
   hosts: [wasm-verify.local]
-  gateways: [wasm-gateway]
+  gateways: [llm-token-stats-wasm-gateway]
   http:
     - name: synthetic-model-route
       match: [{uri: {prefix: /}}]
       route:
         - destination:
-            host: collection-fixture.TEST_NAMESPACE.svc.cluster.local
+            host: llm-token-stats-collection-fixture.TEST_NAMESPACE.svc.cluster.local
             port: {number: 8081}
 ---
 apiVersion: security.istio.io/v1beta1
 kind: PeerAuthentication
-metadata: {name: observer-strict, namespace: TEST_NAMESPACE}
+metadata: {name: llm-token-stats-observer-strict, namespace: TEST_NAMESPACE}
 spec:
-  selector: {matchLabels: {app: metering-observer}}
+  selector: {matchLabels: {app: llm-token-stats-observer}}
   mtls: {mode: STRICT}
 ---
 apiVersion: networking.istio.io/v1alpha3
 kind: EnvoyFilter
-metadata: {name: wasm-verify-auth-route, namespace: TEST_NAMESPACE}
+metadata: {name: llm-token-stats-wasm-verify-auth-route, namespace: TEST_NAMESPACE}
 spec:
   priority: -20
   workloadSelector: {labels: {istio: TEST_NAMESPACE}}
@@ -107,6 +107,6 @@ spec:
             failure_mode_allow: false
             grpc_service:
               envoy_grpc:
-                cluster_name: outbound|9002||collection-fixture.TEST_NAMESPACE.svc.cluster.local
-                authority: collection-fixture.TEST_NAMESPACE.svc.cluster.local
+                cluster_name: outbound|9002||llm-token-stats-collection-fixture.TEST_NAMESPACE.svc.cluster.local
+                authority: llm-token-stats-collection-fixture.TEST_NAMESPACE.svc.cluster.local
               timeout: 1s

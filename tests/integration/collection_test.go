@@ -34,7 +34,7 @@ import (
 	"github.com/twmb/franz-go/pkg/kmsg"
 )
 
-const dsn = "root@tcp(doris:9030)/metering_development?timeout=5s&readTimeout=5s&writeTimeout=5s&interpolateParams=true&time_zone=%27%2B00%3A00%27"
+const dsn = "root@tcp(llm-token-stats-doris:9030)/metering_development?timeout=5s&readTimeout=5s&writeTimeout=5s&interpolateParams=true&time_zone=%27%2B00%3A00%27"
 
 func uuid(t *testing.T) string {
 	t.Helper()
@@ -71,7 +71,7 @@ func eventually(t *testing.T, f func() bool) {
 }
 func kafka(t *testing.T) *kgo.Client {
 	t.Helper()
-	c, err := kgo.NewClient(kgo.SeedBrokers("kafka:9092"), kgo.RequiredAcks(kgo.AllISRAcks()), kgo.DisableIdempotentWrite(), kgo.RecordRetries(1), kgo.RecordPartitioner(kgo.ManualPartitioner()))
+	c, err := kgo.NewClient(kgo.SeedBrokers("llm-token-stats-kafka:9092"), kgo.RequiredAcks(kgo.AllISRAcks()), kgo.DisableIdempotentWrite(), kgo.RecordRetries(1), kgo.RecordPartitioner(kgo.ManualPartitioner()))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -102,7 +102,7 @@ func TestCollectionEndToEnd(t *testing.T) {
 				body["test_case"] = "missing_usage"
 			}
 			b, _ := json.Marshal(body)
-			req, _ := http.NewRequest("POST", "http://e2e-gateway:8080/v1/chat/completions", bytes.NewReader(b))
+			req, _ := http.NewRequest("POST", "http://llm-token-stats-e2e-gateway:8080/v1/chat/completions", bytes.NewReader(b))
 			req.Header.Set("Content-Type", "application/json")
 			req.Header.Set("x-request-id", xid)
 			req.Header.Set("Authorization", "Bearer synthetic-sentinel-key")
@@ -133,7 +133,7 @@ func TestCollectionEndToEnd(t *testing.T) {
 			if err = json.Unmarshal([]byte(raw), &event); err != nil || event.RouteName != "unknown" {
 				t.Fatal("unnamed Envoy route must be recorded as unknown")
 			}
-			if event.GatewayInstanceID != os.Getenv("METERING_TEST_NAMESPACE")+"/e2e-gateway" {
+			if event.GatewayInstanceID != os.Getenv("METERING_TEST_NAMESPACE")+"/llm-token-stats-e2e-gateway" {
 				t.Fatalf("runtime gateway identity = %q", event.GatewayInstanceID)
 			}
 			if event.MappingStatus != "lookup_not_implemented" || event.CustomerMappingStatus != "lookup_not_implemented" || event.IdentityStatus != "invalid" || event.ServiceID != nil || event.ProviderID != nil || event.ApiKeyID != nil || event.CustomerID != nil || strings.Contains(raw, "synthetic-sentinel-key") {
@@ -192,7 +192,7 @@ func TestCollectionEndToEnd(t *testing.T) {
 		} {
 			id := uuid(t)
 			ids = append(ids, id)
-			req, _ := http.NewRequest(tc.method, "http://e2e-gateway:8080"+tc.path, strings.NewReader(`{"model":"fixture","stream":false}`))
+			req, _ := http.NewRequest(tc.method, "http://llm-token-stats-e2e-gateway:8080"+tc.path, strings.NewReader(`{"model":"fixture","stream":false}`))
 			req.Host = "model.example.invalid"
 			req.Header.Set("content-type", "application/json")
 			req.Header.Set("x-request-id", id)
@@ -216,7 +216,7 @@ func TestCollectionEndToEnd(t *testing.T) {
 
 func gatewaySelectedRequests(t *testing.T) uint64 {
 	t.Helper()
-	res, err := (&http.Client{Timeout: 5 * time.Second}).Get("http://e2e-gateway:9901/stats?filter=metering_requests_selected_total")
+	res, err := (&http.Client{Timeout: 5 * time.Second}).Get("http://llm-token-stats-e2e-gateway:9901/stats?filter=metering_requests_selected_total")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -267,7 +267,7 @@ func TestStreamLoadConfirmationLoss(t *testing.T) {
 			t.Error(err)
 			return
 		}
-		req, err := http.NewRequestWithContext(r.Context(), r.Method, "http://doris:8040"+r.URL.RequestURI(), bytes.NewReader(body))
+		req, err := http.NewRequestWithContext(r.Context(), r.Method, "http://llm-token-stats-doris:8040"+r.URL.RequestURI(), bytes.NewReader(body))
 		if err != nil {
 			t.Error(err)
 			return
@@ -318,8 +318,8 @@ func TestUnknownSchemaPausesPartition(t *testing.T) {
 	if err != nil || len(resp.Topics) != 1 || resp.Topics[0].ErrorCode != 0 {
 		t.Fatalf("create local test topic: %v", err)
 	}
-	s := localStore(t, "http://doris:8040")
-	c := config.Config{Kafka: config.Kafka{Brokers: []string{"kafka:9092"}, Topic: topic}, Consumer: config.Consumer{Group: group, AcceptedConfigs: []string{"collection-v1"}}, Doris: s.Cfg}
+	s := localStore(t, "http://llm-token-stats-doris:8040")
+	c := config.Config{Kafka: config.Kafka{Brokers: []string{"llm-token-stats-kafka:9092"}, Topic: topic}, Consumer: config.Consumer{Group: group, AcceptedConfigs: []string{"collection-v1"}}, Doris: s.Cfg}
 	if err = c.ConsumerDefaults(); err != nil {
 		t.Fatal(err)
 	}
@@ -440,7 +440,7 @@ func TestHTTPRewriteBoundariesAndTimeout(t *testing.T) {
 				reader = &stalledBody{first: body[:40], tail: body[40:]}
 			}
 			xid := uuid(t)
-			req, _ := http.NewRequest("POST", "http://e2e-gateway:8080/v1/chat/completions", reader)
+			req, _ := http.NewRequest("POST", "http://llm-token-stats-e2e-gateway:8080/v1/chat/completions", reader)
 			req.Header.Set("Content-Type", "application/json")
 			req.Header.Set("x-request-id", xid)
 			req.Header.Set("Authorization", "Bearer synthetic-sentinel-key")

@@ -35,7 +35,7 @@ func TestClientRequestIDsRemainSeparateObservations(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			xid := uuid(t)
-			req, _ := http.NewRequest("POST", "http://e2e-gateway:8080/v1/chat/completions", bytes.NewBufferString(`{"model":"fixture","stream":false,"messages":[]}`))
+			req, _ := http.NewRequest("POST", "http://llm-token-stats-e2e-gateway:8080/v1/chat/completions", bytes.NewBufferString(`{"model":"fixture","stream":false,"messages":[]}`))
 			req.Host = "model.example.invalid"
 			req.Header.Set("content-type", "application/json")
 			req.Header.Set("x-request-id", xid)

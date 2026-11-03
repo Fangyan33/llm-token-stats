@@ -1,7 +1,7 @@
 "apiVersion": "v1"
 "kind": "ConfigMap"
 "metadata":
-  "name": "metering-usage-worker"
+  "name": "llm-token-stats-usage-worker"
   "namespace": "metering"
 "data":
   "usage-worker.json": |
@@ -16,27 +16,27 @@
         "poll_interval_seconds": 2,
         "max_run_seconds": 21600,
         "lock_mode": "kubernetes",
-        "lease_name": "metering-usage-worker"
+        "lease_name": "llm-token-stats-usage-worker"
       }
     }
 ---
 "apiVersion": "v1"
 "kind": "ServiceAccount"
 "metadata":
-  "name": "metering-usage-worker"
+  "name": "llm-token-stats-usage-worker"
   "namespace": "metering"
 ---
 "apiVersion": "coordination.k8s.io/v1"
 "kind": "Lease"
 "metadata":
-  "name": "metering-usage-worker"
+  "name": "llm-token-stats-usage-worker"
   "namespace": "metering"
 "spec": {}
 ---
 "apiVersion": "rbac.authorization.k8s.io/v1"
 "kind": "Role"
 "metadata":
-  "name": "metering-usage-worker"
+  "name": "llm-token-stats-usage-worker"
   "namespace": "metering"
 "rules":
   -
@@ -45,7 +45,7 @@
     "resources":
       - "leases"
     "resourceNames":
-      - "metering-usage-worker"
+      - "llm-token-stats-usage-worker"
     "verbs":
       - "get"
       - "update"
@@ -60,22 +60,22 @@
 "apiVersion": "rbac.authorization.k8s.io/v1"
 "kind": "RoleBinding"
 "metadata":
-  "name": "metering-usage-worker"
+  "name": "llm-token-stats-usage-worker"
   "namespace": "metering"
 "subjects":
   -
     "kind": "ServiceAccount"
-    "name": "metering-usage-worker"
+    "name": "llm-token-stats-usage-worker"
     "namespace": "metering"
 "roleRef":
   "apiGroup": "rbac.authorization.k8s.io"
   "kind": "Role"
-  "name": "metering-usage-worker"
+  "name": "llm-token-stats-usage-worker"
 ---
 "apiVersion": "batch/v1"
 "kind": "CronJob"
 "metadata":
-  "name": "metering-usage-worker"
+  "name": "llm-token-stats-usage-worker"
   "namespace": "metering"
 "spec":
   "schedule": "0 1 * * *"
@@ -94,7 +94,7 @@
           "containers":
             -
               "name": "usage-worker"
-              "image": "metering-usage-worker:local"
+              "image": "llm-token-stats-usage-worker:local"
               "imagePullPolicy": "IfNotPresent"
               "args":
                 - "--config"
@@ -103,7 +103,7 @@
               "envFrom":
                 -
                   "secretRef":
-                    "name": "metering-consumer-credentials"
+                    "name": "llm-token-stats-consumer-credentials"
               "env":
                 -
                   "name": "POD_NAME"
@@ -133,9 +133,9 @@
                   "cpu": "1"
                   "memory": "512Mi"
           "restartPolicy": "Never"
-          "serviceAccountName": "metering-usage-worker"
+          "serviceAccountName": "llm-token-stats-usage-worker"
           "volumes":
             -
               "name": "config"
               "configMap":
-                "name": "metering-usage-worker"
+                "name": "llm-token-stats-usage-worker"

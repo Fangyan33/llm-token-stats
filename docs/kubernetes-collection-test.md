@@ -66,8 +66,8 @@ Istio 部署验收使用独立的 `llm-metering-k8s-<run-id>` topic / 消费组�
 
 ```sh
 kubectl --context kind-kind -n metering-wasm-verify get deployment,pod,job,svc
-kubectl --context kind-kind -n metering-wasm-verify logs job/collection-integration
-kubectl --context kind-kind -n metering-wasm-verify port-forward service/wasm-gateway 28080:8080
+kubectl --context kind-kind -n metering-wasm-verify logs job/llm-token-stats-collection-integration
+kubectl --context kind-kind -n metering-wasm-verify port-forward service/llm-token-stats-wasm-gateway 28080:8080
 ```
 
 在另一终端发送合成请求：

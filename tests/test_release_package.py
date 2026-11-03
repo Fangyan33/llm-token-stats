@@ -20,6 +20,7 @@ class ReleasePackageTests(unittest.TestCase):
         return {
             'RELEASE_ACCEPTED_REQUEST_HOSTS': '["API.Company.com.", "*.company.com"]',
             'RELEASE_GATEWAY_LABELS': '["app=ai-gateway"]',
+            'RELEASE_ENVOYFILTER_NAME': 'llm-token-stats-envoyfilter-wasm-canary',
         }
 
     def test_inputs_use_existing_contract_without_cluster_access(self):
@@ -30,6 +31,7 @@ class ReleasePackageTests(unittest.TestCase):
         self.assertEqual(args.accepted_request_host, ['api.company.com', '*.company.com'])
         self.assertEqual(release.bundle.selector(args.gateway_label), {'app': 'ai-gateway'})
         self.assertEqual(args.platform, 'linux/amd64')
+        self.assertEqual(args.envoyfilter_name, 'llm-token-stats-envoyfilter-wasm-canary')
         self.assertFalse(args.include_dependency_images)
 
     def test_release_needs_no_environment_inputs(self):
@@ -37,6 +39,7 @@ class ReleasePackageTests(unittest.TestCase):
             args = release.bundle.parser().parse_args(release.package_options({}))
         run.assert_not_called()
         self.assertEqual(release.bundle.selector(args.gateway_label), {"istio": "ingressgateway"})
+        self.assertEqual(args.envoyfilter_name, 'llm-token-stats-envoyfilter-wasm')
 
     def test_missing_or_blank_host_input_defaults_to_all_hosts(self):
         for host_input in (None, '', '   '):
@@ -63,6 +66,8 @@ class ReleasePackageTests(unittest.TestCase):
             ('RELEASE_GATEWAY_LABELS', '["bad/key/name=x"]'),
             ('RELEASE_GATEWAY_LABELS', '["gateway`id`=value"]'),
             ('RELEASE_NAMESPACE', 'metering;id'),
+            ('RELEASE_ENVOYFILTER_NAME', 'wrong-prefix'),
+            ('RELEASE_ENVOYFILTER_NAME', 'llm-token-stats-$(shell id)'),
             ('RELEASE_STORAGE_CLASS', '$(shell id)'),
         ]
         for name, value in cases:
@@ -90,7 +95,7 @@ class ReleasePackageTests(unittest.TestCase):
         (package / 'images/images.tar').write_bytes(os.urandom(4096))
         (package / 'envoyfilter.yaml').write_text(
             'apiVersion: networking.istio.io/v1alpha3\nkind: EnvoyFilter\nmetadata:\n  name: synthetic-test\n')
-        images = {'observer': 'metering-observer:test', 'consumer': 'metering-consumer:test'}
+        images = {'observer': 'llm-token-stats-observer:test', 'consumer': 'llm-token-stats-consumer:test'}
         manifest = {'platform': 'linux/amd64', 'images': {**images, **release.bundle.RUNTIME_IMAGES},
                     'archived_images': images, 'external_images': release.bundle.RUNTIME_IMAGES}
         (package / 'manifest.json').write_text(json.dumps(manifest) + '\n')

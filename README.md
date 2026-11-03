@@ -60,17 +60,21 @@ make manifest   # 生成 dist/collection-manifest.json，记录工具版本与�
 
 ### Observer 与 Consumer 镜像
 
+项目构建的镜像及项目创建的 Kubernetes 对象统一使用 `llm-token-stats-` 前缀，包含 usage-worker、Kafka/Doris 部署和测试辅助对象；官方依赖镜像和命名空间保留原名。现有源代码路径、二进制和 Wasm 文件名保持不变。
+
+升级时，改名后的清单会创建新资源。先停用旧 Consumer、usage-worker 和旧采集 EnvoyFilter，再启用对应新工作负载，避免重复调度或重复过滤；Kafka/Doris 数据及 PVC 迁移需单独安排，不会自动搬迁或删除。旧 EnvoyFilter 包括固定名、按 UID 或标签摘要生成的旧名称，应按旧清单移除。
+
 两个 Dockerfile 都从源码构建 Go 服务二进制。Observer 镜像还会复制宿主机上 `make wasm` 生成的插件，因此必须先生成 Wasm，再构建镜像。
 
-镜像版本由 `scripts/image_tag.py` 统一生成：当前提交有 Git tag 时使用该 tag，否则使用至少 12 位 commit 短 hash，例如 `observer:v1.2.3` 或 `observer:2d36b71036b8`。同一提交有多个 tag 时，按 Git 版本排序取最高项；历史提交的 tag 不用于当前版本。Git tag 不符合 Docker tag 的字符或长度限制时，脚本直接报错。
+镜像版本由 `scripts/image_tag.py` 统一生成：当前提交有 Git tag 时使用该 tag，否则使用至少 12 位 commit 短 hash，例如 `llm-token-stats-observer:v1.2.3` 或 `llm-token-stats-observer:2d36b71036b8`。同一提交有多个 tag 时，按 Git 版本排序取最高项；历史提交的 tag 不用于当前版本。Git tag 不符合 Docker tag 的字符或长度限制时，脚本直接报错。
 
 以下以 `linux/amd64` 为例，镜像仓库请按实际发布环境设置：
 
 ```sh
 export IMAGE_REGISTRY=registry.example.com/llm-token-stats
 export IMAGE_TAG="$(python3 scripts/image_tag.py)"
-export OBSERVER_IMAGE="$IMAGE_REGISTRY/observer:$IMAGE_TAG"
-export CONSUMER_IMAGE="$IMAGE_REGISTRY/consumer:$IMAGE_TAG"
+export OBSERVER_IMAGE="$IMAGE_REGISTRY/llm-token-stats-observer:$IMAGE_TAG"
+export CONSUMER_IMAGE="$IMAGE_REGISTRY/llm-token-stats-consumer:$IMAGE_TAG"
 
 make wasm
 docker build --platform linux/amd64 -f deploy/observer/Dockerfile -t "$OBSERVER_IMAGE" .
@@ -103,7 +107,7 @@ make package PACKAGE_DIR=dist/package-with-dependencies \
 
 包内 `k8s/` 包含已渲染的完整 YAML：Namespace、持久化的单节点 Kafka / Doris、Observer / Consumer Deployment 与 Service、全部 ConfigMap / Secret、Kafka topic 初始化 Job，以及 Doris `001/002/003` 迁移和初始化 Job。
 
-启用归属查询 API 时，`service_lookup.credential_env` 只填写环境变量名 `METERING_SERVICE_LOOKUP_TOKEN`，真实密钥放入 `metering-observer-lookups` Secret 的同名键；不要将密钥直接填进 `credential_env`。客户查询同理使用 `METERING_CUSTOMER_LOOKUP_TOKEN`，URI 为空时无需提供凭据。修改 ConfigMap / Secret 后重启 Observer；包内 README 提供具体命令。
+启用归属查询 API 时，`service_lookup.credential_env` 只填写环境变量名 `METERING_SERVICE_LOOKUP_TOKEN`，真实密钥放入 `llm-token-stats-observer-lookups` Secret 的同名键；不要将密钥直接填进 `credential_env`。客户查询同理使用 `METERING_CUSTOMER_LOOKUP_TOKEN`，URI 为空时无需提供凭据。修改 ConfigMap / Secret 后重启 Observer；包内 README 提供具体命令。
 
 Kafka 默认使用 24 分区、单副本，数据保留 72 小时。存储默认使用集群 StorageClass，可通过 `--storage-class` 和 `--kafka-storage`、`--doris-fe-storage`、`--doris-be-storage` 调整。分发配置使用明文 Kafka、Doris root 空密码和 `dev` 环境标识，适用于受控开发环境。生产环境的独立基础设施和认证配置见下文。
 
@@ -124,9 +128,9 @@ docker load -i images/images.tar
 
 kubectl apply -f k8s/
 kubectl -n metering wait --for=condition=complete \
-  job/metering-kafka-init job/metering-doris-init --timeout=20m
-kubectl -n metering rollout status deployment/metering-consumer --timeout=5m
-kubectl -n metering rollout status deployment/metering-observer --timeout=5m
+  job/llm-token-stats-kafka-init job/llm-token-stats-doris-init --timeout=20m
+kubectl -n metering rollout status deployment/llm-token-stats-consumer --timeout=5m
+kubectl -n metering rollout status deployment/llm-token-stats-observer --timeout=5m
 
 # 先应用汇总的关闭态 EnvoyFilter，确认 Wasm 下载摘要与过滤器顺序后启用。
 kubectl apply -f envoyfilter.yaml
@@ -149,6 +153,7 @@ GitHub Runner 无需访问目标 Kubernetes 集群，也不需要 Pod 身份；�
 | `RELEASE_GATEWAY_LABELS` | 可选，网关标签的 JSON 字符串数组，如 `["app=ai-gateway"]`；默认 `["istio=ingressgateway"]` |
 | `RELEASE_NAMESPACE` | 可选，采集命名空间，默认 `metering` |
 | `RELEASE_GATEWAY_NAMESPACE` | 可选，网关命名空间，默认 `istio-system` |
+| `RELEASE_ENVOYFILTER_NAME` | 可选，默认 `llm-token-stats-envoyfilter-wasm`；同一命名空间多网关独立配置时须使用不同名称 |
 | `RELEASE_STORAGE_CLASS` | 可选，StorageClass 名称；未配置时使用目标集群默认值 |
 
 网关扩容或 Pod 重建不需要修改发布参数；命名空间和标签需与目标部署约定一致。
@@ -183,9 +188,9 @@ Observer 镜像将同一份 `dist/gateway-observer-v1.wasm` 放在 `/usr/share/m
 }
 ```
 
-下载接口为 `GET/HEAD /wasm/gateway-observer-v1.wasm`，仅提供这一文件，默认集群地址为 `http://metering-observer.metering.svc.cluster.local:9093/wasm/gateway-observer-v1.wasm`。下载服务不调用 Kafka，最多允许 8 个并发下载，超限返回 503；读头超时为 3 秒，写超时为 30 秒。启用下载服务后，文件不可读、Wasm 文件头非法或端口绑定失败都会阻止 Observer 启动。
+下载接口为 `GET/HEAD /wasm/gateway-observer-v1.wasm`，仅提供这一文件，默认集群地址为 `http://llm-token-stats-observer.metering.svc.cluster.local:9093/wasm/gateway-observer-v1.wasm`。下载服务不调用 Kafka，最多允许 8 个并发下载，超限返回 503；读头超时为 3 秒，写超时为 30 秒。启用下载服务后，文件不可读、Wasm 文件头非法或端口绑定失败都会阻止 Observer 启动。
 
-启动本地栈后，下载并核对实际内容；生产可先在另一个终端执行 `kubectl -n metering port-forward service/metering-observer 19093:9093`，再使用相同命令：
+启动本地栈后，下载并核对实际内容；生产可先在另一个终端执行 `kubectl -n metering port-forward service/llm-token-stats-observer 19093:9093`，再使用相同命令：
 
 ```sh
 curl --noproxy '*' --fail --output dist/gateway-observer.download.wasm \
@@ -388,21 +393,21 @@ Doris 使用独立账号，仅授予采集表所需的查询与写入权限。DS
 ```sh
 export SECRET_DIR="$PWD/.private/secrets"
 
-kubectl -n metering create secret generic metering-kafka-tls \
+kubectl -n metering create secret generic llm-token-stats-kafka-tls \
   --from-file=ca.crt="$SECRET_DIR/kafka-ca.crt" \
   --dry-run=client -o yaml | kubectl apply -f -
-kubectl -n metering create secret generic metering-kafka-sasl \
+kubectl -n metering create secret generic llm-token-stats-kafka-sasl \
   --from-file=username="$SECRET_DIR/observer-kafka-username" \
   --from-file=password="$SECRET_DIR/observer-kafka-password" \
   --dry-run=client -o yaml | kubectl apply -f -
-kubectl -n metering create secret generic metering-consumer-credentials \
+kubectl -n metering create secret generic llm-token-stats-consumer-credentials \
   --from-env-file="$SECRET_DIR/consumer.env" \
   --dry-run=client -o yaml | kubectl apply -f -
 
-kubectl -n metering create configmap metering-observer \
+kubectl -n metering create configmap llm-token-stats-observer \
   --from-file=observer.json="$DEPLOY_DIR/observer.json" \
   --dry-run=client -o yaml | kubectl apply -f -
-kubectl -n metering create configmap metering-consumer \
+kubectl -n metering create configmap llm-token-stats-consumer \
   --from-file=consumer.json="$DEPLOY_DIR/consumer.json" \
   --dry-run=client -o yaml | kubectl apply -f -
 ```
@@ -431,9 +436,9 @@ for component in ('observer', 'consumer'):
 PY
 
 kubectl apply -f "$DEPLOY_DIR/consumer.yaml"
-kubectl -n metering rollout status deployment/metering-consumer --timeout=5m
+kubectl -n metering rollout status deployment/llm-token-stats-consumer --timeout=5m
 kubectl apply -f "$DEPLOY_DIR/observer.yaml"
-kubectl -n metering rollout status deployment/metering-observer --timeout=5m
+kubectl -n metering rollout status deployment/llm-token-stats-observer --timeout=5m
 kubectl -n metering get pods,svc
 ```
 
@@ -456,15 +461,16 @@ export GATEWAY_POD=替换为灰度网关Pod名
 python3 scripts/render_gateway_filter.py \
   --config "$DEPLOY_DIR/gateway-observer.json" \
   --wasm-file dist/gateway-observer-v1.wasm \
-  --wasm-url http://metering-observer.metering.svc.cluster.local:9093/wasm/gateway-observer-v1.wasm \
-  --wasm-cluster 'outbound|9093||metering-observer.metering.svc.cluster.local' \
+  --wasm-url http://llm-token-stats-observer.metering.svc.cluster.local:9093/wasm/gateway-observer-v1.wasm \
+  --wasm-cluster 'outbound|9093||llm-token-stats-observer.metering.svc.cluster.local' \
   --gateway-label app=istio-ingressgateway-canary \
+  --envoyfilter-name llm-token-stats-envoyfilter-wasm-canary \
   --gateway-namespace istio-system \
   --output "$DEPLOY_DIR/envoyfilter.disabled.yaml"
 kubectl apply -f "$DEPLOY_DIR/envoyfilter.disabled.yaml"
 ```
 
-渲染器验证配置和 Wasm 产物，计算文件 SHA-256，根据排序后的工作负载标签生成稳定的 `gateway-observer-<摘要>` 名称。同一选择器的启用态、关闭态与版本更新使用同一资源，不同选择器使用独立资源。过滤器保留代理 `metadata.NAMESPACE` 匹配，即使资源位于 Istio 根配置命名空间，也只作用于目标命名空间；上例的 `app=istio-ingressgateway-canary` 必须替换为已有灰度工作负载的实际启动标签。
+渲染器验证配置和 Wasm 产物，计算文件 SHA-256，默认使用固定名称 `llm-token-stats-envoyfilter-wasm`，不自动追加摘要。渲染和打包均可通过 `--envoyfilter-name` 指定名称；同一命名空间多网关需要独立配置时，须显式使用不同名称，例如 `llm-token-stats-envoyfilter-wasm-canary`。名称必须以 `llm-token-stats-` 开头并符合不超过 63 字符的 DNS 标签规则。启用态、关闭态与版本更新使用同一名称，修改选择器会更新同名对象。过滤器保留代理 `metadata.NAMESPACE` 匹配，即使资源位于 Istio 根配置命名空间，也只作用于目标命名空间；上例的 `app=istio-ingressgateway-canary` 必须替换为已有灰度工作负载的实际启动标签。
 
 `gateway_instance_id` 由 Wasm 在插件启动时读取 Envoy 的 `node.metadata.NAMESPACE` 和 `node.metadata.NAME`，组合为 `namespace/pod-name`；配置 JSON 不再接受此字段。Istio 1.13.5 默认提供这两项元数据，无需修改网关 Pod 模板。多个副本共享同一 EnvoyFilter，各自读取实例名称，扩容或重建后无需重新渲染。标识不包含 Pod UID，同名 Pod 重建后标识不变；跨集群分析需结合 `cluster_name`。身份缺失、非法或组合后超过现有协议的 128 字节上限时停止该插件采集，增加 `metering_gateway_identity_unavailable_total`，业务继续放行；不截断名称、不回退到固定值，也不读取客户端请求头。
 
@@ -495,7 +501,7 @@ istioctl proxy-config all "$GATEWAY_POD" -n istio-system -o json \
   > "$DEPLOY_DIR/gateway-config-dump.json"
 ```
 
-确认过滤器顺序为 ext_authz → Wasm → router，且远程 Wasm 已加载成功。检查 HTTP 下载集群 `outbound|9093||metering-observer.metering.svc.cluster.local` 和 HTTP/2 采集集群 `outbound|9090||metering-observer.metering.svc.cluster.local` 是否均存在，并确认网格 mTLS、网络策略和授权允许访问相应端口。集群名称以实际服务发现结果为准；仅凭 Service 已创建或健康探针成功，无法确认下载和采集链路已就绪。
+确认过滤器顺序为 ext_authz → Wasm → router，且远程 Wasm 已加载成功。检查 HTTP 下载集群 `outbound|9093||llm-token-stats-observer.metering.svc.cluster.local` 和 HTTP/2 采集集群 `outbound|9090||llm-token-stats-observer.metering.svc.cluster.local` 是否均存在，并确认网格 mTLS、网络策略和授权允许访问相应端口。集群名称以实际服务发现结果为准；仅凭 Service 已创建或健康探针成功，无法确认下载和采集链路已就绪。
 
 使用 Istio `outbound|端口||服务DNS` 集群时，插件自动将 gRPC authority 设置为 `服务DNS:端口`，保留路由集群与 mTLS/SNI。自定义 ext_authz 配置也应显式设置 `grpc_service.envoy_grpc.authority` 为有效服务 DNS，不能让带 `|` 的集群名作为 HTTP/2 authority。
 
@@ -507,9 +513,10 @@ istioctl proxy-config all "$GATEWAY_POD" -n istio-system -o json \
 python3 scripts/render_gateway_filter.py \
   --config "$DEPLOY_DIR/gateway-observer.json" \
   --wasm-file dist/gateway-observer-v1.wasm \
-  --wasm-url http://metering-observer.metering.svc.cluster.local:9093/wasm/gateway-observer-v1.wasm \
-  --wasm-cluster 'outbound|9093||metering-observer.metering.svc.cluster.local' \
+  --wasm-url http://llm-token-stats-observer.metering.svc.cluster.local:9093/wasm/gateway-observer-v1.wasm \
+  --wasm-cluster 'outbound|9093||llm-token-stats-observer.metering.svc.cluster.local' \
   --gateway-label app=istio-ingressgateway-canary \
+  --envoyfilter-name llm-token-stats-envoyfilter-wasm-canary \
   --gateway-namespace istio-system \
   --enable \
   --output "$DEPLOY_DIR/envoyfilter.enabled.yaml"
@@ -553,7 +560,7 @@ make k8s-test
 
 ```sh
 kubectl --context kind-kind -n metering-wasm-verify get deployment,pod,svc
-kubectl --context kind-kind -n metering-wasm-verify port-forward service/wasm-gateway 28080:8080
+kubectl --context kind-kind -n metering-wasm-verify port-forward service/llm-token-stats-wasm-gateway 28080:8080
 ```
 
 保持端口转发，在另一个终端发送合成 SSE 请求：

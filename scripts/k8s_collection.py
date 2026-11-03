@@ -88,7 +88,7 @@ def wasm_configs(dump):
 
 def cluster_configs(topic, group, database="metering_development"):
     database_name(database)
-    kafka = {'bootstrap_servers': ['kafka:9092'], 'topic': topic}
+    kafka = {'bootstrap_servers': ['llm-token-stats-kafka:9092'], 'topic': topic}
     observer = json.loads((ROOT / 'configs/observer.production.example.json').read_text())
     observer['kafka'] = kafka
     consumer = json.loads((ROOT / 'configs/consumer.production.example.json').read_text())
@@ -97,10 +97,10 @@ def cluster_configs(topic, group, database="metering_development"):
     consumer['doris']['database'] = database
     observer['observer'].update(cluster_name='kind', deployment_environment='stg')
     # all-in-one 直接访问 BE，避免 FE 重定向到容器内回环地址。
-    consumer['doris']['fe_url'] = 'http://doris:8040'
-    consumer['doris']['allowed_load_hosts'] = ['doris:8040']
+    consumer['doris']['fe_url'] = 'http://llm-token-stats-doris:8040'
+    consumer['doris']['allowed_load_hosts'] = ['llm-token-stats-doris:8040']
     credentials = {
-        'DORIS_DSN': ('root@tcp(doris:9030)/' + database + '?timeout=5s&readTimeout=30s'
+        'DORIS_DSN': ('root@tcp(llm-token-stats-doris:9030)/' + database + '?timeout=5s&readTimeout=30s'
                       '&writeTimeout=10s&interpolateParams=true&time_zone=%27%2B00%3A00%27'),
         'DORIS_USER': 'root', 'DORIS_PASSWORD': '',
     }
@@ -171,13 +171,13 @@ class Harness:
         self.kubectl('apply', '-f', '-', input=json.dumps(value))
 
     def kafka(self, tool, *args):
-        return self.kubectl('-n', self.namespace, 'exec', 'deployment/kafka', '--',
+        return self.kubectl('-n', self.namespace, 'exec', 'deployment/llm-token-stats-kafka', '--',
                             '/opt/kafka/bin/kafka-' + tool + '.sh',
-                            '--bootstrap-server', 'kafka:9092', *args)
+                            '--bootstrap-server', 'llm-token-stats-kafka:9092', *args)
 
     def sql(self, sql):
         sql = render_sql(sql, getattr(self, 'database', 'metering_development'))
-        return self.kubectl('-n', self.namespace, 'exec', 'deployment/doris', '--',
+        return self.kubectl('-n', self.namespace, 'exec', 'deployment/llm-token-stats-doris', '--',
                             'mysql', '--default-character-set=utf8mb4', '-uroot', '-h127.0.0.1',
                             '-P9030', '-N', '-e', sql)
 
@@ -222,7 +222,7 @@ class Harness:
         write_json(self.output / 'infrastructure.json', manifest)
         self.apply(manifest)
         for name in ('kafka', 'doris'):
-            self.kubectl('-n', self.namespace, 'rollout', 'status', 'deployment/' + name,
+            self.kubectl('-n', self.namespace, 'rollout', 'status', 'deployment/llm-token-stats-' + name,
                          '--timeout=240s', timeout=255)
         def ready():
             try:
@@ -242,7 +242,7 @@ class Harness:
 
     def build_images(self):
         self.image_tag = resolve_image_tag(ROOT)
-        self.images = {name: 'metering-' + name + ':' + self.image_tag
+        self.images = {name: 'llm-token-stats-' + name + ':' + self.image_tag
                        for name in ('observer', 'consumer', 'fixture', 'integration')}
         write_json(self.output / 'images.json', {'image_tag': self.image_tag, 'images': self.images})
         k8s_integration.prepare_suite(ROOT, self.namespace)
@@ -279,10 +279,10 @@ class Harness:
                     spec['volumes'] = [v for v in spec['volumes'] if v['name'] == 'config']
                 resources.append(resource)
             resources.append({'apiVersion': 'v1', 'kind': 'ConfigMap',
-                              'metadata': {'name': 'metering-' + name, 'namespace': self.namespace},
+                              'metadata': {'name': 'llm-token-stats-' + name, 'namespace': self.namespace},
                               'data': {name + '.json': json.dumps(config, indent=2)}})
         resources.append({'apiVersion': 'v1', 'kind': 'Secret', 'type': 'Opaque',
-                          'metadata': {'name': 'metering-consumer-credentials', 'namespace': self.namespace},
+                          'metadata': {'name': 'llm-token-stats-consumer-credentials', 'namespace': self.namespace},
                           'stringData': credentials})
         text = (ROOT / 'deploy/k8s-test/fixtures.yaml').read_text()
         text = text.replace('TEST_NAMESPACE', self.namespace).replace('TEST_FIXTURE_IMAGE', self.images['fixture'])
@@ -303,17 +303,17 @@ class Harness:
                       key=lambda p: p['name'])
 
     def render_filter(self):
-        pods = self.pods('metering-wasm-gateway')
+        pods = self.pods('llm-token-stats-wasm-gateway')
         require(len(pods) == 1, '测试网关必须恰有一个 Pod')
         self.gateway = pods[0]
         self.gateway_instance_id = self.namespace + '/' + self.gateway['metadata']['name']
         config = json.loads((ROOT / 'configs/gateway-observer.example.json').read_text())
         config['accepted_request_hosts'] = ['wasm-verify.local']
-        config['observer_cluster'] = 'outbound|9090||metering-observer.' + self.namespace + '.svc.cluster.local'
+        config['observer_cluster'] = 'outbound|9090||llm-token-stats-observer.' + self.namespace + '.svc.cluster.local'
         path = self.output / 'gateway-observer.json'
         write_json(path, config)
         output = self.output / 'envoyfilter.yaml'
-        dns = 'metering-observer.' + self.namespace + '.svc.cluster.local'
+        dns = 'llm-token-stats-observer.' + self.namespace + '.svc.cluster.local'
         run([sys.executable, 'scripts/render_gateway_filter.py', '--gateway-label', 'istio=' + self.namespace,
              '--gateway-namespace', self.namespace,
              '--config', str(path), '--wasm-url', 'http://' + dns + ':9093/wasm/gateway-observer-v1.wasm',
@@ -348,7 +348,7 @@ class Harness:
         log_path = self.output / ('port-forward.' + pod_name + '.log' if pod_name else 'port-forward.log')
         with log_path.open('w') as log:
             process = subprocess.Popen([*self.kube, '-n', self.namespace, 'port-forward',
-                                        '--address=127.0.0.1', 'pod/' + pod_name if pod_name else 'service/wasm-gateway', ':8080'],
+                                        '--address=127.0.0.1', 'pod/' + pod_name if pod_name else 'service/llm-token-stats-wasm-gateway', ':8080'],
                                        cwd=ROOT, stdout=log, stderr=subprocess.STDOUT, text=True)
             try:
                 def ready():
@@ -396,9 +396,10 @@ class Harness:
     def check_workload_isolation(self, resource):
         before = self.get('-n', self.namespace, 'get', 'envoyfilter', self.filter_name)
         output = self.output / 'envoyfilter.canary.yaml'
-        dns = 'metering-observer.' + self.namespace + '.svc.cluster.local'
+        dns = 'llm-token-stats-observer.' + self.namespace + '.svc.cluster.local'
         run([sys.executable, 'scripts/render_gateway_filter.py',
              '--gateway-label', 'istio=canary-' + self.run_id, '--gateway-namespace', self.namespace,
+             '--envoyfilter-name', 'llm-token-stats-envoyfilter-wasm-canary',
              '--config', str(self.output / 'gateway-observer.json'),
              '--wasm-url', 'http://' + dns + ':9093/wasm/gateway-observer-v1.wasm',
              '--wasm-cluster', 'outbound|9093||' + dns, '--output', str(output)])
@@ -444,7 +445,7 @@ class Harness:
             rows = [line.split('\t') for line in self.sql(sql).splitlines()]
             return rows if len(rows) >= 6 else None
         rows = wait_for('Kubernetes Consumer 写入 Doris', events, 90)
-        producers = {p['metadata']['uid'] for p in self.pods('metering-observer')}
+        producers = {p['metadata']['uid'] for p in self.pods('llm-token-stats-observer')}
         validate_events(results, rows, gateway_instance_id or self.gateway_instance_id, producers, self.topic)
         require(all(row[18] == self.args.kind_cluster for row in rows), '集群配置未固定')
         raw = self.sql('SELECT event_json FROM metering.events_raw WHERE x_request_id IN (' + ids + ');')
@@ -454,10 +455,10 @@ class Harness:
 
     def check_gateway_scale(self):
         before = self.get('-n', self.namespace, 'get', 'envoyfilter', self.filter_name)
-        self.kubectl('-n', self.namespace, 'scale', 'deployment/wasm-gateway', '--replicas=2')
-        self.kubectl('-n', self.namespace, 'rollout', 'status', 'deployment/wasm-gateway',
+        self.kubectl('-n', self.namespace, 'scale', 'deployment/llm-token-stats-wasm-gateway', '--replicas=2')
+        self.kubectl('-n', self.namespace, 'rollout', 'status', 'deployment/llm-token-stats-wasm-gateway',
                      '--timeout=180s', timeout=195)
-        pods = self.pods('metering-wasm-gateway')
+        pods = self.pods('llm-token-stats-wasm-gateway')
         require(len(pods) == 2 and self.gateway['metadata']['uid'] in {p['metadata']['uid'] for p in pods},
                 '扩容必须保留原网关并增加一个新副本')
         results = []
@@ -508,7 +509,7 @@ class Harness:
         return report
 
     def check_consumer(self):
-        consumer = self.pods('metering-consumer')
+        consumer = self.pods('llm-token-stats-consumer')
         require(len(consumer) == 1, '必须由一个独立 Kubernetes Consumer 消费')
         def committed():
             raw = self.kafka('consumer-groups', '--describe', '--group', self.group)
@@ -532,17 +533,17 @@ class Harness:
         wait_for('独立 Consumer 消费组成员', lambda: group_state('Stable', 1), 60)
         try:
             print('核验 Consumer 归属：缩容 Kubernetes Consumer，等待消费组成员归零', flush=True)
-            self.kubectl('-n', self.namespace, 'scale', 'deployment/metering-consumer', '--replicas=0')
+            self.kubectl('-n', self.namespace, 'scale', 'deployment/llm-token-stats-consumer', '--replicas=0')
             empty = wait_for('Kubernetes Consumer 停止后消费组归零', lambda: group_state('Empty', 0), 90)
             (self.output / 'consumer-group.stopped.txt').write_text(empty)
         finally:
-            self.kubectl('-n', self.namespace, 'scale', 'deployment/metering-consumer', '--replicas=1')
-        self.kubectl('-n', self.namespace, 'rollout', 'status', 'deployment/metering-consumer',
+            self.kubectl('-n', self.namespace, 'scale', 'deployment/llm-token-stats-consumer', '--replicas=1')
+        self.kubectl('-n', self.namespace, 'rollout', 'status', 'deployment/llm-token-stats-consumer',
                       '--timeout=180s', timeout=195)
         stable = wait_for('Kubernetes Consumer 恢复入组', lambda: group_state('Stable', 1), 60)
         (self.output / 'consumer-group.restored.txt').write_text(stable)
         wait_for('Consumer 恢复后已提交位点保持', committed, 60)
-        restored = self.pods('metering-consumer')
+        restored = self.pods('llm-token-stats-consumer')
         restored = next(p for p in restored if not p['metadata'].get('deletionTimestamp'))
         return {'pod_name': restored['metadata']['name'], 'pod_uid': restored['metadata']['uid'],
                 'initial_pod_uid': consumer[0]['metadata']['uid'], 'pod_ip': restored['status']['podIP'],
@@ -552,24 +553,24 @@ class Harness:
     def verify_pods(self, gateway_replicas=1):
         pods = [p for p in self.get('-n', self.namespace, 'get', 'pods')['items']
                 if p['metadata'].get('labels', {}).get('app') in
-                ('metering-observer', 'metering-consumer', 'collection-fixture', 'metering-wasm-gateway')]
+                ('llm-token-stats-observer', 'llm-token-stats-consumer', 'llm-token-stats-collection-fixture', 'llm-token-stats-wasm-gateway')]
         require(len(pods) == 4 + gateway_replicas, '测试 Pod 数量与 Observer/Consumer/fixture/网关副本数不符')
         for pod in pods:
             statuses = pod['status'].get('containerStatuses', [])
             require(statuses and all(s['ready'] and s['restartCount'] == 0 for s in statuses),
                     '测试 Pod 未 Ready 或曾重启：' + pod['metadata']['name'])
             spec = pod['spec']
-            if pod['metadata']['labels'].get('app') == 'metering-wasm-gateway':
+            if pod['metadata']['labels'].get('app') == 'llm-token-stats-wasm-gateway':
                 require(len(spec['containers']) == 1 and spec['containers'][0]['image'] == 'docker.io/istio/proxyv2:1.13.5',
                         '网关必须使用原始 Istio 1.13.5 镜像')
                 require('wasm' not in json.dumps(spec.get('volumes', [])), '网关不得挂载 Wasm')
-            if pod['metadata']['labels'].get('app') == 'metering-observer':
+            if pod['metadata']['labels'].get('app') == 'llm-token-stats-observer':
                 digest = self.kubectl('-n', self.namespace, 'exec', pod['metadata']['name'], '-c', 'observer',
                                       '--', 'sha256sum', '/usr/share/metering/wasm/gateway-observer-v1.wasm').split()[0]
                 require(digest == self.sha, 'Observer 副本内 Wasm 摘要不一致')
         # 从有 sidecar 的 fixture 经 STRICT mTLS 下载，验证 Service 实际提供的内容。
-        fixture = self.pods('collection-fixture')[0]['metadata']['name']
-        url = 'http://metering-observer.' + self.namespace + '.svc.cluster.local:9093/wasm/gateway-observer-v1.wasm'
+        fixture = self.pods('llm-token-stats-collection-fixture')[0]['metadata']['name']
+        url = 'http://llm-token-stats-observer.' + self.namespace + '.svc.cluster.local:9093/wasm/gateway-observer-v1.wasm'
         # 二进制结果不经文本解码，避免改变校验内容。
         data = subprocess.run([*self.kube, '-n', self.namespace, 'exec', fixture, '-c', 'fixture', '--',
                                'wget', '-qO-', url], cwd=ROOT, check=True, capture_output=True, timeout=15).stdout
@@ -577,7 +578,7 @@ class Harness:
         write_json(self.output / 'pods.result.json', pods)
 
     def verify_infrastructure(self):
-        pods = self.pods('kafka') + self.pods('doris')
+        pods = self.pods('llm-token-stats-kafka') + self.pods('llm-token-stats-doris')
         require(len(pods) == 2, 'Kafka / Doris Pod 数量错误')
         for pod in pods:
             statuses = pod['status'].get('containerStatuses', [])
@@ -591,8 +592,8 @@ class Harness:
         for filename, command in commands.items():
             with contextlib.suppress(Exception):
                 (self.output / filename).write_text(self.kubectl('-n', self.namespace, *command))
-        for name in ('metering-observer', 'metering-consumer', 'collection-fixture', 'wasm-gateway',
-                     'kafka', 'doris', 'e2e-observer', 'e2e-consumer', 'e2e-fixture'):
+        for name in ('llm-token-stats-observer', 'llm-token-stats-consumer', 'llm-token-stats-collection-fixture', 'llm-token-stats-wasm-gateway',
+                     'llm-token-stats-kafka', 'llm-token-stats-doris', 'llm-token-stats-e2e-observer', 'llm-token-stats-e2e-consumer', 'llm-token-stats-e2e-fixture'):
             with contextlib.suppress(Exception):
                 (self.output / (name + '.log')).write_text(self.kubectl(
                     '-n', self.namespace, 'logs', 'deployment/' + name, '--all-containers=true', '--tail=100'))
@@ -624,7 +625,7 @@ class Harness:
             manifest = self.manifest()
             write_json(self.output / 'resources.json', manifest)
             self.apply(manifest)
-            for name in ('metering-observer', 'metering-consumer', 'collection-fixture', 'wasm-gateway'):
+            for name in ('llm-token-stats-observer', 'llm-token-stats-consumer', 'llm-token-stats-collection-fixture', 'llm-token-stats-wasm-gateway'):
                 print('等待 Kubernetes Deployment 就绪：' + name, flush=True)
                 self.kubectl('-n', self.namespace, 'rollout', 'status', 'deployment/' + name,
                               '--timeout=180s', timeout=195)

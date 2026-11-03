@@ -16,6 +16,7 @@ import (
 	"github.com/Fangyan33/llm-token-stats/pkg/observationwire"
 	"github.com/Fangyan33/llm-token-stats/pkg/requesthost"
 	"github.com/Fangyan33/llm-token-stats/pkg/requestid"
+	"github.com/Fangyan33/llm-token-stats/pkg/requestmeta"
 	"github.com/Fangyan33/llm-token-stats/pkg/routeinfo"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -344,6 +345,11 @@ func (s *Server) Observe(stream pb.ObservationService_ObserveServer) error {
 				e = &snapshot
 				e.SchemaVersion, e.EventID, e.EventType = events.SchemaVersion, id+":start", "request_started"
 				e.LogicalRequestID, e.ObservationID, e.ObservationScope = st.LogicalRequestId, id, "gateway_response"
+				e.UserID, e.UserAgent = st.UserId, st.UserAgent
+				e.RequestHeaders = make(map[string]string, len(st.RequestHeaders))
+				for k, v := range st.RequestHeaders {
+					e.RequestHeaders[k] = v
+				}
 				e.XRequestID, e.ProducerID, e.GatewayInstanceID = st.XRequestId, s.Cfg.ProducerID, st.GatewayInstanceId
 				e.ConfigVersion, e.AdapterID, e.RouteName = st.ConfigVersion, st.AdapterId, st.RouteName
 				e.RequestStartedAtMs, e.EventCreatedAtMs = st.RequestStartedAtMs, time.Now().UnixMilli()
@@ -485,6 +491,9 @@ func (s *Server) Observe(stream pb.ObservationService_ObserveServer) error {
 func validIdentity(s *string) bool     { return s != nil && validString(*s, 128) }
 func validString(s string, n int) bool { return len(s) > 0 && len(s) <= n && utf8.ValidString(s) }
 func (s *Server) validStart(st *pb.Start) bool {
+	if !requestmeta.Valid(st.UserId, st.UserAgent, st.RequestHeaders) {
+		return false
+	}
 	if st.RequestStartedAtMs < 1 || st.RequestStartedAtMs > 253402300799999 || st.RequestStartedAtMs > time.Now().UnixMilli()+300000 || st.Method != "POST" || !validString(st.GatewayInstanceId, 128) || !validString(st.ConfigVersion, 128) || st.AdapterId != "chat_completions_v1" || !events.Has(s.Cfg.AcceptedConfigs, st.ConfigVersion) || !events.Has(s.Cfg.AcceptedAdapters, st.AdapterId) || len(st.RequestContentType) > 128 || len(st.RequestContentEncoding) > 128 {
 		return false
 	}

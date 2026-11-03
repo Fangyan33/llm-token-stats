@@ -5,15 +5,18 @@
 SET time_zone = '+00:00';
 
 -- 日统计输入视图：按 UTC 请求日期和观察 ID 合并开始与结果事件，派生模型、用量来源及统计资格。
--- 保留未知归属和冲突标识，供日物化视图排除冲突后按八个维度聚合；资格判断不修改原始事件。
+-- 保留未知归属和冲突标识，供日物化视图排除冲突后按九个维度聚合；资格判断不修改原始事件。
 CREATE VIEW IF NOT EXISTS metering.request_statistics (
     request_date COMMENT 'UTC 请求日期，由 request_started_at_ms 换算，不由事件到达时间或 UUID 推导',
     observation_id COMMENT 'Observer 为一次观察生成的规范 UUIDv4；内部主标识及 Kafka key',
     logical_request_id COMMENT 'Wasm 按配置提取的客户端请求 ID；可空、可重复，不用于内部去重',
+    user_id COMMENT '按有序候选头提取的用户 ID；客户端上报的统计维度，未知为 NULL',
+    user_agent COMMENT '标准 User-Agent 请求头快照；未知为 NULL',
+    request_headers COMMENT '白名单请求头的小写名称与字符串值；无有效项为空 Map',
     start_variants COMMENT '该观察的开始事件内容变体数；大于 1 表示冲突，不是调用次数',
     usage_variants COMMENT '该观察的结果事件内容变体数；0 表示未观察结果，大于 1 表示冲突',
     started_count COMMENT '该日期内同一观察的不同开始时间数量；大于 1 表示时间冲突',
-    identity_count COMMENT '该日期内同一观察的不同十六项归属与部署快照数量；大于 1 表示冲突',
+    identity_count COMMENT '该日期内同一观察的不同十七项归属与部署及用户快照数量；大于 1 表示冲突',
     name_count COMMENT '同请求不同名称快照元组数量；大于 1 表示冲突',
     customer_id COMMENT '与 api_key_id 同次成功解析得到的客户 ID；未知为 NULL，不采信客户端自报 ID',
     provider_id COMMENT '服务接口返回的服务所属供应商 ID；未知为 NULL，不代表隐藏的实际执行方',
@@ -60,11 +63,11 @@ SELECT a.*,
             WHEN a.input_tokens_source = 'estimated_generic' AND a.output_tokens_source = 'estimated_generic' THEN 'estimated_generic'
             ELSE 'mixed' END AS usage_source
 FROM (
-    SELECT request_date, observation_id, MAX(logical_request_id) AS logical_request_id,
+    SELECT request_date, observation_id, MAX(logical_request_id) AS logical_request_id, MAX(user_id) AS user_id, ANY_VALUE(user_agent) AS user_agent, ANY_VALUE(request_headers) AS request_headers,
            SUM(CASE WHEN event_type = 'request_started' THEN 1 ELSE 0 END) AS start_variants,
            SUM(CASE WHEN event_type = 'usage_observed' THEN 1 ELSE 0 END) AS usage_variants,
            COUNT(DISTINCT request_started_at_ms) AS started_count,
-           COUNT(DISTINCT CAST(JSON_ARRAY(service_id, provider_id, api_key_id, customer_id, identity_status, config_version, gateway_instance_id, adapter_id, x_request_id, logical_request_id, cluster_name, deployment_environment, mapping_status, mapping_version, customer_mapping_status, customer_mapping_version) AS STRING)) AS identity_count,
+           COUNT(DISTINCT CAST(JSON_ARRAY(service_id, provider_id, api_key_id, customer_id, identity_status, config_version, gateway_instance_id, adapter_id, x_request_id, logical_request_id, cluster_name, deployment_environment, mapping_status, mapping_version, customer_mapping_status, customer_mapping_version, user_id) AS STRING)) AS identity_count,
            COUNT(DISTINCT CAST(JSON_ARRAY(service_name, provider_name, customer_name) AS STRING)) AS name_count,
            MAX(customer_id) AS customer_id, MAX(provider_id) AS provider_id,
            MAX(api_key_id) AS api_key_id, MAX(service_id) AS service_id,
@@ -92,12 +95,13 @@ FROM (
 ) a
 LEFT JOIN metering.request_conflict_ids c ON a.observation_id = c.observation_id;
 
--- 日用量物化视图：从请求统计投影按日期及八个维度汇总无冲突请求数、有效 token 和质量指标。
+-- 日用量物化视图：从请求统计投影按日期及九个维度汇总无冲突请求数、有效 token 和质量指标。
 -- 由 usage-worker 仅刷新已结束日期；公共统计保留未知归属，客户及 API Key 报表需过滤对应未知 ID。
 CREATE MATERIALIZED VIEW IF NOT EXISTS metering.usage_daily_mv (
     stat_date COMMENT '日统计或重算通知对应的 UTC 请求日期',
     cluster_name COMMENT 'Observer 配置固定的集群名称，业务请求不能覆盖',
     deployment_environment COMMENT 'Observer 固定部署环境：prd、stg 或 dev',
+    user_id COMMENT '客户端用户 ID 统计维度；未知保持 NULL，整体统计保留未知用户',
     customer_id COMMENT '客户统计维度；未知保持 NULL，客户报表需过滤未知归属',
     provider_id COMMENT '供应商统计维度；未知保持 NULL，已知供应商统计包含客户未知请求',
     api_key_id COMMENT '稳定 API Key 统计维度；未知保持 NULL，API Key 报表需过滤未知归属',
@@ -135,7 +139,7 @@ PROPERTIES (
     "use_for_rewrite" = "false",
     "refresh_partition_num" = "1"
 ) AS
-SELECT request_date AS stat_date, cluster_name, deployment_environment, customer_id, provider_id, api_key_id, service_id, model, usage_source,
+SELECT request_date AS stat_date, cluster_name, deployment_environment, user_id, customer_id, provider_id, api_key_id, service_id, model, usage_source,
        COUNT(*) AS request_count,
        SUM(CASE WHEN start_variants = 1 THEN 1 ELSE 0 END) AS started_request_count,
        SUM(CASE WHEN usage_variants = 1 THEN 1 ELSE 0 END) AS usage_observed_request_count,
@@ -158,14 +162,15 @@ SELECT request_date AS stat_date, cluster_name, deployment_environment, customer
        SUM(CASE WHEN usage_variants = 1 AND statistics_usage_eligible = 1 AND input_tokens IS NOT NULL AND output_tokens IS NOT NULL AND reported_total_tokens IS NOT NULL THEN 1 ELSE 0 END) AS reported_total_known_requests
 FROM metering.request_statistics
 WHERE has_conflict = 0
-GROUP BY request_date, cluster_name, deployment_environment, customer_id, provider_id, api_key_id, service_id, model, usage_source;
+GROUP BY request_date, cluster_name, deployment_environment, user_id, customer_id, provider_id, api_key_id, service_id, model, usage_source;
 
--- 月用量嵌套物化视图：直接按自然月及相同八个维度累加日物化视图的指标，不重新扫描原始事件。
+-- 月用量嵌套物化视图：直接按自然月及相同九个维度累加日物化视图的指标，不重新扫描原始事件。
 -- 由 usage-worker 在相关日统计成功后刷新，当前月累计到昨日；全未知用量保持 NULL，已知零保持 0。
 CREATE MATERIALIZED VIEW IF NOT EXISTS metering.usage_monthly_mv (
     stat_month COMMENT '统计月对应的 UTC 自然月首日',
     cluster_name COMMENT 'Observer 配置固定的集群名称，业务请求不能覆盖',
     deployment_environment COMMENT 'Observer 固定部署环境：prd、stg 或 dev',
+    user_id COMMENT '客户端用户 ID 统计维度；未知保持 NULL，整体统计保留未知用户',
     customer_id COMMENT '客户统计维度；未知保持 NULL，客户报表需过滤未知归属',
     provider_id COMMENT '供应商统计维度；未知保持 NULL，已知供应商统计包含客户未知请求',
     api_key_id COMMENT '稳定 API Key 统计维度；未知保持 NULL，API Key 报表需过滤未知归属',
@@ -203,7 +208,7 @@ PROPERTIES (
     "use_for_rewrite" = "false",
     "refresh_partition_num" = "1"
 ) AS
-SELECT DATE_TRUNC(stat_date, 'month') AS stat_month, cluster_name, deployment_environment, customer_id, provider_id, api_key_id, service_id, model, usage_source,
+SELECT DATE_TRUNC(stat_date, 'month') AS stat_month, cluster_name, deployment_environment, user_id, customer_id, provider_id, api_key_id, service_id, model, usage_source,
        SUM(request_count) AS request_count,
        SUM(started_request_count) AS started_request_count,
        SUM(usage_observed_request_count) AS usage_observed_request_count,
@@ -225,7 +230,7 @@ SELECT DATE_TRUNC(stat_date, 'month') AS stat_month, cluster_name, deployment_en
        SUM(reasoning_known_requests) AS reasoning_known_requests,
        SUM(reported_total_known_requests) AS reported_total_known_requests
 FROM metering.usage_daily_mv
-GROUP BY DATE_TRUNC(stat_date, 'month'), cluster_name, deployment_environment, customer_id, provider_id, api_key_id, service_id, model, usage_source;
+GROUP BY DATE_TRUNC(stat_date, 'month'), cluster_name, deployment_environment, user_id, customer_id, provider_id, api_key_id, service_id, model, usage_source;
 
 CREATE TABLE IF NOT EXISTS metering.summary_mv_refresh_runs (
     period_type VARCHAR(8) NOT NULL COMMENT '统计期类型 DAY 或 MONTH',

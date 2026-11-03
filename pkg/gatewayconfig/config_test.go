@@ -189,3 +189,39 @@ func TestExactRouteAndOrderedRuleCompatibility(t *testing.T) {
 		t.Fatal("wildcard did not accept other route")
 	}
 }
+
+func TestUserHeaderLists(t *testing.T) {
+	data, _ := os.ReadFile("../../configs/gateway-observer.example.json")
+	for _, value := range []any{nil, "user-id", []string{"Authorization"}, []string{"Cookie"}, []string{"x-api-key"}, []string{"x-remote-data"}, []string{"x-u", "X-U"}, []string{":path"}, []string{"a", "b", "c", "d", "e", "f", "g", "h", "i"}} {
+		var raw map[string]any
+		json.Unmarshal(data, &raw)
+		raw["user_id_header"] = value
+		b, _ := json.Marshal(raw)
+		if _, err := Decode(b); err == nil {
+			t.Fatal("invalid candidate list accepted")
+		}
+	}
+	for _, names := range [][]string{nil, {}, {"X-User", "user-id"}} {
+		var raw map[string]any
+		json.Unmarshal(data, &raw)
+		if names == nil {
+			delete(raw, "user_id_header")
+		} else {
+			raw["user_id_header"] = names
+		}
+		b, _ := json.Marshal(raw)
+		cfg, err := Decode(b)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := names
+		if names == nil {
+			want = []string{"user-id"}
+		} else if len(names) > 0 {
+			want = []string{"x-user", "user-id"}
+		}
+		if !reflect.DeepEqual(cfg.UserIDHeader, want) {
+			t.Fatal("default/ordered normalization")
+		}
+	}
+}

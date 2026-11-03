@@ -8,6 +8,7 @@ import (
 	w "github.com/Fangyan33/llm-token-stats/pkg/observationwire"
 	"github.com/Fangyan33/llm-token-stats/pkg/requesthost"
 	"github.com/Fangyan33/llm-token-stats/pkg/requestid"
+	"github.com/Fangyan33/llm-token-stats/pkg/requestmeta"
 	"github.com/Fangyan33/llm-token-stats/pkg/routeinfo"
 	"github.com/Fangyan33/llm-token-stats/pkg/strictjson"
 	"github.com/tetratelabs/proxy-wasm-go-sdk/proxywasm"
@@ -371,6 +372,13 @@ func (h *httpContext) OnHttpRequestHeaders(_ int, eos bool) types.Action {
 	h.instanceID = r.instanceID
 	r.count("requests_selected")
 	ct, enc := header("content-type"), header("content-encoding")
+	// Freeze the bounded snapshot while all client headers still exist. Body
+	// rewriting must also remain available when observation admission/open fails.
+	var start []byte
+	if int64(len(r.states)) < h.cfg.RootMaxStreams {
+		start = h.startPayload(now, eos, authority, actualRoute, rule.AdapterID, ct, enc)
+		defer clear(start)
+	}
 	mt, _, err := mime.ParseMediaType(strings.ToLower(ct))
 	action := types.ActionContinue
 	if !eos && err == nil && mt == "application/json" && (enc == "" || strings.EqualFold(enc, "identity")) {
@@ -407,11 +415,17 @@ func (h *httpContext) OnHttpRequestHeaders(_ int, eos bool) types.Action {
 	r.states[token] = s
 	r.resourceMetrics()
 	s.eos[0] = eos
+	r.send(s, 10, start, false)
+	return action
+}
+
+// startPayload freezes request headers before rewrite preparation changes them.
+func (h *httpContext) startPayload(now time.Time, eos bool, authority, route, adapter, ct, enc string) []byte {
 	b := w.UInt(nil, 1, uint64(now.UnixMilli()))
 	b = w.String(b, 2, h.instanceID)
 	b = w.String(b, 3, h.cfg.ConfigVersion)
-	b = w.String(b, 4, routeinfo.Name(actualRoute))
-	b = w.String(b, 6, rule.AdapterID)
+	b = w.String(b, 4, routeinfo.Name(route))
+	b = w.String(b, 6, adapter)
 	if len(authority) <= 512 && utf8.ValidString(authority) {
 		b = w.String(b, 16, authority)
 	}
@@ -448,9 +462,8 @@ func (h *httpContext) OnHttpRequestHeaders(_ int, eos bool) types.Action {
 		}
 		clear(value)
 	}
-	r.send(s, 10, b, false)
-	clear(b)
-	return action
+	// Start is always the first frame in a new observation stream.
+	return h.requestMetadata(b, 1)
 }
 
 // Istio cluster names contain '|', which is not a valid HTTP/2 authority for Go gRPC.
@@ -742,4 +755,67 @@ func (h *httpContext) OnDelete() {
 		h.root.drop(h.s, "context_deleted")
 	}
 	h.s = nil
+}
+
+// requestMetadata appends optional fields only while both budgets allow them.
+// Failed optional reads never drop the existing Start or pause business traffic.
+func (h *httpContext) requestMetadata(b []byte, seq uint64) []byte {
+	var uid, agent *string
+	extras := map[string]string{}
+	fits := func(next []byte) bool {
+		return len(w.Frame(seq, 10, next)) <= int(h.cfg.MetadataMaxBytes) && requestmeta.JSONSize(uid, agent, extras) <= requestmeta.MaxJSONBytes
+	}
+	if len(h.cfg.UserIDHeader) > 0 {
+		headers, err := proxywasm.GetHttpRequestHeaders()
+		if err == nil {
+			for _, name := range h.cfg.UserIDHeader {
+				count, value := 0, ""
+				for _, pair := range headers {
+					if strings.EqualFold(pair[0], name) {
+						count++
+						value = pair[1]
+					}
+				}
+				if count != 1 || !requestmeta.Value(value, requestmeta.MaxUserID) {
+					continue
+				}
+				uid = &value
+				next := w.String(b, 19, value)
+				if fits(next) {
+					b = next
+					break
+				}
+				uid = nil
+			}
+		}
+	}
+	value, err := proxywasm.GetProperty([]string{"request", "headers", "user-agent"})
+	if err == nil && requestmeta.Value(string(value), requestmeta.MaxUserAgent) {
+		v := string(value)
+		agent = &v
+		next := w.String(b, 20, v)
+		if fits(next) {
+			b = next
+		} else {
+			agent = nil
+		}
+	}
+	clear(value)
+	for _, name := range h.cfg.ExtraRequestHeaders {
+		value, err := proxywasm.GetProperty([]string{"request", "headers", name})
+		if err == nil && requestmeta.Value(string(value), requestmeta.MaxValue) {
+			v := string(value)
+			extras[name] = v
+			entry := w.String(w.String(nil, 1, name), 2, v)
+			next := w.Bytes(b, 21, entry)
+			if fits(next) {
+				b = next
+			} else {
+				delete(extras, name)
+			}
+			clear(entry)
+		}
+		clear(value)
+	}
+	return b
 }

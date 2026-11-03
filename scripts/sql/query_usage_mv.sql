@@ -16,3 +16,10 @@ WHERE customer_id IS NOT NULL AND api_key_id IS NOT NULL
   AND stat_month >= DATE_SUB(DATE_TRUNC(CURRENT_DATE(), 'month'), INTERVAL 12 MONTH)
 GROUP BY stat_month, cluster_name, deployment_environment, customer_id, api_key_id;
 -- Check period status alongside results. RUNNING/GAP are not confirmed zero.
+
+-- User daily totals. Unknown users still contribute to provider/customer totals above.
+SELECT stat_date, cluster_name, deployment_environment, customer_id, user_id,
+       SUM(request_count) AS request_count, SUM(total_tokens) AS total_tokens
+FROM metering.usage_daily_mv
+WHERE user_id IS NOT NULL AND stat_date < CURRENT_DATE()
+GROUP BY stat_date, cluster_name, deployment_environment, customer_id, user_id;

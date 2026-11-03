@@ -1,4 +1,7 @@
 {
+  "user_id": null,
+  "user_agent": null,
+  "request_headers": {},
   "schema_version": 1,
   "event_id": "7f6c2a90-4b13-4b68-9d21-67283e0c5f44:usage",
   "event_type": "usage_observed",

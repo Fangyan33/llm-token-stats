@@ -9,6 +9,8 @@ type Route struct {
 	AdapterID string   `json:"adapter_id"`
 }
 type Config struct {
+	UserIDHeader            []string `json:"user_id_header"`
+	ExtraRequestHeaders     []string `json:"extra_request_headers"`
 	SchemaVersion           int64    `json:"schema_version"`
 	Enabled                 bool     `json:"enabled"`
 	ConfigVersion           string   `json:"config_version"`

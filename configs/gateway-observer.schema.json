@@ -218,6 +218,32 @@
         "pattern": "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"
       },
       "description": "按优先级选择首个合法客户端请求 ID；名称忽略大小写且不得重复；缺省或空列表不采集。"
+    },
+    "user_id_header": {
+      "type": "array",
+      "maxItems": 8,
+      "uniqueItems": true,
+      "default": [
+        "user-id"
+      ],
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 128,
+        "pattern": "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"
+      }
+    },
+    "extra_request_headers": {
+      "type": "array",
+      "maxItems": 16,
+      "uniqueItems": true,
+      "default": [],
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 128,
+        "pattern": "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"
+      }
     }
   }
 }

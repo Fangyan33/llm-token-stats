@@ -21,7 +21,7 @@ func TestDiagnosticRouteIdentityAndSnapshotConflicts(t *testing.T) {
 	s := localStore(t, "http://llm-token-stats-doris:8040")
 	cl := kafka(t)
 	topic, group := batchingTopic(t, cl)
-	for _, mode := range []string{"diagnostic_route", "tenant_conflict", "provider_conflict", "environment_conflict", "name_conflict", "client_id_conflict"} {
+	for _, mode := range []string{"diagnostic_route", "user_id_conflict", "tenant_conflict", "provider_conflict", "environment_conflict", "name_conflict", "client_id_conflict"} {
 		t.Run(mode, func(t *testing.T) {
 			now := time.Now()
 			id := uuid(t)
@@ -44,6 +44,9 @@ func TestDiagnosticRouteIdentityAndSnapshotConflicts(t *testing.T) {
 				if e.EventType == "usage_observed" {
 					e.EventID = id + ":usage"
 					e.RequestFinishedAtMs, e.ObservationEndedAtMs = events.Ptr(now.UnixMilli()), events.Ptr(now.UnixMilli())
+					if mode == "user_id_conflict" {
+						e.UserID = events.Ptr("different-user")
+					}
 					if mode == "tenant_conflict" {
 						e.CustomerID = events.Ptr("different-customer")
 					}

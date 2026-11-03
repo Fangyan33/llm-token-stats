@@ -139,6 +139,18 @@ class CollectionContractsTest(unittest.TestCase):
         config.pop('logical_request_id_headers')
         contracts.validate_config(config)
 
+    def test_request_metadata_contract(self):
+        for field in ('user_id_header', 'extra_request_headers'):
+            for value in (None, 'x-user', ['Authorization'], ['Cookie'], ['x-api-key'], ['x-remote-data'], ['x-a', 'X-A'], [':path']):
+                self.assert_config_invalid(lambda c: c.update({field: value}))
+        for key, value in (('user_id', ''), ('user_id', 'a'*513), ('user_agent', '<'*2048),
+                           ('request_headers', {'x-team': 1}), ('request_headers', {'Authorization': 'secret'}),
+                           ('request_headers', {'x-team': 'a'*1025}), ('request_headers', {'x-'+str(i): 'a' for i in range(17)})):
+            self.assert_event_invalid(lambda e: e.update({key: value}))
+        event = copy.deepcopy(self.event)
+        event['request_headers'] = dict(reversed(list(event['request_headers'].items())))
+        self.assertEqual(contracts.event_hashes(event), contracts.event_hashes(self.event))
+
     def test_unknown_customer_can_have_eligible_usage(self):
         event = copy.deepcopy(self.event)
         event.update(api_key_id=None, customer_id=None, customer_name=None,

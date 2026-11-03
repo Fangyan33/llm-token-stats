@@ -54,8 +54,8 @@ NOTES = {
                         '无物理存储，继承基础表在线范围', '已实现',
                         '连接 event_details 与 requests，按当前质量口径重算资格并排除 has_conflict=1 的事件，包含历史客户未知但用量有效的请求；统计候选不是收费资格。'),
     'request_statistics': ('逻辑投影', 'usage_daily_mv', '日期加观察请求 ID', '继承原始日分区范围', '已实现', '保留未知归属，按质量重算历史 statistics_usage_eligible，不修改原始事件。'),
-    'usage_daily_mv': ('usage-worker 显式刷新', '日统计查询、usage_monthly_mv', 'UTC 日期加八个统计维度', '按日分区，保留前 12 个完整 UTC 月加当月；仅计算已结束日期', '已实现，生产验收待完成', '公共统计含未知客户；客户/API Key 报表过滤未知归属，服务及供应商按已知 ID 查询。'),
-    'usage_monthly_mv': ('usage-worker 在日成功后刷新', '月统计查询', 'UTC 月首加八个统计维度', '按自然月分区，随日视图同步过期，当前月累计到昨日', '已实现，生产验收待完成', '直接累加日物化视图；全部未知仍为 NULL，不扫描原始事件。'),
+    'usage_daily_mv': ('usage-worker 显式刷新', '日统计查询、usage_monthly_mv', 'UTC 日期加九个统计维度', '按日分区，保留前 12 个完整 UTC 月加当月；仅计算已结束日期', '已实现，生产验收待完成', '公共统计含未知客户；客户/API Key 报表过滤未知归属，服务及供应商按已知 ID 查询。'),
+    'usage_monthly_mv': ('usage-worker 在日成功后刷新', '月统计查询', 'UTC 月首加九个统计维度', '按自然月分区，随日视图同步过期，当前月累计到昨日', '已实现，生产验收待完成', '直接累加日物化视图；全部未知仍为 NULL，不扫描原始事件。'),
     'summary_mv_refresh_runs': ('usage-worker', '任务恢复及通知确认', '统计期加刷新 UUID', '独立保存，不随原始分区删除', '已实现', '提交前持久化恢复信息，成功须匹配 Doris 任务 ID 及完成分区。'),
     'summary_mv_refresh_inputs': ('usage-worker', '通知确认', '日期加刷新 UUID 加通知 ID', '独立保存，不随原始分区删除', '已实现', '仅关联 SUCCEEDED 任务的精确输入得到确认；新通知留给下轮。'),
     'summary_mv_refresh_state': ('usage-worker', '查询覆盖和任务状态', '统计期', '保留最新成功版本及覆盖、月依赖向量', '已实现', 'GAP、未生成、过期与已确认零请求分别展示。')

@@ -21,7 +21,7 @@ IDENTITY_FIELDS = (
     "service_id", "provider_id", "api_key_id", "customer_id", "identity_status",
     "config_version", "gateway_instance_id", "adapter_id", "x_request_id", "logical_request_id",
     "cluster_name", "deployment_environment", "mapping_status", "mapping_version",
-    "customer_mapping_status", "customer_mapping_version",
+    "customer_mapping_status", "customer_mapping_version", "user_id",
 )
 TOKEN_NAMES = (
     "input_tokens", "output_tokens", "cached_read_tokens", "cached_write_tokens",
@@ -72,7 +72,7 @@ def validate_schema(value, schema, document=None, location="$"):
     supported = {
         "$schema", "$defs", "$ref", "title", "description", "default", "type",
         "const", "enum", "allOf", "anyOf", "if", "then", "else", "properties",
-        "required", "additionalProperties", "items", "minItems", "maxItems",
+        "required", "additionalProperties", "maxProperties", "propertyNames", "items", "minItems", "maxItems",
         "uniqueItems", "minLength", "maxLength", "pattern", "minimum", "maximum",
     }
     require(set(schema) <= supported, "unsupported_schema_keyword")
@@ -115,6 +115,11 @@ def validate_schema(value, schema, document=None, location="$"):
         validate_schema(value, schema.get(branch, {}), document, location)
     if type(value) is dict:
         props = schema.get("properties", {})
+        require(len(value) <= schema.get("maxProperties", sys.maxsize), location + ":maxProperties")
+        for key in value:
+            validate_schema(key, schema.get("propertyNames", {}), document, location + ":key")
+            if key not in props and isinstance(schema.get("additionalProperties"), dict):
+                validate_schema(value[key], schema["additionalProperties"], document, location + "." + key)
         require(set(schema.get("required", [])) <= value.keys(), location + ":required")
         if schema.get("additionalProperties") is False:
             require(value.keys() <= props.keys(), location + ":unknown_field")
@@ -165,6 +170,7 @@ def go_json(value):
 def canonical_event(event):
     schema = load(ROOT / "api/events/v1/metering-event.schema.json")
     ordered = {name: event[name] for name in schema["properties"]}
+    ordered["request_headers"] = dict(sorted(event["request_headers"].items()))
     if event["usage"] is not None:
         ordered["usage"] = {name: {part: event["usage"][name][part] for part in ("value", "source")} for name in TOKEN_NAMES}
     return go_json(ordered)
@@ -206,6 +212,12 @@ def validate_event(event, kafka_key=None, now_ms=None, input_size=None):
     require(event["event_id"] == request_id + suffix, "event_id_mismatch")
     if kafka_key is not None:
         require(kafka_key == request_id.encode("utf-8"), "kafka_key_mismatch")
+    for key, limit in (("user_id", 512), ("user_agent", 2048)):
+        if event[key] is not None:
+            require(header_value(event[key], limit), 'request_metadata_value')
+    for key, value in event['request_headers'].items():
+        require(allowed_header(key) and key == key.lower() and header_value(value, 1024), 'request_metadata_header')
+    require(len(go_json({k: event[k] for k in ('user_id', 'user_agent', 'request_headers')})) <= 4096, 'request_metadata_bytes')
     host = event['request_host']
     if host is not None:
         import ipaddress
@@ -295,6 +307,13 @@ def normalize_request_host_pattern(pattern):
         raise ContractError('request_host_pattern_ip')
     return '*.' + host if wildcard else host
 
+def allowed_header(name):
+    return name.lower() not in ('authorization', 'proxy-authorization', 'cookie', 'set-cookie', 'x-api-key', 'api-key', 'x-remote-data')
+
+def header_value(value, limit):
+    return (isinstance(value, str) and 0 < utf8_size(value) <= limit and bool(value.strip())
+            and all(ord(c) >= 32 and ord(c) != 127 or c == '\t' for c in value))
+
 def validate_config(config, release=False):
     schema = load(ROOT / "configs/gateway-observer.schema.json")
     validate_schema(config, schema)
@@ -305,6 +324,9 @@ def validate_config(config, release=False):
             require(utf8_size(config[name]) <= field["maxLength"], name + ":utf8_bytes")
     headers = [name.lower() for name in config.get('logical_request_id_headers', [])]
     require(len(headers) == len(set(headers)), 'duplicate_request_id_header')
+    for field in ('user_id_header', 'extra_request_headers'):
+        names = [name.lower() for name in config.get(field, [])]
+        require(len(names) == len(set(names)) and all(allowed_header(n) for n in names), 'request_header_config')
     patterns = [normalize_request_host_pattern(p) for p in config.get('accepted_request_hosts', [])]
     require(len(patterns) == len(set(patterns)), 'duplicate_request_host_pattern')
     names = []
@@ -358,7 +380,7 @@ def validate_repository():
             row = re.search(r"^\| " + re.escape(name) + r" \|.*?\| (\d+) \|", doc, re.M)
             require(row is not None and int(row.group(1)) == value, "config_table_drift:" + name)
     ddl = (ROOT / "migrations/doris/metering/001_init.sql").read_text(encoding="utf-8")
-    columns = set(re.findall(r"^\s+(\w+)\s+(?:DATE|VARCHAR|CHAR|BIGINT|SMALLINT|INT|STRING|TINYINT|ARRAY|DATETIME)", ddl, re.M))
+    columns = set(re.findall(r"^\s+(\w+)\s+(?:DATE|VARCHAR|CHAR|BIGINT|SMALLINT|INT|STRING|TINYINT|ARRAY|MAP|DATETIME)", ddl, re.M))
     fields = load(ROOT / "api/events/v1/metering-event.schema.json")["properties"]
     require(set(fields) - {"usage"} <= columns, "event_doris_column_drift")
     require(all(n in columns and n + "_source" in columns for n in TOKEN_NAMES), "token_doris_column_drift")

@@ -43,5 +43,9 @@
   "logical_request_id_headers": [
     "x-client-request-id",
     "request_id"
-  ]
+  ],
+  "user_id_header": [
+    "user-id"
+  ],
+  "extra_request_headers": []
 }

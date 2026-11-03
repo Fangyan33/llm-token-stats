@@ -104,13 +104,14 @@ func Validate(b []byte, kind string) error {
 		return err
 	}
 	seen := map[int]bool{}
+	mapKeys := map[string]bool{}
 	one := false
 	for _, f := range fs {
 		wire, known, child, isString := descriptor(kind, f.N)
 		if !known {
 			continue
 		}
-		if seen[f.N] || wire != f.Wire {
+		if (seen[f.N] && !(kind == "start" && f.N == 21)) || wire != f.Wire {
 			return Err
 		}
 		seen[f.N] = true
@@ -127,6 +128,22 @@ func Validate(b []byte, kind string) error {
 			}
 			one = true
 		}
+		if kind == "start" && f.N == 21 {
+			fields, err := Read(f.B)
+			if err != nil {
+				return Err
+			}
+			key := ""
+			for _, entry := range fields {
+				if entry.N == 1 {
+					key = string(entry.B)
+				}
+			}
+			if key == "" || mapKeys[key] || len(mapKeys) >= 16 {
+				return Err
+			}
+			mapKeys[key] = true
+		}
 		if child != "" {
 			if Validate(f.B, child) != nil {
 				return Err
@@ -135,7 +152,7 @@ func Validate(b []byte, kind string) error {
 		if isString && !utf8.Valid(f.B) {
 			return Err
 		}
-		if kind == "start" && (f.N == 17 && len(f.B) > 4096 || f.N == 16 && len(f.B) > 512 || f.N == 18 && len(f.B) > 128) {
+		if kind == "start" && (f.N == 17 && len(f.B) > 4096 || f.N == 16 && len(f.B) > 512 || f.N == 18 && len(f.B) > 128 || f.N == 19 && len(f.B) > 512 || f.N == 20 && len(f.B) > 2048) {
 			return Err
 		}
 		if kind == "chunk" && f.N == 4 && len(f.B) > 16384 {
@@ -171,7 +188,14 @@ func descriptor(kind string, n int) (int, bool, string, bool) {
 		if n == 17 {
 			return 2, true, "", false
 		}
-		if n >= 2 && n <= 16 || n == 18 {
+		if n == 21 {
+			return 2, true, "header_entry", false
+		}
+		if n >= 2 && n <= 16 || n >= 18 && n <= 20 {
+			return 2, true, "", true
+		}
+	case "header_entry":
+		if n == 1 || n == 2 {
 			return 2, true, "", true
 		}
 	case "headers":

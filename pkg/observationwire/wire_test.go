@@ -35,3 +35,16 @@ func TestReservedIdentityAndCredentialWireLimits(t *testing.T) {
 		}
 	}
 }
+
+func TestRequestHeaderMapWireValidation(t *testing.T) {
+	entry := String(String(nil, 1, "x-team"), 2, "team-a")
+	start := Bytes(nil, 21, entry)
+	if Validate(Frame(1, 10, start), "frame") != nil {
+		t.Fatal("valid map rejected")
+	}
+	for _, bad := range [][]byte{Bytes(start, 21, entry), String(nil, 19, string(make([]byte, 513))), String(nil, 20, string(make([]byte, 2049))), Bytes(nil, 21, append(entry, String(nil, 2, "again")...))} {
+		if Validate(Frame(1, 10, bad), "frame") == nil {
+			t.Fatal("duplicate or unbounded metadata accepted")
+		}
+	}
+}

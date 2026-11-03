@@ -5,6 +5,9 @@
   "type": "object",
   "additionalProperties": false,
   "required": [
+    "user_id",
+    "user_agent",
+    "request_headers",
     "schema_version",
     "event_id",
     "event_type",
@@ -53,6 +56,37 @@
     "customer_name"
   ],
   "properties": {
+    "user_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "minLength": 1,
+      "maxLength": 512
+    },
+    "user_agent": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "minLength": 1,
+      "maxLength": 2048
+    },
+    "request_headers": {
+      "type": "object",
+      "maxProperties": 16,
+      "propertyNames": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 128,
+        "pattern": "^[!#$%&'*+.^_`|~0-9a-z-]+$"
+      },
+      "additionalProperties": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 1024
+      }
+    },
     "schema_version": {
       "const": 1
     },

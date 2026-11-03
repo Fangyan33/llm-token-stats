@@ -2,7 +2,7 @@
 
 本文描述当前唯一采集模型，面向开发、运维和数据使用者。实体表的类型、键、说明来自仓库 DDL；视图类型及可空性按 SQL 和既有类型推导，需在目标 Doris 4.1.3 核验。整数显示宽度和 DECIMALV3 名称归一化为 SQL 类型。
 
-覆盖 10 张实体表、122 个实体字段，以及 5 个逻辑视图、191 个逻辑视图字段，以及 2 个异步物化视图。当前本地 Consumer 写入 metering_development；迁移仅定义当前最终结构，不提供旧开发库的原地升级。
+覆盖 10 张实体表、125 个实体字段，以及 5 个逻辑视图、203 个逻辑视图字段，以及 2 个异步物化视图。当前本地 Consumer 写入 metering_development；迁移仅定义当前最终结构，不提供旧开发库的原地升级。
 
 ## 使用口径
 
@@ -94,6 +94,9 @@ flowchart TD
 | event_type | VARCHAR(32) | 否 | 未声明 | — | 事件类型：request_started 或 usage_observed；两者合计仍是一次请求 |
 | x_request_id | VARCHAR(128) | 是 | 未声明 | — | 网关可见的 X-Request-Id，仅辅助关联；可空、可重复，不用于授权或去重 |
 | logical_request_id | VARCHAR(128) | 是 | 未声明 | — | Wasm 按配置提取的客户端请求 ID；可空、可重复，不用于内部去重 |
+| user_id | VARCHAR(512) | 是 | 未声明 | — | 按有序候选头提取的用户 ID；客户端上报的统计维度，未知为 NULL |
+| user_agent | VARCHAR(2048) | 是 | 未声明 | — | 标准 User-Agent 请求头快照；未知为 NULL |
+| request_headers | MAP<STRING, STRING> | 否 | 未声明 | — | 白名单请求头的小写名称与字符串值；无有效项为空 Map |
 | observation_scope | VARCHAR(32) | 否 | 未声明 | — | 观察范围，当前固定 gateway_response，不代表所有隐藏的上游尝试 |
 | producer_id | VARCHAR(128) | 否 | 未声明 | — | 生成此事件的 Observer 实例标识，部署时使用实际 Pod UID |
 | gateway_instance_id | VARCHAR(128) | 否 | 未声明 | — | 观察请求的网关实例标识，新版为命名空间/Pod名称，历史值可能为Pod UID |
@@ -115,7 +118,7 @@ flowchart TD
 | customer_id | VARCHAR(128) | 是 | 未声明 | — | 与 api_key_id 同次成功解析得到的客户 ID；未知为 NULL，不采信客户端自报 ID |
 | provider_id | VARCHAR(128) | 是 | 未声明 | — | 服务接口返回的服务所属供应商 ID；未知为 NULL，不代表隐藏的实际执行方 |
 | identity_status | VARCHAR(16) | 否 | 未声明 | — | 客户归属状态：known 或 invalid；仅完整客户解析成功为 known，不表示鉴权判定 |
-| identity_hash | CHAR(64) | 否 | 未声明 | — | 固定十六项归属与部署快照元组的规范 SHA-256，不含原始密钥或诊断路由 |
+| identity_hash | CHAR(64) | 否 | 未声明 | — | 固定十七项归属与部署及用户快照元组的规范 SHA-256，不含原始密钥或诊断路由 |
 | request_started_at_ms | BIGINT | 否 | 未声明 | — | 网关观察到请求头的 Unix 毫秒时间；决定 UTC 统计日期 |
 | observation_ended_at_ms | BIGINT | 是 | 未声明 | — | Observer 结束观察的 Unix 毫秒时间；start 为 NULL，不等于业务结束时间 |
 | request_finished_at_ms | BIGINT | 是 | 未声明 | — | 有效网关 End 提供的请求结束 Unix 毫秒时间；未收到有效 End 时为 NULL |
@@ -440,6 +443,9 @@ GAP、未生成、过期与已确认零请求分别展示。
 | event_type | VARCHAR(32) | 否 | —（派生） | — | 事件类型：request_started 或 usage_observed；两者合计仍是一次请求 |
 | x_request_id | VARCHAR(128) | 是 | —（派生） | — | 网关可见的 X-Request-Id，仅辅助关联；可空、可重复，不用于授权或去重 |
 | logical_request_id | VARCHAR(128) | 是 | —（派生） | — | Wasm 按配置提取的客户端请求 ID；可空、可重复，不用于内部去重 |
+| user_id | VARCHAR(512) | 是 | —（派生） | — | 按有序候选头提取的用户 ID；客户端上报的统计维度，未知为 NULL |
+| user_agent | VARCHAR(2048) | 是 | —（派生） | — | 标准 User-Agent 请求头快照；未知为 NULL |
+| request_headers | MAP<STRING,STRING> | 否 | —（派生） | — | 白名单请求头的小写名称与字符串值；无有效项为空 Map |
 | observation_scope | VARCHAR(32) | 否 | —（派生） | — | 观察范围，当前固定 gateway_response，不代表所有隐藏的上游尝试 |
 | producer_id | VARCHAR(128) | 否 | —（派生） | — | 生成此事件的 Observer 实例标识，部署时使用实际 Pod UID |
 | gateway_instance_id | VARCHAR(128) | 否 | —（派生） | — | 观察请求的网关实例标识，新版为命名空间/Pod名称，历史值可能为Pod UID |
@@ -514,6 +520,9 @@ GAP、未生成、过期与已确认零请求分别展示。
 | request_date | DATE | 否 | —（派生） | — | UTC 请求日期，由 request_started_at_ms 换算，不由事件到达时间或 UUID 推导 |
 | observation_id | VARCHAR(36) | 否 | —（派生） | — | Observer 为一次观察生成的规范 UUIDv4；内部主标识及 Kafka key |
 | logical_request_id | VARCHAR(128) | 是 | —（派生） | — | Wasm 按配置提取的客户端请求 ID；可空、可重复，不用于内部去重 |
+| user_id | VARCHAR(512) | 是 | —（派生） | — | 按有序候选头提取的用户 ID；客户端上报的统计维度，未知为 NULL |
+| user_agent | VARCHAR(2048) | 是 | —（派生） | — | 标准 User-Agent 请求头快照；未知为 NULL |
+| request_headers | MAP<STRING,STRING> | 否 | —（派生） | — | 白名单请求头的小写名称与字符串值；无有效项为空 Map |
 | start_variants | BIGINT | 否 | —（派生） | — | 该观察的开始事件内容变体数；大于 1 表示冲突，不是调用次数 |
 | usage_variants | BIGINT | 否 | —（派生） | — | 该观察的结果事件内容变体数；0 表示未观察结果，大于 1 表示冲突 |
 | request_started_at_ms | BIGINT | 否 | —（派生） | — | 网关观察到请求头的 Unix 毫秒时间；决定 UTC 统计日期 |
@@ -568,6 +577,9 @@ GAP、未生成、过期与已确认零请求分别展示。
 | event_type | VARCHAR(32) | 否 | —（派生） | — | 事件类型：request_started 或 usage_observed；两者合计仍是一次请求 |
 | x_request_id | VARCHAR(128) | 是 | —（派生） | — | 网关可见的 X-Request-Id，仅辅助关联；可空、可重复，不用于授权或去重 |
 | logical_request_id | VARCHAR(128) | 是 | —（派生） | — | Wasm 按配置提取的客户端请求 ID；可空、可重复，不用于内部去重 |
+| user_id | VARCHAR(512) | 是 | —（派生） | — | 按有序候选头提取的用户 ID；客户端上报的统计维度，未知为 NULL |
+| user_agent | VARCHAR(2048) | 是 | —（派生） | — | 标准 User-Agent 请求头快照；未知为 NULL |
+| request_headers | MAP<STRING,STRING> | 否 | —（派生） | — | 白名单请求头的小写名称与字符串值；无有效项为空 Map |
 | observation_scope | VARCHAR(32) | 否 | —（派生） | — | 观察范围，当前固定 gateway_response，不代表所有隐藏的上游尝试 |
 | producer_id | VARCHAR(128) | 否 | —（派生） | — | 生成此事件的 Observer 实例标识，部署时使用实际 Pod UID |
 | gateway_instance_id | VARCHAR(128) | 否 | —（派生） | — | 观察请求的网关实例标识，新版为命名空间/Pod名称，历史值可能为Pod UID |
@@ -642,10 +654,13 @@ GAP、未生成、过期与已确认零请求分别展示。
 | request_date | DATE | 否 | —（派生） | — | UTC 请求日期，由 request_started_at_ms 换算，不由事件到达时间或 UUID 推导 |
 | observation_id | VARCHAR(36) | 否 | —（派生） | — | Observer 为一次观察生成的规范 UUIDv4；内部主标识及 Kafka key |
 | logical_request_id | VARCHAR(128) | 是 | —（派生） | — | Wasm 按配置提取的客户端请求 ID；可空、可重复，不用于内部去重 |
+| user_id | VARCHAR(512) | 是 | —（派生） | — | 按有序候选头提取的用户 ID；客户端上报的统计维度，未知为 NULL |
+| user_agent | VARCHAR(2048) | 是 | —（派生） | — | 标准 User-Agent 请求头快照；未知为 NULL |
+| request_headers | MAP<STRING,STRING> | 否 | —（派生） | — | 白名单请求头的小写名称与字符串值；无有效项为空 Map |
 | start_variants | BIGINT | 否 | —（派生） | — | 该观察的开始事件内容变体数；大于 1 表示冲突，不是调用次数 |
 | usage_variants | BIGINT | 否 | —（派生） | — | 该观察的结果事件内容变体数；0 表示未观察结果，大于 1 表示冲突 |
 | started_count | BIGINT | 否 | —（派生） | — | 该日期内同一观察的不同开始时间数量；大于 1 表示时间冲突 |
-| identity_count | BIGINT | 否 | —（派生） | — | 该日期内同一观察的不同十六项归属与部署快照数量；大于 1 表示冲突 |
+| identity_count | BIGINT | 否 | —（派生） | — | 该日期内同一观察的不同十七项归属与部署及用户快照数量；大于 1 表示冲突 |
 | name_count | BIGINT | 否 | —（派生） | — | 同请求不同名称快照元组数量；大于 1 表示冲突 |
 | customer_id | VARCHAR(128) | 是 | —（派生） | — | 与 api_key_id 同次成功解析得到的客户 ID；未知为 NULL，不采信客户端自报 ID |
 | provider_id | VARCHAR(128) | 是 | —（派生） | — | 服务接口返回的服务所属供应商 ID；未知为 NULL，不代表隐藏的实际执行方 |
@@ -691,7 +706,7 @@ GAP、未生成、过期与已确认零请求分别展示。
 | 类型 | 异步物化视图，手动分区刷新 |
 | 写入者 | usage-worker 显式刷新 |
 | 读取者 | 日统计查询、usage_monthly_mv |
-| 数据粒度 | UTC 日期加八个统计维度 |
+| 数据粒度 | UTC 日期加九个统计维度 |
 | 唯一键 | 无独立唯一键 |
 | 分区、分桶及保留 | 按日分区，保留前 12 个完整 UTC 月加当月；仅计算已结束日期 |
 | 实现状态 | 已实现，生产验收待完成 |
@@ -702,6 +717,7 @@ GAP、未生成、过期与已确认零请求分别展示。
 | stat_date | DATE | 否 | —（派生） | — | 日统计或重算通知对应的 UTC 请求日期 |
 | cluster_name | VARCHAR(65533) | 否 | —（派生） | — | Observer 配置固定的集群名称，业务请求不能覆盖 |
 | deployment_environment | VARCHAR(65533) | 否 | —（派生） | — | Observer 固定部署环境：prd、stg 或 dev |
+| user_id | VARCHAR(65533) | 是 | —（派生） | — | 客户端用户 ID 统计维度；未知保持 NULL，整体统计保留未知用户 |
 | customer_id | VARCHAR(65533) | 是 | —（派生） | — | 客户统计维度；未知保持 NULL，客户报表需过滤未知归属 |
 | provider_id | VARCHAR(65533) | 是 | —（派生） | — | 供应商统计维度；未知保持 NULL，已知供应商统计包含客户未知请求 |
 | api_key_id | VARCHAR(65533) | 是 | —（派生） | — | 稳定 API Key 统计维度；未知保持 NULL，API Key 报表需过滤未知归属 |
@@ -740,7 +756,7 @@ GAP、未生成、过期与已确认零请求分别展示。
 | 类型 | 异步物化视图，手动分区刷新 |
 | 写入者 | usage-worker 在日成功后刷新 |
 | 读取者 | 月统计查询 |
-| 数据粒度 | UTC 月首加八个统计维度 |
+| 数据粒度 | UTC 月首加九个统计维度 |
 | 唯一键 | 无独立唯一键 |
 | 分区、分桶及保留 | 按自然月分区，随日视图同步过期，当前月累计到昨日 |
 | 实现状态 | 已实现，生产验收待完成 |
@@ -751,6 +767,7 @@ GAP、未生成、过期与已确认零请求分别展示。
 | stat_month | DATE | 否 | —（派生） | — | 统计月对应的 UTC 自然月首日 |
 | cluster_name | VARCHAR(65533) | 否 | —（派生） | — | Observer 配置固定的集群名称，业务请求不能覆盖 |
 | deployment_environment | VARCHAR(65533) | 否 | —（派生） | — | Observer 固定部署环境：prd、stg 或 dev |
+| user_id | VARCHAR(65533) | 是 | —（派生） | — | 客户端用户 ID 统计维度；未知保持 NULL，整体统计保留未知用户 |
 | customer_id | VARCHAR(65533) | 是 | —（派生） | — | 客户统计维度；未知保持 NULL，客户报表需过滤未知归属 |
 | provider_id | VARCHAR(65533) | 是 | —（派生） | — | 供应商统计维度；未知保持 NULL，已知供应商统计包含客户未知请求 |
 | api_key_id | VARCHAR(65533) | 是 | —（派生） | — | 稳定 API Key 统计维度；未知保持 NULL，API Key 报表需过滤未知归属 |

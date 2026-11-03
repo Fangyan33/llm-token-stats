@@ -226,7 +226,7 @@ func (s *Store) Evidence(ctx context.Context, ids []string) ([]consumer.Evidence
 
 // IdentityKeySQL keeps the field order aligned with events.IdentityHash and the request projections.
 // This JSON tuple is used only for equality within Doris, not as a payload hash.
-const IdentityKeySQL = "CAST(JSON_ARRAY(service_id, provider_id, api_key_id, customer_id, identity_status, config_version, gateway_instance_id, adapter_id, x_request_id, logical_request_id, cluster_name, deployment_environment, mapping_status, mapping_version, customer_mapping_status, customer_mapping_version) AS STRING)"
+const IdentityKeySQL = "CAST(JSON_ARRAY(service_id, provider_id, api_key_id, customer_id, identity_status, config_version, gateway_instance_id, adapter_id, x_request_id, logical_request_id, cluster_name, deployment_environment, mapping_status, mapping_version, customer_mapping_status, customer_mapping_version, user_id) AS STRING)"
 
 const NameKeySQL = "CAST(JSON_ARRAY(service_name, provider_name, customer_name) AS STRING)"
 

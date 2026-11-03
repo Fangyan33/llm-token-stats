@@ -493,3 +493,7 @@ public class MeteringConsumer {
 | 已解析到流式终结 usage，之后观察中断，缺少完整结束信息 | `stream_incomplete` | `known` | `false` |
 | 响应和用量完整，仅客户身份缺失 | `response_complete` | `known` | `true` |
 | 响应完整结束，但输入、输出与上报总量对不上 | `response_complete` | `conflict` | `false` |
+
+## 用户与扩展请求头
+
+事件新增 `user_id`、`user_agent`、`request_headers` 三个必填键：前两项可为 `null`，扩展头为字符串 Map，无有效项为 `{}`。Wasm 的 `user_id_header` 为有序候选列表；默认读取 `user-id`。两个事件保存相同快照；用户 ID 纳入日/月汇总维度。配置、预算与查询示例见[请求头采集说明](request-header-collection.md)。

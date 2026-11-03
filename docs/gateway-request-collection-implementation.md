@@ -151,6 +151,9 @@ message Start {
   bytes api_key = 17;              // Transient Bearer token, at most 4096 bytes; never log
   optional string x_request_id = 15; // 网关可见的 X-Request-Id，仅辅助关联
   optional string logical_request_id = 18; // Wasm 按配置从客户端请求头提取；未命中不设置
+  optional string user_id = 19; // 按候选头顺序提取，最多 512 UTF-8 字节
+  optional string user_agent = 20; // 标准 User-Agent，最多 2048 UTF-8 字节
+  map<string, string> request_headers = 21; // 小写白名单头名，最多 16 项
 }
 
 message ResponseHeaders {
@@ -743,7 +746,11 @@ Consumer/Doris 故障可以依赖 Kafka 72 小时保留恢复，与禁止采集�
   "logical_request_id_headers": [
     "x-client-request-id",
     "request_id"
-  ]
+  ],
+  "user_id_header": [
+    "user-id"
+  ],
+  "extra_request_headers": []
 }
 ```
 

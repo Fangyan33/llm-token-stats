@@ -45,8 +45,8 @@ class DorisSchemaTests(unittest.TestCase):
     def test_all_current_objects_and_columns_have_annotations(self):
         tables = [r for r in self.relations.values() if r['kind'] == 'TABLE']
         views = [r for r in self.relations.values() if r['kind'] == 'VIEW']
-        self.assertEqual((len(tables), sum(len(r['columns']) for r in tables)), (10, 122))
-        self.assertEqual((len(views), sum(len(r['columns']) for r in views)), (5, 191))
+        self.assertEqual((len(tables), sum(len(r['columns']) for r in tables)), (10, 125))
+        self.assertEqual((len(views), sum(len(r['columns']) for r in views)), (5, 203))
         materialized = [r for r in self.relations.values() if r['kind'] == 'MATERIALIZED VIEW']
         self.assertEqual([r['name'] for r in materialized], ['usage_daily_mv', 'usage_monthly_mv'])
         for relation in self.relations.values():

@@ -4,6 +4,7 @@ import (
 	"errors"
 	"github.com/Fangyan33/llm-token-stats/pkg/requesthost"
 	"github.com/Fangyan33/llm-token-stats/pkg/requestid"
+	"github.com/Fangyan33/llm-token-stats/pkg/requestmeta"
 	"github.com/Fangyan33/llm-token-stats/pkg/strictjson"
 	"strings"
 	"unicode"
@@ -16,7 +17,7 @@ const MaxRewriteTimeoutMS int64 = 450
 const MaxTickMS int64 = 10
 
 func Decode(b []byte) (Config, error) {
-	var c Config
+	c := Config{UserIDHeader: []string{"user-id"}}
 	if len(b) > 65536 || strictjson.Decode(b, &c) != nil {
 		return c, errors.New("config_invalid")
 	}
@@ -31,6 +32,21 @@ func Decode(b []byte) (Config, error) {
 		if _, present := fields["logical_request_id_headers"]; present {
 			return c, errors.New("config_request_id_headers")
 		}
+	}
+	fields, _ := strictjson.Fields(b, 64, 100000)
+	for _, name := range []string{"user_id_header", "extra_request_headers"} {
+		if span, present := fields[name]; present && strings.TrimSpace(string(b[span.Start:span.End])) == "null" {
+			return c, errors.New("config_request_headers")
+		}
+	}
+	var headerErr error
+	c.UserIDHeader, headerErr = requestmeta.Normalize(c.UserIDHeader, 8)
+	if headerErr != nil {
+		return c, headerErr
+	}
+	c.ExtraRequestHeaders, headerErr = requestmeta.Normalize(c.ExtraRequestHeaders, requestmeta.MaxHeaders)
+	if headerErr != nil {
+		return c, headerErr
 	}
 	if c.SchemaVersion != 1 || !str(c.ConfigVersion, 128) || !str(c.ObserverCluster, 256) || len(c.Routes) > 128 {
 		return c, errors.New("config_invalid")

@@ -9,6 +9,7 @@ import (
 	"github.com/Fangyan33/llm-token-stats/internal/config"
 	"github.com/Fangyan33/llm-token-stats/internal/identitylookup"
 	"github.com/Fangyan33/llm-token-stats/pkg/requesthost"
+	"github.com/Fangyan33/llm-token-stats/pkg/requestmeta"
 	"github.com/Fangyan33/llm-token-stats/pkg/statwindow"
 	"github.com/Fangyan33/llm-token-stats/pkg/strictjson"
 	"math"
@@ -22,14 +23,18 @@ func Ptr[T any](v T) *T    { return &v }
 func Hash(b []byte) string { h := sha256.Sum256(b); return hex.EncodeToString(h[:]) }
 func Tuple(v any) string   { b, _ := json.Marshal(v); return Hash(b) }
 func Canonical(e *Event) ([]byte, error) {
-	b, err := json.Marshal(e)
+	copy := *e
+	if copy.RequestHeaders == nil {
+		copy.RequestHeaders = map[string]string{}
+	}
+	b, err := json.Marshal(&copy)
 	if err != nil || len(b) > MaxBytes {
 		return nil, errors.New("event_size")
 	}
 	return b, nil
 }
 func IdentityHash(e *Event) string {
-	return Tuple([]any{e.ServiceID, e.ProviderID, e.ApiKeyID, e.CustomerID, e.IdentityStatus, e.ConfigVersion, e.GatewayInstanceID, e.AdapterID, e.XRequestID, e.LogicalRequestID, e.ClusterName, e.DeploymentEnvironment, e.MappingStatus, e.MappingVersion, e.CustomerMappingStatus, e.CustomerMappingVersion})
+	return Tuple([]any{e.ServiceID, e.ProviderID, e.ApiKeyID, e.CustomerID, e.IdentityStatus, e.ConfigVersion, e.GatewayInstanceID, e.AdapterID, e.XRequestID, e.LogicalRequestID, e.ClusterName, e.DeploymentEnvironment, e.MappingStatus, e.MappingVersion, e.CustomerMappingStatus, e.CustomerMappingVersion, e.UserID})
 }
 func Decode(b, key []byte, now time.Time) (*Event, error) {
 	if len(b) > MaxBytes {
@@ -50,6 +55,9 @@ func Decode(b, key []byte, now time.Time) (*Event, error) {
 	var e Event
 	if strictjson.Decode(b, &e) != nil {
 		return nil, errors.New("event_json")
+	}
+	if !requestmeta.Valid(e.UserID, e.UserAgent, e.RequestHeaders) {
+		return nil, errors.New("event_request_headers")
 	}
 	if string(key) != e.ObservationID {
 		return nil, errors.New("event_id")

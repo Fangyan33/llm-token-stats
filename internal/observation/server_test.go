@@ -66,6 +66,9 @@ func TestObserveEOSAndOnceFinalization(t *testing.T) {
 				t.Fatal(err)
 			}
 			st := &pb.Start{RequestStartedAtMs: time.Now().UnixMilli(), GatewayInstanceId: "gateway", ConfigVersion: "v1", RouteName: "chat", AdapterId: "chat_completions_v1", RequestAuthority: "Model.Example.invalid:443", ApiKey: []byte("synthetic-key"), Method: "POST", RequestContentType: "application/json"}
+			st.UserId = events.Ptr("synthetic-user")
+			st.UserAgent = events.Ptr("sdk/1.0")
+			st.RequestHeaders = map[string]string{"x-team-id": "team-a"}
 			if mode == "client_id" {
 				st.LogicalRequestId = events.Ptr("Client-Correlation:42")
 			}
@@ -129,6 +132,11 @@ func TestObserveEOSAndOnceFinalization(t *testing.T) {
 			}
 			if mode == "legacy_invalid_host" && (e.RequestHost != nil || e.MappingStatus != "invalid_host") {
 				t.Fatal("legacy diagnostic contract changed")
+			}
+			for _, snapshot := range k.es {
+				if snapshot.UserID == nil || *snapshot.UserID != "synthetic-user" || snapshot.UserAgent == nil || *snapshot.UserAgent != "sdk/1.0" || snapshot.RequestHeaders["x-team-id"] != "team-a" {
+					t.Fatal("request metadata snapshot changed")
+				}
 			}
 			if k.es[0].RouteName != wantRoute || e.RouteName != wantRoute {
 				t.Fatalf("diagnostic route must be fixed across events: %q / %q", k.es[0].RouteName, e.RouteName)

@@ -104,6 +104,16 @@ func check(v any, s map[string]any) error {
 	switch x := v.(type) {
 	case map[string]any:
 		props, _ := s["properties"].(map[string]any)
+		if n, ok := s["maxProperties"].(float64); ok && len(x) > int(n) {
+			return bad()
+		}
+		if names, ok := s["propertyNames"].(map[string]any); ok {
+			for k := range x {
+				if err := check(k, names); err != nil {
+					return err
+				}
+			}
+		}
 		if req, ok := s["required"].([]any); ok {
 			for _, k := range req {
 				if _, ok := x[k.(string)]; !ok {
@@ -113,6 +123,10 @@ func check(v any, s map[string]any) error {
 		}
 		for k, val := range x {
 			if p, ok := props[k].(map[string]any); ok {
+				if err := check(val, p); err != nil {
+					return err
+				}
+			} else if p, ok := s["additionalProperties"].(map[string]any); ok {
 				if err := check(val, p); err != nil {
 					return err
 				}

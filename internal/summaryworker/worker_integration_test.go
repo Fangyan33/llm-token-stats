@@ -177,7 +177,11 @@ func TestDorisNestedSummaries(t *testing.T) {
 		}
 		args = nil
 		for i, k := range keys {
-			if marks[i] == "?" {
+			if k == "request_headers" {
+				b, _ := json.Marshal(row[k])
+				marks[i] = "CAST(? AS MAP<STRING, STRING>)"
+				args = append(args, string(b))
+			} else if marks[i] == "?" {
 				args = append(args, row[k])
 			}
 		}

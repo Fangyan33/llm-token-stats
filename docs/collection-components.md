@@ -221,3 +221,7 @@ Observer 必填 cluster_name、deployment_environment，service_lookup/customer_
 Consumer 的 doris.database、DSN、Stream Load 和证据/巡检 SQL 使用同一经过校验的库名。初始化使用 `python3 scripts/render_doris_sql.py --database 数据库 migrations/doris/metering/001_init.sql`，对其余初始化 SQL 同样渲染。本地默认 metering_development，新 Kubernetes 测试每次用 metering_k8s_<run-id>；不修改旧 metering 库及其消息，清理保留测试库作为证据。普通 Docker 联调使用合成 token 和隔离明文网络；生产/真实密钥只允许已验证的网格 mTLS/TLS。
 
 数据库字段及每张表的作用见[数据库表与字段文档](doris-database-schema.md)。全部表和字段注释直接随初始化脚本创建，数据库字典通过隔离库的实际元数据校验后生成。
+
+## 用户与扩展请求头
+
+事件新增 `user_id`、`user_agent`、`request_headers` 三个必填键：前两项可为 `null`，扩展头为字符串 Map，无有效项为 `{}`。Wasm 的 `user_id_header` 为有序候选列表；默认读取 `user-id`。两个事件保存相同快照；用户 ID 纳入日/月汇总维度。配置、预算与查询示例见[请求头采集说明](request-header-collection.md)。

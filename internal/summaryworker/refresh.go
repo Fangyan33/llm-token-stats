@@ -289,7 +289,7 @@ func (w *Worker) validate(ctx context.Context, r Run) error {
 		}
 		// Compare every dimension and metric, including NULL semantics. EXCEPT is set
 		// equality here because both sides have one row per complete grouping key.
-		dims := "cluster_name,deployment_environment,customer_id,provider_id,api_key_id,service_id,model,usage_source"
+		dims := "cluster_name,deployment_environment,user_id,customer_id,provider_id,api_key_id,service_id,model,usage_source"
 		sums := make([]string, 0, len(metrics))
 		for _, m := range metrics {
 			sums = append(sums, "SUM("+m+") AS "+m)

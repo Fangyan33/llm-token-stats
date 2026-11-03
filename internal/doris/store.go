@@ -19,9 +19,11 @@ import (
 )
 
 type Store struct {
-	DB   *sql.DB
-	Cfg  config.Doris
-	HTTP *http.Client
+	DB       *sql.DB
+	Cfg      config.Doris
+	HTTP     *http.Client
+	username string
+	password string
 }
 
 func New(c config.Doris) (*Store, error) {
@@ -43,12 +45,13 @@ func New(c config.Doris) (*Store, error) {
 	db.SetMaxOpenConns(8)
 	db.SetMaxIdleConns(4)
 	db.SetConnMaxLifetime(time.Minute)
-	s := &Store{DB: db, Cfg: c}
+	// Freeze the same credentials for SQL and HTTP for this Store's lifetime.
+	s := &Store{DB: db, Cfg: c, username: parsed.User, password: parsed.Passwd}
 	s.HTTP = &http.Client{Timeout: 15 * time.Second, CheckRedirect: func(r *http.Request, via []*http.Request) error {
 		if len(via) > 3 || !s.allowed(r.URL) || r.Method != "PUT" || len(via) > 0 && via[0].URL.Scheme == "https" && r.URL.Scheme != "https" {
 			return errors.New("doris_redirect")
 		}
-		r.SetBasicAuth(os.Getenv(c.UsernameEnv), os.Getenv(c.PasswordEnv))
+		r.SetBasicAuth(s.username, s.password)
 		return nil
 	}}
 	return s, nil
@@ -144,7 +147,7 @@ func (s *Store) Load(ctx context.Context, table, label string, body []byte, rows
 	if err != nil {
 		return errors.New("doris_request")
 	}
-	r.SetBasicAuth(os.Getenv(s.Cfg.UsernameEnv), os.Getenv(s.Cfg.PasswordEnv))
+	r.SetBasicAuth(s.username, s.password)
 	for k, v := range map[string]string{"label": label, "Expect": "100-continue", "format": "json", "read_json_by_line": "true", "max_filter_ratio": "0", "timezone": "+00:00", "strict_mode": "true", "timeout": "10"} {
 		r.Header.Set(k, v)
 	}

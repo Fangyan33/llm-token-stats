@@ -113,6 +113,9 @@ class KubernetesCollectionTests(unittest.TestCase):
         self.assertNotEqual(topic, 'llm-metering-events')
         self.assertNotEqual(consumer['consumer']['group_id'], 'llm-metering-doris-v1')
         self.assertIn('llm-token-stats-doris:9030', credentials['DORIS_DSN'])
+        self.assertEqual(set(credentials), {'DORIS_DSN'})
+        self.assertNotIn('username_env', consumer['doris'])
+        self.assertNotIn('password_env', consumer['doris'])
         self.assertEqual(observer['kafka']['bootstrap_servers'], ['llm-token-stats-kafka:9092'])
 
     def test_acceptance_rejects_compose_producer_wrong_topic_and_unknown_zero(self):
@@ -144,7 +147,7 @@ class KubernetesCollectionTests(unittest.TestCase):
         infra = integration.infrastructure('metering-wasm-unit')
         names = {item['metadata']['name'] for item in infra['items']}
         self.assertEqual(names, {'llm-token-stats-kafka', 'llm-token-stats-doris'})
-        job = integration.job_resources('metering-wasm-unit', 'llm-token-stats-integration:test')
+        job = integration.job_resources('metering-wasm-unit', 'llm-token-stats-integration:test', 'llm-token-stats-consumer:test')
         for item in infra['items'] + job['items']:
             self.assertTrue(item['metadata']['name'].startswith('llm-token-stats-'))
         encoded = json.dumps(job)
@@ -193,7 +196,8 @@ class KubernetesCollectionTests(unittest.TestCase):
     def test_normal_gateway_waits_for_download_service_before_start(self):
         with tempfile.TemporaryDirectory() as directory:
             harness = self.harness(directory)
-            harness.images = {'integration': 'llm-token-stats-integration:test'}
+            harness.images = {'integration': 'llm-token-stats-integration:test',
+                              'consumer': 'llm-token-stats-consumer:test'}
             gateway = {'kind': 'Pod', 'metadata': {'name': 'llm-token-stats-e2e-gateway'}}
             manifests = {'apiVersion': 'v1', 'kind': 'List', 'items': [gateway, {'kind': 'Service'}]}
             events = []

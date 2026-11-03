@@ -150,7 +150,6 @@ def configurations(args):
         'DORIS_DSN': (f'root@tcp(llm-token-stats-doris.{ns}.svc.cluster.local:9030)/{args.database}'
                       '?timeout=5s&readTimeout=30s&writeTimeout=10s&interpolateParams=true'
                       '&time_zone=%27%2B00%3A00%27'),
-        'DORIS_USER': 'root', 'DORIS_PASSWORD': '',
     }
     resources = [resource('ConfigMap', 'llm-token-stats-' + name, ns,
                           data={name + '.json': json.dumps(config, ensure_ascii=False, indent=2) + '\n'})

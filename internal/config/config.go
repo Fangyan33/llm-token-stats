@@ -93,8 +93,6 @@ type Doris struct {
 	FE           string   `json:"fe_url"`
 	AllowedHosts []string `json:"allowed_load_hosts"`
 	DSNEnv       string   `json:"dsn_env"`
-	UsernameEnv  string   `json:"username_env"`
-	PasswordEnv  string   `json:"password_env"`
 	Database     string   `json:"database"`
 }
 type Position struct {

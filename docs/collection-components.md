@@ -160,7 +160,7 @@ python3 scripts/render_gateway_filter.py \
 
 Istio 的 `outbound|端口|子集|服务DNS` 是路由集群名，不能原样作为 Go gRPC 服务的 HTTP/2 `:authority`。插件保持 `cluster_name` 不变，自动将这类集群的 authority 设置为 `服务DNS:端口`；普通本地集群名保持原值，不改变集群 TLS/SNI。自定义 ext_authz 若同样使用 Istio 集群名，必须在其 `grpc_service.envoy_grpc.authority` 显式填写有效服务 DNS。
 
-Doris Stream Load 只向 `allowed_load_hosts` 发送凭据，拒绝未登记跳转及 HTTPS 降级到 HTTP。每个 label 的冻结内容摘要参与命名；超时或确认丢失后先查询原事务为 VISIBLE，再核对全部行键。`Label Already Exists` 不是成功判据。
+Doris SQL 查询和 HTTP Stream Load（包括允许的重定向）统一使用 `dsn_env` 指向的 DSN 中的用户名和密码，凭据在初始化时读取；更新 Secret 后需重建 Pod。Doris 配置不再接受 `username_env`、`password_env`，独立的 `DORIS_USER`、`DORIS_PASSWORD` 不再生效。Stream Load 只向 `allowed_load_hosts` 发送凭据，拒绝未登记跳转及 HTTPS 降级到 HTTP。每个 label 的冻结内容摘要参与命名；超时或确认丢失后先查询原事务为 VISIBLE，再核对全部行键。`Label Already Exists` 不是成功判据。
 
 ## Observer Wasm 下载服务
 

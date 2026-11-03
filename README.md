@@ -384,11 +384,11 @@ cp configs/gateway-observer.example.json "$DEPLOY_DIR/gateway-observer.json"
 KAFKA_USERNAME=替换为Consumer账号
 KAFKA_PASSWORD=替换为Consumer密码
 DORIS_DSN=用户名:密码@tcp(doris-fe.doris.svc.cluster.local:9030)/metering?timeout=5s&readTimeout=30s&writeTimeout=10s&interpolateParams=true&time_zone=%27%2B00%3A00%27
-DORIS_USER=替换为StreamLoad用户名
-DORIS_PASSWORD=替换为StreamLoad密码
 ```
 
-Doris 使用独立账号，仅授予采集表所需的查询与写入权限。DSN 必须包含连接、读写超时和 UTC 会话设置；迁移需单独执行，服务不会代为运行。Kafka 如需客户端证书，在配置中增加 `cert_file`、`key_file`，并将对应文件加入下述 TLS Secret。
+Doris 的 SQL 查询与 HTTP Stream Load 统一使用 DSN 中的用户名和密码，不再读取 `DORIS_USER`、`DORIS_PASSWORD`。使用独立账号，授予采集表所需的查询与写入权限。DSN 必须包含连接、读写超时和 UTC 会话设置；密码遵循 MySQL 驱动的 DSN 语法，不额外进行 URL 编码，开发环境仍支持空密码。迁移需单独执行，服务不会代为运行。Kafka 如需客户端证书，在配置中增加 `cert_file`、`key_file`，并将对应文件加入下述 TLS Secret。
+
+升级时从 Doris JSON 对象删除 `username_env`、`password_env`，否则严格配置校验会拒绝启动；Kafka 的同名字段继续保留。配套更新 ConfigMap、Secret 和 Consumer 镜像，并重建 Pod 加载 DSN；凭据在进程初始化时读取，运行期间不热更新。回滚时配套恢复旧镜像与旧配置。
 
 ```sh
 export SECRET_DIR="$PWD/.private/secrets"

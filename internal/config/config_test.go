@@ -86,6 +86,27 @@ func TestConsumerFlushConfiguration(t *testing.T) {
 	}
 }
 
+func TestRejectRemovedDorisCredentials(t *testing.T) {
+	for _, field := range []string{"username_env", "password_env"} {
+		data, err := os.ReadFile("../../configs/consumer.local.json")
+		if err != nil {
+			t.Fatal(err)
+		}
+		data = []byte(strings.Replace(string(data), `"dsn_env":`, strconv.Quote(field)+`: "OBSOLETE", "dsn_env":`, 1))
+		path := filepath.Join(t.TempDir(), "consumer.json")
+		if err := os.WriteFile(path, data, 0600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Read(path); err == nil {
+			t.Fatalf("removed Doris field %s accepted", field)
+		}
+	}
+	// Kafka still uses independent SASL credentials.
+	if _, err := Read("../../configs/consumer.production.example.json"); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestRejectRemovedAdmissionFields(t *testing.T) {
 	for _, component := range []string{"observer", "consumer"} {
 		for _, field := range []string{"accepted_service_ids", "accepted_request_hosts"} {

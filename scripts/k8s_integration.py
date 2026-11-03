@@ -123,8 +123,7 @@ def suite_resources(root, namespace, images):
             container['envFrom'] = [{'secretRef': {'name': 'llm-token-stats-e2e-credentials'}}]
         items += group
     items.append(resource('Secret', 'llm-token-stats-e2e-credentials', namespace, stringData={
-        'DORIS_DSN': 'root@tcp(llm-token-stats-doris:9030)/metering_development?timeout=5s&readTimeout=30s&writeTimeout=10s&interpolateParams=true&time_zone=%27%2B00%3A00%27',
-        'DORIS_USER': 'root', 'DORIS_PASSWORD': ''}))
+        'DORIS_DSN': 'root@tcp(llm-token-stats-doris:9030)/metering_development?timeout=5s&readTimeout=30s&writeTimeout=10s&interpolateParams=true&time_zone=%27%2B00%3A00%27'}))
     items.append(resource('ConfigMap', 'llm-token-stats-e2e-gateway', namespace, data={'envoy.json': json.dumps(bootstrap(root, namespace))}))
     gateway = resource('Pod', 'llm-token-stats-e2e-gateway', namespace, spec={
         'automountServiceAccountToken': False, 'containers': [{
@@ -141,7 +140,7 @@ def suite_resources(root, namespace, images):
     return {'apiVersion': 'v1', 'kind': 'List', 'items': items}
 
 
-def job_resources(namespace, image):
+def job_resources(namespace, image, consumer_image):
     name = 'llm-token-stats-collection-integration'
     account = resource('ServiceAccount', name, namespace)
     role = resource('Role', name, namespace, rules=[
@@ -159,6 +158,7 @@ def job_resources(namespace, image):
                                           'containers': [{'name': 'tests', 'image': image, 'imagePullPolicy': 'IfNotPresent',
                                                           'env': [{'name': 'METERING_TEST_NAMESPACE', 'value': namespace},
                                                                   {'name': 'METERING_TEST_IMAGE', 'value': image},
+                                                                  {'name': 'METERING_CONSUMER_IMAGE', 'value': consumer_image},
                                                                   {'name': 'POD_IP', 'valueFrom': {'fieldRef': {'fieldPath': 'status.podIP'}}}],
                                                           'resources': {'requests': {'cpu': '100m', 'memory': '128Mi'},
                                                                         'limits': {'cpu': '2', 'memory': '512Mi'}}}]}}}}
@@ -182,7 +182,7 @@ def run_suite(harness, root, migrations, render_sql):
         harness.kubectl('-n', harness.namespace, 'rollout', 'status', 'deployment/' + name, '--timeout=180s', timeout=195)
     harness.apply(gateway)
     harness.kubectl('-n', harness.namespace, 'wait', '--for=condition=Ready', 'pod/llm-token-stats-e2e-gateway', '--timeout=120s', timeout=135)
-    manifest = job_resources(harness.namespace, harness.images['integration'])
+    manifest = job_resources(harness.namespace, harness.images['integration'], harness.images['consumer'])
     (harness.output / 'integration-job.json').write_text(json.dumps(manifest, indent=2))
     harness.apply(manifest)
     deadline = time.monotonic() + 1350

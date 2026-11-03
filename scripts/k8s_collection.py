@@ -102,7 +102,6 @@ def cluster_configs(topic, group, database="metering_development"):
     credentials = {
         'DORIS_DSN': ('root@tcp(llm-token-stats-doris:9030)/' + database + '?timeout=5s&readTimeout=30s'
                       '&writeTimeout=10s&interpolateParams=true&time_zone=%27%2B00%3A00%27'),
-        'DORIS_USER': 'root', 'DORIS_PASSWORD': '',
     }
     return observer, consumer, credentials
 

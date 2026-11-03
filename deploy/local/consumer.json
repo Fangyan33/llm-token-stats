@@ -19,8 +19,6 @@
       "doris:8040"
     ],
     "database": "metering_development",
-    "dsn_env": "DORIS_DSN",
-    "username_env": "DORIS_USER",
-    "password_env": "DORIS_PASSWORD"
+    "dsn_env": "DORIS_DSN"
   }
 }

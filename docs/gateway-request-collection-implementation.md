@@ -846,9 +846,7 @@ Consumer：
       "doris-be-0.doris-be.doris.svc.cluster.local:8040"
     ],
     "database": "metering",
-    "dsn_env": "DORIS_DSN",
-    "username_env": "DORIS_USER",
-    "password_env": "DORIS_PASSWORD"
+    "dsn_env": "DORIS_DSN"
   }
 }
 ```

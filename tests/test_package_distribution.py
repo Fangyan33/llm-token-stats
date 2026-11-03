@@ -104,6 +104,9 @@ class DistributionTests(unittest.TestCase):
             self.assertNotIn('accepted_service_ids', settings)
             self.assertNotIn('accepted_request_hosts', settings)
         self.assertEqual(consumer['doris']['database'], 'offline_data')
+        self.assertNotIn('username_env', consumer['doris'])
+        self.assertNotIn('password_env', consumer['doris'])
+        self.assertEqual(set(objects['llm-token-stats-consumer-credentials']['data']), {'DORIS_DSN'})
         self.assertEqual(consumer['doris']['fe_url'], 'http://llm-token-stats-doris.isolated.svc.cluster.local:8040')
         sql = objects['llm-token-stats-doris-migrations']['data']
         self.assertEqual(list(sql), list(bundle.MIGRATIONS))

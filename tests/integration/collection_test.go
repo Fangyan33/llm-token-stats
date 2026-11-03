@@ -248,10 +248,8 @@ func eventsUUID(s string) bool { return observationwire.UUID(s) }
 func localStore(t *testing.T, target string) *doris.Store {
 	t.Helper()
 	t.Setenv("METERING_TEST_DSN", dsn)
-	t.Setenv("METERING_TEST_USER", "root")
-	t.Setenv("METERING_TEST_PASS", "")
 	u, _ := url.Parse(target)
-	s, err := doris.New(config.Doris{FE: target, AllowedHosts: []string{u.Host}, DSNEnv: "METERING_TEST_DSN", UsernameEnv: "METERING_TEST_USER", PasswordEnv: "METERING_TEST_PASS", Database: "metering_development"})
+	s, err := doris.New(config.Doris{FE: target, AllowedHosts: []string{u.Host}, DSNEnv: "METERING_TEST_DSN", Database: "metering_development"})
 	if err != nil {
 		t.Fatal(err)
 	}

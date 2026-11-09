@@ -12,6 +12,8 @@ LLM Token Stats 在网关旁路观察大模型请求和响应，提取模型返�
 当前请求标识分为：Observer 生成的内部 `observation_id`、Wasm 从 `logical_request_id_headers` 有序列表提取的可空客户端 `logical_request_id`，以及网关可见的 `x_request_id`。候选列表缺省或为空时不采集客户端 ID；最多 8 个头，取首个非空且匹配 `[A-Za-z0-9._:-]{1,128}` 的单值，跳过缺失、非法或重复头，不截断、不补值。配置示例按 `x-client-request-id`、`request_id` 排序。客户端 ID 可重复，内部关联和计数统一使用 `observation_id`；采集插件不再注入 `X-Metering-Request-Id`。Kafka 事件保持唯一的 `schema_version=1` 契约，当前模型直接采用上述字段语义。详情见[采集标识契约](docs/gateway-request-collection-implementation.md#22-请求标识及时间)。
 
 
+流式请求已增加网关首末有效生成内容时间观测，Doris 明细视图派生 TTFT/TPOT；不估算 token，缺少输出量时仅保留可测 TTFT，非流式两项为 NULL。见[请求性能指标](docs/request-performance.md)。
+
 ## 架构与组件职责
 
 ```mermaid

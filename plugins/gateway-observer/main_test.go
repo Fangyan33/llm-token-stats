@@ -534,3 +534,47 @@ func TestConfiguredGatewayIdentityRejected(t *testing.T) {
 		t.Fatalf("missing rejection metric: %d %v", n, err)
 	}
 }
+
+func TestResponseChunksShareCallbackTime(t *testing.T) {
+	h := testHost(t)
+	id := h.InitializeHttpContext()
+	h.CallOnRequestHeaders(id, [][2]string{{":method", "POST"}, {":path", "/v1/chat/completions"}, {":authority", "model.example.invalid"}, {"content-type", "application/json"}}, false)
+	h.CallOnRequestBody(id, []byte(`{"stream":true}`), true)
+	h.CallOnResponseHeaders(id, [][2]string{{":status", "200"}, {"content-type", "text/event-stream"}}, false)
+	if h.CallOnResponseBody(id, bytes.Repeat([]byte("x"), 40000), true) != types.ActionContinue {
+		t.Fatal("timing paused response")
+	}
+	var elapsed *int64
+	count := 0
+	calls := proxytest.GrpcCalls()
+	if len(calls) != 1 {
+		t.Fatalf("observation streams=%d", len(calls))
+	}
+	for _, b := range calls[0].Messages {
+		var f pb.ObservationFrame
+		if err := proto.Unmarshal(b, &f); err != nil {
+			t.Fatal(err)
+		}
+		c := f.GetBodyChunk()
+		if c == nil {
+			continue
+		}
+		if c.Direction == pb.Direction_REQUEST {
+			if c.ObservedElapsedUs != nil {
+				t.Fatal("request got response time")
+			}
+			continue
+		}
+		if c.ObservedElapsedUs == nil || *c.ObservedElapsedUs < 0 {
+			t.Fatal("response time missing")
+		}
+		if elapsed != nil && *elapsed != *c.ObservedElapsedUs {
+			t.Fatal("split callback timings differ")
+		}
+		elapsed = c.ObservedElapsedUs
+		count++
+	}
+	if count != 3 {
+		t.Fatalf("chunks=%d", count)
+	}
+}

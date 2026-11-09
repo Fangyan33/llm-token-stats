@@ -151,6 +151,22 @@ class CollectionContractsTest(unittest.TestCase):
         event['request_headers'] = dict(reversed(list(event['request_headers'].items())))
         self.assertEqual(contracts.event_hashes(event), contracts.event_hashes(self.event))
 
+    def test_response_timing_metadata(self):
+        event = copy.deepcopy(self.event)
+        event.update(response_streaming=True, first_output_elapsed_us=100000, last_output_elapsed_us=300000)
+        contracts.validate_event(event)
+        for changes in ({'response_streaming': False}, {'response_streaming': None},
+                        {'last_output_elapsed_us': 99999}, {'first_output_elapsed_us': None},
+                        {'first_output_elapsed_us': -1}, {'last_output_elapsed_us': 9223372036854775808}):
+            bad = copy.deepcopy(event)
+            bad.update(changes)
+            with self.assertRaises(contracts.ContractError):
+                contracts.validate_event(bad)
+        started = contracts.load(ROOT / 'testdata/collection/request-started.json')
+        started['response_streaming'] = True
+        with self.assertRaises(contracts.ContractError):
+            contracts.validate_event(started)
+
     def test_unknown_customer_can_have_eligible_usage(self):
         event = copy.deepcopy(self.event)
         event.update(api_key_id=None, customer_id=None, customer_name=None,

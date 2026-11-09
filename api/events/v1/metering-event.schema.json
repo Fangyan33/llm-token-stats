@@ -5,6 +5,9 @@
   "type": "object",
   "additionalProperties": false,
   "required": [
+    "response_streaming",
+    "first_output_elapsed_us",
+    "last_output_elapsed_us",
     "user_id",
     "user_agent",
     "request_headers",
@@ -56,6 +59,28 @@
     "customer_name"
   ],
   "properties": {
+    "response_streaming": {
+      "type": [
+        "boolean",
+        "null"
+      ]
+    },
+    "first_output_elapsed_us": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 0,
+      "maximum": 9223372036854775807
+    },
+    "last_output_elapsed_us": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 0,
+      "maximum": 9223372036854775807
+    },
     "user_id": {
       "type": [
         "string",
@@ -638,6 +663,60 @@
           },
           "terminal_observed": {
             "const": true
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "event_type": {
+            "const": "request_started"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "response_streaming": {
+            "const": null
+          },
+          "first_output_elapsed_us": {
+            "const": null
+          },
+          "last_output_elapsed_us": {
+            "const": null
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "first_output_elapsed_us": {
+            "type": "integer"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "response_streaming": {
+            "const": true
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "last_output_elapsed_us": {
+            "type": "integer"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "first_output_elapsed_us": {
+            "type": "integer"
           }
         }
       }

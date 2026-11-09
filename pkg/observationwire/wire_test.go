@@ -48,3 +48,15 @@ func TestRequestHeaderMapWireValidation(t *testing.T) {
 		}
 	}
 }
+
+func TestResponseElapsedWire(t *testing.T) {
+	chunk := UInt(UInt(nil, 1, 2), 6, 0)
+	if Validate(Frame(1, 12, chunk), "frame") != nil {
+		t.Fatal("present zero elapsed rejected")
+	}
+	for _, bad := range [][]byte{UInt(chunk, 6, 1), String(UInt(nil, 1, 2), 6, "wrong-wire")} {
+		if Validate(Frame(1, 12, bad), "frame") == nil {
+			t.Fatal("invalid elapsed metadata accepted")
+		}
+	}
+}

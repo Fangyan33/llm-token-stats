@@ -58,6 +58,7 @@ message BodyChunk {
   uint64 offset = 3;               // 每方向从 0 开始的正文绝对字节偏移
   bytes data = 4;
   bool end_stream = 5;             // 仅当前回调最后一个子片设置
+  optional int64 observed_elapsed_us = 6; // 响应回调距请求头的微秒耗时；同回调拆片相同，缺失或负值不用于计时
 }
 
 message End {

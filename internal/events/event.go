@@ -91,6 +91,9 @@ func Decode(b, key []byte, now time.Time) (*Event, error) {
 	if _, err := Canonical(&e); err != nil {
 		return nil, err
 	}
+	if !timingValid(&e) {
+		return nil, errors.New("event_timing")
+	}
 	if e.EventType == "request_started" {
 		return &e, nil
 	}
@@ -235,6 +238,24 @@ func mappingValid(e *Event) bool {
 		}
 	} else if e.ApiKeyID != nil || e.CustomerID != nil || e.CustomerMappingVersion != nil || e.CustomerName != nil {
 		return false
+	}
+	return true
+}
+
+// Timing metadata is optional; invalid clocks degrade in Observer before emit.
+func timingValid(e *Event) bool {
+	if e.EventType == "request_started" && (e.ResponseStreaming != nil || e.FirstOutputElapsedUS != nil || e.LastOutputElapsedUS != nil) {
+		return false
+	}
+	if e.FirstOutputElapsedUS != nil {
+		if e.ResponseStreaming == nil || !*e.ResponseStreaming || *e.FirstOutputElapsedUS < 0 {
+			return false
+		}
+	}
+	if e.LastOutputElapsedUS != nil {
+		if e.FirstOutputElapsedUS == nil || *e.LastOutputElapsedUS < *e.FirstOutputElapsedUS {
+			return false
+		}
 	}
 	return true
 }

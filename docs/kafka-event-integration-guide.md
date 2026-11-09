@@ -80,6 +80,9 @@ UUIDv4 不包含时间。`request_started_at_ms` 仍由网关观察并作为事�
 | `customer_name` | 字符串 / 是 | 请求发生时的客户名称快照，非空合法 UTF-8、最多 512 字节；对应解析失败为 null。两类事件一致，重命名不覆盖历史。 |
 | `identity_status` | 字符串 / 否 | 客户接口完整成功时 known，否则 invalid；不表示鉴权判定，invalid 不进入有效客户汇总。 |
 | `request_started_at_ms` | 整数 / 否 | 网关观察到请求头的开始时间，也是统计归属和 UTC `request_date` 的来源；与 UUIDv4 独立，同一请求的两种事件必须一致。 |
+| `response_streaming` | 布尔值 / 是 | 响应类型：SSE 为 true、JSON 为 false，未知类型为 null；start 为 null。 |
+| `first_output_elapsed_us` | 整数 / 是 | 首有效生成内容距网关请求头的微秒耗时；start、非流式或未知为 null。 |
+| `last_output_elapsed_us` | 整数 / 是 | 最后观测的有效生成内容距网关请求头的微秒耗时；不表示响应已完整，未知为 null。 |
 | `observation_ended_at_ms` | 整数 / 是 | Observer 结束本次观察的时间；start 尚未结束时为 `null`。它不等于网关确认业务请求结束。 |
 | `request_finished_at_ms` | 整数 / 是 | 网关有效 End 中取得的请求结束时间；未收到有效 End 时为 `null`，不能补当前时间。 |
 | `event_created_at_ms` | 整数 / 否 | Observer 创建此 Kafka 事件的时间；通常晚于请求开始时间。 |
@@ -161,6 +164,9 @@ UUIDv4 不包含时间。`request_started_at_ms` 仍由网关观察并作为事�
   "customer_mapping_status": "mapped",
   "identity_status": "known",
   "request_started_at_ms": 1789862400000,
+  "response_streaming": true,
+  "first_output_elapsed_us": 100000,
+  "last_output_elapsed_us": 1100000,
   "observation_ended_at_ms": 1789862401200,
   "request_finished_at_ms": 1789862401195,
   "event_created_at_ms": 1789862401201,
@@ -497,3 +503,5 @@ public class MeteringConsumer {
 ## 用户与扩展请求头
 
 事件新增 `user_id`、`user_agent`、`request_headers` 三个必填键：前两项可为 `null`，扩展头为字符串 Map，无有效项为 `{}`。Wasm 的 `user_id_header` 为有序候选列表；默认读取 `user-id`。两个事件保存相同快照；用户 ID 纳入日/月汇总维度。配置、预算与查询示例见[请求头采集说明](request-header-collection.md)。
+
+TTFT/TPOT 不进入 Kafka 事件；Doris 根据上述时间事实和上报输出量在明细视图中派生，参见[请求性能指标](request-performance.md)。

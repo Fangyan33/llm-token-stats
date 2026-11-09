@@ -1,4 +1,7 @@
 {
+  "response_streaming": null,
+  "first_output_elapsed_us": null,
+  "last_output_elapsed_us": null,
   "user_id": null,
   "user_agent": null,
   "request_headers": {},

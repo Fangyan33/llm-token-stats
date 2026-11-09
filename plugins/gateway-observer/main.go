@@ -645,6 +645,9 @@ func (h *httpContext) OnHttpRequestBody(n int, eos bool) types.Action {
 	return types.ActionContinue
 }
 func (h *httpContext) observeBuffer(d, n int, eos bool) {
+	h.observeBufferAt(d, n, eos, time.Now())
+}
+func (h *httpContext) observeBufferAt(d, n int, eos bool, observedAt time.Time) {
 	if !h.root.active(h.s) {
 		return
 	}
@@ -666,9 +669,12 @@ func (h *httpContext) observeBuffer(d, n int, eos bool) {
 		h.root.drop(h.s, "body_read_failed")
 		return
 	}
-	h.observeBytes(d, b, eos, false)
+	h.observeBytesAt(d, b, eos, observedAt)
 }
 func (h *httpContext) observeBytes(d int, b []byte, eos, full bool) {
+	h.observeBytesAt(d, b, eos, time.Now())
+}
+func (h *httpContext) observeBytesAt(d int, b []byte, eos bool, observedAt time.Time) {
 	s, r := h.s, h.root
 	if !r.active(s) || s.eos[d] {
 		return
@@ -676,6 +682,7 @@ func (h *httpContext) observeBytes(d int, b []byte, eos, full bool) {
 	if !h.bodyCapacity(d, len(b), eos) {
 		return
 	}
+	observed := observedAt.Sub(s.started).Microseconds()
 	chunks := (len(b) + int(h.cfg.ChunkBytes) - 1) / int(h.cfg.ChunkBytes)
 	if chunks == 0 && eos {
 		chunks = 1
@@ -687,6 +694,9 @@ func (h *httpContext) observeBytes(d int, b []byte, eos, full bool) {
 		v = w.UInt(v, 2, s.bodySeq[d]+1)
 		v = w.UInt(v, 3, s.offset[d])
 		v = w.Bytes(v, 4, b[from:to])
+		if d == 1 {
+			v = w.UInt(v, 6, uint64(observed))
+		}
 		end := eos && i == chunks-1
 		if end {
 			v = w.UInt(v, 5, 1)
@@ -748,8 +758,9 @@ func (h *httpContext) OnHttpResponseHeaders(_ int, eos bool) types.Action {
 	return types.ActionContinue
 }
 func (h *httpContext) OnHttpResponseBody(n int, eos bool) types.Action {
+	observedAt := time.Now()
 	if h.selected {
-		h.observeBuffer(1, n, eos)
+		h.observeBufferAt(1, n, eos, observedAt)
 	}
 	return types.ActionContinue
 }

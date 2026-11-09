@@ -241,6 +241,9 @@ def validate_event(event, kafka_key=None, now_ms=None, input_size=None):
         require("identity_invalid" in event["anomaly_codes"], "identity_invalid_code")
     require(event["anomaly_codes"] == sorted(event["anomaly_codes"]), "anomaly_order")
     validate_raw_usage(event["raw_usage_json"])
+    first, last = event['first_output_elapsed_us'], event['last_output_elapsed_us']
+    require(first is None or event['response_streaming'] is True, 'timing_streaming')
+    require(last is None or first is not None and last >= first, 'timing_order')
     started = event["request_started_at_ms"]
     if now_ms is not None:
         require(started <= now_ms + 300000, "future_request_time")
@@ -380,7 +383,7 @@ def validate_repository():
             row = re.search(r"^\| " + re.escape(name) + r" \|.*?\| (\d+) \|", doc, re.M)
             require(row is not None and int(row.group(1)) == value, "config_table_drift:" + name)
     ddl = (ROOT / "migrations/doris/metering/001_init.sql").read_text(encoding="utf-8")
-    columns = set(re.findall(r"^\s+(\w+)\s+(?:DATE|VARCHAR|CHAR|BIGINT|SMALLINT|INT|STRING|TINYINT|ARRAY|MAP|DATETIME)", ddl, re.M))
+    columns = set(re.findall(r"^\s+(\w+)\s+(?:DATE|VARCHAR|CHAR|BIGINT|SMALLINT|INT|STRING|TINYINT|BOOLEAN|ARRAY|MAP|DATETIME)", ddl, re.M))
     fields = load(ROOT / "api/events/v1/metering-event.schema.json")["properties"]
     require(set(fields) - {"usage"} <= columns, "event_doris_column_drift")
     require(all(n in columns and n + "_source" in columns for n in TOKEN_NAMES), "token_doris_column_drift")

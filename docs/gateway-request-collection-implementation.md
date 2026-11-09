@@ -169,6 +169,7 @@ message BodyChunk {
   uint64 offset = 3;               // 每方向从 0 开始的正文绝对字节偏移
   bytes data = 4;
   bool end_stream = 5;             // 仅当前回调最后一个子片设置
+  optional int64 observed_elapsed_us = 6; // 响应回调距请求头的微秒耗时；同回调拆片相同，缺失或负值不用于计时
 }
 
 message End {
@@ -1114,3 +1115,7 @@ Consumer、Observer、插件和 SDK 扩展已实现，标准代码已由 protoc 
 - [Proxy-Wasm ABI 0.2.1](https://github.com/proxy-wasm/spec/blob/main/abi-versions/v0.2.1/README.md)、[SDK v0.24.0 生命周期回调](https://github.com/tetratelabs/proxy-wasm-go-sdk/blob/v0.24.0/proxywasm/internal/abi_callback_lifecycle.go)、[HTTP callout 回调](https://github.com/tetratelabs/proxy-wasm-go-sdk/blob/v0.24.0/proxywasm/internal/abi_callback_l7.go)
 - [franz-go v1.18.1 配置实现](https://github.com/twmb/franz-go/blob/v1.18.1/pkg/kgo/config.go)、[producer 实现](https://github.com/twmb/franz-go/blob/v1.18.1/pkg/kgo/producer.go)
 - [Doris Unique Key](https://doris.apache.org/docs/4.x/table-design/data-model/unique/)、[普通视图](https://doris.apache.org/docs/4.x/sql-manual/sql-statements/table-and-view/view/CREATE-VIEW/)
+
+## 请求性能时间事实
+
+Wasm 在响应正文回调入口采集 `BodyChunk.observed_elapsed_us`，同一次回调拆片共用该时间。Observer 解析有效生成内容，仅在结果事件增加 `response_streaming`、`first_output_elapsed_us`、`last_output_elapsed_us`；开始事件均为 null。时间缺失或倒退只降级相应时间字段，不改变 usage 接纳。Consumer 按原值写入 Doris，明细视图计算 TTFT/TPOT；不使用 tokenizer，也不保存逐片段时间列表。详细口径、NULL 条件及查询示例见[请求性能指标](request-performance.md)。

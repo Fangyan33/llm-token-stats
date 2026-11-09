@@ -2,7 +2,7 @@
 
 本文描述当前唯一采集模型，面向开发、运维和数据使用者。实体表的类型、键、说明来自仓库 DDL；视图类型及可空性按 SQL 和既有类型推导，需在目标 Doris 4.1.3 核验。整数显示宽度和 DECIMALV3 名称归一化为 SQL 类型。
 
-覆盖 10 张实体表、125 个实体字段，以及 5 个逻辑视图、203 个逻辑视图字段，以及 2 个异步物化视图。当前本地 Consumer 写入 metering_development；迁移仅定义当前最终结构，不提供旧开发库的原地升级。
+覆盖 10 张实体表、128 个实体字段，以及 5 个逻辑视图、215 个逻辑视图字段，以及 2 个异步物化视图。当前本地 Consumer 写入 metering_development；迁移仅定义当前最终结构，不提供旧开发库的原地升级。
 
 ## 使用口径
 
@@ -11,7 +11,7 @@
 - Observer 支持 HTTP/HTTPS 归属查询，环境仅接受 prd/stg/dev；ID 与服务、供应商和客户名称作为请求快照保存。默认缓存成功结果 30 分钟，瞬时故障最多再沿用 15 分钟并保持 mapped；明确错误作废旧值。名称可能来自缓存，历史记录不补写；空 URI 或无可用结果侧为 NULL。
 - 采集范围由 Wasm 的 accepted_request_hosts 统一筛选；无效或不匹配的 Host 不产生观察事件，Observer / Consumer 不做服务或 Host 白名单过滤，历史诊断仍按原契约保存。
 - 观察取消后保留已完成的单侧归属，未返回侧在原查询截止时间复核旧值回退资格；无法回退时标为 lookup_timeout，快照冻结后不接受迟到回写。
-- 全部时间按 UTC。Unix 毫秒字段带 _ms；DATETIME(3) 是 UTC 审计时间。offset 仅在同一 topic/分区比较，first/last 包含，next 不包含。
+- 绝对时间按 UTC；*_at_ms 为 Unix 毫秒，*_elapsed_us 为相对网关请求头的微秒耗时，ttft_ms/tpot_ms 是视图派生毫秒值；DATETIME(3) 是 UTC 审计时间。offset 仅在同一 topic/分区比较，first/last 包含，next 不包含。
 - Unique Key 是 Doris 幂等键。下述关系是应用逻辑关联，没有声明数据库外键。协调表不是数据库锁，也不使 Kafka/Doris 成为分布式事务。
 - usage-worker 已实现 T+1 日/月物化视图刷新、恢复及自然月清理；统计 HTTP API 尚未实现。本地测试不代表生产验收。
 
@@ -54,6 +54,7 @@ flowchart TD
   event_conflicts -. 排除同事件冲突 .-> event_details
   events_raw --> requests
   request_conflict_ids --> requests
+  event_details --> requests
   event_details --> usage_effective
   requests --> usage_effective
   events_raw --> request_statistics
@@ -120,6 +121,9 @@ flowchart TD
 | identity_status | VARCHAR(16) | 否 | 未声明 | — | 客户归属状态：known 或 invalid；仅完整客户解析成功为 known，不表示鉴权判定 |
 | identity_hash | CHAR(64) | 否 | 未声明 | — | 固定十七项归属与部署及用户快照元组的规范 SHA-256，不含原始密钥或诊断路由 |
 | request_started_at_ms | BIGINT | 否 | 未声明 | — | 网关观察到请求头的 Unix 毫秒时间；决定 UTC 统计日期 |
+| response_streaming | BOOLEAN | 是 | 未声明 | — | 响应是否流式；未知为 NULL |
+| first_output_elapsed_us | BIGINT | 是 | 未声明 | — | 首个有效生成内容相对请求头的微秒耗时；未知为 NULL |
+| last_output_elapsed_us | BIGINT | 是 | 未声明 | — | 最后观测的有效生成内容相对请求头的微秒耗时；未知为 NULL |
 | observation_ended_at_ms | BIGINT | 是 | 未声明 | — | Observer 结束观察的 Unix 毫秒时间；start 为 NULL，不等于业务结束时间 |
 | request_finished_at_ms | BIGINT | 是 | 未声明 | — | 有效网关 End 提供的请求结束 Unix 毫秒时间；未收到有效 End 时为 NULL |
 | event_created_at_ms | BIGINT | 否 | 未声明 | — | Observer 创建此事件的 Unix 毫秒时间，不作为请求统计日期 |
@@ -420,13 +424,13 @@ GAP、未生成、过期与已确认零请求分别展示。
 
 **作用：** 事件业务字段明细投影。
 
-直接从 events_raw 排除同事件内容冲突并投影业务字段，省去内部 Kafka 坐标、入库时间等字段；请求级冲突还需通过 requests 判断。
+直接从 events_raw 排除同事件内容冲突并投影业务字段，按网关时间事实派生 TTFT/TPOT；请求级冲突还需通过 requests 判断。
 
 | 属性 | 说明 |
 | --- | --- |
 | 类型 | 逻辑视图，无物理数据副本 |
 | 写入者 | 逻辑视图，无独立写入 |
-| 读取者 | 明细查询、usage_effective |
+| 读取者 | 明细查询、requests、usage_effective |
 | 数据粒度 | 一个无同事件内容冲突的事件 |
 | 唯一键 | 无独立唯一键 |
 | 分区、分桶及保留 | 无物理存储，继承基础表在线范围 |
@@ -468,6 +472,9 @@ GAP、未生成、过期与已确认零请求分别展示。
 | provider_id | VARCHAR(128) | 是 | —（派生） | — | 服务接口返回的服务所属供应商 ID；未知为 NULL，不代表隐藏的实际执行方 |
 | identity_status | VARCHAR(16) | 否 | —（派生） | — | 客户归属状态：known 或 invalid；仅完整客户解析成功为 known，不表示鉴权判定 |
 | request_started_at_ms | BIGINT | 否 | —（派生） | — | 网关观察到请求头的 Unix 毫秒时间；决定 UTC 统计日期 |
+| response_streaming | BOOLEAN | 是 | —（派生） | — | 响应是否流式；未知为 NULL |
+| first_output_elapsed_us | BIGINT | 是 | —（派生） | — | 首个有效生成内容相对请求头的微秒耗时；未知为 NULL |
+| last_output_elapsed_us | BIGINT | 是 | —（派生） | — | 最后观测的有效生成内容相对请求头的微秒耗时；未知为 NULL |
 | observation_ended_at_ms | BIGINT | 是 | —（派生） | — | Observer 结束观察的 Unix 毫秒时间；start 为 NULL，不等于业务结束时间 |
 | request_finished_at_ms | BIGINT | 是 | —（派生） | — | 有效网关 End 提供的请求结束 Unix 毫秒时间；未收到有效 End 时为 NULL |
 | event_created_at_ms | BIGINT | 否 | —（派生） | — | Observer 创建此事件的 Unix 毫秒时间，不作为请求统计日期 |
@@ -494,6 +501,8 @@ GAP、未生成、过期与已确认零请求分别展示。
 | reasoning_tokens_source | VARCHAR(16) | 是 | —（派生） | — | 输出中的推理 token 子项的来源：reported 或 unknown；开始事件为 NULL，不实现估算 |
 | reported_total_tokens | BIGINT | 是 | —（派生） | — | 服务单独上报的总 token 数；NULL 表示未知，0 表示服务报告的有效零值；子项不与父项重复相加 |
 | reported_total_tokens_source | VARCHAR(16) | 是 | —（派生） | — | 服务单独上报的总 token 数的来源：reported 或 unknown；开始事件为 NULL，不实现估算 |
+| ttft_ms | DOUBLE | 是 | —（派生） | — | 首有效输出延迟，毫秒；不可测为 NULL |
+| tpot_ms | DOUBLE | 是 | —（派生） | — | 请求整体每输出 token 耗时，毫秒；不可测为 NULL |
 | raw_usage_json | STRING | 否 | —（派生） | — | 仅含白名单数字用量字段的规范 JSON，不含正文或密钥；最多 4096 字节 |
 | raw_usage_truncated | TINYINT | 否 | —（派生） | — | 原始用量 JSON 是否因界限截断：1 是、0 否 |
 | anomaly_codes | ARRAY<VARCHAR(64)> | 否 | —（派生） | — | 固定、排序且去重的异常码数组；不包含任意错误文本 |
@@ -548,6 +557,8 @@ GAP、未生成、过期与已确认零请求分别展示。
 | request_finished_at_ms | BIGINT | 是 | —（派生） | — | 有效网关 End 提供的请求结束 Unix 毫秒时间；未收到有效 End 时为 NULL |
 | terminal_observed | TINYINT | 是 | —（派生） | — | 是否收到有效网关 End：1 是、0 否；为 0 时请求结束时间必须为 NULL |
 | business_outcome | VARCHAR(32) | 是 | —（派生） | — | 有没有观察到响应完整结束？response_complete、stream_incomplete 或 unknown；start 为 NULL |
+| ttft_ms | DOUBLE | 是 | —（派生） | — | 无请求冲突时的首输出延迟，毫秒 |
+| tpot_ms | DOUBLE | 是 | —（派生） | — | 无请求冲突时的每输出 token 耗时，毫秒 |
 | has_conflict | TINYINT | 否 | —（派生） | — | 请求是否有内容、时间、日期、归属或持久冲突标记：1 是、0 否；为 1 时禁止用于有效统计 |
 
 ## usage_effective
@@ -602,6 +613,9 @@ GAP、未生成、过期与已确认零请求分别展示。
 | provider_id | VARCHAR(128) | 是 | —（派生） | — | 服务接口返回的服务所属供应商 ID；未知为 NULL，不代表隐藏的实际执行方 |
 | identity_status | VARCHAR(16) | 否 | —（派生） | — | 客户归属状态：known 或 invalid；仅完整客户解析成功为 known，不表示鉴权判定 |
 | request_started_at_ms | BIGINT | 否 | —（派生） | — | 网关观察到请求头的 Unix 毫秒时间；决定 UTC 统计日期 |
+| response_streaming | BOOLEAN | 是 | —（派生） | — | 响应是否流式；未知为 NULL |
+| first_output_elapsed_us | BIGINT | 是 | —（派生） | — | 首个有效生成内容相对请求头的微秒耗时；未知为 NULL |
+| last_output_elapsed_us | BIGINT | 是 | —（派生） | — | 最后观测的有效生成内容相对请求头的微秒耗时；未知为 NULL |
 | observation_ended_at_ms | BIGINT | 是 | —（派生） | — | Observer 结束观察的 Unix 毫秒时间；start 为 NULL，不等于业务结束时间 |
 | request_finished_at_ms | BIGINT | 是 | —（派生） | — | 有效网关 End 提供的请求结束 Unix 毫秒时间；未收到有效 End 时为 NULL |
 | event_created_at_ms | BIGINT | 否 | —（派生） | — | Observer 创建此事件的 Unix 毫秒时间，不作为请求统计日期 |
@@ -628,6 +642,8 @@ GAP、未生成、过期与已确认零请求分别展示。
 | reasoning_tokens_source | VARCHAR(16) | 是 | —（派生） | — | 输出中的推理 token 子项的来源：reported 或 unknown；开始事件为 NULL，不实现估算 |
 | reported_total_tokens | BIGINT | 是 | —（派生） | — | 服务单独上报的总 token 数；NULL 表示未知，0 表示服务报告的有效零值；子项不与父项重复相加 |
 | reported_total_tokens_source | VARCHAR(16) | 是 | —（派生） | — | 服务单独上报的总 token 数的来源：reported 或 unknown；开始事件为 NULL，不实现估算 |
+| ttft_ms | DOUBLE | 是 | —（派生） | — | 首有效输出延迟，毫秒；不可测为 NULL |
+| tpot_ms | DOUBLE | 是 | —（派生） | — | 请求整体每输出 token 耗时，毫秒；不可测为 NULL |
 | raw_usage_json | STRING | 否 | —（派生） | — | 仅含白名单数字用量字段的规范 JSON，不含正文或密钥；最多 4096 字节 |
 | raw_usage_truncated | TINYINT | 否 | —（派生） | — | 原始用量 JSON 是否因界限截断：1 是、0 否 |
 | anomaly_codes | ARRAY<VARCHAR(64)> | 否 | —（派生） | — | 固定、排序且去重的异常码数组；不包含任意错误文本 |

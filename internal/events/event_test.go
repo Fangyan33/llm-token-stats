@@ -155,3 +155,51 @@ func TestMappingInvariantsAndSecretRejection(t *testing.T) {
 		}
 	}
 }
+
+func TestTimingContract(t *testing.T) {
+	data, err := os.ReadFile("../../testdata/collection/usage-known.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	base, err := Decode(data, []byte("7f6c2a90-4b13-4b68-9d21-67283e0c5f44"), time.Time{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name   string
+		change func(*Event)
+		valid  bool
+	}{
+		{"observed", func(e *Event) {
+			e.ResponseStreaming = Ptr(true)
+			e.FirstOutputElapsedUS = Ptr(int64(100000))
+			e.LastOutputElapsedUS = Ptr(int64(300000))
+		}, true},
+		{"zero", func(e *Event) {
+			e.ResponseStreaming = Ptr(true)
+			e.FirstOutputElapsedUS = Ptr(int64(0))
+			e.LastOutputElapsedUS = Ptr(int64(0))
+		}, true},
+		{"uncertain_last", func(e *Event) { e.ResponseStreaming = Ptr(true); e.FirstOutputElapsedUS = Ptr(int64(100000)) }, true},
+		{"non_streaming", func(e *Event) { e.ResponseStreaming = Ptr(false) }, true},
+		{"unknown_stream", func(e *Event) { e.FirstOutputElapsedUS = Ptr(int64(1)) }, false},
+		{"non_stream_time", func(e *Event) { e.ResponseStreaming = Ptr(false); e.FirstOutputElapsedUS = Ptr(int64(1)) }, false},
+		{"last_without_first", func(e *Event) { e.ResponseStreaming = Ptr(true); e.LastOutputElapsedUS = Ptr(int64(1)) }, false},
+		{"regression", func(e *Event) {
+			e.ResponseStreaming = Ptr(true)
+			e.FirstOutputElapsedUS = Ptr(int64(2))
+			e.LastOutputElapsedUS = Ptr(int64(1))
+		}, false},
+		{"negative", func(e *Event) { e.ResponseStreaming = Ptr(true); e.FirstOutputElapsedUS = Ptr(int64(-1)) }, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := *base
+			tc.change(&e)
+			b, _ := Canonical(&e)
+			_, err := Decode(b, []byte(e.ObservationID), time.Time{})
+			if (err == nil) != tc.valid {
+				t.Fatalf("valid=%v err=%v", tc.valid, err)
+			}
+		})
+	}
+}

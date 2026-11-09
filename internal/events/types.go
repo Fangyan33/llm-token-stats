@@ -15,6 +15,9 @@ type Usage struct {
 	ReportedTotalTokens Token `json:"reported_total_tokens"`
 }
 type Event struct {
+	ResponseStreaming      *bool             `json:"response_streaming"`
+	FirstOutputElapsedUS   *int64            `json:"first_output_elapsed_us"`
+	LastOutputElapsedUS    *int64            `json:"last_output_elapsed_us"`
 	UserID                 *string           `json:"user_id"`
 	UserAgent              *string           `json:"user_agent"`
 	RequestHeaders         map[string]string `json:"request_headers"`

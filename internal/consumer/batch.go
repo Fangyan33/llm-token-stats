@@ -97,6 +97,12 @@ func FreezeContext(ctx context.Context, rs []*kgo.Record, c config.Consumer, now
 				row[n] = 0
 			}
 		}
+		if e.ResponseStreaming != nil {
+			row["response_streaming"] = 0
+			if *e.ResponseStreaming {
+				row["response_streaming"] = 1
+			}
+		}
 		d := date(e.RequestStartedAtMs)
 		h := events.Hash(canonical)
 		row["request_date"] = d

@@ -287,10 +287,11 @@ func TestConsumerLongFlushRebalanceAndReplay(t *testing.T) {
 	}
 }
 
-func TestConsumerRealTenMinuteIdleFlush(t *testing.T) {
+func TestConsumerRealOneMinuteIdleFlush(t *testing.T) {
+	const flushInterval = time.Minute
 	db, cl := database(t), kafka(t)
 	topic, group := batchingTopic(t, cl)
-	h := startBatchingConsumer(t, topic, group, 20000, 16<<20, 600000)
+	h := startBatchingConsumer(t, topic, group, 20000, 16<<20, int(flushInterval.Milliseconds()))
 	eventually(t, func() bool { return h.health.Ready.Load() })
 	body, key := syntheticBatchUsage(t)
 	start := time.Now()
@@ -298,15 +299,15 @@ func TestConsumerRealTenMinuteIdleFlush(t *testing.T) {
 	eventually(t, func() bool { return h.worker.Client.UncommittedOffsets()[topic][0].Offset == 1 })
 	polled := time.Now()
 	// Bound the real monotonic wait; also keep observing Doris throughout the
-	// window, rather than proving only that the row exists ten minutes later.
-	deadline := polled.Add(11 * time.Minute)
+	// window, rather than proving only that the row exists one minute later.
+	deadline := polled.Add(flushInterval + time.Minute)
 	for time.Now().Before(deadline) {
 		var n int
 		if err := db.QueryRow("SELECT COUNT(*) FROM metering_development.events_raw WHERE kafka_topic=?", topic).Scan(&n); err != nil {
 			t.Fatal(err)
 		}
 		if n > 0 {
-			if time.Since(start) < 10*time.Minute {
+			if time.Since(start) < flushInterval {
 				t.Fatalf("premature flush after %v", time.Since(start))
 			}
 			waitBatchCommit(t, cl, topic, group, 0, 1)
@@ -315,5 +316,5 @@ func TestConsumerRealTenMinuteIdleFlush(t *testing.T) {
 		}
 		time.Sleep(time.Second)
 	}
-	t.Fatal("idle batch did not become visible within 11 minutes")
+	t.Fatal("idle batch did not become visible within 2 minutes")
 }

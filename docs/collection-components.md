@@ -216,7 +216,7 @@ Consumer 按 Kafka 分区跨多次拉取攒批：达到 `max_batch_rows`（默�
 
 600000 ms 是最大攒批等待预算，不是每隔 10 分钟才允许写库：条数/字节达到上限会提前写入；实际可见延迟还包括冻结、排队、数据库处理和重试。攒批时尚未发起 Doris 导入，不自动放宽 Doris HTTP/事务超时。提高上限不会自动修改默认参数或部署资源；启用大批次前需按实际分区数验收内存及处理耗时。
 
-20000 条、16 MiB 和真实十分钟到期写入的隔离 Kubernetes 验收结果见[大批次验收记录](spec/plan/consumer-batch-limits-verification.md)。
+20000 条、16 MiB 和历史十分钟到期写入的隔离 Kubernetes 验收结果见[大批次验收记录](spec/plan/consumer-batch-limits-verification.md)。当前空闲到期集成用例使用真实 1 分钟等待，持续检查不得提前写入，并验证到期后的数据可见性与 offset 提交；600000 ms 上限仍由配置与调度单元测试覆盖。
 
 [消费协调初始化](../migrations/doris/metering/002_consumer_coordination.sql)保存消费起点和保留期缺口；这些表及凭据/通知本轮不自动清理。新组持久登记 Kafka earliest；已有组缺少起点时通过 `initial_offsets` 明确接管。多份不兼容起点阻塞分区。已保存的恢复位置落后于 earliest 时登记缺口并暂停；经人工处置后，`gap_resume_offsets` 必须填写该分区当时的 earliest，不能填 latest。恢复新流量不会抹掉缺口或把历史覆盖改为可信。
 

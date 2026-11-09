@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 )
 
@@ -104,10 +105,23 @@ func main() {
 			}
 			out.Header().Set("Content-Type", "text/event-stream")
 			out.Header().Set("Trailer", "x-test-end")
+			performance := strings.HasPrefix(req.TestCase, "performance")
+			if performance {
+				fmt.Fprint(out, "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\"}}]}\n\n")
+				out.(http.Flusher).Flush()
+				time.Sleep(80 * time.Millisecond)
+			}
 			fmt.Fprint(out, "data: {\"model\":\"model-test\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"你好\"}}]}\n\n")
 			out.(http.Flusher).Flush()
-			time.Sleep(20 * time.Millisecond)
-			if req.TestCase != "missing_usage" {
+			if performance {
+				time.Sleep(80 * time.Millisecond)
+				fmt.Fprint(out, "data: {\"choices\":[{\"index\":1,\"delta\":{\"content\":\"world\"}}]}\n\n")
+				out.(http.Flusher).Flush()
+				time.Sleep(150 * time.Millisecond)
+			} else {
+				time.Sleep(20 * time.Millisecond)
+			}
+			if req.TestCase != "missing_usage" && req.TestCase != "performance_missing_usage" {
 				fmt.Fprint(out, "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":4,\"total_tokens\":14}}\n\n")
 			}
 			fmt.Fprint(out, "data: [DONE]\n\n")

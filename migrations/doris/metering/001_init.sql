@@ -43,6 +43,9 @@ CREATE TABLE IF NOT EXISTS metering.events_raw (
     identity_status VARCHAR(16) NOT NULL COMMENT '客户归属状态：known 或 invalid；仅完整客户解析成功为 known，不表示鉴权判定',
     identity_hash CHAR(64) NOT NULL COMMENT '固定十七项归属与部署及用户快照元组的规范 SHA-256，不含原始密钥或诊断路由',
     request_started_at_ms BIGINT NOT NULL COMMENT '网关观察到请求头的 Unix 毫秒时间；决定 UTC 统计日期',
+    response_streaming BOOLEAN NULL COMMENT '响应是否流式；未知为 NULL',
+    first_output_elapsed_us BIGINT NULL COMMENT '首个有效生成内容相对请求头的微秒耗时；未知为 NULL',
+    last_output_elapsed_us BIGINT NULL COMMENT '最后观测的有效生成内容相对请求头的微秒耗时；未知为 NULL',
     observation_ended_at_ms BIGINT NULL COMMENT 'Observer 结束观察的 Unix 毫秒时间；start 为 NULL，不等于业务结束时间',
     request_finished_at_ms BIGINT NULL COMMENT '有效网关 End 提供的请求结束 Unix 毫秒时间；未收到有效 End 时为 NULL',
     event_created_at_ms BIGINT NOT NULL COMMENT 'Observer 创建此事件的 Unix 毫秒时间，不作为请求统计日期',
@@ -181,6 +184,9 @@ CREATE VIEW IF NOT EXISTS metering.event_details (
     provider_id COMMENT '服务接口返回的服务所属供应商 ID；未知为 NULL，不代表隐藏的实际执行方',
     identity_status COMMENT '客户归属状态：known 或 invalid；仅完整客户解析成功为 known，不表示鉴权判定',
     request_started_at_ms COMMENT '网关观察到请求头的 Unix 毫秒时间；决定 UTC 统计日期',
+    response_streaming COMMENT '响应是否流式；未知为 NULL',
+    first_output_elapsed_us COMMENT '首个有效生成内容相对请求头的微秒耗时；未知为 NULL',
+    last_output_elapsed_us COMMENT '最后观测的有效生成内容相对请求头的微秒耗时；未知为 NULL',
     observation_ended_at_ms COMMENT 'Observer 结束观察的 Unix 毫秒时间；start 为 NULL，不等于业务结束时间',
     request_finished_at_ms COMMENT '有效网关 End 提供的请求结束 Unix 毫秒时间；未收到有效 End 时为 NULL',
     event_created_at_ms COMMENT 'Observer 创建此事件的 Unix 毫秒时间，不作为请求统计日期',
@@ -207,6 +213,8 @@ CREATE VIEW IF NOT EXISTS metering.event_details (
     reasoning_tokens_source COMMENT '输出中的推理 token 子项的来源：reported 或 unknown；开始事件为 NULL，不实现估算',
     reported_total_tokens COMMENT '服务单独上报的总 token 数；NULL 表示未知，0 表示服务报告的有效零值；子项不与父项重复相加',
     reported_total_tokens_source COMMENT '服务单独上报的总 token 数的来源：reported 或 unknown；开始事件为 NULL，不实现估算',
+    ttft_ms COMMENT '首有效输出延迟，毫秒；不可测为 NULL',
+    tpot_ms COMMENT '请求整体每输出 token 耗时，毫秒；不可测为 NULL',
     raw_usage_json COMMENT '仅含白名单数字用量字段的规范 JSON，不含正文或密钥；最多 4096 字节',
     raw_usage_truncated COMMENT '原始用量 JSON 是否因界限截断：1 是、0 否',
     anomaly_codes COMMENT '固定、排序且去重的异常码数组；不包含任意错误文本'
@@ -218,13 +226,15 @@ SELECT v.request_date, v.observation_id, v.event_id, v.payload_hash,
        v.deployment_environment, v.mapping_status, v.mapping_version, v.customer_mapping_status,
        v.customer_mapping_version, v.service_id, v.service_name, v.provider_name,
        v.customer_name, v.api_key_id, v.customer_id, v.provider_id,
-       v.identity_status, v.request_started_at_ms, v.observation_ended_at_ms, v.request_finished_at_ms,
+       v.identity_status, v.request_started_at_ms, v.response_streaming, v.first_output_elapsed_us, v.last_output_elapsed_us, v.observation_ended_at_ms, v.request_finished_at_ms,
        v.event_created_at_ms, v.request_model, v.response_model, v.http_status,
        v.upstream_attempt_count, v.response_flags, v.response_code_details, v.business_outcome,
        v.terminal_observed, v.observation_status, v.usage_status, v.usage_eligible,
        v.input_tokens, v.input_tokens_source, v.output_tokens, v.output_tokens_source,
        v.cached_read_tokens, v.cached_read_tokens_source, v.cached_write_tokens, v.cached_write_tokens_source,
        v.reasoning_tokens, v.reasoning_tokens_source, v.reported_total_tokens, v.reported_total_tokens_source,
+       CASE WHEN v.response_streaming = 1 AND v.first_output_elapsed_us >= 0 THEN CAST(v.first_output_elapsed_us AS DOUBLE) / 1000.0 END AS ttft_ms,
+       CASE WHEN v.response_streaming = 1 AND v.first_output_elapsed_us >= 0 AND v.last_output_elapsed_us >= v.first_output_elapsed_us AND v.terminal_observed = 1 AND v.observation_status = 'complete' AND v.usage_status <> 'conflict' AND v.output_tokens_source = 'reported' AND v.output_tokens > 1 THEN CAST(v.last_output_elapsed_us - v.first_output_elapsed_us AS DOUBLE) / 1000.0 / NULLIF(v.output_tokens - 1, 0) END AS tpot_ms,
        v.raw_usage_json, v.raw_usage_truncated, v.anomaly_codes
 FROM metering.events_raw v
 LEFT JOIN metering.event_conflicts c
@@ -265,6 +275,8 @@ CREATE VIEW IF NOT EXISTS metering.requests (
     request_finished_at_ms COMMENT '有效网关 End 提供的请求结束 Unix 毫秒时间；未收到有效 End 时为 NULL',
     terminal_observed COMMENT '是否收到有效网关 End：1 是、0 否；为 0 时请求结束时间必须为 NULL',
     business_outcome COMMENT '有没有观察到响应完整结束？response_complete、stream_incomplete 或 unknown；start 为 NULL',
+    ttft_ms COMMENT '无请求冲突时的首输出延迟，毫秒',
+    tpot_ms COMMENT '无请求冲突时的每输出 token 耗时，毫秒',
     has_conflict COMMENT '请求是否有内容、时间、日期、归属或持久冲突标记：1 是、0 否；为 1 时禁止用于有效统计'
 ) AS
 SELECT a.request_date, a.observation_id, a.logical_request_id, a.user_id, a.user_agent, a.request_headers, a.start_variants, a.usage_variants,
@@ -279,6 +291,8 @@ SELECT a.request_date, a.observation_id, a.logical_request_id, a.user_id, a.user
        CASE WHEN a.usage_variants = 1 THEN a.request_finished_at_ms END AS request_finished_at_ms,
        CASE WHEN a.usage_variants = 1 THEN a.terminal_observed ELSE 0 END AS terminal_observed,
        CASE WHEN a.usage_variants = 1 THEN a.business_outcome END AS business_outcome,
+       CASE WHEN a.start_variants <= 1 AND a.usage_variants = 1 AND a.started_count = 1 AND a.date_count = 1 AND a.identity_count = 1 AND a.name_count = 1 AND m.observation_id IS NULL THEN d.ttft_ms END AS ttft_ms,
+       CASE WHEN a.start_variants <= 1 AND a.usage_variants = 1 AND a.started_count = 1 AND a.date_count = 1 AND a.identity_count = 1 AND a.name_count = 1 AND m.observation_id IS NULL THEN d.tpot_ms END AS tpot_ms,
        CASE WHEN a.start_variants > 1 OR a.usage_variants > 1
                  OR a.started_count > 1 OR a.date_count > 1 OR a.identity_count > 1 OR a.name_count > 1
                  OR m.observation_id IS NOT NULL THEN 1 ELSE 0 END AS has_conflict
@@ -310,7 +324,8 @@ FROM (
     FROM metering.events_raw
     GROUP BY observation_id
 ) a
-LEFT JOIN metering.request_conflict_ids m ON a.observation_id = m.observation_id;
+LEFT JOIN metering.request_conflict_ids m ON a.observation_id = m.observation_id
+LEFT JOIN metering.event_details d ON a.observation_id = d.observation_id AND d.event_type = 'usage_observed';
 
 -- 有效用量明细视图：连接事件明细和请求诊断，筛选观察完整、终态有效、输入输出已知且无请求冲突的结果事件。
 -- 按当前质量规则判断统计资格，允许客户未知但用量有效的请求；原始未知值保持 NULL，统计资格不表示收费资格。
@@ -348,6 +363,9 @@ CREATE VIEW IF NOT EXISTS metering.usage_effective (
     provider_id COMMENT '服务接口返回的服务所属供应商 ID；未知为 NULL，不代表隐藏的实际执行方',
     identity_status COMMENT '客户归属状态：known 或 invalid；仅完整客户解析成功为 known，不表示鉴权判定',
     request_started_at_ms COMMENT '网关观察到请求头的 Unix 毫秒时间；决定 UTC 统计日期',
+    response_streaming COMMENT '响应是否流式；未知为 NULL',
+    first_output_elapsed_us COMMENT '首个有效生成内容相对请求头的微秒耗时；未知为 NULL',
+    last_output_elapsed_us COMMENT '最后观测的有效生成内容相对请求头的微秒耗时；未知为 NULL',
     observation_ended_at_ms COMMENT 'Observer 结束观察的 Unix 毫秒时间；start 为 NULL，不等于业务结束时间',
     request_finished_at_ms COMMENT '有效网关 End 提供的请求结束 Unix 毫秒时间；未收到有效 End 时为 NULL',
     event_created_at_ms COMMENT 'Observer 创建此事件的 Unix 毫秒时间，不作为请求统计日期',
@@ -374,6 +392,8 @@ CREATE VIEW IF NOT EXISTS metering.usage_effective (
     reasoning_tokens_source COMMENT '输出中的推理 token 子项的来源：reported 或 unknown；开始事件为 NULL，不实现估算',
     reported_total_tokens COMMENT '服务单独上报的总 token 数；NULL 表示未知，0 表示服务报告的有效零值；子项不与父项重复相加',
     reported_total_tokens_source COMMENT '服务单独上报的总 token 数的来源：reported 或 unknown；开始事件为 NULL，不实现估算',
+    ttft_ms COMMENT '首有效输出延迟，毫秒；不可测为 NULL',
+    tpot_ms COMMENT '请求整体每输出 token 耗时，毫秒；不可测为 NULL',
     raw_usage_json COMMENT '仅含白名单数字用量字段的规范 JSON，不含正文或密钥；最多 4096 字节',
     raw_usage_truncated COMMENT '原始用量 JSON 是否因界限截断：1 是、0 否',
     anomaly_codes COMMENT '固定、排序且去重的异常码数组；不包含任意错误文本'

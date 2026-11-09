@@ -206,7 +206,7 @@ func descriptor(kind string, n int) (int, bool, string, bool) {
 			return 2, true, "", true
 		}
 	case "chunk":
-		if n >= 1 && n <= 5 {
+		if n >= 1 && n <= 6 {
 			if n == 4 {
 				return 2, true, "", false
 			}

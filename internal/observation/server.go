@@ -235,6 +235,8 @@ func (s *Server) Observe(stream pb.ObservationService_ObserveServer) (result err
 		e.RequestModel = p.RequestModel
 		e.ResponseModel = p.ResponseModel
 		e.HTTPStatus = statusCode
+		e.ResponseStreaming = p.ResponseStreaming
+		e.FirstOutputElapsedUS, e.LastOutputElapsedUS = p.FirstOutputUS, p.LastOutputUS
 		e.Usage = p.Usage
 		e.RawUsageJSON = p.Raw
 		e.RawUsageTruncated = p.Truncated
@@ -408,6 +410,9 @@ func (s *Server) Observe(stream pb.ObservationService_ObserveServer) (result err
 							}
 						}
 						if valid {
+							if d == 1 && len(b.Data) > 0 {
+								p.SetElapsed(b.ObservedElapsedUs)
+							}
 							err := p.Feed(d == 0, b.Data, b.EndStream)
 							if err != nil {
 								valid = false

@@ -14,6 +14,12 @@ import (
 var ErrLimit = errors.New("parse_limit")
 
 type Parser struct {
+	ResponseStreaming           *bool
+	ElapsedUS                   *int64
+	FirstOutputUS, LastOutputUS *int64
+	timingBroken                bool
+	previousUS                  *int64
+
 	Request, Response, line, data              []byte
 	SSE, Done, ReqSupported, RespSupported     bool
 	RequestModel, ResponseModel                *string
@@ -45,6 +51,9 @@ func (p *Parser) Content(request bool, ct, enc string) {
 	} else {
 		p.RespSupported = supported
 		p.SSE = mt == "text/event-stream"
+		if err == nil && (mt == "application/json" || p.SSE) {
+			p.ResponseStreaming = events.Ptr(p.SSE)
+		}
 	}
 }
 func (p *Parser) Feed(request bool, b []byte, eos bool) error {
@@ -181,6 +190,9 @@ func (p *Parser) document(b []byte, sse bool) error {
 	var m map[string]json.RawMessage
 	if strictjson.Decode(b, &m) != nil || m == nil {
 		return errors.New("protocol_error")
+	}
+	if sse {
+		p.output(m)
 	}
 	if v, ok := m["model"]; ok {
 		p.ResponseModel = p.model(v)

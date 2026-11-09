@@ -110,9 +110,10 @@ func fetchRecords(part int32, start int64, count, size int) kgo.FetchTopicPartit
 }
 
 func TestBatchRowsAcrossPolls(t *testing.T) {
-	for _, rows := range []int{129, 5000} {
+	for _, rows := range []int{129, 5000, 20000} {
 		t.Run(strconv.Itoa(rows), func(t *testing.T) {
 			w, store, client := batchWorker(rows, 4<<20), &batchStore{}, &batchClient{}
+			w.Cfg.Consumer.FlushMS = 600000
 			client.onCommit = func() {
 				if len(store.loads) == 0 || store.loads[len(store.loads)-1].table != "consumer_batch_receipts" {
 					t.Fatal("committed before receipt confirmation")
@@ -183,7 +184,7 @@ func TestBatchByteBoundary(t *testing.T) {
 }
 
 func TestPartialBatchDeadlineWithoutNewRecords(t *testing.T) {
-	for _, ms := range []int{1000, 15000} {
+	for _, ms := range []int{1000, 15000, 600000} {
 		t.Run(strconv.Itoa(ms), func(t *testing.T) {
 			w, store, client := batchWorker(5000, 4<<20), &batchStore{}, &batchClient{}
 			w.Cfg.Consumer.FlushMS = ms
@@ -222,11 +223,8 @@ func TestPartitionBuffersAndRebalanceWindow(t *testing.T) {
 	w.processPartition(context.Background(), fetchRecords(1, 101, 2, 2), now.Add(200*time.Millisecond), false, store, client)
 	// The release window must not move forward when hot partitions replace
 	// their tails, otherwise continuous traffic could block rebalance forever.
-	if wait := w.pollWait(now.Add(900*time.Millisecond), time.Time{}); wait != 200*time.Millisecond {
+	if wait := w.pollWait(now.Add(900 * time.Millisecond)); wait != 200*time.Millisecond {
 		t.Fatalf("hot partition's tail deadline = %v", wait)
-	}
-	if wait := w.pollWait(now.Add(900*time.Millisecond), now.Add(time.Second)); wait != 100*time.Millisecond {
-		t.Fatalf("poll wait = %v", wait)
 	}
 	w.processPartition(context.Background(), fetchRecords(0, 0, 0, 0), time.Now(), true, store, client)
 	w.processPartition(context.Background(), fetchRecords(1, 0, 0, 0), time.Now(), true, store, client)
@@ -238,7 +236,7 @@ func TestPartitionBuffersAndRebalanceWindow(t *testing.T) {
 func TestFrozenBatchRetryAfterPartialPoll(t *testing.T) {
 	for _, failure := range []string{"load", "commit", "commit_code"} {
 		t.Run(failure, func(t *testing.T) {
-			w, store, client := batchWorker(200, 4<<20), &batchStore{}, &batchClient{}
+			w, store, client := batchWorker(20000, 4<<20), &batchStore{}, &batchClient{}
 			switch failure {
 			case "load":
 				store.fail = "consumer_batch_receipts"
@@ -248,10 +246,10 @@ func TestFrozenBatchRetryAfterPartialPoll(t *testing.T) {
 				client.commitCode = 22
 			}
 			now := time.Now()
-			w.processPartition(context.Background(), fetchRecords(0, 0, 100, 2), now, false, store, client)
-			w.processPartition(context.Background(), fetchRecords(0, 100, 101, 2), now, false, store, client)
+			w.processPartition(context.Background(), fetchRecords(0, 0, 10000, 2), now, false, store, client)
+			w.processPartition(context.Background(), fetchRecords(0, 10000, 10001, 2), now, false, store, client)
 			frozen := w.pending[0]
-			if frozen == nil || frozen.First != 0 || frozen.Last != 199 || len(w.buffered) != 0 || !reflect.DeepEqual(client.seeks, []int64{0}) || len(client.paused) != 1 {
+			if frozen == nil || frozen.First != 0 || frozen.Last != 19999 || len(w.buffered) != 0 || !reflect.DeepEqual(client.seeks, []int64{0}) || len(client.paused) != 1 {
 				t.Fatal("failed batch was not frozen and rewound to its original first offset")
 			}
 			first := store.loads[0]
@@ -264,10 +262,10 @@ func TestFrozenBatchRetryAfterPartialPoll(t *testing.T) {
 					break
 				}
 			}
-			if repeated == nil || repeated.label != first.label || repeated.body != first.body || repeated.rows != 200 {
+			if repeated == nil || repeated.label != first.label || repeated.body != first.body || repeated.rows != 20000 {
 				t.Fatal("retry changed the frozen load content or label")
 			}
-			if len(w.pending) != 0 || w.blocked[0] || client.commits[len(client.commits)-1] != 200 || !reflect.DeepEqual(client.seeks, []int64{0, 200}) {
+			if len(w.pending) != 0 || w.blocked[0] || client.commits[len(client.commits)-1] != 20000 || !reflect.DeepEqual(client.seeks, []int64{0, 20000}) {
 				t.Fatalf("retry did not commit the entire frozen range: commits=%v seeks=%v", client.commits, client.seeks)
 			}
 		})

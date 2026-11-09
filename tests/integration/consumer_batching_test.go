@@ -3,12 +3,16 @@
 package integration
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"os"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/Fangyan33/llm-token-stats/internal/config"
+	"github.com/Fangyan33/llm-token-stats/internal/events"
 	"github.com/Fangyan33/llm-token-stats/internal/health"
 	"github.com/Fangyan33/llm-token-stats/internal/ingestworker"
 	"github.com/twmb/franz-go/pkg/kgo"
@@ -57,7 +61,7 @@ type runningBatchConsumer struct {
 	done   <-chan struct{}
 }
 
-func startBatchingConsumer(t *testing.T, topic, group string, rows, bytes int) *runningBatchConsumer {
+func startBatchingConsumer(t *testing.T, topic, group string, rows, bytes int, intervalMS ...int) *runningBatchConsumer {
 	t.Helper()
 	s := localStore(t, "http://llm-token-stats-doris:8040")
 	c := config.Config{
@@ -65,6 +69,9 @@ func startBatchingConsumer(t *testing.T, topic, group string, rows, bytes int) *
 		Consumer: config.Consumer{Group: group, Rows: rows, Bytes: bytes, FlushMS: 500,
 			AcceptedConfigs: []string{"collection-v1"}},
 		Doris: s.Cfg,
+	}
+	if len(intervalMS) > 0 {
+		c.Consumer.FlushMS = intervalMS[0]
 	}
 	if err := c.ConsumerDefaults(); err != nil {
 		t.Fatal(err)
@@ -169,4 +176,144 @@ func TestConsumerShutdownReplaysPartialBatch(t *testing.T) {
 	if err := db.QueryRow("SELECT COUNT(*) FROM metering_development.ingest_rejections WHERE kafka_topic=?", topic).Scan(&count); err != nil || count != 1 {
 		t.Fatalf("shutdown replay lost or duplicated a record: count=%d err=%v", count, err)
 	}
+}
+
+func syntheticBatchUsage(t *testing.T) ([]byte, string) {
+	t.Helper()
+	body, err := os.ReadFile("../../testdata/collection/usage-known.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var e events.Event
+	if err = json.Unmarshal(body, &e); err != nil {
+		t.Fatal(err)
+	}
+	e.ObservationID = uuid(t)
+	e.EventID = e.ObservationID + ":usage"
+	now := time.Now().UTC()
+	delta := now.Add(-2*time.Second).UnixMilli() - e.RequestStartedAtMs
+	e.RequestStartedAtMs += delta
+	*e.ObservationEndedAtMs += delta
+	*e.RequestFinishedAtMs += delta
+	e.EventCreatedAtMs = now.UnixMilli()
+	body, err = events.Canonical(&e)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return body, e.ObservationID
+}
+
+func TestConsumerMaximumBatchLimits(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		count  int
+		padded bool
+	}{
+		{"20000_rows", 20000, false},
+		{"16_MiB_valid_events", 512, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db, cl := database(t), kafka(t)
+			topic, group := batchingTopic(t, cl)
+			records := make([]*kgo.Record, tc.count)
+			for i := range records {
+				body, key := []byte(`{}`), ""
+				if tc.padded {
+					body, key = syntheticBatchUsage(t)
+					body = append(body, bytes.Repeat([]byte(" "), 32768-len(body)-len(key))...)
+				}
+				records[i] = &kgo.Record{Topic: topic, Partition: 0, Key: []byte(key), Value: body}
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+			err := cl.ProduceSync(ctx, records...).FirstErr()
+			cancel()
+			if err != nil {
+				t.Fatal(err)
+			}
+			startBatchingConsumer(t, topic, group, 20000, 16<<20, 600000)
+			waitBatchCommit(t, cl, topic, group, 0, int64(tc.count))
+			var n int
+			if err = db.QueryRow("SELECT COUNT(*) FROM metering_development.consumer_batch_receipts WHERE kafka_topic=? AND first_offset=0 AND next_offset=?", topic, tc.count).Scan(&n); err != nil || n != 1 {
+				t.Fatalf("batch split: count=%d err=%v", n, err)
+			}
+			table := "ingest_rejections"
+			if tc.padded {
+				table = "events_raw"
+			}
+			if err = db.QueryRow("SELECT COUNT(*) FROM metering_development."+table+" WHERE kafka_topic=?", topic).Scan(&n); err != nil || n != tc.count {
+				t.Fatalf("visible rows=%d err=%v", n, err)
+			}
+		})
+	}
+}
+
+func TestConsumerLongFlushRebalanceAndReplay(t *testing.T) {
+	db, cl := database(t), kafka(t)
+	topic, group := batchingTopic(t, cl)
+	first := startBatchingConsumer(t, topic, group, 20000, 16<<20, 600000)
+	eventually(t, func() bool { return first.health.Ready.Load() })
+	for p := int32(0); p < 2; p++ {
+		publish(t, cl, topic, p, "synthetic", []byte(`{}`))
+	}
+	eventually(t, func() bool {
+		offsets := first.worker.Client.UncommittedOffsets()
+		return offsets[topic][0].Offset == 1 && offsets[topic][1].Offset == 1
+	})
+	second := startBatchingConsumer(t, topic, group, 20000, 16<<20, 600000)
+	eventually(t, func() bool {
+		return first.health.Ready.Load() && second.health.Ready.Load() && len(first.worker.Client.UncommittedOffsets()[topic]) == 1 && len(second.worker.Client.UncommittedOffsets()[topic]) == 1
+	})
+	var n int
+	if err := db.QueryRow("SELECT COUNT(*) FROM metering_development.consumer_batch_receipts WHERE kafka_topic=?", topic).Scan(&n); err != nil || n != 0 {
+		t.Fatalf("rebalance flushed partial buffers: %d %v", n, err)
+	}
+	first.stop()
+	second.stop()
+	select {
+	case <-first.done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first shutdown blocked")
+	}
+	select {
+	case <-second.done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("second shutdown blocked")
+	}
+	startBatchingConsumer(t, topic, group, 20000, 16<<20)
+	waitBatchCommit(t, cl, topic, group, 0, 1)
+	waitBatchCommit(t, cl, topic, group, 1, 1)
+	if err := db.QueryRow("SELECT COUNT(*) FROM metering_development.ingest_rejections WHERE kafka_topic=?", topic).Scan(&n); err != nil || n != 2 {
+		t.Fatalf("replay rows=%d err=%v", n, err)
+	}
+}
+
+func TestConsumerRealTenMinuteIdleFlush(t *testing.T) {
+	db, cl := database(t), kafka(t)
+	topic, group := batchingTopic(t, cl)
+	h := startBatchingConsumer(t, topic, group, 20000, 16<<20, 600000)
+	eventually(t, func() bool { return h.health.Ready.Load() })
+	body, key := syntheticBatchUsage(t)
+	start := time.Now()
+	publish(t, cl, topic, 0, key, body)
+	eventually(t, func() bool { return h.worker.Client.UncommittedOffsets()[topic][0].Offset == 1 })
+	polled := time.Now()
+	// Bound the real monotonic wait; also keep observing Doris throughout the
+	// window, rather than proving only that the row exists ten minutes later.
+	deadline := polled.Add(11 * time.Minute)
+	for time.Now().Before(deadline) {
+		var n int
+		if err := db.QueryRow("SELECT COUNT(*) FROM metering_development.events_raw WHERE kafka_topic=?", topic).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		if n > 0 {
+			if time.Since(start) < 10*time.Minute {
+				t.Fatalf("premature flush after %v", time.Since(start))
+			}
+			waitBatchCommit(t, cl, topic, group, 0, 1)
+			t.Logf("real idle flush visible and committed after %v", time.Since(start))
+			return
+		}
+		time.Sleep(time.Second)
+	}
+	t.Fatal("idle batch did not become visible within 11 minutes")
 }

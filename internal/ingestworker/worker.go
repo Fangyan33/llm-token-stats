@@ -32,27 +32,25 @@ type Worker struct {
 	blocked  map[int32]bool
 	retryAt  map[int32]time.Time
 	auditOK  bool
+	// gate serializes partition lifecycle changes with bounded processing rounds.
+	gate     sync.RWMutex
+	epochs   map[int32]uint64
+	revision uint64
+	queued   map[int32]queuedPartition
+	now      func() time.Time
 }
 
 func (w *Worker) owns(p int32) bool { w.mu.Lock(); defer w.mu.Unlock(); return w.owned[p] }
 func New(c config.Config, s *doris.Store, h *health.State) (*Worker, error) {
-	w := &Worker{Cfg: c, Store: s, Health: h, owned: map[int32]bool{}, ready: map[int32]bool{}, pending: map[int32]*consumer.Batch{}, buffered: map[int32]*recordBuffer{}, blocked: map[int32]bool{}, retryAt: map[int32]time.Time{}}
+	w := &Worker{Cfg: c, Store: s, Health: h, owned: map[int32]bool{}, ready: map[int32]bool{}, pending: map[int32]*consumer.Batch{}, buffered: map[int32]*recordBuffer{}, blocked: map[int32]bool{}, retryAt: map[int32]time.Time{}, epochs: map[int32]uint64{}, queued: map[int32]queuedPartition{}}
 	o, err := producer.Options(c.Kafka)
 	if err != nil {
 		return nil, err
 	}
 	v := kversion.Stable()
 	v.SetMaxKeyVersion(9, 7)
-	o = append(o, kgo.MaxVersions(v), kgo.ConsumerGroup(c.Consumer.Group), kgo.ConsumeTopics(c.Kafka.Topic), kgo.DisableAutoCommit(), kgo.ConsumeResetOffset(kgo.NoResetOffset()), kgo.BlockRebalanceOnPoll(), kgo.FetchMaxBytes(4<<20), kgo.FetchMaxPartitionBytes(1<<20), kgo.BrokerMaxReadBytes(8<<20), kgo.MaxConcurrentFetches(1), kgo.FetchMaxWait(time.Duration(c.Consumer.FlushMS)*time.Millisecond), kgo.OnPartitionsAssigned(func(ctx context.Context, cl *kgo.Client, ps map[string][]int32) {
-		w.mu.Lock()
-		w.auditOK = false
-		for _, p := range ps[c.Kafka.Topic] {
-			w.owned[p] = true
-			w.ready[p] = false
-		}
-		w.mu.Unlock()
-		logging.Recovered("kafka_group", "kafka_group_recovered", "topic", c.Kafka.Topic, "group", c.Consumer.Group)
-		logging.Info("partitions_assigned", "topic", c.Kafka.Topic, "partition_count", len(ps[c.Kafka.Topic]))
+	o = append(o, kgo.MaxVersions(v), kgo.ConsumerGroup(c.Consumer.Group), kgo.ConsumeTopics(c.Kafka.Topic), kgo.DisableAutoCommit(), kgo.ConsumeResetOffset(kgo.NoResetOffset()), kgo.BlockRebalanceOnPoll(), kgo.FetchMaxBytes(4<<20), kgo.FetchMaxPartitionBytes(1<<20), kgo.BrokerMaxReadBytes(8<<20), kgo.MaxConcurrentFetches(1), kgo.FetchMaxWait(5*time.Second), kgo.OnPartitionsAssigned(func(ctx context.Context, cl *kgo.Client, ps map[string][]int32) {
+		w.assign(ps)
 	}), kgo.OnPartitionsRevoked(func(ctx context.Context, cl *kgo.Client, ps map[string][]int32) { w.revoke(ps) }), kgo.OnPartitionsLost(func(ctx context.Context, cl *kgo.Client, ps map[string][]int32) { w.revoke(ps) }))
 	w.Client, err = kgo.NewClient(o...)
 	if err == nil {
@@ -61,9 +59,14 @@ func New(c config.Config, s *doris.Store, h *health.State) (*Worker, error) {
 	return w, err
 }
 func (w *Worker) revoke(ps map[string][]int32) {
+	w.gate.Lock()
+	defer w.gate.Unlock()
 	logging.Info("partitions_revoked", "topic", w.Cfg.Kafka.Topic, "partition_count", len(ps[w.Cfg.Kafka.Topic]))
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	w.revision++
+	w.auditOK = false
+	w.Health.Ready.Store(false)
 	for _, p := range ps[w.Cfg.Kafka.Topic] {
 		delete(w.owned, p)
 		delete(w.ready, p)
@@ -71,6 +74,8 @@ func (w *Worker) revoke(ps map[string][]int32) {
 		delete(w.buffered, p)
 		delete(w.blocked, p)
 		delete(w.retryAt, p)
+		delete(w.epochs, p)
+		delete(w.queued, p)
 	}
 }
 func (w *Worker) positions(ctx context.Context, p int32) (int64, int64, error) {
@@ -198,150 +203,11 @@ func (w *Worker) setup(ctx context.Context, p int32) (int64, error) {
 	}
 	return next, nil
 }
-func (w *Worker) Run(ctx context.Context) error {
-	defer w.Client.CloseAllowingRebalance()
-	auditTick := time.NewTicker(time.Minute)
-	defer auditTick.Stop()
-	var releaseAt time.Time
-	for ctx.Err() == nil {
-		w.mu.Lock()
-		parts := []int32{}
-		resume := []int32{}
-		for p, at := range w.retryAt {
-			if !time.Now().Before(at) && w.owned[p] {
-				resume = append(resume, p)
-				delete(w.retryAt, p)
-			}
-		}
-		for p := range w.owned {
-			if !w.ready[p] {
-				parts = append(parts, p)
-			}
-		}
-		w.mu.Unlock()
-		if len(resume) > 0 {
-			w.Client.ResumeFetchPartitions(map[string][]int32{w.Cfg.Kafka.Topic: resume})
-		}
-		for _, p := range parts {
-			c, cancel := context.WithTimeout(ctx, 15*time.Second)
-			next, err := w.setup(c, p)
-			cancel()
-			if err != nil {
-				logging.Failure("partition_setup_failed", "partition_setup/"+fmt.Sprint(p), err, "topic", w.Cfg.Kafka.Topic, "partition", p)
-				w.mu.Lock()
-				w.blocked[p] = true
-				w.mu.Unlock()
-				w.Client.PauseFetchPartitions(map[string][]int32{w.Cfg.Kafka.Topic: {p}})
-				w.Health.Count("partition_paused")
-				continue
-			}
-			w.Client.SetOffsets(map[string]map[int32]kgo.EpochOffset{w.Cfg.Kafka.Topic: {p: {Epoch: -1, Offset: next}}})
-			w.mu.Lock()
-			w.ready[p] = true
-			delete(w.blocked, p)
-			w.mu.Unlock()
-			w.Client.ResumeFetchPartitions(map[string][]int32{w.Cfg.Kafka.Topic: {p}})
-			logging.Recovered("partition_setup/"+fmt.Sprint(p), "partition_setup_recovered", "partition", p, "next_offset", next)
-			logging.Info("partition_ready", "partition", p, "next_offset", next)
-		}
-		pollCtx, pollCancel := context.WithTimeout(ctx, w.pollWait(time.Now(), releaseAt))
-		fetch := w.Client.PollRecords(pollCtx, w.Cfg.Consumer.Rows)
-		pollCancel()
-		if ctx.Err() != nil {
-			w.Client.AllowRebalance()
-			break
-		}
-		for _, e := range fetch.Errors() {
-			if errors.Is(e.Err, context.DeadlineExceeded) || errors.Is(e.Err, context.Canceled) {
-				continue
-			}
-			w.Health.Count("fetch_failure")
-			logging.Failure("kafka_fetch_failed", "kafka_fetch/"+fmt.Sprint(e.Partition), e.Err, "topic", e.Topic, "partition", e.Partition)
-			w.mu.Lock()
-			w.ready[e.Partition] = false
-			delete(w.buffered, e.Partition)
-			w.mu.Unlock()
-			w.Client.PauseFetchPartitions(map[string][]int32{e.Topic: {e.Partition}})
-		}
-		receivedAt := time.Now()
-		partitions := map[int32]kgo.FetchTopicPartition{}
-		fetch.EachPartition(func(fp kgo.FetchTopicPartition) {
-			if len(fp.Records) == 0 {
-				return
-			}
-			if prev, ok := partitions[fp.Partition]; ok {
-				fp.Records = append(prev.Records, fp.Records...)
-			}
-			partitions[fp.Partition] = fp
-		})
-		w.mu.Lock()
-		force := !releaseAt.IsZero() && !receivedAt.Before(releaseAt)
-		for p, b := range w.buffered {
-			if _, ok := partitions[p]; !ok {
-				partitions[p] = kgo.FetchTopicPartition{Topic: w.Cfg.Kafka.Topic, FetchPartition: kgo.FetchPartition{Partition: p}}
-			}
-			force = force || !receivedAt.Before(b.started.Add(config.Duration(w.Cfg.Consumer.FlushMS)))
-		}
-		w.mu.Unlock()
-		var wg sync.WaitGroup
-		sem := make(chan struct{}, 4)
-		for _, fp := range partitions {
-			wg.Add(1)
-			sem <- struct{}{}
-			go func() {
-				defer wg.Done()
-				defer func() { <-sem }()
-				w.processPartition(ctx, fp, receivedAt, force, w.Store, w.Client)
-			}()
-		}
-		wg.Wait()
-		// Keep the poll's rebalance protection while accumulating records. At the
-		// accumulation window's deadline, flush all partial buffers before
-		// releasing it, so a busy partition cannot postpone rebalance indefinitely.
-		w.mu.Lock()
-		empty := len(w.buffered) == 0
-		w.mu.Unlock()
-		if empty {
-			w.Client.AllowRebalance()
-			releaseAt = time.Time{}
-		} else if releaseAt.IsZero() {
-			releaseAt = receivedAt.Add(config.Duration(w.Cfg.Consumer.FlushMS))
-		}
-		// Do not hold a partial batch's rebalance protection through a database
-		// audit; finish the bounded accumulation window first.
-		if empty {
-			select {
-			case <-auditTick.C:
-				w.audit(ctx)
-			default:
-				w.mu.Lock()
-				needAudit := !w.auditOK && len(w.owned) > 0 && len(w.blocked) == 0
-				for p := range w.owned {
-					needAudit = needAudit && w.ready[p]
-				}
-				w.mu.Unlock()
-				if needAudit {
-					w.audit(ctx)
-				}
-			}
-		}
-		w.mu.Lock()
-		ready := w.auditOK && len(w.owned) > 0 && len(w.blocked) == 0
-		for p := range w.owned {
-			ready = ready && w.ready[p]
-		}
-		w.mu.Unlock()
-		if previous := w.Health.Ready.Swap(ready); previous != ready {
-			logging.Info("readiness_changed", "ready", ready)
-		}
-	}
-	w.Health.Ready.Store(false)
-	logging.Info("consumer_stopping")
-	return ctx.Err()
-}
+func (w *Worker) Run(ctx context.Context) error { return w.run(ctx) }
 func (w *Worker) audit(ctx context.Context) {
 	w.mu.Lock()
 	w.auditOK = false
+	revision := w.revision
 	w.mu.Unlock()
 	w.Health.Ready.Store(false)
 	if !w.watermarks(ctx) {
@@ -413,7 +279,7 @@ func (w *Worker) audit(ctx context.Context) {
 	logging.Recovered("consumer_audit", "consumer_audit_recovered")
 	logging.Debug("consumer_audit_completed", "conflict_count", len(ids))
 	w.mu.Lock()
-	w.auditOK = true
+	w.auditOK = w.revision == revision
 	w.mu.Unlock()
 }
 func (w *Worker) String() string { return fmt.Sprintf("consumer %s", w.Cfg.Consumer.Group) }

@@ -1,6 +1,7 @@
 package consumer
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -30,6 +31,11 @@ type Batch struct {
 func date(ms int64) string     { return time.UnixMilli(ms).UTC().Format("2006-01-02") }
 func Stamp(t time.Time) string { return t.UTC().Format("2006-01-02 15:04:05.000") }
 func Freeze(rs []*kgo.Record, c config.Consumer, now time.Time) (*Batch, error) {
+	return FreezeContext(context.Background(), rs, c, now)
+}
+
+// FreezeContext includes decoding and encoding in the worker's processing budget.
+func FreezeContext(ctx context.Context, rs []*kgo.Record, c config.Consumer, now time.Time) (*Batch, error) {
 	if len(rs) == 0 {
 		return nil, ErrPause
 	}
@@ -38,6 +44,9 @@ func Freeze(rs []*kgo.Record, c config.Consumer, now time.Time) (*Batch, error) 
 	bytes := 0
 	prev := int64(-1)
 	for _, r := range rs {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		bytes += len(r.Value) + len(r.Key)
 		if r.Topic != b.Topic || r.Partition != b.Partition || r.Offset <= prev || r.Offset < 0 || bytes > c.Bytes {
 			return nil, ErrPause
@@ -103,21 +112,34 @@ func Freeze(rs []*kgo.Record, c config.Consumer, now time.Time) (*Batch, error) 
 		b.Dates[d] = append(b.Dates[d], h)
 	}
 	b.ID = events.Tuple([]any{1, b.Topic, b.Partition, b.First, b.Last, evidence})
-	b.Loads["events_raw"] = EncodeRows(b.Raw)
-	b.Loads["ingest_rejections"] = EncodeRows(b.Rejected)
+	var err error
+	if b.Loads["events_raw"], err = encodeRowsContext(ctx, b.Raw); err != nil {
+		return nil, err
+	}
+	if b.Loads["ingest_rejections"], err = encodeRowsContext(ctx, b.Rejected); err != nil {
+		return nil, err
+	}
 	return b, nil
 }
 
 var tokenNames = []string{"input_tokens", "output_tokens", "cached_read_tokens", "cached_write_tokens", "reasoning_tokens", "reported_total_tokens"}
 
 func EncodeRows(rs []map[string]any) []byte {
+	b, _ := encodeRowsContext(context.Background(), rs)
+	return b
+}
+
+func encodeRowsContext(ctx context.Context, rs []map[string]any) ([]byte, error) {
 	var b []byte
 	for _, r := range rs {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		v, _ := json.Marshal(r)
 		b = append(b, v...)
 		b = append(b, '\n')
 	}
-	return b
+	return b, ctx.Err()
 }
 func Label(table string, b *Batch, body []byte) string {
 	return table + "_" + events.Tuple([]any{1, b.Topic, b.Partition, b.First, b.Last, events.Hash(body)})

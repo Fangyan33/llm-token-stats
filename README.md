@@ -553,7 +553,7 @@ EnvoyFilter 全部使用块式 YAML，插件参数位于 `google.protobuf.Struct
 
 Observer 健康端口为 `9091`，Consumer 为 `9092`，均提供 `/livez`、`/readyz`、`/metrics`，可从受控终端通过 `kubectl port-forward` 访问。`readyz` 成功后，还需确认真实请求已经入库。
 
-Consumer 按分区攒批，默认达到 5000 条、4 MiB 或等待 15 秒时写入。Doris 不可用时，Consumer 暂停相应分区并保留冻结批次；遇到未知 schema 时也会暂停，不会跳过。恢复位置落后于 Kafka earliest 时，系统会记录缺口并暂停，需按[恢复说明](docs/collection-components.md#consumer-恢复与统计边界)处理，不能跳到 latest 掩盖数据丢失。
+Consumer 按分区攒批，默认达到 5000 条、4 MiB 或等待 15 秒时写入；三个可配置上限分别为 20000 条、16 MiB、10 分钟，默认值保持不变。长时间攒批不阻止分区移交或等待缓冲清空后才巡检，撤销的未提交数据由新消费者从 Kafka 重放。批次字节预算不等于进程内存限制，需结合分区数和冻结编码开销配置资源。Doris 不可用时，Consumer 暂停相应分区并保留冻结批次；遇到未知 schema 时也会暂停，不会跳过。恢复位置落后于 Kafka earliest 时，系统会记录缺口并暂停，需按[恢复说明](docs/collection-components.md#consumer-恢复与统计边界)处理，不能跳到 latest 掩盖数据丢失。
 
 Observer 只提供当前镜像内的一个 Wasm 版本。升级时，先发布 Observer，等待所有副本的下载摘要一致，再更新网关的 URL 和摘要配置。滚动升级期间，按旧摘要下载可能失败，采集允许暂时缺失；已加载的插件可以继续运行，但旧网关重启后不保证还能下载到旧文件。
 

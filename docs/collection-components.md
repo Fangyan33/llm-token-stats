@@ -1,6 +1,6 @@
 # 网关采集组件运行说明
 
-更新日期：2026-11-02。[实现计划](spec/plan/gateway-collection-implementation.md)已落地到三个可构建组件。业务仍直接经过网关到模型服务；Wasm 旁路发送有界片段，Observer 解析后使用原生 Producer 写 Kafka，Consumer 确认 Doris 可见性后提交 offset。仅产生 `request_started`、`usage_observed`，未知值保留 null/unknown。
+更新日期：2026-11-09。[实现计划](spec/plan/gateway-collection-implementation.md)已落地到三个可构建组件。业务仍直接经过网关到模型服务；Wasm 旁路发送有界片段，Observer 解析后使用原生 Producer 写 Kafka，Consumer 确认 Doris 可见性后提交 offset。仅产生 `request_started`、`usage_observed`，未知值保留 null/unknown。
 
 本轮命令、故障处理及资源归零证据见[本地验证记录](spec/plan/gateway-collection-verification.md)，实际镜像 digest 见[镜像记录](../deploy/local/images.lock.json)。
 
@@ -200,9 +200,23 @@ ECDS 内部名称按配置摘要隔离；Kubernetes EnvoyFilter 名称仍固定�
 
 每分区顺序执行：冻结记录 → events_raw / ingest_rejections 可见 → 跨在线分区冲突标记可见 → 全部日期通知可见 → 批次凭据可见 → 提交下一 offset。数据库故障暂停对应分区，保留一份冻结批次并有界重试；撤销 owner 后停止新写入/提交，新 owner 从已提交位置重放。相同事件与摘要由 Unique Key 去重；不同变体保留并永久登记冲突。
 
-Consumer 按 Kafka 分区跨多次拉取攒批：达到 `max_batch_rows`（默认 5000）、`max_batch_bytes`（默认 4 MiB），或最早一条记录等待 `flush_interval_ms`（默认 15000 ms，即 15 秒；可配置范围 1–15000 ms）后写入；下一条放不进字节预算时先写已有前缀。字节预算按 Kafka key/value 计量，不是展开后的 Stream Load 正文或进程 RSS 上限。每次拉取最多配置的行数，没有额外的 128 条写入限制；数据库回查仍按 128 条拆分查询。每个已分配分区最多保留一份未满批次或一份失败后的冻结批次，写库并发最多 4 个分区；总内存还包含本次拉取、冻结编码与 Kafka 客户端缓冲，需要按分区数和实际事件大小验收。
+Consumer 按 Kafka 分区跨多次拉取攒批：达到 `max_batch_rows`（默认 5000，可配置范围 1–20000）、`max_batch_bytes`（默认 4 MiB，可配置范围 32768–16777216 字节，即最多 16 MiB），或最早一条记录等待 `flush_interval_ms`（默认 15000 ms，即 15 秒；可配置范围 1–600000 ms，最多 10 分钟）后写入；下一条放不进字节预算时先写已有前缀。字节预算按 Kafka key/value 计量，不是展开后的 Stream Load 正文或进程 RSS 上限。每次拉取最多配置的行数，没有额外的 128 条写入限制；数据库回查仍按 128 条拆分查询，提取组内共同键条件减少重复表达式；不同记录的多列键保持配对匹配，不放宽可见性校验。每个已分配分区保留一份未满批次或一份失败后的冻结批次，写库并发最多 4 个分区；处理轮次到期时最多额外保留一份 poll 结果及其合并的已有缓冲，处理完之前不继续拉取。总内存还包含冻结对象、展开后的编码正文与 Kafka 客户端缓冲，需要按分区数和实际事件大小验收。例如 24 个分区各缓存接近 16 MiB 时，仅记录字节就接近 384 MiB，不能据此推断 512 MiB 的进程内存限制足够。
 
-即使没有后续消息，未满批次到期也会写入。攒批期间保留 Kafka poll 的 rebalance 保护；一个攒批窗口到期时也会写入其他分区的未满批次，然后允许分区移交，避免持续流量无限推迟 rebalance。写库或巡检耗时可能延长实际可见延迟，15000 ms 是默认攒批等待预算。失败时回退到冻结批次的首 offset、沿用原内容及 label；分区撤销清除未提交缓冲，后续 owner 从 Kafka 已提交位置重放。
+即使没有后续消息，未满批次到期也会写入；不同分区按各自最早记录计时，后续消息和其他分区到期不会重置该期限或强制刷新本分区。攒批与 Kafka fetch 等待、分区移交解耦：fetch 最长等待固定为 5 秒，应用 poll 最长等待 500 ms。每轮处理保护预算为 45 秒、单批冻结/写库/提交预算为 30 秒，到期取消处理并释放保护，未开始的记录下轮继续；单次拉取仍沿用 4 MiB、每分区 1 MiB、响应读取 8 MiB 的限制，通过跨 poll 累积实现 16 MiB 批次。合作式 rebalance 保留未撤销分区的缓冲和截止时间；撤销分区清除未提交缓冲和冻结批次，由新 owner 从 Kafka 已提交位置重放，不为移交强制写入小批次。退出不等待攒批期限。失败重试沿用冻结内容及 label，确认全部可见后才提交 offset。初次审计及分钟巡检不等待缓冲清空；旧分配的审计结果不能更新新分配的就绪状态。
+
+三个字段省略或为 0 时使用既有默认值；负数、越界值和小于 32768 的非零字节预算拒绝启动。以下片段同时启用三个新上限，须合并到现有 Consumer 配置的 `consumer` 节点中：
+
+```json
+{
+  "flush_interval_ms": 600000,
+  "max_batch_rows": 20000,
+  "max_batch_bytes": 16777216
+}
+```
+
+600000 ms 是最大攒批等待预算，不是每隔 10 分钟才允许写库：条数/字节达到上限会提前写入；实际可见延迟还包括冻结、排队、数据库处理和重试。攒批时尚未发起 Doris 导入，不自动放宽 Doris HTTP/事务超时。提高上限不会自动修改默认参数或部署资源；启用大批次前需按实际分区数验收内存及处理耗时。
+
+20000 条、16 MiB 和真实十分钟到期写入的隔离 Kubernetes 验收结果见[大批次验收记录](spec/plan/consumer-batch-limits-verification.md)。
 
 [消费协调初始化](../migrations/doris/metering/002_consumer_coordination.sql)保存消费起点和保留期缺口；这些表及凭据/通知本轮不自动清理。新组持久登记 Kafka earliest；已有组缺少起点时通过 `initial_offsets` 明确接管。多份不兼容起点阻塞分区。已保存的恢复位置落后于 earliest 时登记缺口并暂停；经人工处置后，`gap_resume_offsets` 必须填写该分区当时的 earliest，不能填 latest。恢复新流量不会抹掉缺口或把历史覆盖改为可信。
 

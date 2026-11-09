@@ -126,28 +126,29 @@ func (s *Store) verify(ctx context.Context, table string, rows []map[string]any)
 	if !ok {
 		return logging.WithCause("doris_table", nil)
 	}
+	if table == "consumer_batch_receipts" {
+		ks = append(append([]string(nil), ks...), "next_offset", "notification_count", "notification_digest")
+	}
 	seen := map[string]bool{}
-	wheres := []string{}
+	values := [][]string{}
 	for _, r := range rows {
-		parts := []string{}
+		parts, vals := []string{}, []string{}
 		for _, k := range ks {
-			parts = append(parts, "`"+k+"`="+quote(r[k]))
+			val := quote(r[k])
+			vals = append(vals, val)
+			parts = append(parts, "`"+k+"`="+val)
 		}
-		if table == "consumer_batch_receipts" {
-			for _, k := range []string{"next_offset", "notification_count", "notification_digest"} {
-				parts = append(parts, "`"+k+"`="+quote(r[k]))
-			}
-		}
-		where := strings.Join(parts, " AND ")
-		if !seen[where] {
-			seen[where] = true
-			wheres = append(wheres, "("+where+")")
+		key := strings.Join(parts, " AND ")
+		if !seen[key] {
+			seen[key] = true
+			values = append(values, vals)
 		}
 	}
-	for i := 0; i < len(wheres); i += 128 {
-		end := min(i+128, len(wheres))
+	for i := 0; i < len(values); i += 128 {
+		end := min(i+128, len(values))
 		var n int
-		if err := s.DB.QueryRowContext(ctx, "SELECT COUNT(*) FROM "+s.Database()+"."+table+" WHERE "+strings.Join(wheres[i:end], " OR ")).Scan(&n); err != nil || n != end-i {
+		predicate := visibilityPredicate(ks, values[i:end])
+		if err := s.DB.QueryRowContext(ctx, "SELECT COUNT(*) FROM "+s.Database()+"."+table+" WHERE "+predicate).Scan(&n); err != nil || n != end-i {
 			logging.Failure("doris_visibility_failed", "doris_visibility", err, "table", table, "expected_rows", end-i, "visible_rows", n)
 			return logging.WithCause("doris_visibility", err)
 		}

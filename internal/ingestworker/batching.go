@@ -26,15 +26,12 @@ type partitionClient interface {
 	CommitOffsetsSync(context.Context, map[string]map[int32]kgo.EpochOffset, func(*kgo.Client, *kmsg.OffsetCommitRequest, *kmsg.OffsetCommitResponse, error))
 }
 
-func (w *Worker) pollWait(now, releaseAt time.Time) time.Duration {
+func (w *Worker) pollWait(now time.Time) time.Duration {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	wait := 500 * time.Millisecond
 	for _, b := range w.buffered {
 		wait = min(wait, b.started.Add(config.Duration(w.Cfg.Consumer.FlushMS)).Sub(now))
-	}
-	if !releaseAt.IsZero() {
-		wait = min(wait, releaseAt.Sub(now))
 	}
 	return max(wait, 0)
 }
@@ -42,6 +39,7 @@ func (w *Worker) pollWait(now, releaseAt time.Time) time.Duration {
 func (w *Worker) processPartition(ctx context.Context, fp kgo.FetchTopicPartition, receivedAt time.Time, force bool, store consumer.Store, client partitionClient) {
 	w.mu.Lock()
 	ready := w.ready[fp.Partition] && w.owned[fp.Partition]
+	epoch := w.epochs[fp.Partition]
 	previous := w.buffered[fp.Partition]
 	delete(w.buffered, fp.Partition)
 	w.mu.Unlock()
@@ -55,7 +53,13 @@ func (w *Worker) processPartition(ctx context.Context, fp kgo.FetchTopicPartitio
 		started = previous.started
 	}
 	for len(rs) > 0 {
+		if ctx.Err() != nil {
+			fp.Records = rs
+			w.deferPartition(fp, started, epoch)
+			return
+		}
 		batchStarted := time.Now()
+		c, cancel := context.WithTimeout(ctx, 30*time.Second)
 		w.mu.Lock()
 		b := w.pending[fp.Partition]
 		w.mu.Unlock()
@@ -68,7 +72,7 @@ func (w *Worker) processPartition(ctx context.Context, fp kgo.FetchTopicPartitio
 			}
 			if n == 0 {
 				err = consumer.ErrPause
-			} else if !force && n == len(rs) && n < w.Cfg.Consumer.Rows && total < w.Cfg.Consumer.Bytes && time.Now().Before(started.Add(config.Duration(w.Cfg.Consumer.FlushMS))) {
+			} else if !force && n == len(rs) && n < w.Cfg.Consumer.Rows && total < w.Cfg.Consumer.Bytes && w.clockNow().Before(started.Add(config.Duration(w.Cfg.Consumer.FlushMS))) {
 				w.mu.Lock()
 				if w.owned[fp.Partition] {
 					// Copy only the uncommitted tail; do not retain a whole fetched
@@ -76,9 +80,16 @@ func (w *Worker) processPartition(ctx context.Context, fp kgo.FetchTopicPartitio
 					w.buffered[fp.Partition] = &recordBuffer{records: append([]*kgo.Record(nil), rs...), started: started}
 				}
 				w.mu.Unlock()
+				cancel()
 				return
 			} else {
-				b, err = consumer.Freeze(rs[:n], w.Cfg.Consumer, time.Now())
+				b, err = consumer.FreezeContext(c, rs[:n], w.Cfg.Consumer, w.clockNow())
+				if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+					cancel()
+					fp.Records = rs
+					w.deferPartition(fp, started, epoch)
+					return
+				}
 				if err == nil {
 					w.mu.Lock()
 					w.pending[fp.Partition] = b
@@ -97,10 +108,12 @@ func (w *Worker) processPartition(ctx context.Context, fp kgo.FetchTopicPartitio
 		}
 		if err == nil {
 			logging.Debug("batch_processing", "topic", fp.Topic, "partition", fp.Partition, "first_offset", b.First, "last_offset", b.Last, "record_count", len(b.Records))
-			c, cancel := context.WithTimeout(ctx, 30*time.Second)
-			p := consumer.Processor{Store: store, Owns: func() bool { return w.owns(fp.Partition) }}
+			p := consumer.Processor{Store: store, Owns: func() bool { return w.ownsEpoch(fp.Partition, epoch) }}
 			err = p.Process(c, b)
-			if err == nil && w.owns(fp.Partition) {
+			if err == nil {
+				err = c.Err()
+			}
+			if err == nil && w.ownsEpoch(fp.Partition, epoch) {
 				offsets := map[string]map[int32]kgo.EpochOffset{fp.Topic: {fp.Partition: {Epoch: b.Records[len(b.Records)-1].LeaderEpoch, Offset: b.Last + 1}}}
 				client.CommitOffsetsSync(c, offsets, func(_ *kgo.Client, _ *kmsg.OffsetCommitRequest, r *kmsg.OffsetCommitResponse, e error) {
 					err = e
@@ -121,12 +134,12 @@ func (w *Worker) processPartition(ctx context.Context, fp kgo.FetchTopicPartitio
 					logging.Recovered("offset_commit/"+strconv.Itoa(int(fp.Partition)), "offset_commit_recovered", "partition", fp.Partition)
 				}
 			}
-			cancel()
 		}
+		cancel()
 		if err != nil {
 			w.Health.Count("batch_failure")
 			logging.Failure("batch_failed_partition_paused", "batch/"+strconv.Itoa(int(fp.Partition)), err, "topic", fp.Topic, "partition", fp.Partition, "first_offset", rs[0].Offset, "duration_ms", time.Since(batchStarted).Milliseconds(), "retryable", err != consumer.ErrPause)
-			if !w.owns(fp.Partition) {
+			if !w.ownsEpoch(fp.Partition, epoch) {
 				return
 			}
 			client.SetOffsets(map[string]map[int32]kgo.EpochOffset{fp.Topic: {fp.Partition: {Epoch: -1, Offset: rs[0].Offset}}})
@@ -139,7 +152,7 @@ func (w *Worker) processPartition(ctx context.Context, fp kgo.FetchTopicPartitio
 			client.PauseFetchPartitions(map[string][]int32{fp.Topic: {fp.Partition}})
 			return
 		}
-		if !w.owns(fp.Partition) {
+		if !w.ownsEpoch(fp.Partition, epoch) {
 			return
 		}
 		w.mu.Lock()

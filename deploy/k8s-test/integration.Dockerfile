@@ -2,4 +2,4 @@
 FROM alpine:latest
 COPY k8s-suite/ /suite/
 WORKDIR /suite/tests/integration
-ENTRYPOINT ["/suite/integration.test", "-test.v", "-test.count=1", "-test.timeout=20m"]
+ENTRYPOINT ["/suite/integration.test", "-test.v", "-test.count=1", "-test.timeout=30m"]

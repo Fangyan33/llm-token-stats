@@ -65,7 +65,8 @@ func TestConsumerFlushConfiguration(t *testing.T) {
 		{name: "production_example", path: "../../configs/consumer.production.example.json", want: 15000},
 		{name: "explicit_shorter_interval", path: "../../configs/consumer.local.json", override: 1000, want: 1000},
 		{name: "minimum_interval", path: "../../configs/consumer.local.json", override: 1, want: 1},
-		{name: "above_maximum", path: "../../configs/consumer.local.json", override: 15001, wantErr: true},
+		{name: "maximum_interval", path: "../../configs/consumer.local.json", override: 600000, want: 600000},
+		{name: "above_maximum", path: "../../configs/consumer.local.json", override: 600001, wantErr: true},
 		{name: "negative_interval", path: "../../configs/consumer.local.json", override: -1, wantErr: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -81,6 +82,39 @@ func TestConsumerFlushConfiguration(t *testing.T) {
 			}
 			if !tc.wantErr && c.Consumer.FlushMS != tc.want {
 				t.Fatalf("flush interval = %d, want %d", c.Consumer.FlushMS, tc.want)
+			}
+		})
+	}
+}
+
+func TestConsumerBatchLimits(t *testing.T) {
+	for _, tc := range []struct {
+		name            string
+		rows, bytes, ms int
+		bad             bool
+	}{
+		{"defaults", 0, 0, 0, false},
+		{"all_maximum", 20000, 16 << 20, 600000, false},
+		{"all_minimum", 1, 32768, 1, false},
+		{"rows_above", 20001, 16 << 20, 600000, true},
+		{"bytes_above", 20000, (16 << 20) + 1, 600000, true},
+		{"time_above", 20000, 16 << 20, 600001, true},
+		{"rows_negative", -1, 0, 0, true},
+		{"bytes_negative", 0, -1, 0, true},
+		{"time_negative", 0, 0, -1, true},
+		{"bytes_below", 0, 32767, 0, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c, err := Read("../../configs/consumer.local.json")
+			if err != nil {
+				t.Fatal(err)
+			}
+			c.Consumer.Rows, c.Consumer.Bytes, c.Consumer.FlushMS = tc.rows, tc.bytes, tc.ms
+			if err = c.ConsumerDefaults(); (err != nil) != tc.bad {
+				t.Fatalf("validation: %v", err)
+			}
+			if tc.name == "defaults" && (c.Consumer.Rows != 5000 || c.Consumer.Bytes != 4<<20 || c.Consumer.FlushMS != 15000) {
+				t.Fatal("defaults changed")
 			}
 		})
 	}

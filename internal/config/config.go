@@ -223,7 +223,7 @@ func (c *Config) ConsumerDefaults() error {
 	if c.Doris.Database == "" {
 		c.Doris.Database = "metering"
 	}
-	if !text(c.Consumer.Group, 128) || c.Consumer.Rows < 1 || c.Consumer.Rows > 5000 || c.Consumer.Bytes < 32768 || c.Consumer.Bytes > 4<<20 || c.Consumer.FlushMS < 1 || c.Consumer.FlushMS > 15000 || !DatabaseName(c.Doris.Database) || !registration(c.Consumer.AcceptedConfigs) || len(c.Doris.AllowedHosts) == 0 || !codes(c.Consumer.Flags) || !codes(c.Consumer.Details) {
+	if !text(c.Consumer.Group, 128) || c.Consumer.Rows < 1 || c.Consumer.Rows > 20000 || c.Consumer.Bytes < 32768 || c.Consumer.Bytes > 16<<20 || c.Consumer.FlushMS < 1 || c.Consumer.FlushMS > 600000 || !DatabaseName(c.Doris.Database) || !registration(c.Consumer.AcceptedConfigs) || len(c.Doris.AllowedHosts) == 0 || !codes(c.Consumer.Flags) || !codes(c.Consumer.Details) {
 		return logging.WithCause("config_consumer", nil)
 	}
 	for _, ps := range [][]Position{c.Consumer.Initial, c.Consumer.Resume} {

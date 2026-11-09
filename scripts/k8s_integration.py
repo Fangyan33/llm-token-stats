@@ -155,7 +155,7 @@ def job_resources(namespace, image, consumer_image, proxy_image=IMAGES[2]):
                        roleRef={'apiGroup': 'rbac.authorization.k8s.io', 'kind': 'Role', 'name': name})
     binding['apiVersion'] = 'rbac.authorization.k8s.io/v1'
     job = {'apiVersion': 'batch/v1', 'kind': 'Job', 'metadata': {'name': name, 'namespace': namespace},
-           'spec': {'backoffLimit': 0, 'activeDeadlineSeconds': 1320,
+           'spec': {'backoffLimit': 0, 'activeDeadlineSeconds': 1920,
                     'template': {'metadata': {'annotations': {'sidecar.istio.io/inject': 'false'}},
                                  'spec': {'serviceAccountName': name, 'restartPolicy': 'Never',
                                           'containers': [{'name': 'tests', 'image': image, 'imagePullPolicy': 'IfNotPresent',
@@ -189,7 +189,7 @@ def run_suite(harness, root, migrations, render_sql):
     manifest = job_resources(harness.namespace, harness.images['integration'], harness.images['consumer'], harness.proxy_image)
     (harness.output / 'integration-job.json').write_text(json.dumps(manifest, indent=2))
     harness.apply(manifest)
-    deadline = time.monotonic() + 1350
+    deadline = time.monotonic() + 1950
     while time.monotonic() < deadline:
         job = harness.get('-n', harness.namespace, 'get', 'job', 'llm-token-stats-collection-integration')
         status = job.get('status', {})

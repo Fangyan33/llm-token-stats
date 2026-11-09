@@ -5,8 +5,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"github.com/Fangyan33/llm-token-stats/internal/logging"
 	"io"
-	"log"
+	"log/slog"
 	"net/http"
 	"strings"
 	"testing"
@@ -87,7 +88,7 @@ func TestResponseEnvelopes(t *testing.T) {
 				t.Run(tc.name, func(t *testing.T) {
 					var logs bytes.Buffer
 					calls := 0
-					r := &remote{credential: "synthetic-credential", uri: "http://directory.invalid/", logger: log.New(&logs, "", 0), client: &http.Client{Transport: lookupTransport(func(*http.Request) (*http.Response, error) {
+					r := &remote{credential: "synthetic-credential", uri: "http://directory.invalid/", logger: logging.New("observer", &logs, slog.LevelInfo), client: &http.Client{Transport: lookupTransport(func(*http.Request) (*http.Response, error) {
 						calls++
 						return &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": []string{"application/json"}}, Body: io.NopCloser(strings.NewReader(tc.body))}, nil
 					})}}
@@ -114,12 +115,12 @@ func TestResponseEnvelopes(t *testing.T) {
 						t.Fatal("query retried or logged more than once")
 					}
 					var entry map[string]any
-					if json.Unmarshal(bytes.TrimSpace(logs.Bytes()), &entry) != nil || entry["lookup_type"] != kind || entry["http_status"] != float64(200) {
+					if !readTextLog(logs.Bytes(), &entry) || entry["lookup_type"] != kind || entry["http_status"] != float64(200) {
 						t.Fatal("invalid response log")
 					}
 					wantLevel, wantStatus := "INFO", "mapped"
 					if tc.want != "" {
-						wantLevel, wantStatus = "WARN", tc.want
+						wantLevel, wantStatus = "ERROR", tc.want
 					}
 					if entry["level"] != wantLevel || entry["status"] != wantStatus {
 						t.Fatal("invalid log outcome")
@@ -142,7 +143,7 @@ func TestResponseMessageLogPrivacy(t *testing.T) {
 			}
 			encoded, _ := json.Marshal(body)
 			var logs bytes.Buffer
-			r := &remote{credential: credential, uri: "http://private-directory.invalid/", logger: log.New(&logs, "", 0), client: &http.Client{Transport: lookupTransport(func(*http.Request) (*http.Response, error) {
+			r := &remote{credential: credential, uri: "http://private-directory.invalid/", logger: logging.New("observer", &logs, slog.LevelInfo), client: &http.Client{Transport: lookupTransport(func(*http.Request) (*http.Response, error) {
 				return &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": []string{"application/json"}}, Body: io.NopCloser(bytes.NewReader(encoded))}, nil
 			})}}
 			flushLogs := testResponseLogQueue(t, r)
@@ -164,7 +165,7 @@ func TestResponseMessageLogPrivacy(t *testing.T) {
 				t.Fatal("log message was not safely escaped")
 			}
 			var entry map[string]any
-			if json.Unmarshal(bytes.TrimSpace(logs.Bytes()), &entry) != nil || !strings.HasPrefix(entry["responseMsg"].(string), "凭据=[REDACTED]; token=[REDACTED]") {
+			if !readTextLog(logs.Bytes(), &entry) || !strings.HasPrefix(entry["responseMsg"].(string), "凭据=[REDACTED]; token=[REDACTED]") {
 				t.Fatal("responseMsg missing or overlap redaction failed")
 			}
 		})
@@ -201,7 +202,7 @@ func TestAuthenticationResponseEnvelopes(t *testing.T) {
 			} {
 				t.Run(tc.name, func(t *testing.T) {
 					var logs bytes.Buffer
-					r := &remote{uri: "http://directory.invalid/", credential: "synthetic-credential", logger: log.New(&logs, "", 0), client: &http.Client{Transport: lookupTransport(func(*http.Request) (*http.Response, error) {
+					r := &remote{uri: "http://directory.invalid/", credential: "synthetic-credential", logger: logging.New("observer", &logs, slog.LevelInfo), client: &http.Client{Transport: lookupTransport(func(*http.Request) (*http.Response, error) {
 						var body io.Reader = strings.NewReader(tc.body)
 						if tc.name == "read_failure" {
 							body = failedLookupResponseReader{}
@@ -228,7 +229,7 @@ func TestAuthenticationResponseEnvelopes(t *testing.T) {
 						t.Fatal("authentication failure classification or log privacy", err)
 					}
 					var entry map[string]any
-					if json.Unmarshal(bytes.TrimSpace(logs.Bytes()), &entry) != nil || entry["http_status"] != float64(401) || entry["status"] != "lookup_unavailable" || entry["level"] != "WARN" {
+					if !readTextLog(logs.Bytes(), &entry) || entry["http_status"] != float64(401) || entry["status"] != "lookup_unavailable" || entry["level"] != "ERROR" {
 						t.Fatal("authentication log metadata")
 					}
 					if tc.valid {
@@ -274,7 +275,7 @@ func TestLogMessageLimitAndFailurePrivacy(t *testing.T) {
 		lookupSuccessJSON(`{}`) + strings.Repeat(secret, maxResponseBytes/len(secret)+1),
 	} {
 		var logs bytes.Buffer
-		r := &remote{uri: "http://directory.invalid", logger: log.New(&logs, "", 0), client: &http.Client{Transport: lookupTransport(func(*http.Request) (*http.Response, error) {
+		r := &remote{uri: "http://directory.invalid", logger: logging.New("observer", &logs, slog.LevelInfo), client: &http.Client{Transport: lookupTransport(func(*http.Request) (*http.Response, error) {
 			return &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": []string{"application/json"}}, Body: io.NopCloser(strings.NewReader(body))}, nil
 		})}}
 		flushLogs := testResponseLogQueue(t, r)
@@ -285,7 +286,7 @@ func TestLogMessageLimitAndFailurePrivacy(t *testing.T) {
 		}
 	}
 	var logs bytes.Buffer
-	r := &remote{uri: "http://directory.invalid", logger: log.New(&logs, "", 0), client: &http.Client{Transport: lookupTransport(func(*http.Request) (*http.Response, error) {
+	r := &remote{uri: "http://directory.invalid", logger: logging.New("observer", &logs, slog.LevelInfo), client: &http.Client{Transport: lookupTransport(func(*http.Request) (*http.Response, error) {
 		return nil, errors.New(secret)
 	})}}
 	flushLogs := testResponseLogQueue(t, r)

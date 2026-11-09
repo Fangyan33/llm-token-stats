@@ -11,6 +11,7 @@ import (
 	"github.com/Fangyan33/llm-token-stats/internal/events"
 	"github.com/Fangyan33/llm-token-stats/internal/health"
 	"github.com/Fangyan33/llm-token-stats/internal/identitylookup"
+	"github.com/Fangyan33/llm-token-stats/internal/logging"
 	"github.com/Fangyan33/llm-token-stats/internal/producer"
 	"github.com/Fangyan33/llm-token-stats/pkg/credentials"
 	"github.com/Fangyan33/llm-token-stats/pkg/observationwire"
@@ -97,10 +98,17 @@ type ackWrite struct {
 	done chan error
 }
 
-func (s *Server) Observe(stream pb.ObservationService_ObserveServer) error {
+func (s *Server) Observe(stream pb.ObservationService_ObserveServer) (result error) {
+	started := time.Now()
+	defer func() {
+		if result != nil && stream.Context().Err() == nil {
+			logging.Warn("observation_ended_early", "observation", "grpc_status", int(status.Code(result)), "duration_ms", time.Since(started).Milliseconds())
+		}
+	}()
 	s.Health.GaugeFunc("observer_active_streams", s.active.Load)
 	s.Health.GaugeFunc("observer_parser_reserved_bytes", s.bytes.Load)
 	if s.active.Add(1) > int64(s.Cfg.MaxActive) {
+		logging.Warn("observation_rejected", "observer_capacity", "reason", "active_stream_limit")
 		s.active.Add(-1)
 		return status.Error(codes.ResourceExhausted, "resource_limit")
 	}
@@ -108,6 +116,7 @@ func (s *Server) Observe(stream pb.ObservationService_ObserveServer) error {
 	// Allow for the decoded frame, one queued frame, and a receive in progress.
 	reservation := int64(3 * 32768)
 	if !s.reserve(reservation) {
+		logging.Warn("observation_rejected", "observer_capacity", "reason", "parser_budget")
 		return status.Error(codes.ResourceExhausted, "resource_limit")
 	}
 	defer func() { s.bytes.Add(-reservation) }()
@@ -146,6 +155,7 @@ func (s *Server) Observe(stream pb.ObservationService_ObserveServer) error {
 					a.done <- err
 				}
 				if err != nil {
+					logging.Failure("observation_ack_failed", "observer_ack", err, "grpc_status", int(status.Code(err)))
 					cancel()
 					return
 				}
@@ -283,6 +293,7 @@ func (s *Server) Observe(stream pb.ObservationService_ObserveServer) error {
 		e.UsageEligible = eligible
 		s.Sink.Emit(e)
 		s.Health.Count("observer_finalized")
+		logging.Debug("observation_finalized", "observation_id", e.ObservationID, "reason", reason, "usage_status", e.UsageStatus, "duration_ms", time.Since(started).Milliseconds())
 	}
 	defer func() {
 		reason := "transport_lost"
@@ -304,6 +315,7 @@ func (s *Server) Observe(stream pb.ObservationService_ObserveServer) error {
 			return status.Error(codes.DeadlineExceeded, reason)
 		case <-ticker.C:
 			if at := writing.Load(); at > 0 && time.Now().UnixNano()-at > int64(2*time.Second) {
+				logging.Failure("observation_ack_timeout", "observer_ack", context.DeadlineExceeded, "timeout_ms", 2000)
 				final("transport_lost", nil)
 				s.Health.Count("ack_write_failure")
 				return status.Error(codes.DeadlineExceeded, "ack_timeout")
@@ -318,6 +330,7 @@ func (s *Server) Observe(stream pb.ObservationService_ObserveServer) error {
 				if r.err == io.EOF {
 					return nil
 				}
+				logging.Failure("observation_receive_failed", "observer_receive", r.err, "grpc_status", int(status.Code(r.err)))
 				return status.Error(codes.InvalidArgument, "protocol_error")
 			}
 			f := r.f
@@ -341,6 +354,7 @@ func (s *Server) Observe(stream pb.ObservationService_ObserveServer) error {
 				snapshot := s.emptySnapshot(st, "lookup_timeout")
 				lookup = s.beginResolve(ctx, st)
 				start = st
+				logging.Debug("observation_started", "observation_id", id, "config_version", st.ConfigVersion)
 				st.RouteName = routeinfo.Name(st.RouteName)
 				e = &snapshot
 				e.SchemaVersion, e.EventID, e.EventType = events.SchemaVersion, id+":start", "request_started"

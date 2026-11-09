@@ -16,6 +16,8 @@ spec:
           envFrom:
             - secretRef: {name: llm-token-stats-observer-lookups, optional: true}
           env:
+            - name: LOG_LEVEL
+              value: info
             - name: POD_UID
               valueFrom: {fieldRef: {fieldPath: metadata.uid}}
             - name: KAFKA_USERNAME

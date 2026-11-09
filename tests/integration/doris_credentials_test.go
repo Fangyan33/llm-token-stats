@@ -150,6 +150,30 @@ func TestDSNCredentialsEndToEnd(t *testing.T) {
 	if status, _ := dsnConsumerHTTP(base, "/readyz"); status != 503 {
 		t.Fatalf("wrong-password readiness = %d", status)
 	}
+	// Verify the actual entrypoint reports the SQL cause without either DSN or
+	// synthetic password, including the password echoed by some server errors.
+	eventually(t, func() bool {
+		var pods struct {
+			Items []struct {
+				Metadata struct{ Name string }
+				Status   struct{ PodIP string }
+			}
+		}
+		if err := json.Unmarshal(kubeRequest(t, "GET", "pods", nil), &pods); err != nil {
+			t.Fatal(err)
+		}
+		for _, pod := range pods.Items {
+			if "http://"+pod.Status.PodIP+":9092" != base {
+				continue
+			}
+			logs := string(kubeRequest(t, "GET", "pods/"+pod.Metadata.Name+"/log?container=consumer", nil))
+			if strings.Contains(logs, password) || strings.Contains(logs, "synthetic-wrong-password") || strings.Contains(logs, wrong) {
+				t.Fatal("Consumer error logs leaked Doris credentials")
+			}
+			return strings.Contains(logs, "event=configuration_loaded") && strings.Contains(logs, "level=ERROR") && strings.Contains(logs, "sql_error_code=1045")
+		}
+		return false
+	})
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
 	req := kmsg.NewPtrOffsetFetchRequest()

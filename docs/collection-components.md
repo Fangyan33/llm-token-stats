@@ -72,7 +72,7 @@ Observer 环境仅接受 `prd`、`stg`、`dev`。分别设置 `observer.service_
 
 两个接口的 HTTP 200 响应使用 `responseCode`、`responseMsg`、`success`、`data` 包装。成功要求 `responseCode="000000"`、`success=true`，原有 ID 与名称位于 `data`。未查询到数据或查询出多条数据使用 HTTP 200、`responseCode="650013"`，统一映射为 `lookup_invalid_response`，不能推断为未登记；第三方入参检查不合法使用 HTTP 200、`responseCode="100001"`，映射为 `lookup_unavailable`。两者 `success=false`，`data` 为 null 或缺省。认证失败使用 HTTP 401、`responseCode="401"`、`success=false`、`responseMsg="Unauthorized"`，映射为 `lookup_unavailable`，合法认证响应的消息同样记录脱敏日志。HTTP 400、429、5xx 保持原故障处理，不兼容旧英文业务码。不接受旧扁平成功响应，详细映射见[归属接口契约](spec/plan/host-service-provider-implementation.md#48-错误契约与-observer-映射)。
 
-每次 HTTP 查询完成后，Observer 将一条 `event=identity_lookup_response` 的 JSON 记录非阻塞交付给共享日志队列，含查询类型、HTTP 状态、业务码、成功标志、`responseMsg` 和该次调用的本地状态；成功 INFO、失败 WARN。消息不参与判断，可省略或为空；写日志前先替换当前凭据及客户 token，再按 UTF-8 边界限制为 1024 字节，转义换行和控制字符。未取得有效外层字段时仅记录固定诊断，不打印原始正文；不记录 URL、请求体、认证头或 data。响应包装不进入 Kafka/Doris，ID 与名称仍按原快照保存。 两类查询共用 256 条待写日志的进程级队列和单个后台写入协程；日志输出阻塞不影响归属结果返回、token 清理和查询额度释放。队列满时丢弃新日志，`/metrics` 中的 `metering_lookup_logs_dropped_total` 累计队列满丢失数。仅已脱敏的日志文本进入队列，不重试，进程退出不等待日志排空。
+每次实际 HTTP 查询完成后，Observer 按统一文本格式记录 `event=identity_lookup_response`，包含查询类型、耗时、HTTP 状态、业务码、成功标志、脱敏后的 `responseMsg` 和本地状态；成功为 INFO，失败为 ERROR，并遵循 `LOG_LEVEL` 和同类故障汇总规则。消息不参与判断，可省略或为空；先替换当前凭据及客户 token，再按 UTF-8 边界限制为 1024 字节，转义换行和控制字符。不打印 URL、请求体、认证头、data 或非法响应的原始正文。响应包装不进入 Kafka/Doris。日志使用进程共享的 256 条有界队列和单个输出协程；只有已脱敏文本入队，阻塞不影响归属返回、token 清理和额度释放。队列满时丢弃新日志，保留 `metering_lookup_logs_dropped_total`，并提供进程级 `metering_logs_dropped_total`；退出排空最多等待 200ms。
 
 `lookup_timeout_ms` 默认 200 ms（最大 2000），两类查询并行使用请求级等待截止时间，从查询协调开始时计时；共享任务沿用首次发起时的截止时间，加入者不延长；`lookup_max_concurrency` 默认 64（最大 256），不排队；每项 `max_requests_per_second` 默认 1000，独立限速且不等待。缓存命中和合并等待先于远端额度检查，不占远端并发或速率额度；只有发起新任务的请求占用并发额度。响应正文和响应头各限 8192 字节，不跟随重定向、不使用环境代理、不自动重试、不缓存原始 token。进度 ACK 和正文处理不等待外部查询；两类事件在相同快照冻结后发送。
 
@@ -235,3 +235,27 @@ Consumer 的 doris.database、DSN、Stream Load 和证据/巡检 SQL 使用同�
 ## 用户与扩展请求头
 
 事件新增 `user_id`、`user_agent`、`request_headers` 三个必填键：前两项可为 `null`，扩展头为字符串 Map，无有效项为 `{}`。Wasm 的 `user_id_header` 为有序候选列表；默认读取 `user-id`。两个事件保存相同快照；用户 ID 纳入日/月汇总维度。配置、预算与查询示例见[请求头采集说明](request-header-collection.md)。
+
+## 组件日志与 LOG_LEVEL
+
+Observer、Consumer 和 usage-worker 在启动时读取环境变量 `LOG_LEVEL`，支持 `debug`、`info`、`warn`、`error`，忽略大小写和首尾空格。默认 `info`；非法值告警并回退到 `info`，修改后重启生效。Wasm 只输出必要的 INFO/WARN/ERROR；其 `debug` 与 `info` 输出范围相同。
+
+日志使用单行可读文本，Go 服务写 stderr，Wasm 写 Envoy 日志。字段包括时间、等级、组件、事件及调用阶段、耗时、协议状态和安全提取的错误原因。DEBUG 用于观察生命周期、缓存、批次 offset、刷新任务及阶段耗时；不输出正文、密钥、认证头、完整 DSN、SQL 或 SQL 参数。SQL 错误记录错误码和 SQLState，不直接打印可能含数据或凭据的服务端消息。
+
+```sh
+LOG_LEVEL=debug ./dist/observer --config configs/observer.local.json
+LOG_LEVEL=debug ./dist/consumer --config configs/consumer.local.json
+LOG_LEVEL=debug ./dist/usage-worker --config configs/usage-worker.local.json --once
+# Compose 将宿主 LOG_LEVEL 传给这三个服务及 gateway，配置变化后重新创建容器
+LOG_LEVEL=debug docker compose -f deploy/local/compose.yaml up -d observer consumer gateway
+# Kubernetes 环境变量变更会触发 Deployment 滚动
+kubectl --context CONTEXT -n metering set env deployment/llm-token-stats-observer LOG_LEVEL=debug
+kubectl --context CONTEXT -n metering set env deployment/llm-token-stats-consumer LOG_LEVEL=debug
+kubectl --context CONTEXT -n metering set env cronjob/llm-token-stats-usage-worker LOG_LEVEL=debug
+```
+
+对生产已有网关，在 `istio-proxy` 容器中设置 `LOG_LEVEL=info`，并将 `wasm:info` 合并到 Pod 模板的 `sidecar.istio.io/componentLogLevel` 注解，保留其他组件的既有设置，完成滚动后再启用或重推插件。独立 Envoy 使用 `--component-log-level wasm:info`；其全局等级可以继续保持 warning。EnvoyFilter 的 `vm_config.environment_variables.host_env_keys` 仅包含 `LOG_LEVEL`。Wasm 使用最小 WASI 环境读取，不引入文件系统或进程退出 ABI。
+
+同类故障首次立即详细输出，之后每 30 秒汇总重复次数及最近原因，成功后记录恢复。聚合状态、日志队列与单条字段长度均有界，不按请求 ID 建聚合键。输出阻塞或队列满时允许丢日志，Observer/Consumer 的 `/metrics` 提供 `metering_logs_dropped_total`，Observer 另保留归属查询丢失计数。Wasm 日志在 tick 中、业务恢复处理之后输出，每轮最多 8 条；最多缓存 64 条，满时丢弃并在后续汇总。关闭或退出阶段可能丢失尚未输出的日志。
+
+客户端初始化日志不代表外部连接成功；网络连接、Kafka 投递、Doris 可见性和汇总刷新各自记录实际结果。正常取消、正常关闭和空轮询超时不当作依赖故障。

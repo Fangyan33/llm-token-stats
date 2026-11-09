@@ -227,6 +227,7 @@ def applications(args, images):
             container['envFrom'] = [{'secretRef': {'name': 'llm-token-stats-observer-lookups', 'optional': True}}]
         else:
             container['envFrom'] = [{'secretRef': {'name': 'llm-token-stats-consumer-credentials'}}]
+        container.setdefault('env', []).append({'name': 'LOG_LEVEL', 'value': 'info'})
         template = pod_spec([container], volumes=[{'name': 'config', 'configMap': {'name': app}}])
         template['metadata']['labels'] = {'app': app}
         resources.append(resource('Deployment', app, args.namespace, spec={
@@ -270,6 +271,7 @@ def summary_resources(args, images):
                  'volumeMounts': [{'name': 'config', 'mountPath': '/config', 'readOnly': True}],
                  'resources': {'requests': {'cpu': '100m', 'memory': '64Mi'},
                                'limits': {'cpu': '1', 'memory': '512Mi'}}}
+    container['env'].append({'name': 'LOG_LEVEL', 'value': 'info'})
     template = pod_spec([container], restartPolicy='Never')
     template['spec'].update(serviceAccountName='llm-token-stats-usage-worker',
                             volumes=[{'name': 'config', 'configMap': {'name': 'llm-token-stats-usage-worker'}}])
@@ -481,6 +483,14 @@ kubectl apply -f envoyfilter.yaml
 ```
 
 网关命名空间：{args.gateway_namespace}；工作负载标签：{json.dumps(selector(args.gateway_label), ensure_ascii=False)}。
+
+Observer、Consumer、usage-worker 的 LOG_LEVEL 默认 info，支持 debug/info/warn/error，修改环境变量后重启生效。
+日志为单行可读文本；同类故障首次详细输出、每 30 秒汇总重复次数，日志输出有界且不等待采集热路径。
+Wasm 仅输出 INFO/WARN/ERROR，debug 与 info 的输出范围相同；EnvoyFilter 只向 VM 透传 LOG_LEVEL。
+在既有网关 istio-proxy 容器中设置 LOG_LEVEL=info，并在 Pod 模板的
+sidecar.istio.io/componentLogLevel 注解中合并 wasm:info，保留其他组件的既有等级，然后完成滚动。
+这使 INFO 不被宿主过滤；不要将整个 Envoy 的日志等级改为 debug。
+
 EnvoyFilter 名称：{args.envoyfilter_name}，同样记录于 manifest.json 的 gateway_filter_name。
 代理 NAMESPACE 匹配将作用范围固定在上述命名空间，即使该命名空间是 Istio 根配置命名空间。
 默认名称固定为 llm-token-stats-envoyfilter-wasm，不自动添加摘要；启用态、关闭态和版本更新保持名称一致。

@@ -288,7 +288,7 @@ class Harness:
                     container.update(image=self.images[name], imagePullPolicy='IfNotPresent')
                     container['resources'] = {'requests': {'cpu': '50m', 'memory': '64Mi'},
                                               'limits': {'cpu': '1', 'memory': '256Mi'}}
-                    container['env'] = [e for e in container.get('env', []) if e['name'] == 'POD_UID']
+                    container['env'] = [e for e in container.get('env', []) if e['name'] in ('POD_UID', 'LOG_LEVEL')]
                     container['volumeMounts'] = [v for v in container['volumeMounts'] if v['name'] == 'config']
                     spec['volumes'] = [v for v in spec['volumes'] if v['name'] == 'config']
                 resources.append(resource)

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"github.com/Fangyan33/llm-token-stats/pkg/credentials"
 	"github.com/Fangyan33/llm-token-stats/pkg/gatewayconfig"
+	"github.com/Fangyan33/llm-token-stats/pkg/logsafe"
 	w "github.com/Fangyan33/llm-token-stats/pkg/observationwire"
 	"github.com/Fangyan33/llm-token-stats/pkg/requesthost"
 	"github.com/Fangyan33/llm-token-stats/pkg/requestid"
@@ -81,6 +82,7 @@ type root struct {
 	metrics      map[string]proxywasm.MetricCounter
 	gauges       map[string]proxywasm.MetricGauge
 	gaugeValues  [5]int64
+	logs         wasmLogger
 }
 
 func (r *root) resourceMetrics() {
@@ -95,13 +97,16 @@ func (r *root) resourceMetrics() {
 			var err error
 			g, err = proxywasm.TryDefineGaugeMetric("metering_" + name)
 			if err != nil {
+				r.repeatedLog(logsafe.Warn, "metric_definition_failed", "metric", name, "host_status", hostError(err))
 				continue
 			}
 			r.gauges[name] = g
 		}
 		if value != r.gaugeValues[i] {
-			if g.TryAdd(value-r.gaugeValues[i]) == nil {
+			if err := g.TryAdd(value - r.gaugeValues[i]); err == nil {
 				r.gaugeValues[i] = value
+			} else {
+				r.repeatedLog(logsafe.Warn, "metric_update_failed", "metric", name, "host_status", hostError(err))
 			}
 		}
 	}
@@ -113,13 +118,18 @@ func (r *root) count(name string) {
 		var err error
 		m, err = proxywasm.TryDefineCounterMetric("metering_" + name + "_total")
 		if err != nil {
+			r.repeatedLog(logsafe.Warn, "metric_definition_failed", "metric", name, "host_status", hostError(err))
 			return
 		}
 		r.metrics[name] = m
 	}
-	_ = m.TryIncrement(1)
+	if err := m.TryIncrement(1); err != nil {
+		r.repeatedLog(logsafe.Warn, "metric_update_failed", "metric", name, "host_status", hostError(err))
+	}
 }
 func (r *root) OnPluginStart(_ int) types.OnPluginStartStatus {
+	r.initLogging()
+	defer r.flushLogs(maxPendingLogs)
 	r.cleanup()
 	r.instanceID = ""
 	r.resourceMetrics()
@@ -128,6 +138,7 @@ func (r *root) OnPluginStart(_ int) types.OnPluginStartStatus {
 		r.cfg, err = gatewayconfig.Decode(b)
 	}
 	if err != nil {
+		r.log(logsafe.Error, "plugin_configuration_failed", "reason", "invalid_configuration", "action", "passthrough")
 		r.cfg.Enabled = false
 		r.count("config_invalid")
 		return types.OnPluginStartStatusOK
@@ -137,15 +148,18 @@ func (r *root) OnPluginStart(_ int) types.OnPluginStartStatus {
 		// Pod template. Resolve once per root, never from request headers or config.
 		r.instanceID = gatewayInstanceID(property("node", "metadata", "NAMESPACE"), property("node", "metadata", "NAME"))
 		if r.instanceID == "" {
+			r.log(logsafe.Error, "gateway_identity_unavailable", "action", "passthrough")
 			r.cfg.Enabled = false
 			r.count("gateway_identity_unavailable")
 			return types.OnPluginStartStatusOK
 		}
 	}
-	if proxywasm.SetTickPeriodMilliSeconds(uint32(r.cfg.TickMS)) != nil {
+	if err := proxywasm.SetTickPeriodMilliSeconds(uint32(r.cfg.TickMS)); err != nil {
+		r.log(logsafe.Error, "plugin_tick_failed", "host_status", hostError(err), "action", "passthrough")
 		r.cfg.Enabled = false
 		r.count("config_invalid")
 	}
+	r.log(logsafe.Info, "plugin_configured", "enabled", strconv.FormatBool(r.cfg.Enabled), "config_version", r.cfg.ConfigVersion, "observer_cluster", r.cfg.ObserverCluster, "log_level", r.logs.level.String())
 	return types.OnPluginStartStatusOK
 }
 func (r *root) NewHttpContext(id uint32) types.HttpContext { return &httpContext{root: r, id: id} }
@@ -167,6 +181,13 @@ func (r *root) drop(s *state, reason string) {
 	r.resourceMetrics()
 	proxywasm.CancelGrpcStream(r.id, s.token)
 	r.count("dropped_" + reason)
+	switch reason {
+	case "closed", "shutdown", "context_deleted":
+	case "transport_lost", "send_failed", "protocol_error", "timeout":
+		r.repeatedLog(logsafe.Error, "observation_"+reason, "observer_cluster", r.cfg.ObserverCluster, "grpc_stream", strconv.FormatUint(uint64(s.token), 10))
+	default:
+		r.repeatedLog(logsafe.Warn, "observation_"+reason, "action", "skip_observation")
+	}
 }
 func (r *root) cleanup() {
 	for _, h := range r.requests {
@@ -176,8 +197,13 @@ func (r *root) cleanup() {
 		r.drop(s, "shutdown")
 	}
 }
-func (r *root) OnPluginDone() bool   { r.cleanup(); return true }
-func (r *root) OnDelete()            { r.cleanup() }
+func (r *root) OnPluginDone() bool {
+	r.cleanup()
+	r.log(logsafe.Info, "plugin_stopped")
+	r.flushLogs(maxPendingLogs)
+	return true
+}
+func (r *root) OnDelete()            { r.cleanup(); r.flushLogs(maxPendingLogs) }
 func (r *root) active(s *state) bool { return s != nil && r.states[s.token] == s }
 func (r *root) schedule(s *state) {
 	if !r.active(s) {
@@ -232,10 +258,12 @@ func (r *root) send(s *state, kind int, b []byte, end bool) bool {
 	s.seq++
 	s.frames = append(s.frames, frame{s.seq, n, time.Now()})
 	r.resourceMetrics()
-	if proxywasm.SendGrpcMessage(s.token, encoded, end) != nil {
+	if err := proxywasm.SendGrpcMessage(s.token, encoded, end); err != nil {
+		r.repeatedLog(logsafe.Error, "grpc_send_failed", "host_status", hostError(err), "observer_cluster", r.cfg.ObserverCluster)
 		r.drop(s, "send_failed")
 		return false
 	}
+	r.logRecovered("grpc_send_failed")
 	s.ending = end
 	r.schedule(s)
 	return true
@@ -274,7 +302,12 @@ func (r *root) OnReceive(token uint32, size int) {
 	r.resourceMetrics()
 	r.schedule(s)
 }
-func (r *root) OnClose(token, status uint32) { r.drop(r.states[token], "transport_lost") }
+func (r *root) OnClose(token, status uint32) {
+	if r.states[token] != nil && status != 0 {
+		r.repeatedLog(logsafe.Error, "grpc_closed", "grpc_status", strconv.FormatUint(uint64(status), 10), "observer_cluster", r.cfg.ObserverCluster)
+	}
+	r.drop(r.states[token], "transport_lost")
+}
 func (r *root) OnTick() {
 	// Business resumes have their own queue: a backlog of observation ACK
 	// timeouts must not consume their processing budget.
@@ -288,6 +321,7 @@ func (r *root) OnTick() {
 		d := heap.Pop(&r.q).(*deadline)
 		r.drop(r.states[d.id], "timeout")
 	}
+	r.flushLogs(8)
 }
 
 type httpContext struct {
@@ -396,20 +430,25 @@ func (h *httpContext) OnHttpRequestHeaders(_ int, eos bool) types.Action {
 			} else {
 				h.releaseRewrite()
 				r.count("rewrite_header_failed")
+				r.repeatedLog(logsafe.Warn, "rewrite_header_failed", "host_status", hostError(err), "action", "original_body")
 			}
 		} else {
 			r.count("rewrite_resource_limit")
+			r.repeatedLog(logsafe.Warn, "rewrite_resource_limit", "action", "original_body")
 		}
 	}
 	if int64(len(r.states)) >= h.cfg.RootMaxStreams {
+		r.repeatedLog(logsafe.Warn, "observation_stream_limit", "action", "skip_observation")
 		return action
 	}
 	upstream := grpcUpstream(h.cfg.ObserverCluster)
 	token, err := proxywasm.OpenGrpcStream(r.id, upstream, "metering.v1.ObservationService", "Observe", r)
 	if err != nil {
 		r.count("dropped_open_failed")
+		r.repeatedLog(logsafe.Error, "grpc_open_failed", "host_status", hostError(err), "observer_cluster", h.cfg.ObserverCluster)
 		return action
 	}
+	r.logRecovered("grpc_open_failed")
 	s := &state{token: token, started: now}
 	h.s = s
 	r.states[token] = s
@@ -518,6 +557,7 @@ func (h *httpContext) downgrade(resume bool) {
 				h.retryResume()
 			}
 			h.root.count("rewrite_context_failed")
+			h.root.repeatedLog(logsafe.Error, "rewrite_context_failed", "host_status", hostError(err), "action", "retry_resume")
 			h.root.drop(h.s, "context_lost")
 			return
 		}
@@ -526,11 +566,15 @@ func (h *httpContext) downgrade(resume bool) {
 		if err := proxywasm.ResumeHttpRequest(); err != nil {
 			h.retryResume()
 			h.root.count("rewrite_resume_failed")
+			h.root.repeatedLog(logsafe.Error, "rewrite_resume_failed", "host_status", hostError(err), "action", "retry_resume")
 			h.root.drop(h.s, "rewrite_timeout_boundary")
 			return
 		}
 	}
 	h.releaseRewrite()
+	h.root.logRecovered("rewrite_context_failed")
+	h.root.logRecovered("rewrite_resume_failed")
+	h.root.repeatedLog(logsafe.Warn, "rewrite_passthrough", "action", "original_body")
 	h.root.count("rewrite_passthrough")
 	// Async resume may bypass later body callbacks in the pinned Envoy. Do not
 	// delay business resume to copy the buffered prefix or claim completeness.
@@ -560,6 +604,7 @@ func (h *httpContext) OnHttpRequestBody(n int, eos bool) types.Action {
 			h.releaseRewrite()
 			h.root.drop(h.s, "body_limit")
 			h.root.count("rewrite_body_limit")
+			h.root.repeatedLog(logsafe.Warn, "rewrite_body_limit", "action", "original_body")
 			return types.ActionContinue
 		}
 		if !eos {
@@ -582,9 +627,11 @@ func (h *httpContext) OnHttpRequestBody(n int, eos bool) types.Action {
 		if err != nil {
 			out = b
 			h.root.count("rewrite_invalid_json")
+			h.root.repeatedLog(logsafe.Warn, "rewrite_invalid_json", "action", "original_body")
 		}
 		if err == nil {
-			if proxywasm.ReplaceHttpRequestBody(out) != nil {
+			if err := proxywasm.ReplaceHttpRequestBody(out); err != nil {
+				h.root.repeatedLog(logsafe.Error, "rewrite_replace_failed", "host_status", hostError(err), "action", "original_body")
 				h.root.drop(h.s, "rewrite_replace_failed")
 				h.releaseRewrite()
 				return types.ActionContinue

@@ -7,6 +7,7 @@ import (
 	"github.com/Fangyan33/llm-token-stats/internal/config"
 	"github.com/Fangyan33/llm-token-stats/internal/events"
 	"github.com/Fangyan33/llm-token-stats/internal/health"
+	"github.com/Fangyan33/llm-token-stats/internal/logging"
 	"github.com/twmb/franz-go/pkg/kerr"
 	"github.com/twmb/franz-go/pkg/kgo"
 	"github.com/twmb/franz-go/pkg/sasl/plain"
@@ -27,7 +28,7 @@ type Producer struct {
 }
 
 func Options(k config.Kafka) ([]kgo.Opt, error) {
-	o := []kgo.Opt{kgo.SeedBrokers(k.Brokers...)}
+	o := []kgo.Opt{kgo.SeedBrokers(k.Brokers...), kgo.WithHooks(logging.KafkaHooks{})}
 	t, err := k.TLS()
 	if err != nil {
 		return nil, err
@@ -51,6 +52,7 @@ func New(ctx context.Context, cfg config.Kafka, h *health.State, fatal func()) (
 		return nil, err
 	}
 	p.c = c
+	logging.Info("kafka_producer_configured", "topic", cfg.Topic, "broker_count", len(cfg.Brokers))
 	go p.watch(ctx)
 	return p, nil
 }
@@ -66,6 +68,7 @@ func (p *Producer) Emit(e *events.Event) {
 	b, err := events.Canonical(e)
 	if err != nil {
 		p.h.Count("producer_dropped")
+		logging.Warn("producer_event_rejected", "producer_event", "reason", "invalid_event")
 		return
 	}
 	r := &kgo.Record{Topic: p.cfg.Topic, Key: []byte(e.ObservationID), Value: b}
@@ -73,6 +76,7 @@ func (p *Producer) Emit(e *events.Event) {
 	if p.closed || p.c == nil || len(p.pending) >= 256 {
 		p.mu.Unlock()
 		p.h.Count("producer_dropped")
+		logging.Warn("producer_event_dropped", "producer_capacity", "reason", "unavailable_or_full", "capacity", 256)
 		return
 	}
 	c := p.c
@@ -86,7 +90,10 @@ func (p *Producer) Emit(e *events.Event) {
 		p.mu.Unlock()
 		if err == nil {
 			p.h.Count("producer_success")
+			logging.Recovered("producer_delivery", "producer_delivery_recovered", "topic", p.cfg.Topic)
+			logging.Debug("producer_delivered", "topic", r.Topic, "partition", r.Partition, "offset", r.Offset)
 		} else {
+			logging.Failure("producer_delivery_failed", "producer_delivery", err, "topic", r.Topic, "partition", r.Partition)
 			if errors.Is(err, kgo.ErrMaxBuffered) || errors.Is(err, kerr.UnknownTopicOrPartition) {
 				p.h.Count("producer_definite_failure")
 			} else {
@@ -131,15 +138,22 @@ func (p *Producer) watch(ctx context.Context) {
 			p.mu.Unlock()
 			if stuck {
 				p.h.Count("producer_watchdog")
+				logging.Error("producer_watchdog_rebuilding", nil, "pending_age_ms", 3000)
 				done := make(chan struct{})
 				go func() { old.Close(); close(done) }()
 				select {
 				case <-done:
 				case <-time.After(time.Second):
+					logging.Error("producer_watchdog_close_timeout", nil)
 					p.fatal()
 					return
 				}
 				c, err := p.client()
+				if err != nil {
+					logging.Error("producer_rebuild_failed", err)
+				} else {
+					logging.Info("producer_rebuilt")
+				}
 				p.mu.Lock()
 				if !p.closed && err == nil {
 					p.c = c

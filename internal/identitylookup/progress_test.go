@@ -6,8 +6,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/Fangyan33/llm-token-stats/internal/logging"
 	"io"
-	"log"
+	"log/slog"
 	"net"
 	"net/http"
 	"strings"
@@ -59,7 +60,7 @@ func TestAuthenticationHeadersNotifyBeforeDiagnosticBody(t *testing.T) {
 				transport := &http.Transport{DialContext: func(context.Context, string, string) (net.Conn, error) { return client, nil }}
 				defer transport.CloseIdleConnections()
 				var logs bytes.Buffer
-				r := &remote{uri: "http://synthetic.invalid/", credential: "synthetic-credential", logger: log.New(&logs, "", 0), client: &http.Client{Transport: transport}}
+				r := &remote{uri: "http://synthetic.invalid/", credential: "synthetic-credential", logger: logging.New("observer", &logs, slog.LevelInfo), client: &http.Client{Transport: transport}}
 				flush := testResponseLogQueue(t, r)
 				var notifications atomic.Int32
 				notified := make(chan error, 1)
@@ -139,7 +140,7 @@ func TestAuthenticationHeadersNotifyBeforeDiagnosticBody(t *testing.T) {
 					t.Fatal("duplicated notification/log or leaked credential")
 				}
 				var entry map[string]any
-				if json.Unmarshal(bytes.TrimSpace(logs.Bytes()), &entry) != nil || entry["status"] != "lookup_unavailable" || entry["http_status"] != float64(status) {
+				if !readTextLog(logs.Bytes(), &entry) || entry["status"] != "lookup_unavailable" || entry["http_status"] != float64(status) {
 					t.Fatal("missing authentication diagnostic")
 				}
 				if mode == "complete" {

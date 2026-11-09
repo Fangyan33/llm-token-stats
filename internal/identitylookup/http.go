@@ -8,7 +8,6 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
-	"log"
 	"mime"
 	"net"
 	"net/http"
@@ -18,6 +17,7 @@ import (
 	"time"
 
 	"github.com/Fangyan33/llm-token-stats/internal/config"
+	"github.com/Fangyan33/llm-token-stats/internal/logging"
 	"github.com/Fangyan33/llm-token-stats/pkg/strictjson"
 )
 
@@ -38,8 +38,7 @@ type remote struct {
 	tokens          float64
 	last            time.Time
 	maxRPS          int
-	logger          *log.Logger
-	logQueue        *responseLogQueue
+	logger          *logging.Logger
 }
 type serviceRemote struct{ *remote }
 type customerRemote struct{ *remote }
@@ -47,29 +46,29 @@ type customerRemote struct{ *remote }
 func newRemote(c config.Lookup) (*remote, error) {
 	u, err := url.Parse(c.URI)
 	if err != nil || c.URI == "" || !config.LookupURI(c.URI) || c.MaxRPS < 0 || c.MaxRPS > 100000 {
-		return nil, errors.New("lookup_config")
+		return nil, logging.WithCause("lookup_config", nil)
 	}
 	credential := os.Getenv(c.CredentialEnv)
 	if len(credential) == 0 || len(credential) > 4096 {
-		return nil, errors.New("lookup_credential")
+		return nil, logging.WithCause("lookup_credential", nil)
 	}
 	for _, b := range []byte(credential) {
 		if b <= ' ' || b >= 127 {
-			return nil, errors.New("lookup_credential")
+			return nil, logging.WithCause("lookup_credential", nil)
 		}
 	}
 	tlsConfig := &tls.Config{MinVersion: tls.VersionTLS12}
 	if u.Scheme == "https" && c.CAFile != "" {
 		pem, err := os.ReadFile(c.CAFile)
 		if err != nil {
-			return nil, errors.New("lookup_ca")
+			return nil, logging.WithCause("lookup_ca", err)
 		}
 		pool, err := x509.SystemCertPool()
 		if err != nil {
 			pool = x509.NewCertPool()
 		}
 		if !pool.AppendCertsFromPEM(pem) {
-			return nil, errors.New("lookup_ca")
+			return nil, logging.WithCause("lookup_ca", nil)
 		}
 		tlsConfig.RootCAs = pool
 	}
@@ -130,6 +129,7 @@ func (r *remote) post(ctx context.Context, input, output any, record *responseRe
 	req.GetBody = nil
 	res, err := r.client.Do(req)
 	if err != nil {
+		record.Diagnostic = append([]any{"phase", "request"}, logging.ErrorFields(err)...)
 		if ctx.Err() != nil {
 			return failure("lookup_timeout")
 		}
@@ -171,6 +171,7 @@ func (r *remote) post(ctx context.Context, input, output any, record *responseRe
 		return failure("lookup_unavailable")
 	}
 	if err != nil {
+		record.Diagnostic = append([]any{"phase", "read_response"}, logging.ErrorFields(err)...)
 		if ctx.Err() != nil {
 			return failure("lookup_timeout")
 		}
@@ -266,8 +267,9 @@ func (r *remote) allow() bool {
 }
 
 func (r serviceRemote) Resolve(ctx context.Context, request ServiceLookupRequest) (result ServiceIdentity, err error) {
+	started := time.Now()
 	var record responseRecord
-	defer func() { r.logResponse("service", record, err) }()
+	defer func() { record.ElapsedMS = time.Since(started).Milliseconds(); r.logResponse("service", record, err) }()
 	err = r.post(ctx, request, &result, &record)
 	if err == nil && (!ValidID(result.ServiceID) || !ValidID(result.ProviderID) || !ValidName(result.ServiceName) || !ValidName(result.ProviderName)) {
 		err = failure("lookup_invalid_response")
@@ -278,9 +280,13 @@ func (r serviceRemote) Resolve(ctx context.Context, request ServiceLookupRequest
 	return result, nil
 }
 func (r customerRemote) Resolve(ctx context.Context, token []byte) (result CustomerIdentity, err error) {
+	started := time.Now()
 	var record responseRecord
 	key := string(token)
-	defer func() { r.logResponse("customer", record, err, key) }()
+	defer func() {
+		record.ElapsedMS = time.Since(started).Milliseconds()
+		r.logResponse("customer", record, err, key)
+	}()
 	err = r.post(ctx, struct {
 		APIKey string `json:"api_key"`
 	}{key}, &result, &record)

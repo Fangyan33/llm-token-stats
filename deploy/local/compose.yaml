@@ -30,6 +30,7 @@ services:
     image: alpine:latest
     command: [/app/observer, --config, /config/observer.json]
     environment:
+      LOG_LEVEL: '${LOG_LEVEL:-info}'
       METERING_SERVICE_LOOKUP_TOKEN: '${METERING_SERVICE_LOOKUP_TOKEN:-}'
       METERING_CUSTOMER_LOOKUP_TOKEN: '${METERING_CUSTOMER_LOOKUP_TOKEN:-}'
     volumes: ['../../dist:/app:ro', './observer.json:/config/observer.json:ro']
@@ -38,6 +39,7 @@ services:
     image: alpine:latest
     command: [/app/consumer, --config, /config/consumer.json]
     environment:
+      LOG_LEVEL: '${LOG_LEVEL:-info}'
       DORIS_DSN: 'root@tcp(doris:9030)/metering_development?timeout=5s&readTimeout=30s&writeTimeout=10s&interpolateParams=true&time_zone=%27%2B00%3A00%27'
     volumes: ['../../dist:/app:ro', './consumer.json:/config/consumer.json:ro']
     ports: ['0.0.0.0:19092:9092']
@@ -46,12 +48,15 @@ services:
     profiles: ['summary']
     command: [/app/usage-worker, --config, /config/usage-worker.json, --once]
     environment:
+      LOG_LEVEL: '${LOG_LEVEL:-info}'
       DORIS_DSN: 'root@tcp(doris:9030)/metering_development?timeout=5s&interpolateParams=true'
     volumes: ['../../dist:/app:ro', '../../configs/usage-worker.local.json:/config/usage-worker.json:ro', '/tmp/metering-summary-locks:/tmp/metering-summary-locks']
   gateway:
     image: istio/proxyv2:1.13.5
     entrypoint: [/usr/local/bin/envoy]
-    command: [-c, /config/envoy.json, --concurrency, '2', --log-level, warning]
+    command: [-c, /config/envoy.json, --concurrency, '2', --log-level, warning, --component-log-level, 'wasm:info']
+    environment:
+      LOG_LEVEL: '${LOG_LEVEL:-info}'
     volumes: ['../../dist/envoy.remote.json:/config/envoy.json:ro']
     ports: ['0.0.0.0:18080:8080', '0.0.0.0:19000:9901']
 volumes:

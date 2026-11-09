@@ -113,6 +113,8 @@ def suite_resources(root, namespace, images, proxy_image=IMAGES[2]):
         template['metadata']['labels']['e2e-component'] = 'true'
         spec = template['spec']
         container = spec['containers'][0]
+        if component != 'fixture':
+            container.setdefault('env', []).append({'name': 'LOG_LEVEL', 'value': 'info'})
         health, port = ('/healthz', 8081) if component == 'fixture' else ('/readyz', ports[-1] if component == 'consumer' else 9091)
         container['readinessProbe'] = {'httpGet': {'path': health, 'port': port}, 'periodSeconds': 2}
         if config:
@@ -128,7 +130,8 @@ def suite_resources(root, namespace, images, proxy_image=IMAGES[2]):
     gateway = resource('Pod', 'llm-token-stats-e2e-gateway', namespace, spec={
         'automountServiceAccountToken': False, 'containers': [{
             'name': 'envoy', 'image': proxy_image, 'imagePullPolicy': 'IfNotPresent',
-            'command': ['/usr/local/bin/envoy'], 'args': ['-c', '/config/envoy.json', '--concurrency', '1', '--log-level', 'warning'],
+            'command': ['/usr/local/bin/envoy'], 'args': ['-c', '/config/envoy.json', '--concurrency', '1', '--log-level', 'warning', '--component-log-level', 'wasm:info'],
+            'env': [{'name': 'LOG_LEVEL', 'value': 'info'}],
             'readinessProbe': {'httpGet': {'path': '/ready', 'port': 9901}, 'periodSeconds': 2},
             'resources': {'requests': {'cpu': '50m', 'memory': '64Mi'}, 'limits': {'cpu': '1', 'memory': '512Mi'}},
             'volumeMounts': [{'name': 'config', 'mountPath': '/config', 'readOnly': True}]}],

@@ -4,6 +4,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
+	"github.com/Fangyan33/llm-token-stats/internal/logging"
 	"github.com/Fangyan33/llm-token-stats/pkg/strictjson"
 	"net/url"
 	"os"
@@ -56,7 +57,7 @@ func (c LookupCache) Settings() (LookupCacheSettings, error) {
 	entries, ttl := value(c.MaxEntries, 10000), value(c.TTLSeconds, 1800)
 	stale, retry := value(c.StaleIfErrorSeconds, 900), value(c.StaleRetryIntervalSeconds, 5)
 	if entries < 1 || entries > 100000 || ttl < 1 || ttl > 86400 || stale < 0 || stale > 86400 || retry < 1 || retry > 300 {
-		return LookupCacheSettings{}, fmt.Errorf("config_lookup_cache")
+		return LookupCacheSettings{}, logging.WithCause("config_lookup_cache", nil)
 	}
 	return LookupCacheSettings{
 		Enabled:    c.Enabled == nil || *c.Enabled,
@@ -122,13 +123,13 @@ func Read(path string) (Config, error) {
 	var c Config
 	b, err := os.ReadFile(path)
 	if err != nil {
-		return c, fmt.Errorf("config_file")
+		return c, logging.WithCause("config_file", err)
 	}
 	if len(b) > 65536 || strictjson.Decode(b, &c) != nil {
-		return c, fmt.Errorf("config_invalid")
+		return c, logging.WithCause("config_invalid", nil)
 	}
 	if !kafkaTopicName.MatchString(c.Kafka.Topic) || c.Kafka.Topic == "." || c.Kafka.Topic == ".." || len(c.Kafka.Brokers) == 0 {
-		return c, fmt.Errorf("config_kafka")
+		return c, logging.WithCause("config_kafka", nil)
 	}
 	return c, nil
 }
@@ -174,7 +175,7 @@ func (c *Config) ObserverDefaults() error {
 			w.Listen = ":9093"
 		}
 		if !text(w.File, 4096) || !text(w.Listen, 256) {
-			return fmt.Errorf("config_wasm_download")
+			return logging.WithCause("config_wasm_download", nil)
 		}
 	}
 	if c.Observer.Listen == "" {
@@ -199,7 +200,7 @@ func (c *Config) ObserverDefaults() error {
 		c.Observer.ProducerID = os.Getenv("POD_UID")
 	}
 	if !text(c.Observer.ClusterName, 128) || !Environment(c.Observer.DeploymentEnvironment) || !LookupURI(c.Observer.ServiceLookup.URI) || !LookupURI(c.Observer.CustomerLookup.URI) || !text(c.Observer.ProducerID, 128) || c.Observer.MaxActive < 1 || c.Observer.MaxActive > 4096 || c.Observer.ParserBudget < 3*32768 || c.Observer.ParserBudget > 256<<20 || c.Observer.MaxObservationMS < 1 || c.Observer.MaxObservationMS > 605000 || c.Observer.MaxConnections < 1 || c.Observer.MaxConnections > 128 || !registration(c.Observer.AcceptedConfigs) || len(c.Observer.AcceptedAdapters) != 1 || c.Observer.AcceptedAdapters[0] != "chat_completions_v1" || !codes(c.Observer.Flags) || !codes(c.Observer.Details) {
-		return fmt.Errorf("config_observer")
+		return logging.WithCause("config_observer", nil)
 	}
 	return nil
 }
@@ -223,13 +224,13 @@ func (c *Config) ConsumerDefaults() error {
 		c.Doris.Database = "metering"
 	}
 	if !text(c.Consumer.Group, 128) || c.Consumer.Rows < 1 || c.Consumer.Rows > 5000 || c.Consumer.Bytes < 32768 || c.Consumer.Bytes > 4<<20 || c.Consumer.FlushMS < 1 || c.Consumer.FlushMS > 15000 || !DatabaseName(c.Doris.Database) || !registration(c.Consumer.AcceptedConfigs) || len(c.Doris.AllowedHosts) == 0 || !codes(c.Consumer.Flags) || !codes(c.Consumer.Details) {
-		return fmt.Errorf("config_consumer")
+		return logging.WithCause("config_consumer", nil)
 	}
 	for _, ps := range [][]Position{c.Consumer.Initial, c.Consumer.Resume} {
 		seen := map[int32]bool{}
 		for _, p := range ps {
 			if p.Partition < 0 || p.Offset < 0 || seen[p.Partition] {
-				return fmt.Errorf("config_offsets")
+				return logging.WithCause("config_offsets", nil)
 			}
 			seen[p.Partition] = true
 		}
@@ -272,17 +273,17 @@ func (k Kafka) TLS() (*tls.Config, error) {
 	if k.CAFile != "" {
 		b, err := os.ReadFile(k.CAFile)
 		if err != nil {
-			return nil, fmt.Errorf("kafka_tls")
+			return nil, logging.WithCause("kafka_tls", err)
 		}
 		t.RootCAs = x509.NewCertPool()
 		if !t.RootCAs.AppendCertsFromPEM(b) {
-			return nil, fmt.Errorf("kafka_tls")
+			return nil, logging.WithCause("kafka_tls", nil)
 		}
 	}
 	if k.CertFile != "" {
 		cert, err := tls.LoadX509KeyPair(k.CertFile, k.KeyFile)
 		if err != nil {
-			return nil, fmt.Errorf("kafka_tls")
+			return nil, logging.WithCause("kafka_tls", err)
 		}
 		t.Certificates = []tls.Certificate{cert}
 	}

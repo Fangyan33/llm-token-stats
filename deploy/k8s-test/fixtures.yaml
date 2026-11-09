@@ -36,6 +36,7 @@ spec:
       labels: {app: llm-token-stats-wasm-gateway, istio: TEST_NAMESPACE}
       annotations:
         inject.istio.io/templates: gateway
+        sidecar.istio.io/componentLogLevel: "wasm:info"
         proxy.istio.io/config: |
           concurrency: 2
           proxyStatsMatcher:
@@ -46,6 +47,8 @@ spec:
         - name: istio-proxy
           image: docker.io/istio/proxyv2:1.14.6
           env:
+            - name: LOG_LEVEL
+              value: info
             - name: ISTIO_AGENT_ENABLE_WASM_REMOTE_LOAD_CONVERSION
               value: "false"
           imagePullPolicy: IfNotPresent

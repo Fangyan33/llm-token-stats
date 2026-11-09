@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"fmt"
+	"github.com/Fangyan33/llm-token-stats/internal/logging"
 	"reflect"
 	"sort"
 	"strings"
@@ -25,7 +26,14 @@ func randomID() string {
 }
 
 // Run captures the UTC cutoff once. from/to are optional, left-closed/right-open.
-func (w *Worker) Run(ctx context.Context, from, to string) error {
+func (w *Worker) Run(ctx context.Context, from, to string) (result error) {
+	started := time.Now()
+	phase := "validate_range"
+	defer func() {
+		if result != nil {
+			logging.Failure("summary_run_failed", "summary_run", result, "phase", phase, "duration_ms", time.Since(started).Milliseconds())
+		}
+	}()
 	now := time.Now()
 	if w.Now != nil {
 		now = w.Now()
@@ -41,7 +49,7 @@ func (w *Worker) Run(ctx context.Context, from, to string) error {
 	}
 	end := today
 	if start.After(today) {
-		return fmt.Errorf("collection_start_in_future")
+		return logging.WithCause("collection_start_in_future", nil)
 	}
 	if from != "" || to != "" {
 		a, e := ParseDate(from)
@@ -50,7 +58,7 @@ func (w *Worker) Run(ctx context.Context, from, to string) error {
 		}
 		b, e := ParseDate(to)
 		if e != nil || !b.After(a) || a.Before(start) || b.After(today) {
-			return fmt.Errorf("invalid_backfill_range")
+			return logging.WithCause("invalid_backfill_range", nil)
 		}
 		start = a
 		end = b
@@ -58,15 +66,20 @@ func (w *Worker) Run(ctx context.Context, from, to string) error {
 	if e = w.Guard.Check(ctx); e != nil {
 		return e
 	}
+	logging.Info("summary_run_started", "from", start.Format("2006-01-02"), "to", end.Format("2006-01-02"))
+	phase = "check_definitions"
 	if e = w.checkDefinitions(ctx); e != nil {
 		return e
 	}
+	phase = "recover"
 	if e = w.recover(ctx, today, cutoff); e != nil {
 		return e
 	}
+	phase = "purge"
 	if e = w.purge(ctx, cutoff); e != nil {
 		return e
 	}
+	phase = "refresh"
 	parts, e := w.Store.partitions(ctx, "events_raw")
 	if e != nil {
 		return e
@@ -93,6 +106,7 @@ func (w *Worker) Run(ctx context.Context, from, to string) error {
 	}
 	gaps := false
 	for _, m := range keys {
+		logging.Debug("summary_month_selected", "stat_month", m, "day_count", len(months[m]))
 		for _, d := range months[m] {
 			if e = ctx.Err(); e != nil {
 				return e
@@ -103,6 +117,7 @@ func (w *Worker) Run(ctx context.Context, from, to string) error {
 				return e
 			}
 			if p, ok := parts[date]; !ok || !p.End.Equal(d.AddDate(0, 0, 1)) {
+				logging.Warn("summary_coverage_gap", "summary_coverage", "stat_date", date, "reason", "source_partition_missing")
 				state.Status = "GAP"
 				state.ErrorCode = "source_partition_missing"
 				if e = w.Store.saveState(ctx, state); e != nil {
@@ -152,6 +167,7 @@ func (w *Worker) Run(ctx context.Context, from, to string) error {
 			return e
 		}
 		if !complete {
+			logging.Warn("summary_coverage_gap", "summary_coverage", "stat_month", m, "reason", "daily_coverage_missing")
 			state.Status = "GAP"
 			state.ErrorCode = "daily_coverage_missing"
 			if e = w.Store.saveState(ctx, state); e != nil {
@@ -167,8 +183,9 @@ func (w *Worker) Run(ctx context.Context, from, to string) error {
 		}
 	}
 	if gaps {
-		return fmt.Errorf("summary_coverage_gap")
+		return logging.WithCause("summary_coverage_gap", nil)
 	}
+	logging.Info("summary_run_completed", "duration_ms", time.Since(started).Milliseconds())
 	return nil
 }
 func (w *Worker) recover(ctx context.Context, today, cutoff time.Time) error {
@@ -177,15 +194,16 @@ func (w *Worker) recover(ctx context.Context, today, cutoff time.Time) error {
 		return e
 	}
 	for _, r := range runs {
+		logging.Info("summary_recovering", "refresh_id", r.ID, "period_type", r.Kind, "period_start", r.Date)
 		d, e := ParseDate(r.Date)
 		if e != nil {
 			return e
 		}
 		if r.Kind != "DAY" && r.Kind != "MONTH" {
-			return fmt.Errorf("invalid_run_kind")
+			return logging.WithCause("invalid_run_kind", nil)
 		}
 		if !d.Before(today) {
-			return fmt.Errorf("pending_run_outside_window")
+			return logging.WithCause("pending_run_outside_window", nil)
 		}
 		if d.Before(cutoff) {
 			tasks, e := w.Store.tasks(ctx, r.View)
@@ -194,7 +212,7 @@ func (w *Worker) recover(ctx context.Context, today, cutoff time.Time) error {
 			}
 			for _, task := range tasks {
 				if task["Status"] == "RUNNING" || task["Status"] == "PENDING" {
-					return fmt.Errorf("expired_refresh_in_progress")
+					return logging.WithCause("expired_refresh_in_progress", nil)
 				}
 			}
 			r.Status = "FAILED"
@@ -221,7 +239,7 @@ func (w *Worker) recover(ctx context.Context, today, cutoff time.Time) error {
 			next = d.AddDate(0, 1, 0)
 		}
 		if r.View != expectedView || r.Partition != partitionName(d, next) {
-			return fmt.Errorf("invalid_run_target")
+			return logging.WithCause("invalid_run_target", nil)
 		}
 		if r.Kind == "DAY" {
 			rows, e := w.Store.rows(ctx, "SELECT notification_id FROM "+w.Store.table("summary_mv_refresh_inputs")+" WHERE stat_date=? AND refresh_id=? ORDER BY notification_id", r.Date, r.ID)
@@ -234,7 +252,7 @@ func (w *Worker) recover(ctx context.Context, today, cutoff time.Time) error {
 			}
 			if len(ids) != r.InputCount || events.Tuple(ids) != r.InputDigest {
 				if r.Submitted {
-					return fmt.Errorf("submitted_inputs_incomplete")
+					return logging.WithCause("submitted_inputs_incomplete", nil)
 				}
 				r.Status = "FAILED"
 				r.ErrorCode = "input_capture_incomplete"
@@ -260,7 +278,7 @@ func (w *Worker) checkDefinitions(ctx context.Context) error {
 			return e
 		}
 		if len(rows) != 1 {
-			return fmt.Errorf("summary_definition_missing")
+			return logging.WithCause("summary_definition_missing", nil)
 		}
 		var ddl string
 		for k, v := range rows[0] {
@@ -270,7 +288,7 @@ func (w *Worker) checkDefinitions(ctx context.Context) error {
 		}
 		normalized := strings.Join(strings.Fields(strings.ToLower(ddl)), " ")
 		if !strings.Contains(normalized, "on manual") || !strings.Contains(normalized, `"use_for_rewrite" = "false"`) {
-			return fmt.Errorf("summary_definition_must_be_manual")
+			return logging.WithCause("summary_definition_must_be_manual", nil)
 		}
 	}
 	return nil
@@ -284,7 +302,7 @@ func (w *Worker) purge(ctx context.Context, cutoff time.Time) error {
 		}
 		for _, t := range ts {
 			if t["Status"] == "RUNNING" || t["Status"] == "PENDING" {
-				return fmt.Errorf("purge_refresh_in_progress")
+				return logging.WithCause("purge_refresh_in_progress", nil)
 			}
 		}
 	}
@@ -348,8 +366,9 @@ func (w *Worker) purgeTable(ctx context.Context, table string, cutoff time.Time)
 		if p.End.After(cutoff) {
 			continue
 		}
+		logging.Info("summary_expiring_partition", "table", table, "partition", p.Name)
 		if !identifier.MatchString(p.Name) {
-			return fmt.Errorf("invalid_source_partition")
+			return logging.WithCause("invalid_source_partition", nil)
 		}
 		if e = w.Guard.Check(ctx); e != nil {
 			return e
@@ -373,7 +392,7 @@ func (w *Worker) purgeTable(ctx context.Context, table string, cutoff time.Time)
 				return e
 			}
 		}
-		if _, e = w.Store.DB.ExecContext(ctx, "ALTER TABLE "+w.Store.table(table)+" DROP PARTITION "+p.Name); e != nil {
+		if _, e = w.Store.exec(ctx, "ALTER TABLE "+w.Store.table(table)+" DROP PARTITION "+p.Name); e != nil {
 			return e
 		}
 	}

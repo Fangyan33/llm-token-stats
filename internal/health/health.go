@@ -2,11 +2,14 @@ package health
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/Fangyan33/llm-token-stats/internal/logging"
 )
 
 type State struct {
@@ -70,13 +73,21 @@ func (s *State) Handler() http.Handler {
 	return m
 }
 func Start(ctx context.Context, addr string, s *State) *http.Server {
+	s.GaugeFunc("logs_dropped_total", logging.Default().Dropped)
 	srv := &http.Server{Addr: addr, Handler: s.Handler(), ReadHeaderTimeout: 3 * time.Second}
-	go srv.ListenAndServe()
+	go func() {
+		logging.Info("health_listener_starting", "listen", addr)
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			logging.Error("health_listener_failed", err, "listen", addr)
+		}
+	}()
 	go func() {
 		<-ctx.Done()
 		c, cancel := context.WithTimeout(context.Background(), time.Second)
 		defer cancel()
-		srv.Shutdown(c)
+		if err := srv.Shutdown(c); err != nil {
+			logging.Error("health_shutdown_failed", err)
+		}
 	}()
 	return srv
 }

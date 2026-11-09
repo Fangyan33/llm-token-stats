@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"github.com/Fangyan33/llm-token-stats/internal/config"
 	"github.com/Fangyan33/llm-token-stats/internal/consumer"
+	"github.com/Fangyan33/llm-token-stats/internal/logging"
 	"github.com/go-sql-driver/mysql"
 	"io"
 	"net/http"
@@ -28,28 +29,29 @@ type Store struct {
 
 func New(c config.Doris) (*Store, error) {
 	if !config.DatabaseName(c.Database) {
-		return nil, errors.New("doris_database")
+		return nil, logging.WithCause("doris_database", nil)
 	}
 	dsn := os.Getenv(c.DSNEnv)
 	if dsn == "" {
-		return nil, errors.New("doris_dsn")
+		return nil, logging.WithCause("doris_dsn", nil)
 	}
 	parsed, err := mysql.ParseDSN(dsn)
 	if err != nil || parsed.DBName != c.Database {
-		return nil, errors.New("doris_dsn")
+		return nil, logging.WithCause("doris_dsn", nil)
 	}
 	db, err := sql.Open("mysql", dsn)
 	if err != nil {
-		return nil, errors.New("doris_dsn")
+		return nil, logging.WithCause("doris_dsn", nil)
 	}
 	db.SetMaxOpenConns(8)
 	db.SetMaxIdleConns(4)
 	db.SetConnMaxLifetime(time.Minute)
+	logging.Info("doris_client_configured", "database", c.Database)
 	// Freeze the same credentials for SQL and HTTP for this Store's lifetime.
 	s := &Store{DB: db, Cfg: c, username: parsed.User, password: parsed.Passwd}
 	s.HTTP = &http.Client{Timeout: 15 * time.Second, CheckRedirect: func(r *http.Request, via []*http.Request) error {
 		if len(via) > 3 || !s.allowed(r.URL) || r.Method != "PUT" || len(via) > 0 && via[0].URL.Scheme == "https" && r.URL.Scheme != "https" {
-			return errors.New("doris_redirect")
+			return logging.WithCause("doris_redirect", nil)
 		}
 		r.SetBasicAuth(s.username, s.password)
 		return nil
@@ -76,34 +78,53 @@ var keys = map[string][]string{"events_raw": {"request_date", "observation_id", 
 func (s *Store) visible(ctx context.Context, label string) (bool, error) {
 	rows, err := s.DB.QueryContext(ctx, "SHOW TRANSACTION FROM "+s.Database()+" WHERE LABEL = "+quote(label))
 	if err != nil {
-		return false, errors.New("transaction_unknown")
+		// A new label normally has no transaction yet. Doris reports that as
+		// 1105, the same generic code used for real SQL failures. Match only
+		// the known absence diagnostic; other 1105 errors must remain visible.
+		var mysqlErr *mysql.MySQLError
+		missing := "transaction with label " + label + " does not exist"
+		if errors.As(err, &mysqlErr) && mysqlErr.Number == 1105 && (mysqlErr.Message == missing || mysqlErr.Message == "errCode = 2, detailMessage = "+missing) {
+			return false, nil
+		}
+		logging.Failure("doris_sql_failed", "doris_transaction", err, "operation", "transaction_status", "label", label)
+		return false, logging.WithCause("transaction_unknown", err)
 	}
+	logging.Recovered("doris_transaction", "doris_sql_recovered", "operation", "transaction_status")
 	defer rows.Close()
-	cols, _ := rows.Columns()
+	cols, err := rows.Columns()
+	if err != nil {
+		return false, logging.WithCause("transaction_unknown", err)
+	}
 	for rows.Next() {
 		vals := make([]sql.RawBytes, len(cols))
 		ptr := make([]any, len(cols))
 		for i := range vals {
 			ptr[i] = &vals[i]
 		}
-		if rows.Scan(ptr...) != nil {
-			return false, errors.New("transaction_unknown")
+		if err := rows.Scan(ptr...); err != nil {
+			logging.Failure("doris_sql_failed", "doris_transaction", err, "operation", "scan_transaction", "label", label)
+			return false, logging.WithCause("transaction_unknown", err)
 		}
 		for i, c := range cols {
 			if c == "TransactionStatus" {
 				if string(vals[i]) == "ABORTED" {
-					return false, errors.New("transaction_aborted")
+					logging.Failure("doris_transaction_aborted", "doris_transaction", nil, "label", label)
+					return false, logging.WithCause("transaction_aborted", nil)
 				}
 				return string(vals[i]) == "VISIBLE", nil
 			}
 		}
+	}
+	if err := rows.Err(); err != nil {
+		logging.Failure("doris_sql_failed", "doris_transaction", err, "operation", "read_transaction", "label", label)
+		return false, logging.WithCause("transaction_unknown", err)
 	}
 	return false, nil
 }
 func (s *Store) verify(ctx context.Context, table string, rows []map[string]any) error {
 	ks, ok := keys[table]
 	if !ok {
-		return errors.New("doris_table")
+		return logging.WithCause("doris_table", nil)
 	}
 	seen := map[string]bool{}
 	wheres := []string{}
@@ -127,47 +148,61 @@ func (s *Store) verify(ctx context.Context, table string, rows []map[string]any)
 		end := min(i+128, len(wheres))
 		var n int
 		if err := s.DB.QueryRowContext(ctx, "SELECT COUNT(*) FROM "+s.Database()+"."+table+" WHERE "+strings.Join(wheres[i:end], " OR ")).Scan(&n); err != nil || n != end-i {
-			return errors.New("doris_visibility")
+			logging.Failure("doris_visibility_failed", "doris_visibility", err, "table", table, "expected_rows", end-i, "visible_rows", n)
+			return logging.WithCause("doris_visibility", err)
 		}
 	}
+	logging.Recovered("doris_visibility", "doris_visibility_recovered", "table", table)
 	return nil
 }
 func (s *Store) Load(ctx context.Context, table, label string, body []byte, rows []map[string]any) error {
+	started := time.Now()
 	if _, ok := keys[table]; !ok {
-		return errors.New("doris_table")
+		return logging.WithCause("doris_table", nil)
 	}
 	if v, err := s.visible(ctx, label); err == nil && v {
 		return s.verify(ctx, table, rows)
 	}
 	u, err := url.Parse(strings.TrimRight(s.Cfg.FE, "/") + "/api/" + s.Cfg.Database + "/" + table + "/_stream_load")
 	if err != nil || !s.allowed(u) {
-		return errors.New("doris_target")
+		return logging.WithCause("doris_target", nil)
 	}
 	r, err := http.NewRequestWithContext(ctx, "PUT", u.String(), bytes.NewReader(body))
 	if err != nil {
-		return errors.New("doris_request")
+		return logging.WithCause("doris_request", nil)
 	}
 	r.SetBasicAuth(s.username, s.password)
 	for k, v := range map[string]string{"label": label, "Expect": "100-continue", "format": "json", "read_json_by_line": "true", "max_filter_ratio": "0", "timezone": "+00:00", "strict_mode": "true", "timeout": "10"} {
 		r.Header.Set(k, v)
 	}
 	res, err := s.HTTP.Do(r)
+	if err != nil {
+		logging.Failure("doris_stream_load_failed", "doris_http", err, "table", table, "label", label, "row_count", len(rows), "duration_ms", time.Since(started).Milliseconds())
+	}
 	if err == nil {
 		defer res.Body.Close()
-		b, _ := io.ReadAll(io.LimitReader(res.Body, 65536))
+		b, readErr := io.ReadAll(io.LimitReader(res.Body, 65536))
 		var result struct {
 			Status                                                                      string
 			NumberTotalRows, NumberLoadedRows, NumberFilteredRows, NumberUnselectedRows int
 		}
-		if res.StatusCode != 200 || json.Unmarshal(b, &result) != nil {
+		decodeErr := json.Unmarshal(b, &result)
+		if res.StatusCode != 200 || readErr != nil || decodeErr != nil {
+			cause := readErr
+			if cause == nil {
+				cause = decodeErr
+			}
+			logging.Failure("doris_stream_load_response_failed", "doris_http", cause, "table", table, "label", label, "http_status", res.StatusCode, "duration_ms", time.Since(started).Milliseconds())
 			result.Status = "uncertain"
 		}
 		if result.Status == "Success" || result.Status == "Publish Timeout" {
 			if result.NumberTotalRows != len(rows) || result.NumberLoadedRows != len(rows) || result.NumberFilteredRows != 0 || result.NumberUnselectedRows != 0 {
-				return errors.New("doris_row_count")
+				logging.Failure("doris_stream_load_row_count_failed", "doris_load_rows", nil, "table", table, "label", label, "expected_rows", len(rows), "loaded_rows", result.NumberLoadedRows, "filtered_rows", result.NumberFilteredRows)
+				return logging.WithCause("doris_row_count", nil)
 			}
 		} else if result.Status != "Label Already Exists" && result.Status != "uncertain" {
-			return errors.New("doris_load")
+			logging.Failure("doris_stream_load_rejected", "doris_http", nil, "table", table, "label", label, "http_status", res.StatusCode)
+			return logging.WithCause("doris_load", nil)
 		}
 	}
 	ticker := time.NewTicker(100 * time.Millisecond)
@@ -178,11 +213,18 @@ func (s *Store) Load(ctx context.Context, table, label string, body []byte, rows
 			return e
 		}
 		if v {
-			return s.verify(ctx, table, rows)
+			err := s.verify(ctx, table, rows)
+			if err == nil {
+				logging.Recovered("doris_http", "doris_stream_load_recovered", "table", table)
+				logging.Recovered("doris_load_rows", "doris_row_counts_recovered", "table", table)
+				logging.Debug("doris_load_visible", "table", table, "label", label, "row_count", len(rows), "duration_ms", time.Since(started).Milliseconds())
+			}
+			return err
 		}
 		select {
 		case <-ctx.Done():
-			return errors.New("transaction_unknown")
+			logging.Failure("doris_load_visibility_timeout", "doris_visibility", ctx.Err(), "table", table, "label", label, "duration_ms", time.Since(started).Milliseconds())
+			return logging.WithCause("transaction_unknown", nil)
 		case <-ticker.C:
 		}
 	}
@@ -204,24 +246,25 @@ func (s *Store) Evidence(ctx context.Context, ids []string) ([]consumer.Evidence
 		// Compare the single contract using typed identity columns.
 		r, err := s.DB.QueryContext(ctx, "SELECT CAST(request_date AS STRING),observation_id,payload_hash,"+IdentityKeySQL+","+NameKeySQL+",request_started_at_ms,event_id FROM "+s.Database()+".events_raw WHERE observation_id IN ("+strings.Join(qs, ",")+")")
 		if err != nil {
-			return nil, errors.New("doris_evidence")
+			logging.Failure("doris_evidence_failed", "doris_evidence", err, "id_count", end-start)
+			return nil, logging.WithCause("doris_evidence", err)
 		}
 		for r.Next() {
 			var e consumer.Evidence
-			if r.Scan(&e.Date, &e.ID, &e.Hash, &e.Identity, &e.Names, &e.Started, &e.EventID) != nil {
+			if err := r.Scan(&e.Date, &e.ID, &e.Hash, &e.Identity, &e.Names, &e.Started, &e.EventID); err != nil {
 				r.Close()
-				return nil, errors.New("doris_evidence")
+				return nil, logging.WithCause("doris_evidence", err)
 			}
 			out = append(out, e)
 			if len(out) > 100000 {
 				r.Close()
-				return nil, errors.New("evidence_limit")
+				return nil, logging.WithCause("evidence_limit", nil)
 			}
 		}
 		err = r.Err()
 		r.Close()
 		if err != nil {
-			return nil, errors.New("doris_evidence")
+			return nil, logging.WithCause("doris_evidence", err)
 		}
 	}
 	return out, nil

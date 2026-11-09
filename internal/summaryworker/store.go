@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"github.com/Fangyan33/llm-token-stats/internal/logging"
 	"os"
 	"regexp"
 	"strings"
@@ -24,11 +25,11 @@ type Store struct {
 
 func Open(c config.Doris) (*Store, error) {
 	if !config.DatabaseName(c.Database) {
-		return nil, fmt.Errorf("invalid_database")
+		return nil, logging.WithCause("invalid_database", nil)
 	}
 	d, err := mysql.ParseDSN(os.Getenv(c.DSNEnv))
 	if err != nil || d.DBName != c.Database {
-		return nil, fmt.Errorf("summary_dsn")
+		return nil, logging.WithCause("summary_dsn", nil)
 	}
 	if d.Params == nil {
 		d.Params = map[string]string{}
@@ -41,17 +42,20 @@ func Open(c config.Doris) (*Store, error) {
 	d.Timeout = 5 * time.Second
 	db, err := sql.Open("mysql", d.FormatDSN())
 	if err != nil {
-		return nil, fmt.Errorf("summary_connect")
+		return nil, logging.WithCause("summary_connect", nil)
 	}
 	db.SetMaxOpenConns(2)
 	return &Store{db, c.Database}, nil
 }
 func (s *Store) table(name string) string { return "`" + s.Database + "`.`" + name + "`" }
 func (s *Store) rows(ctx context.Context, q string, args ...any) ([]map[string]string, error) {
+	started := time.Now()
 	rows, err := s.DB.QueryContext(ctx, q, args...)
 	if err != nil {
+		logging.Failure("summary_sql_failed", "summary_sql", err, "operation", sqlOperation(q), "duration_ms", time.Since(started).Milliseconds())
 		return nil, err
 	}
+	logging.Recovered("summary_sql", "summary_sql_recovered")
 	defer rows.Close()
 	cols, err := rows.Columns()
 	if err != nil {
@@ -76,6 +80,29 @@ func (s *Store) rows(ctx context.Context, q string, args ...any) ([]map[string]s
 	return out, rows.Err()
 }
 
+func sqlOperation(q string) string {
+	words := strings.Fields(q)
+	if len(words) == 0 {
+		return "unknown"
+	}
+	switch words[0] {
+	case "SELECT", "SHOW", "INSERT", "ALTER", "REFRESH":
+		return words[0]
+	}
+	return "unknown"
+}
+func (s *Store) exec(ctx context.Context, q string, args ...any) (sql.Result, error) {
+	started := time.Now()
+	r, err := s.DB.ExecContext(ctx, q, args...)
+	if err != nil {
+		logging.Failure("summary_sql_failed", "summary_sql", err, "operation", sqlOperation(q), "duration_ms", time.Since(started).Milliseconds())
+	} else {
+		logging.Recovered("summary_sql", "summary_sql_recovered")
+		logging.Debug("summary_sql_completed", "operation", sqlOperation(q), "duration_ms", time.Since(started).Milliseconds())
+	}
+	return r, err
+}
+
 type Partition struct {
 	Name       string
 	Start, End time.Time
@@ -90,7 +117,7 @@ func (s *Store) partitions(ctx context.Context, table string) (map[string]Partit
 	for _, r := range rows {
 		bs := bounds.FindAllStringSubmatch(r["Range"], -1)
 		if len(bs) != 2 {
-			return nil, fmt.Errorf("partition_range")
+			return nil, logging.WithCause("partition_range", nil)
 		}
 		a, e := ParseDate(bs[0][1])
 		if e != nil {
@@ -141,7 +168,7 @@ func (s *Store) saveRun(ctx context.Context, r Run) error {
 	if e != nil {
 		return e
 	}
-	_, e = s.DB.ExecContext(ctx, "INSERT INTO "+s.table("summary_mv_refresh_runs")+" VALUES (?,?,?,?,?,?)", r.Kind, r.Date, r.ID, r.Status, string(b), stamp())
+	_, e = s.exec(ctx, "INSERT INTO "+s.table("summary_mv_refresh_runs")+" VALUES (?,?,?,?,?,?)", r.Kind, r.Date, r.ID, r.Status, string(b), stamp())
 	return e
 }
 func (s *Store) saveState(ctx context.Context, r State) error {
@@ -149,7 +176,7 @@ func (s *Store) saveState(ctx context.Context, r State) error {
 	if e != nil {
 		return e
 	}
-	_, e = s.DB.ExecContext(ctx, "INSERT INTO "+s.table("summary_mv_refresh_state")+" VALUES (?,?,?,?,?)", r.Kind, r.Date, r.Status, string(b), stamp())
+	_, e = s.exec(ctx, "INSERT INTO "+s.table("summary_mv_refresh_state")+" VALUES (?,?,?,?,?)", r.Kind, r.Date, r.Status, string(b), stamp())
 	return e
 }
 func (s *Store) state(ctx context.Context, kind, date string) (State, error) {
@@ -203,7 +230,7 @@ func (s *Store) inputs(ctx context.Context, r Run, ids []string) error {
 			qs = append(qs, "(?,?,?)")
 			args = append(args, r.Date, r.ID, id)
 		}
-		if _, e := s.DB.ExecContext(ctx, "INSERT INTO "+s.table("summary_mv_refresh_inputs")+" VALUES "+strings.Join(qs, ","), args...); e != nil {
+		if _, e := s.exec(ctx, "INSERT INTO "+s.table("summary_mv_refresh_inputs")+" VALUES "+strings.Join(qs, ","), args...); e != nil {
 			return e
 		}
 	}
@@ -212,6 +239,6 @@ func (s *Store) inputs(ctx context.Context, r Run, ids []string) error {
 func stamp() string { return time.Now().UTC().Format("2006-01-02 15:04:05.000") }
 
 func (s *Store) dynamic(ctx context.Context, table string, enabled bool) error {
-	_, e := s.DB.ExecContext(ctx, "ALTER TABLE "+s.table(table)+" SET (\"dynamic_partition.enable\"=\""+fmt.Sprint(enabled)+"\")")
+	_, e := s.exec(ctx, "ALTER TABLE "+s.table(table)+" SET (\"dynamic_partition.enable\"=\""+fmt.Sprint(enabled)+"\")")
 	return e
 }

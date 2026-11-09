@@ -1,11 +1,13 @@
 package doris
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"database/sql/driver"
 	"errors"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -15,6 +17,8 @@ import (
 	"time"
 
 	"github.com/Fangyan33/llm-token-stats/internal/config"
+	"github.com/Fangyan33/llm-token-stats/internal/logging"
+	"github.com/go-sql-driver/mysql"
 )
 
 // An absent transaction lets Load reach the HTTP path without a live database.
@@ -37,6 +41,53 @@ func (absentTransaction) QueryContext(_ context.Context, query string, _ []drive
 }
 func (absentTransaction) Columns() []string         { return []string{"TransactionStatus"} }
 func (absentTransaction) Next([]driver.Value) error { return io.EOF }
+
+type failedTransaction struct {
+	absentTransaction
+	err error
+}
+
+func (f failedTransaction) Connect(context.Context) (driver.Conn, error) { return f, nil }
+func (f failedTransaction) QueryContext(context.Context, string, []driver.NamedValue) (driver.Rows, error) {
+	return nil, f.err
+}
+
+func TestTransactionAbsenceDoesNotLogAnOutage(t *testing.T) {
+	for _, tc := range []struct {
+		name, message string
+		code          uint16
+		absent        bool
+	}{
+		{"missing", "errCode = 2, detailMessage = transaction with label synthetic_label does not exist", 1105, true},
+		{"missing_without_prefix", "transaction with label synthetic_label does not exist", 1105, true},
+		{"other_label", "transaction with label another_label does not exist", 1105, false},
+		{"real_sql_failure", "unavailable backend", 1105, false},
+		{"auth_failure", "synthetic-secret-password", 1045, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var out bytes.Buffer
+			l := logging.New("consumer", &out, slog.LevelInfo)
+			defer l.Close()
+			restore := logging.SetDefault(l)
+			defer restore()
+			db := sql.OpenDB(failedTransaction{err: &mysql.MySQLError{Number: tc.code, Message: tc.message}})
+			defer db.Close()
+			s := &Store{DB: db, Cfg: config.Doris{Database: "metering"}}
+			visible, err := s.visible(t.Context(), "synthetic_label")
+			if visible || (err == nil) != tc.absent {
+				t.Fatal("incorrect transaction classification", visible, err)
+			}
+			ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+			defer cancel()
+			if !l.Flush(ctx) {
+				t.Fatal("flush timeout")
+			}
+			if strings.Contains(out.String(), "event=doris_sql_failed") == tc.absent || strings.Contains(out.String(), "synthetic-secret-password") {
+				t.Fatal("normal absence was logged or SQL outage was hidden", out.String())
+			}
+		})
+	}
+}
 
 func testStore(t *testing.T, target string, hosts []string, password string) *Store {
 	t.Helper()

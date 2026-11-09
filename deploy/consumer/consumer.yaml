@@ -13,6 +13,7 @@ spec:
           args: [--config, /config/consumer.json]
           ports: [{name: health, containerPort: 9092}]
           envFrom: [{secretRef: {name: llm-token-stats-consumer-credentials}}]
+          env: [{name: LOG_LEVEL, value: info}]
           resources: {requests: {cpu: '250m', memory: 128Mi}, limits: {cpu: '1', memory: 512Mi}}
           readinessProbe: {httpGet: {path: /readyz, port: health}}
           livenessProbe: {httpGet: {path: /livez, port: health}}

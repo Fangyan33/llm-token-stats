@@ -625,3 +625,9 @@ python3 scripts/cleanup_k8s_collection.py
 - [Doris 部署与迁移说明](deploy/doris/README.md)
 - [日 / 月汇总设计](docs/daily-monthly-summary-design.md)、[Doris 协调设计](docs/doris-summary-coordination.md)
 - [API Key 鉴权设计](docs/api-key-auth-service-implementation.md)
+
+## 日志排查
+
+Observer、Consumer、usage-worker 通过环境变量 `LOG_LEVEL=debug|info|warn|error` 调整日志，默认 `info`，修改后重启生效。Wasm 暂仅输出 INFO/WARN/ERROR，`debug` 与 `info` 相同。日志为可读文本，外部调用错误带调用阶段、耗时和安全的底层原因；同类错误首次详细输出，之后每 30 秒汇总。正文、密钥及完整 DSN 不进入日志。
+
+已有网关需设置 `istio-proxy` 容器的 `LOG_LEVEL`，并在 Pod 模板的 `sidecar.istio.io/componentLogLevel` 注解中合并 `wasm:info`，保留其他组件设置后完成滚动；EnvoyFilter 会将该环境变量传入 Wasm。独立 Envoy 使用 `--component-log-level wasm:info`。完整命令、日志分级及有界输出说明见[组件日志与 LOG_LEVEL](docs/collection-components.md#组件日志与-log_level)。

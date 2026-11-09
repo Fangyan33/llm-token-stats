@@ -30,6 +30,8 @@ REPLACE_GATEWAY_LABELS
               vm_config:
                 vm_id: gateway-observer-v1
                 runtime: envoy.wasm.runtime.v8
+                environment_variables:
+                  host_env_keys: [LOG_LEVEL]
                 # 缓存缺失时拒绝本次配置并后台下载，不向请求暴露未下载完成的 VM。
                 nack_on_code_cache_miss: true
                 code:

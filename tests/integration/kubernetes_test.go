@@ -90,6 +90,10 @@ func reachableServer(t *testing.T, handler http.Handler) *httptest.Server {
 // Every fault probe uses the pinned real Envoy in its own Pod. Neither Docker
 // access nor a host mount is available to the Job.
 func startEnvoy(t *testing.T, config map[string]any, localWasm bool) (base, admin string, stop func()) {
+	return startEnvoyWithLogLevel(t, config, localWasm, "info")
+}
+
+func startEnvoyWithLogLevel(t *testing.T, config map[string]any, localWasm bool, logLevel string) (base, admin string, stop func()) {
 	t.Helper()
 	name := "llm-token-stats-e2e-envoy-" + uuid(t)
 	config["node"] = map[string]any{"id": name, "cluster": "integration", "metadata": map[string]string{
@@ -115,7 +119,8 @@ func startEnvoy(t *testing.T, config map[string]any, localWasm bool) (base, admi
 	t.Cleanup(stop)
 	meta["annotations"] = map[string]string{"sidecar.istio.io/inject": "false"}
 	container := map[string]any{"name": "envoy", "image": os.Getenv("METERING_ENVOY_IMAGE"), "imagePullPolicy": "IfNotPresent",
-		"command": []string{"/usr/local/bin/envoy"}, "args": []string{"-c", "/config/envoy.json", "--concurrency", "1", "--log-level", "warning"},
+		"command": []string{"/usr/local/bin/envoy"}, "args": []string{"-c", "/config/envoy.json", "--concurrency", "1", "--log-level", "warning", "--component-log-level", "wasm:info"},
+		"env":          []any{map[string]string{"name": "LOG_LEVEL", "value": logLevel}},
 		"volumeMounts": []any{map[string]any{"name": "config", "mountPath": "/config", "readOnly": true}},
 		"resources":    map[string]any{"requests": map[string]string{"cpu": "50m", "memory": "64Mi"}, "limits": map[string]string{"cpu": "1", "memory": "512Mi"}}}
 	spec := map[string]any{"restartPolicy": "Never", "automountServiceAccountToken": false, "containers": []any{container},

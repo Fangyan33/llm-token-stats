@@ -14,6 +14,7 @@ import (
 
 	"github.com/Fangyan33/llm-token-stats/internal/config"
 	"github.com/Fangyan33/llm-token-stats/internal/health"
+	"github.com/Fangyan33/llm-token-stats/internal/logging"
 )
 
 const Path = "/wasm/gateway-observer-v1.wasm"
@@ -31,7 +32,7 @@ type handler struct {
 func open(path string, h *health.State) (*handler, error) {
 	f, err := os.Open(path)
 	if err != nil {
-		return nil, fmt.Errorf("wasm_file_unreadable")
+		return nil, logging.WithCause("wasm_file_unreadable", err)
 	}
 	valid := false
 	defer func() {
@@ -41,15 +42,15 @@ func open(path string, h *health.State) (*handler, error) {
 	}()
 	info, err := f.Stat()
 	if err != nil || !info.Mode().IsRegular() {
-		return nil, fmt.Errorf("wasm_file_invalid")
+		return nil, logging.WithCause("wasm_file_invalid", nil)
 	}
 	var header [8]byte
 	if _, err := f.ReadAt(header[:], 0); err != nil || !bytes.Equal(header[:], []byte{0, 'a', 's', 'm', 1, 0, 0, 0}) {
-		return nil, fmt.Errorf("wasm_file_invalid")
+		return nil, logging.WithCause("wasm_file_invalid", nil)
 	}
 	digest := sha256.New()
 	if _, err := io.Copy(digest, io.NewSectionReader(f, 0, info.Size())); err != nil {
-		return nil, fmt.Errorf("wasm_file_unreadable")
+		return nil, logging.WithCause("wasm_file_unreadable", nil)
 	}
 	valid = true
 	return &handler{file: f, size: info.Size(), modified: info.ModTime(), etag: fmt.Sprintf(`"%x"`, digest.Sum(nil)), slots: make(chan struct{}, maxDownloads), health: h}, nil
@@ -70,10 +71,12 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		defer func() { <-h.slots }()
 	default:
 		h.health.Count("wasm_download_busy")
+		logging.Warn("wasm_download_busy", "wasm_download", "max_downloads", maxDownloads)
 		w.WriteHeader(http.StatusServiceUnavailable)
 		return
 	}
 	h.health.Count("wasm_download_requests")
+	logging.Debug("wasm_download", "method", r.Method, "artifact_bytes", h.size)
 	w.Header().Set("Content-Type", "application/wasm")
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
@@ -97,7 +100,7 @@ func New(c config.WasmDownload, h *health.State) (*Server, error) {
 	l, err := net.Listen("tcp", c.Listen)
 	if err != nil {
 		handler.file.Close()
-		return nil, fmt.Errorf("wasm_http_listen_failure")
+		return nil, logging.WithCause("wasm_http_listen_failure", err)
 	}
 	return &Server{
 		http:     &http.Server{Handler: handler, ReadHeaderTimeout: 3 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 30 * time.Second, MaxHeaderBytes: 8192},

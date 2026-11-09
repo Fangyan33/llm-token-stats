@@ -73,6 +73,7 @@
                           "vm_config": {
                             "vm_id": "gateway-observer-v1",
                             "runtime": "envoy.wasm.runtime.v8",
+                            "environment_variables": {"host_env_keys": ["LOG_LEVEL"]},
                             "code": {
                               "remote": {
                                 "http_uri": {

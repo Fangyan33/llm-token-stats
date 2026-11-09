@@ -9,6 +9,7 @@ import (
 	"github.com/Fangyan33/llm-token-stats/internal/doris"
 	"github.com/Fangyan33/llm-token-stats/internal/events"
 	"github.com/Fangyan33/llm-token-stats/internal/health"
+	"github.com/Fangyan33/llm-token-stats/internal/logging"
 	"github.com/Fangyan33/llm-token-stats/internal/producer"
 	"github.com/twmb/franz-go/pkg/kgo"
 	"github.com/twmb/franz-go/pkg/kmsg"
@@ -50,11 +51,17 @@ func New(c config.Config, s *doris.Store, h *health.State) (*Worker, error) {
 			w.ready[p] = false
 		}
 		w.mu.Unlock()
+		logging.Recovered("kafka_group", "kafka_group_recovered", "topic", c.Kafka.Topic, "group", c.Consumer.Group)
+		logging.Info("partitions_assigned", "topic", c.Kafka.Topic, "partition_count", len(ps[c.Kafka.Topic]))
 	}), kgo.OnPartitionsRevoked(func(ctx context.Context, cl *kgo.Client, ps map[string][]int32) { w.revoke(ps) }), kgo.OnPartitionsLost(func(ctx context.Context, cl *kgo.Client, ps map[string][]int32) { w.revoke(ps) }))
 	w.Client, err = kgo.NewClient(o...)
+	if err == nil {
+		logging.Info("kafka_consumer_configured", "topic", c.Kafka.Topic, "group", c.Consumer.Group, "broker_count", len(c.Kafka.Brokers))
+	}
 	return w, err
 }
 func (w *Worker) revoke(ps map[string][]int32) {
+	logging.Info("partitions_revoked", "topic", w.Cfg.Kafka.Topic, "partition_count", len(ps[w.Cfg.Kafka.Topic]))
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	for _, p := range ps[w.Cfg.Kafka.Topic] {
@@ -72,16 +79,18 @@ func (w *Worker) positions(ctx context.Context, p int32) (int64, int64, error) {
 	req.Topics = []kmsg.OffsetFetchRequestTopic{{Topic: w.Cfg.Kafka.Topic, Partitions: []int32{p}}}
 	r, err := w.Client.Request(ctx, req)
 	if err != nil {
-		return 0, 0, errors.New("kafka_offset")
+		return 0, 0, logging.WithCause("kafka_offset", err)
 	}
 	resp := r.(*kmsg.OffsetFetchResponse)
 	if resp.ErrorCode != 0 {
+		logging.Failure("kafka_offset_failed", "kafka_offset", nil, "kafka_error_code", int(resp.ErrorCode), "partition", p)
 		return 0, 0, errors.New("kafka_offset")
 	}
 	committed := int64(-1)
 	for _, t := range resp.Topics {
 		for _, v := range t.Partitions {
 			if v.ErrorCode != 0 {
+				logging.Failure("kafka_offset_failed", "kafka_offset", nil, "kafka_error_code", int(v.ErrorCode), "partition", p)
 				return 0, 0, errors.New("kafka_offset")
 			}
 			committed = v.Offset
@@ -95,11 +104,12 @@ func (w *Worker) positions(ctx context.Context, p int32) (int64, int64, error) {
 	l.Topics = []kmsg.ListOffsetsRequestTopic{{Topic: w.Cfg.Kafka.Topic, Partitions: []kmsg.ListOffsetsRequestTopicPartition{part}}}
 	r, err = w.Client.Request(ctx, l)
 	if err != nil {
-		return 0, 0, errors.New("kafka_offset")
+		return 0, 0, logging.WithCause("kafka_offset", err)
 	}
 	for _, t := range r.(*kmsg.ListOffsetsResponse).Topics {
 		for _, v := range t.Partitions {
 			if v.ErrorCode != 0 {
+				logging.Failure("kafka_offset_failed", "kafka_offset", nil, "kafka_error_code", int(v.ErrorCode), "partition", p)
 				return 0, 0, errors.New("kafka_offset")
 			}
 			return committed, v.Offset, nil
@@ -114,7 +124,7 @@ func (w *Worker) setup(ctx context.Context, p int32) (int64, error) {
 	}
 	rows, err := w.Store.DB.QueryContext(ctx, "SELECT DISTINCT initial_offset FROM "+w.Store.Database()+".consumer_partition_origins WHERE group_id=? AND kafka_topic=? AND kafka_partition=?", w.Cfg.Consumer.Group, w.Cfg.Kafka.Topic, p)
 	if err != nil {
-		return 0, errors.New("origin_query")
+		return 0, logging.WithCause("origin_query", err)
 	}
 	origins := []int64{}
 	for rows.Next() {
@@ -217,6 +227,7 @@ func (w *Worker) Run(ctx context.Context) error {
 			next, err := w.setup(c, p)
 			cancel()
 			if err != nil {
+				logging.Failure("partition_setup_failed", "partition_setup/"+fmt.Sprint(p), err, "topic", w.Cfg.Kafka.Topic, "partition", p)
 				w.mu.Lock()
 				w.blocked[p] = true
 				w.mu.Unlock()
@@ -230,6 +241,8 @@ func (w *Worker) Run(ctx context.Context) error {
 			delete(w.blocked, p)
 			w.mu.Unlock()
 			w.Client.ResumeFetchPartitions(map[string][]int32{w.Cfg.Kafka.Topic: {p}})
+			logging.Recovered("partition_setup/"+fmt.Sprint(p), "partition_setup_recovered", "partition", p, "next_offset", next)
+			logging.Info("partition_ready", "partition", p, "next_offset", next)
 		}
 		pollCtx, pollCancel := context.WithTimeout(ctx, w.pollWait(time.Now(), releaseAt))
 		fetch := w.Client.PollRecords(pollCtx, w.Cfg.Consumer.Rows)
@@ -243,6 +256,7 @@ func (w *Worker) Run(ctx context.Context) error {
 				continue
 			}
 			w.Health.Count("fetch_failure")
+			logging.Failure("kafka_fetch_failed", "kafka_fetch/"+fmt.Sprint(e.Partition), e.Err, "topic", e.Topic, "partition", e.Partition)
 			w.mu.Lock()
 			w.ready[e.Partition] = false
 			delete(w.buffered, e.Partition)
@@ -317,8 +331,12 @@ func (w *Worker) Run(ctx context.Context) error {
 			ready = ready && w.ready[p]
 		}
 		w.mu.Unlock()
-		w.Health.Ready.Store(ready)
+		if previous := w.Health.Ready.Swap(ready); previous != ready {
+			logging.Info("readiness_changed", "ready", ready)
+		}
 	}
+	w.Health.Ready.Store(false)
+	logging.Info("consumer_stopping")
 	return ctx.Err()
 }
 func (w *Worker) audit(ctx context.Context) {
@@ -335,6 +353,7 @@ func (w *Worker) audit(ctx context.Context) {
 	rows, err := w.Store.DB.QueryContext(c, "SELECT DISTINCT observation_id FROM "+w.Store.Database()+".events_raw GROUP BY observation_id HAVING COUNT(DISTINCT request_started_at_ms)>1 OR COUNT(DISTINCT request_date)>1 OR COUNT(DISTINCT "+doris.IdentityKeySQL+")>1 OR COUNT(DISTINCT "+doris.NameKeySQL+")>1 OR SUM(CASE WHEN event_type='request_started' THEN 1 ELSE 0 END)>1 OR SUM(CASE WHEN event_type='usage_observed' THEN 1 ELSE 0 END)>1")
 	if err != nil {
 		w.Health.Count("audit_failure")
+		logging.Failure("consumer_audit_failed", "consumer_audit", err, "phase", "query_conflicts")
 		return
 	}
 	ids := []string{}
@@ -361,6 +380,7 @@ func (w *Worker) audit(ctx context.Context) {
 		es, err := w.Store.Evidence(c, ids[i:last])
 		if err != nil {
 			w.Health.Count("audit_failure")
+			logging.Failure("consumer_audit_failed", "consumer_audit", err, "phase", "read_evidence")
 			return
 		}
 		marks := []map[string]any{}
@@ -384,11 +404,14 @@ func (w *Worker) audit(ctx context.Context) {
 			b := consumer.EncodeRows(x.r)
 			if err = w.Store.Load(c, x.t, "audit_"+events.Hash(b), b, x.r); err != nil {
 				w.Health.Count("audit_failure")
+				logging.Failure("consumer_audit_failed", "consumer_audit", err, "phase", "save_audit", "table", x.t)
 				return
 			}
 		}
 	}
 	w.Health.Count("audit_success")
+	logging.Recovered("consumer_audit", "consumer_audit_recovered")
+	logging.Debug("consumer_audit_completed", "conflict_count", len(ids))
 	w.mu.Lock()
 	w.auditOK = true
 	w.mu.Unlock()

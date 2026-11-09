@@ -11,6 +11,7 @@ import (
 	pb "github.com/Fangyan33/llm-token-stats/gen/observation/v1"
 	"github.com/Fangyan33/llm-token-stats/internal/events"
 	"github.com/Fangyan33/llm-token-stats/internal/identitylookup"
+	"github.com/Fangyan33/llm-token-stats/internal/logging"
 	"github.com/Fangyan33/llm-token-stats/pkg/credentials"
 )
 
@@ -140,7 +141,9 @@ func (s *Server) resolveQueries(ctx context.Context, st *pb.Start, finished func
 	state.mu.Unlock()
 	if overloaded {
 		s.Health.Count("lookup_overloaded")
+		logging.Warn("lookup_overloaded", "lookup_capacity", "reason", "concurrency_limit")
 	}
+	logging.Debug("lookup_cache_probe", "service_worker", newService, "customer_worker", newCustomer)
 	var workers sync.WaitGroup
 	if newService {
 		resolver := s.ServiceResolver
@@ -246,6 +249,7 @@ collect:
 	state.mu.Unlock()
 	s.Health.Count("service_mapping_" + e.MappingStatus)
 	s.Health.Count("customer_mapping_" + e.CustomerMappingStatus)
+	logging.Debug("lookup_snapshot_frozen", "service_status", e.MappingStatus, "customer_status", e.CustomerMappingStatus)
 	return e
 }
 

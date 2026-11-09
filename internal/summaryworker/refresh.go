@@ -3,7 +3,7 @@ package summaryworker
 import (
 	"context"
 	"encoding/json"
-	"fmt"
+	"github.com/Fangyan33/llm-token-stats/internal/logging"
 	"sort"
 	"strings"
 	"time"
@@ -39,7 +39,7 @@ func taskContextPartitions(raw string) ([]string, error) {
 		return nil, e
 	}
 	if c.TriggerMode != "MANUAL" || c.IsComplete {
-		return nil, fmt.Errorf("unexpected_refresh_trigger")
+		return nil, logging.WithCause("unexpected_refresh_trigger", nil)
 	}
 	return c.Partitions, nil
 }
@@ -64,10 +64,10 @@ func matchTask(r Run, rows []map[string]string) (map[string]string, error) {
 			return nil, e
 		}
 		if len(ps) != 1 || ps[0] != r.Partition {
-			return nil, fmt.Errorf("unexpected_refresh_partitions")
+			return nil, logging.WithCause("unexpected_refresh_partitions", nil)
 		}
 		if found != nil {
-			return nil, fmt.Errorf("ambiguous_refresh_task")
+			return nil, logging.WithCause("ambiguous_refresh_task", nil)
 		}
 		found = row
 	}
@@ -85,7 +85,7 @@ func (w *Worker) refresh(ctx context.Context, r *Run) error {
 	if !r.Submitted {
 		for _, row := range rows {
 			if row["Status"] == "RUNNING" || row["Status"] == "PENDING" {
-				return fmt.Errorf("refresh_already_running")
+				return logging.WithCause("refresh_already_running", nil)
 			}
 		}
 		r.Baseline = nil
@@ -103,10 +103,11 @@ func (w *Worker) refresh(ctx context.Context, r *Run) error {
 		}
 		// The partition is generated from validated DATE bounds, never user SQL.
 		if !identifier.MatchString(r.Partition) {
-			return fmt.Errorf("invalid_partition")
+			return logging.WithCause("invalid_partition", nil)
 		}
-		_, submitErr := w.Store.DB.ExecContext(ctx, "REFRESH MATERIALIZED VIEW "+w.Store.table(r.View)+" PARTITIONS ("+r.Partition+")")
+		_, submitErr := w.Store.exec(ctx, "REFRESH MATERIALIZED VIEW "+w.Store.table(r.View)+" PARTITIONS ("+r.Partition+")")
 		if submitErr != nil {
+			logging.Failure("summary_refresh_submit_uncertain", "summary_submit", submitErr, "view", r.View, "partition", r.Partition, "refresh_id", r.ID)
 			r.ErrorCode = "submit_uncertain"
 			_ = w.Store.saveRun(ctx, *r)
 		}
@@ -129,6 +130,7 @@ func (w *Worker) refresh(ctx context.Context, r *Run) error {
 			return e
 		}
 		if row != nil {
+			logging.Debug("summary_refresh_task", "refresh_id", r.ID, "task_id", row["TaskId"], "task_status", row["Status"])
 			missing = 0
 			r.TaskID = row["TaskId"]
 			r.Status = "RUNNING"
@@ -137,18 +139,20 @@ func (w *Worker) refresh(ctx context.Context, r *Run) error {
 			}
 			switch row["Status"] {
 			case "SUCCESS":
+				logging.Recovered("summary_submit", "summary_refresh_submission_reconciled", "refresh_id", r.ID)
 				var completed []string
 				if json.Unmarshal([]byte(row["CompletedPartitions"]), &completed) != nil || len(completed) != 1 || completed[0] != r.Partition {
-					return fmt.Errorf("incomplete_refresh")
+					return logging.WithCause("incomplete_refresh", nil)
 				}
 				return nil
 			case "FAILED", "CANCELED", "CANCELLED":
+				logging.Error("summary_refresh_task_failed", nil, "refresh_id", r.ID, "task_id", r.TaskID, "task_status", row["Status"], "view", r.View, "partition", r.Partition)
 				r.Status = "FAILED"
 				r.ErrorCode = "doris_refresh_failed"
 				if e = w.Store.saveRun(ctx, *r); e != nil {
 					return e
 				}
-				return fmt.Errorf("doris_refresh_failed")
+				return logging.WithCause("doris_refresh_failed", nil)
 			}
 		} else {
 			missing++
@@ -157,7 +161,7 @@ func (w *Worker) refresh(ctx context.Context, r *Run) error {
 			if missing >= 5 {
 				for _, t := range rows {
 					if t["Status"] == "RUNNING" || t["Status"] == "PENDING" {
-						return fmt.Errorf("unresolved_refresh_task")
+						return logging.WithCause("unresolved_refresh_task", nil)
 					}
 				}
 				r.Submitted = false
@@ -166,7 +170,7 @@ func (w *Worker) refresh(ctx context.Context, r *Run) error {
 				if e = w.Store.saveRun(ctx, *r); e != nil {
 					return e
 				}
-				return fmt.Errorf("refresh_task_missing_retry_next_run")
+				return logging.WithCause("refresh_task_missing_retry_next_run", nil)
 			}
 		}
 		select {
@@ -176,7 +180,7 @@ func (w *Worker) refresh(ctx context.Context, r *Run) error {
 			r.Status = "UNCERTAIN"
 			r.ErrorCode = "refresh_timeout"
 			_ = w.Store.saveRun(context.WithoutCancel(ctx), *r)
-			return fmt.Errorf("refresh_timeout")
+			return logging.WithCause("refresh_timeout", nil)
 		case <-poll.C:
 		}
 	}
@@ -209,6 +213,8 @@ func (w *Worker) finish(ctx context.Context, r *Run) error {
 	return w.Store.saveRun(ctx, *r)
 }
 func (w *Worker) execute(ctx context.Context, kind string, date time.Time, ids []string, versions map[string]string, start, end time.Time) error {
+	started := time.Now()
+	logging.Info("summary_refresh_started", "period_type", kind, "period_start", date.Format("2006-01-02"), "notification_count", len(ids))
 	view := "usage_daily_mv"
 	next := date.AddDate(0, 0, 1)
 	if kind == "MONTH" {
@@ -244,6 +250,7 @@ func (w *Worker) execute(ctx context.Context, kind string, date time.Time, ids [
 	if e = w.finish(ctx, &r); e != nil {
 		return w.failure(ctx, &r, e)
 	}
+	logging.Info("summary_refresh_completed", "refresh_id", r.ID, "task_id", r.TaskID, "view", r.View, "partition", r.Partition, "duration_ms", time.Since(started).Milliseconds())
 	return nil
 }
 func partitionName(a, b time.Time) string {
@@ -272,11 +279,11 @@ func (w *Worker) validate(ctx context.Context, r Run) error {
 		return e
 	}
 	if count != 0 {
-		return fmt.Errorf("summary_invariant")
+		return logging.WithCause("summary_invariant", nil)
 	}
 	if r.Kind == "MONTH" {
 		if r.InputCount != len(r.DailyVersions) || r.InputDigest != events.Tuple(r.DailyVersions) {
-			return fmt.Errorf("monthly_input_digest")
+			return logging.WithCause("monthly_input_digest", nil)
 		}
 		for date, version := range r.DailyVersions {
 			state, e := w.Store.state(ctx, "DAY", date)
@@ -284,7 +291,7 @@ func (w *Worker) validate(ctx context.Context, r Run) error {
 				return e
 			}
 			if state.Status != "SUCCEEDED" || state.SuccessID != version {
-				return fmt.Errorf("monthly_input_changed")
+				return logging.WithCause("monthly_input_changed", nil)
 			}
 		}
 		// Compare every dimension and metric, including NULL semantics. EXCEPT is set
@@ -301,7 +308,7 @@ func (w *Worker) validate(ctx context.Context, r Run) error {
 			return e
 		}
 		if count != 0 {
-			return fmt.Errorf("monthly_daily_mismatch")
+			return logging.WithCause("monthly_daily_mismatch", nil)
 		}
 	}
 	return nil
@@ -312,6 +319,7 @@ var metrics = []string{"request_count", "started_request_count", "usage_observed
 // Best-effort diagnostic state never acknowledges inputs and never writes after
 // ownership loss. The original error remains the caller's failure reason.
 func (w *Worker) failure(ctx context.Context, r *Run, cause error) error {
+	logging.Failure("summary_refresh_failed", "summary_refresh", cause, "refresh_id", r.ID, "view", r.View, "partition", r.Partition, "error_code", r.ErrorCode)
 	if w.Guard.Check(ctx) != nil {
 		return cause
 	}

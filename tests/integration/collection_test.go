@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -28,6 +29,7 @@ import (
 	"github.com/Fangyan33/llm-token-stats/internal/events"
 	"github.com/Fangyan33/llm-token-stats/internal/health"
 	"github.com/Fangyan33/llm-token-stats/internal/ingestworker"
+	"github.com/Fangyan33/llm-token-stats/internal/logging"
 	"github.com/Fangyan33/llm-token-stats/internal/producer"
 	"github.com/Fangyan33/llm-token-stats/pkg/observationwire"
 	"github.com/twmb/franz-go/pkg/kgo"
@@ -285,6 +287,11 @@ func TestStreamLoadConfirmationLoss(t *testing.T) {
 	}))
 	defer proxy.Close()
 	s := localStore(t, proxy.URL)
+	var logs bytes.Buffer
+	logger := logging.New("consumer", &logs, slog.LevelInfo)
+	defer logger.Close()
+	restore := logging.SetDefault(logger)
+	defer restore()
 	id := uuid(t)
 	rows := []map[string]any{{"group_id": "test-confirmation-" + id, "kafka_topic": "llm-metering-development", "kafka_partition": 0, "origin_id": events.Hash([]byte(id)), "initial_offset": 0, "created_at": consumer.Stamp(time.Now())}}
 	body := consumer.EncodeRows(rows)
@@ -299,6 +306,12 @@ func TestStreamLoadConfirmationLoss(t *testing.T) {
 	}
 	if calls.Load() != 1 {
 		t.Fatalf("visible label was sent %d times", calls.Load())
+	}
+	if !logger.Flush(ctx) {
+		t.Fatal("log flush timed out")
+	}
+	if strings.Contains(logs.String(), "event=doris_sql_failed") || !strings.Contains(logs.String(), "event=doris_stream_load_failed") {
+		t.Fatal("normal missing transaction was logged as an outage, or lost HTTP failure diagnostic", logs.String())
 	}
 }
 

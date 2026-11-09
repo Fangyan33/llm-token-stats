@@ -3,10 +3,12 @@ package ingestworker
 import (
 	"context"
 	"errors"
+	"strconv"
 	"time"
 
 	"github.com/Fangyan33/llm-token-stats/internal/config"
 	"github.com/Fangyan33/llm-token-stats/internal/consumer"
+	"github.com/Fangyan33/llm-token-stats/internal/logging"
 	"github.com/twmb/franz-go/pkg/kgo"
 	"github.com/twmb/franz-go/pkg/kmsg"
 )
@@ -53,6 +55,7 @@ func (w *Worker) processPartition(ctx context.Context, fp kgo.FetchTopicPartitio
 		started = previous.started
 	}
 	for len(rs) > 0 {
+		batchStarted := time.Now()
 		w.mu.Lock()
 		b := w.pending[fp.Partition]
 		w.mu.Unlock()
@@ -93,6 +96,7 @@ func (w *Worker) processPartition(ctx context.Context, fp kgo.FetchTopicPartitio
 			}
 		}
 		if err == nil {
+			logging.Debug("batch_processing", "topic", fp.Topic, "partition", fp.Partition, "first_offset", b.First, "last_offset", b.Last, "record_count", len(b.Records))
 			c, cancel := context.WithTimeout(ctx, 30*time.Second)
 			p := consumer.Processor{Store: store, Owns: func() bool { return w.owns(fp.Partition) }}
 			err = p.Process(c, b)
@@ -104,17 +108,24 @@ func (w *Worker) processPartition(ctx context.Context, fp kgo.FetchTopicPartitio
 						for _, t := range r.Topics {
 							for _, p := range t.Partitions {
 								if p.ErrorCode != 0 {
+									logging.Failure("offset_commit_failed", "offset_commit/"+strconv.Itoa(int(fp.Partition)), nil, "kafka_error_code", int(p.ErrorCode), "partition", p.Partition)
 									err = errors.New("commit_failure")
 								}
 							}
 						}
 					}
 				})
+				if err != nil {
+					logging.Failure("offset_commit_failed", "offset_commit/"+strconv.Itoa(int(fp.Partition)), err, "partition", fp.Partition)
+				} else {
+					logging.Recovered("offset_commit/"+strconv.Itoa(int(fp.Partition)), "offset_commit_recovered", "partition", fp.Partition)
+				}
 			}
 			cancel()
 		}
 		if err != nil {
 			w.Health.Count("batch_failure")
+			logging.Failure("batch_failed_partition_paused", "batch/"+strconv.Itoa(int(fp.Partition)), err, "topic", fp.Topic, "partition", fp.Partition, "first_offset", rs[0].Offset, "duration_ms", time.Since(batchStarted).Milliseconds(), "retryable", err != consumer.ErrPause)
 			if !w.owns(fp.Partition) {
 				return
 			}
@@ -137,6 +148,9 @@ func (w *Worker) processPartition(ctx context.Context, fp kgo.FetchTopicPartitio
 		delete(w.retryAt, fp.Partition)
 		w.mu.Unlock()
 		w.Health.Count("batch_committed")
+		logging.Recovered("batch/"+strconv.Itoa(int(fp.Partition)), "batch_processing_recovered", "partition", fp.Partition)
+		logging.Recovered("kafka_fetch/"+strconv.Itoa(int(fp.Partition)), "kafka_fetch_recovered", "partition", fp.Partition)
+		logging.Debug("batch_committed", "partition", fp.Partition, "first_offset", b.First, "last_offset", b.Last, "duration_ms", time.Since(batchStarted).Milliseconds())
 		if rs[n-1].Offset < b.Last {
 			client.SetOffsets(map[string]map[int32]kgo.EpochOffset{fp.Topic: {fp.Partition: {Epoch: -1, Offset: b.Last + 1}}})
 			return

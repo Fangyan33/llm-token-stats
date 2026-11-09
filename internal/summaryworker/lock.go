@@ -2,7 +2,7 @@ package summaryworker
 
 import (
 	"context"
-	"fmt"
+	"github.com/Fangyan33/llm-token-stats/internal/logging"
 	"os"
 	"path/filepath"
 	"syscall"
@@ -20,7 +20,7 @@ func LocalGuard(path string) (Guard, error) {
 	}
 	if e = syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); e != nil {
 		f.Close()
-		return nil, fmt.Errorf("summary_already_running")
+		return nil, logging.WithCause("summary_already_running", nil)
 	}
 	return &localGuard{f}, nil
 }

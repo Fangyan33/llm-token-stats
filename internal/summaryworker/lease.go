@@ -7,6 +7,7 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"fmt"
+	"github.com/Fangyan33/llm-token-stats/internal/logging"
 	"io"
 	"net/http"
 	"os"
@@ -46,15 +47,15 @@ type lease struct {
 func KubernetesGuard(ctx context.Context, name string, store *Store) (Guard, error) {
 	ns, pod, uid := os.Getenv("POD_NAMESPACE"), os.Getenv("POD_NAME"), os.Getenv("POD_UID")
 	if ns == "" || pod == "" || uid == "" {
-		return nil, fmt.Errorf("pod_identity_required")
+		return nil, logging.WithCause("pod_identity_required", nil)
 	}
 	ca, e := os.ReadFile("/var/run/secrets/kubernetes.io/serviceaccount/ca.crt")
 	if e != nil {
-		return nil, fmt.Errorf("kubernetes_ca")
+		return nil, logging.WithCause("kubernetes_ca", e)
 	}
 	pool := x509.NewCertPool()
 	if !pool.AppendCertsFromPEM(ca) {
-		return nil, fmt.Errorf("kubernetes_ca")
+		return nil, logging.WithCause("kubernetes_ca", nil)
 	}
 	g := &kubeGuard{client: &http.Client{Timeout: 10 * time.Second, Transport: &http.Transport{TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12, RootCAs: pool}}}, base: "https://kubernetes.default.svc", path: "/apis/coordination.k8s.io/v1/namespaces/" + ns + "/leases/" + name, namespace: ns, owner: pod + "/" + uid + "/" + newID(), stop: make(chan struct{}), done: make(chan struct{}), store: store}
 	var l lease
@@ -64,11 +65,11 @@ func KubernetesGuard(ctx context.Context, name string, store *Store) (Guard, err
 	if l.Spec.Holder != "" && l.Spec.Holder != g.owner {
 		renew, e := time.Parse(time.RFC3339Nano, l.Spec.Renew)
 		if e != nil || l.Spec.Duration <= 0 || time.Now().Before(renew.Add(time.Duration(l.Spec.Duration)*time.Second)) {
-			return nil, fmt.Errorf("summary_already_running")
+			return nil, logging.WithCause("summary_already_running", nil)
 		}
 		old := strings.Split(l.Spec.Holder, "/")
 		if len(old) != 3 {
-			return nil, fmt.Errorf("lease_owner_unverifiable")
+			return nil, logging.WithCause("lease_owner_unverifiable", nil)
 		}
 		var p struct {
 			Metadata struct {
@@ -80,7 +81,7 @@ func KubernetesGuard(ctx context.Context, name string, store *Store) (Guard, err
 		}
 		code, e := g.api(ctx, "GET", "/api/v1/namespaces/"+ns+"/pods/"+old[0], nil, &p)
 		if code != http.StatusNotFound && (e != nil || p.Metadata.UID == old[1] && (p.Status.Phase != "Succeeded" && p.Status.Phase != "Failed")) {
-			return nil, fmt.Errorf("old_pod_not_terminated")
+			return nil, logging.WithCause("old_pod_not_terminated", nil)
 		}
 		if e = g.idle(ctx); e != nil {
 			return nil, e
@@ -90,7 +91,7 @@ func KubernetesGuard(ctx context.Context, name string, store *Store) (Guard, err
 			return nil, e
 		}
 		if len(frontends) != 1 {
-			return nil, fmt.Errorf("multi_fe_takeover_requires_verification")
+			return nil, logging.WithCause("multi_fe_takeover_requires_verification", nil)
 		}
 		processes, e := store.rows(ctx, "SHOW PROCESSLIST")
 		if e != nil {
@@ -130,15 +131,17 @@ func KubernetesGuard(ctx context.Context, name string, store *Store) (Guard, err
 					next.Spec.Renew = time.Now().UTC().Format(time.RFC3339Nano)
 					_, e = g.api(ctx, "PUT", g.path, next, nil)
 				} else {
-					e = fmt.Errorf("lease_lost")
+					e = logging.WithCause("lease_lost", nil)
 				}
 				if e != nil {
 					g.lost = true
 					g.mu.Unlock()
+					logging.Error("summary_lease_lost", e, "lease", name)
 					return
 				}
 				g.last = time.Now()
 				g.mu.Unlock()
+				logging.Debug("summary_lease_renewed", "lease", name)
 			}
 		}
 	}()
@@ -155,7 +158,7 @@ func (g *kubeGuard) api(ctx context.Context, method, path string, in, out any) (
 	}
 	token, e := os.ReadFile("/var/run/secrets/kubernetes.io/serviceaccount/token")
 	if e != nil {
-		return 0, fmt.Errorf("kubernetes_token")
+		return 0, logging.WithCause("kubernetes_token", e)
 	}
 	req, e := http.NewRequestWithContext(ctx, method, g.base+path, bytes.NewReader(b))
 	if e != nil {
@@ -165,17 +168,23 @@ func (g *kubeGuard) api(ctx context.Context, method, path string, in, out any) (
 	req.Header.Set("Content-Type", "application/json")
 	res, e := g.client.Do(req)
 	if e != nil {
-		return 0, fmt.Errorf("kubernetes_request")
+		logging.Failure("kubernetes_request_failed", "kubernetes_api", e, "method", method)
+		return 0, logging.WithCause("kubernetes_request", e)
 	}
 	defer res.Body.Close()
 	if res.StatusCode < 200 || res.StatusCode >= 300 {
+		if res.StatusCode != http.StatusNotFound {
+			logging.Failure("kubernetes_response_failed", "kubernetes_api", nil, "method", method, "http_status", res.StatusCode)
+		}
 		return res.StatusCode, fmt.Errorf("kubernetes_status_%d", res.StatusCode)
 	}
 	if out != nil {
 		if e = json.NewDecoder(io.LimitReader(res.Body, 1<<20)).Decode(out); e != nil {
-			return res.StatusCode, fmt.Errorf("kubernetes_response")
+			logging.Failure("kubernetes_response_failed", "kubernetes_api", e, "phase", "decode", "http_status", res.StatusCode)
+			return res.StatusCode, logging.WithCause("kubernetes_response", e)
 		}
 	}
+	logging.Recovered("kubernetes_api", "kubernetes_api_recovered")
 	return res.StatusCode, nil
 }
 func (g *kubeGuard) Check(ctx context.Context) error {
@@ -185,7 +194,8 @@ func (g *kubeGuard) Check(ctx context.Context) error {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	if g.lost || time.Since(g.last) > 45*time.Second {
-		return fmt.Errorf("summary_lease_lost")
+		logging.Failure("summary_lease_unavailable", "summary_lease", nil, "last_renewal_age_ms", time.Since(g.last).Milliseconds())
+		return logging.WithCause("summary_lease_lost", nil)
 	}
 	return nil
 }
@@ -197,7 +207,7 @@ func (g *kubeGuard) idle(ctx context.Context) error {
 		}
 		for _, r := range rows {
 			if r["Status"] == "RUNNING" || r["Status"] == "PENDING" {
-				return fmt.Errorf("old_refresh_not_finished")
+				return logging.WithCause("old_refresh_not_finished", nil)
 			}
 		}
 	}
@@ -221,7 +231,7 @@ func (g *kubeGuard) Close() error {
 		return e
 	}
 	if l.Spec.Holder != g.owner {
-		return fmt.Errorf("summary_lease_lost")
+		return logging.WithCause("summary_lease_lost", nil)
 	}
 	l.Spec.Holder = ""
 	_, e := g.api(ctx, "PUT", g.path, l, nil)
@@ -233,13 +243,13 @@ func (g *kubeGuard) Close() error {
 func sqlIdle(rows []map[string]string, database string) error {
 	for _, r := range rows {
 		if _, ok := r["Command"]; !ok {
-			return fmt.Errorf("process_list_unverifiable")
+			return logging.WithCause("process_list_unverifiable", nil)
 		}
 		if r["CurrentConnected"] == "Yes" || r["Db"] != database {
 			continue
 		}
 		if !strings.EqualFold(r["Command"], "Sleep") {
-			return fmt.Errorf("old_sql_not_finished")
+			return logging.WithCause("old_sql_not_finished", nil)
 		}
 	}
 	return nil

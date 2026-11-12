@@ -323,6 +323,7 @@ class Harness:
         self.gateway = pods[0]
         self.gateway_instance_id = self.namespace + '/' + self.gateway['metadata']['name']
         config = json.loads((ROOT / 'configs/gateway-observer.example.json').read_text())
+        config['metrics_enabled'] = True  # Activation and Host gate assertions.
         config['accepted_request_hosts'] = ['wasm-verify.local']
         config['observer_cluster'] = 'outbound|9090||llm-token-stats-observer.' + self.namespace + '.svc.cluster.local'
         path = self.output / 'gateway-observer.json'

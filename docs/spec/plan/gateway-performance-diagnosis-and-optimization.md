@@ -2,6 +2,8 @@
 
 日期：2026-11-11。基于 200 QPS 混合上下文对照、原生 Go 微基准、实际 TinyGo/Wasm 隔离实验和真实 Envoy 的诊断构建。当前阶段仅做诊断和方案，未修改生产采集实现。
 
+后续实现与复测见 [2026-11-12 优化验证](gateway-performance-optimization-verification.md)。本文保留诊断时的源码与实验状态。
+
 ## 结论与证据边界
 
 已经确认：

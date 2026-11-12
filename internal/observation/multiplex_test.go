@@ -2,8 +2,10 @@ package observation
 
 import (
 	"context"
+	"github.com/Fangyan33/llm-token-stats/internal/events"
 	"io"
 	"net"
+	"sync"
 	"testing"
 	"time"
 
@@ -12,6 +14,119 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/test/bufconn"
 )
+
+type blockingSink struct {
+	once             sync.Once
+	entered, release chan struct{}
+}
+
+func (b *blockingSink) Emit(*events.Event) { b.once.Do(func() { close(b.entered) }); <-b.release }
+
+func TestTransportACKDoesNotWaitForParserOrFinalizationSink(t *testing.T) {
+	k := &blockingSink{entered: make(chan struct{}), release: make(chan struct{})}
+	srv := lookupServer(&sink{})
+	srv.Sink = k
+	l := bufconn.Listen(1 << 20)
+	g := grpc.NewServer(grpc.ForceServerCodec(Codec{}))
+	pb.RegisterObservationServiceServer(g, srv)
+	go g.Serve(l)
+	defer g.Stop()
+	defer close(k.release)
+	c, err := grpc.NewClient("passthrough:///queue", grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) { return l.Dial() }), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	st, err := pb.NewObservationServiceClient(c).Observe(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := &pb.ObservationFrame{SchemaVersion: 1, FrameSeq: 1, Payload: &pb.ObservationFrame_Start{Start: lookupStart()}}
+	if err = st.Send(&pb.ObservationBatch{BatchSeq: 1, Frames: []*pb.CaptureFrame{{CaptureId: 1, Frame: start}}}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-k.entered:
+	case <-ctx.Done():
+		t.Fatal("sink not entered")
+	}
+	f := &pb.ObservationFrame{SchemaVersion: 1, FrameSeq: 2, Payload: &pb.ObservationFrame_ResponseHeaders{ResponseHeaders: &pb.ResponseHeaders{HttpStatus: 200}}}
+	st.Send(&pb.ObservationBatch{BatchSeq: 2, Frames: []*pb.CaptureFrame{{CaptureId: 1, Frame: f}}})
+	until := time.Now().Add(500 * time.Millisecond)
+	for {
+		a, e := st.Recv()
+		if e != nil {
+			t.Fatal(e)
+		}
+		if a.AcceptedBatchSeq >= 2 {
+			break
+		}
+		if time.Now().After(until) {
+			t.Fatal("receipt waited for blocked sink")
+		}
+	}
+}
+
+func TestOrdinaryFramesOnlyNeedCumulativeACK(t *testing.T) {
+	srv := lookupServer(&sink{})
+	l := bufconn.Listen(1 << 20)
+	g := grpc.NewServer(grpc.ForceServerCodec(Codec{}))
+	pb.RegisterObservationServiceServer(g, srv)
+	go g.Serve(l)
+	defer g.Stop()
+	c, err := grpc.NewClient("passthrough:///sparse", grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) { return l.Dial() }), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	st, err := pb.NewObservationServiceClient(c).Observe(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	send := func(seq uint64, payload any) {
+		t.Helper()
+		f := &pb.ObservationFrame{SchemaVersion: 1, FrameSeq: seq}
+		switch v := payload.(type) {
+		case *pb.Start:
+			f.Payload = &pb.ObservationFrame_Start{Start: v}
+		case *pb.ResponseHeaders:
+			f.Payload = &pb.ObservationFrame_ResponseHeaders{ResponseHeaders: v}
+		case *pb.BodyChunk:
+			f.Payload = &pb.ObservationFrame_BodyChunk{BodyChunk: v}
+		}
+		if e := st.Send(&pb.ObservationBatch{BatchSeq: seq, Frames: []*pb.CaptureFrame{{CaptureId: 1, Frame: f}}}); e != nil {
+			t.Fatal(e)
+		}
+	}
+	send(1, lookupStart())
+	for {
+		a, e := st.Recv()
+		if e != nil {
+			t.Fatal(e)
+		}
+		if len(a.Acks) > 0 {
+			break
+		}
+	}
+	send(2, &pb.ResponseHeaders{HttpStatus: 200, ContentType: "text/event-stream"})
+	send(3, &pb.BodyChunk{Direction: pb.Direction_RESPONSE, BodySeq: 1, Data: []byte("data: {}\n\n")})
+	for {
+		a, e := st.Recv()
+		if e != nil {
+			t.Fatal(e)
+		}
+		if len(a.Acks) > 0 {
+			t.Fatal("ordinary frame generated capture ACK")
+		}
+		if a.AcceptedBatchSeq >= 3 {
+			break
+		}
+	}
+}
 
 func TestMultiplexedCaptureFailureAndConnectionReuse(t *testing.T) {
 	k := &sink{}

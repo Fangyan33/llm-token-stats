@@ -22,6 +22,7 @@ import (
 	"github.com/Fangyan33/llm-token-stats/pkg/routeinfo"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/encoding/protowire"
 	"google.golang.org/protobuf/proto"
 	"io"
 	"sync"
@@ -62,6 +63,9 @@ type Server struct {
 	lookups          *lookupState
 	lookupInitErr    error
 	lookupNow        func() time.Time
+	queueMu          sync.Mutex
+	queueBytes       int64
+	queueBatches     int
 }
 
 func (s *Server) reserve(n int64) bool {
@@ -364,37 +368,55 @@ func (o *observation) finalize() {
 }
 
 type batchReceived struct {
-	batch *pb.ObservationBatch
-	err   error
+	batch    *pb.ObservationBatch
+	err      error
+	reserved int64
 }
 
 func (s *Server) Observe(stream pb.ObservationService_ObserveServer) error {
 	s.Health.GaugeFunc("observer_active_observations", s.active.Load)
 	s.Health.GaugeFunc("observer_parser_reserved_bytes", s.bytes.Load)
+	s.Health.GaugeFunc("observer_receive_queue_bytes", func() int64 { s.queueMu.Lock(); defer s.queueMu.Unlock(); return s.queueBytes })
+	s.Health.GaugeFunc("observer_receive_queue_batches", func() int64 { s.queueMu.Lock(); defer s.queueMu.Unlock(); return int64(s.queueBatches) })
 	if !s.reserve(3 * 32768) {
 		return status.Error(codes.ResourceExhausted, "resource_limit")
 	}
 	defer s.bytes.Add(-3 * 32768)
 	ctx, cancel := context.WithCancel(stream.Context())
 	defer cancel()
-	recv := make(chan batchReceived, 1)
+	q := s.newReceiveQueue()
+	defer q.close()
+	recv := q.ch
+	receiveErrors := make(chan error, 1)
+	receiptReady := make(chan struct{}, 1)
+	var accepted atomic.Uint64
 	go func() {
+		var seq uint64
 		for {
 			b, err := stream.Recv()
-			select {
-			case recv <- batchReceived{b, err}:
-			case <-ctx.Done():
-				if b != nil {
-					for _, x := range b.Frames {
-						if st := x.GetFrame().GetStart(); st != nil {
-							clear(st.ApiKey)
-						}
-					}
+			if err != nil {
+				select {
+				case recv <- batchReceived{err: err}:
+				case <-ctx.Done():
 				}
 				return
 			}
-			if err != nil {
+			if b == nil || b.BatchSeq != seq+1 || len(b.Frames) == 0 || len(b.Frames) > 128 || proto.Size(b) > 32768 {
+				clearBatch(batchReceived{batch: b})
+				receiveErrors <- status.Error(codes.InvalidArgument, "protocol_error")
 				return
+			}
+			if !q.push(batchReceived{batch: b}) {
+				clearBatch(batchReceived{batch: b})
+				s.Health.Count("observer_receive_queue_full")
+				receiveErrors <- status.Error(codes.ResourceExhausted, "resource_limit")
+				return
+			}
+			seq = b.BatchSeq
+			accepted.Store(seq)
+			select {
+			case receiptReady <- struct{}{}:
+			default:
 			}
 		}
 	}()
@@ -403,23 +425,39 @@ func (s *Server) Observe(stream pb.ObservationService_ObserveServer) error {
 	var writing atomic.Int64
 	var queued atomic.Int64
 	go func() {
+		var lastSent uint64
 		for {
+			var a *pb.ObservationAckBatch
+			fromOut := false
 			select {
 			case <-ctx.Done():
 				return
-			case a := <-out:
-				writing.Store(time.Now().UnixNano())
-				err := stream.Send(a)
-				writing.Store(0)
-				queued.Add(-1)
-				if err != nil {
-					select {
-					case writeErrors <- err:
-					default:
-					}
-					return
-				}
+			case a = <-out:
+				fromOut = true
+			case <-receiptReady:
+				a = &pb.ObservationAckBatch{}
 			}
+			a.AcceptedBatchSeq = max(a.AcceptedBatchSeq, accepted.Load(), lastSent)
+			if a.AcceptedBatchSeq == 0 || a.AcceptedBatchSeq == lastSent && len(a.Acks) == 0 {
+				if fromOut {
+					queued.Add(-1)
+				}
+				continue
+			}
+			writing.Store(time.Now().UnixNano())
+			err := stream.Send(a)
+			writing.Store(0)
+			if fromOut {
+				queued.Add(-1)
+			}
+			if err != nil {
+				select {
+				case writeErrors <- err:
+				default:
+				}
+				return
+			}
+			lastSent = a.AcceptedBatchSeq
 		}
 	}()
 	states := map[uint64]*observation{}
@@ -455,14 +493,17 @@ func (s *Server) Observe(stream pb.ObservationService_ObserveServer) error {
 			return
 		}
 		a := &pb.ObservationAckBatch{AcceptedBatchSeq: batchSeq}
+		size := proto.Size(a)
 		ids := []uint64{}
 		for id, ack := range acks {
 			item := &pb.CaptureAck{CaptureId: id, Ack: ack}
-			a.Acks = append(a.Acks, item)
-			if len(a.Acks) > 128 || proto.Size(a) > 32768 {
-				a.Acks = a.Acks[:len(a.Acks)-1]
+			n := proto.Size(item)
+			n += 1 + protowire.SizeVarint(uint64(n))
+			if len(a.Acks) >= 128 || size+n > 32768 {
 				break
 			}
+			size += n
+			a.Acks = append(a.Acks, item)
 			ids = append(ids, id)
 		}
 		queued.Add(1)
@@ -499,6 +540,8 @@ func (s *Server) Observe(stream pb.ObservationService_ObserveServer) error {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
+		case err := <-receiveErrors:
+			return err
 		case err := <-writeErrors:
 			s.Health.Count("ack_write_failure")
 			return err
@@ -554,48 +597,56 @@ func (s *Server) Observe(stream pb.ObservationService_ObserveServer) error {
 				}
 				return rec.err
 			}
-			b := rec.batch
-			if b == nil || b.BatchSeq != batchSeq+1 || len(b.Frames) == 0 || len(b.Frames) > 128 || proto.Size(b) > 32768 {
-				return status.Error(codes.InvalidArgument, "protocol_error")
-			}
-			batchSeq = b.BatchSeq
-			for _, item := range b.Frames {
-				id, f := item.CaptureId, item.Frame
-				if id == 0 || f == nil {
+			processErr := func() error {
+				defer q.release(rec)
+				defer clearBatch(rec)
+				b := rec.batch
+				if b == nil || b.BatchSeq != batchSeq+1 || len(b.Frames) == 0 || len(b.Frames) > 128 || proto.Size(b) > 32768 {
 					return status.Error(codes.InvalidArgument, "protocol_error")
 				}
-				o := states[id]
-				if o == nil {
-					// Capture keys increase within each transport and are never reused.
-					// Late frames after a close/cancel need no unbounded tombstone map.
-					if id <= lastCapture {
-						if st := f.GetStart(); st != nil {
-							clear(st.ApiKey)
+				batchSeq = b.BatchSeq
+				for _, item := range b.Frames {
+					id, f := item.CaptureId, item.Frame
+					if id == 0 || f == nil {
+						return status.Error(codes.InvalidArgument, "protocol_error")
+					}
+					o := states[id]
+					if o == nil {
+						// Capture keys increase within each transport and are never reused.
+						// Late frames after a close/cancel need no unbounded tombstone map.
+						if id <= lastCapture {
+							if st := f.GetStart(); st != nil {
+								clear(st.ApiKey)
+							}
+							continue
 						}
-						continue
-					}
-					lastCapture = id
-					var err error
-					o, err = s.start(ctx, id, f)
-					if err != nil {
-						uuid, randomErr := s.newID()
-						if randomErr != nil {
-							return status.Error(codes.Unavailable, "random_source")
+						lastCapture = id
+						var err error
+						o, err = s.start(ctx, id, f)
+						if err != nil {
+							uuid, randomErr := s.newID()
+							if randomErr != nil {
+								return status.Error(codes.Unavailable, "random_source")
+							}
+							acks[id] = &pb.ObservationAck{ObservationId: uuid, AcceptedFrameSeq: f.FrameSeq, CloseStream: true, Reason: ackReason(err.Error())}
+							continue
 						}
-						acks[id] = &pb.ObservationAck{ObservationId: uuid, AcceptedFrameSeq: f.FrameSeq, CloseStream: true, Reason: ackReason(err.Error())}
-						continue
+						states[id] = o
+						pending[id] = o
+						o.timer = &observationDeadline{at: time.Now().Add(time.Duration(s.Cfg.MaxObservationMS) * time.Millisecond), capture: id, idx: -1}
+						heap.Push(&deadlines, o.timer)
+						acks[id] = &pb.ObservationAck{ObservationId: o.e.ObservationID, AcceptedFrameSeq: 1, Reason: "accepted"}
+					} else if o.reason == "" {
+						if reason := o.feed(f); reason != "" {
+							finish(o, reason)
+							acks[id] = &pb.ObservationAck{ObservationId: o.e.ObservationID, AcceptedFrameSeq: o.seq, Reason: "accepted"}
+						}
 					}
-					states[id] = o
-					pending[id] = o
-					o.timer = &observationDeadline{at: time.Now().Add(time.Duration(s.Cfg.MaxObservationMS) * time.Millisecond), capture: id, idx: -1}
-					heap.Push(&deadlines, o.timer)
-					acks[id] = &pb.ObservationAck{ObservationId: o.e.ObservationID, AcceptedFrameSeq: 1, Reason: "accepted"}
-				} else if o.reason == "" {
-					if reason := o.feed(f); reason != "" {
-						finish(o, reason)
-					}
-					acks[id] = &pb.ObservationAck{ObservationId: o.e.ObservationID, AcceptedFrameSeq: o.seq, Reason: "accepted"}
 				}
+				return nil
+			}()
+			if processErr != nil {
+				return processErr
 			}
 			drain()
 			flush()

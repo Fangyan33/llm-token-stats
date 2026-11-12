@@ -14,14 +14,46 @@ import (
 )
 
 type Kafka struct {
-	Brokers     []string `json:"bootstrap_servers"`
-	Topic       string   `json:"topic"`
-	CAFile      string   `json:"ca_file"`
-	CertFile    string   `json:"cert_file"`
-	KeyFile     string   `json:"key_file"`
-	UsernameEnv string   `json:"username_env"`
-	PasswordEnv string   `json:"password_env"`
+	Brokers            []string `json:"bootstrap_servers"`
+	Topic              string   `json:"topic"`
+	CAFile             string   `json:"ca_file"`
+	CertFile           string   `json:"cert_file"`
+	KeyFile            string   `json:"key_file"`
+	UsernameEnv        string   `json:"username_env"`
+	PasswordEnv        string   `json:"password_env"`
+	ProducerMaxRecords int      `json:"producer_max_records"`
+	ProducerMaxBytes   int      `json:"producer_max_bytes"`
+	ProducerBatchBytes int      `json:"producer_batch_bytes"`
+	ProducerLingerMS   int      `json:"producer_linger_ms"`
+	ProducerDeliveryMS int      `json:"producer_delivery_timeout_ms"`
+	ProducerWatchdogMS int      `json:"producer_watchdog_timeout_ms"`
 }
+
+func (k *Kafka) ProducerDefaults() error {
+	if k.ProducerMaxRecords == 0 {
+		k.ProducerMaxRecords = 16384
+	}
+	if k.ProducerMaxBytes == 0 {
+		k.ProducerMaxBytes = 64 << 20
+	}
+	if k.ProducerBatchBytes == 0 {
+		k.ProducerBatchBytes = min(1<<20, k.ProducerMaxBytes)
+	}
+	if k.ProducerLingerMS == 0 {
+		k.ProducerLingerMS = 5
+	}
+	if k.ProducerDeliveryMS == 0 {
+		k.ProducerDeliveryMS = 10000
+	}
+	if k.ProducerWatchdogMS == 0 {
+		k.ProducerWatchdogMS = k.ProducerDeliveryMS + 2000
+	}
+	if k.ProducerMaxRecords < 1 || k.ProducerMaxRecords > 1048576 || k.ProducerMaxBytes < 32768 || k.ProducerMaxBytes > 1<<30 || k.ProducerBatchBytes < 1024 || k.ProducerBatchBytes > k.ProducerMaxBytes || k.ProducerBatchBytes > 4<<20 || k.ProducerLingerMS < 0 || k.ProducerLingerMS > 1000 || k.ProducerDeliveryMS < 1000 || k.ProducerDeliveryMS > 60000 || k.ProducerWatchdogMS <= k.ProducerDeliveryMS || k.ProducerWatchdogMS > 120000 {
+		return logging.WithCause("config_producer", nil)
+	}
+	return nil
+}
+
 type Lookup struct {
 	URI           string      `json:"uri"`
 	CredentialEnv string      `json:"credential_env"`
@@ -85,6 +117,8 @@ type Observer struct {
 	Flags                 []string      `json:"response_flags_allowlist"`
 	Details               []string      `json:"response_code_details_allowlist"`
 	MaxConnections        int           `json:"max_connections"`
+	ReceiveQueueBatches   int           `json:"receive_queue_batches"`
+	ReceiveQueueBytes     int64         `json:"receive_queue_bytes"`
 }
 type WasmDownload struct {
 	Listen string `json:"listen"`
@@ -138,6 +172,18 @@ func Read(path string) (Config, error) {
 var kafkaTopicName = regexp.MustCompile(`^[A-Za-z0-9._-]{1,249}$`)
 
 func (c *Config) ObserverDefaults() error {
+	if err := c.Kafka.ProducerDefaults(); err != nil {
+		return err
+	}
+	if c.Observer.ReceiveQueueBatches == 0 {
+		c.Observer.ReceiveQueueBatches = 4096
+	}
+	if c.Observer.ReceiveQueueBytes == 0 {
+		c.Observer.ReceiveQueueBytes = 128 << 20
+	}
+	if c.Observer.ReceiveQueueBatches < 1 || c.Observer.ReceiveQueueBatches > 65536 || c.Observer.ReceiveQueueBytes < 32768 || c.Observer.ReceiveQueueBytes > 4<<30 {
+		return logging.WithCause("config_observer_queue", nil)
+	}
 	if c.Observer.LookupTimeoutMS == 0 {
 		c.Observer.LookupTimeoutMS = 200
 	}

@@ -68,32 +68,66 @@ type BatchAck struct {
 }
 
 func DecodeBatchAck(b []byte) (BatchAck, error) {
-	var out BatchAck
-	if ValidateBatch(b, true) != nil {
-		return out, Err
+	return DecodeBatchAckInto(b, nil)
+}
+
+// DecodeBatchAckInto reuses caller-owned storage. Strings own their bytes;
+// callers may clear the receive buffer immediately after a successful decode.
+func DecodeBatchAckInto(b []byte, storage []CaptureAck) (BatchAck, error) {
+	out := BatchAck{Acks: storage[:0]}
+	if len(b) > 32768 {
+		return BatchAck{}, Err
 	}
-	fs, _ := Read(b)
-	for _, f := range fs {
-		if f.N == 1 {
-			out.Seq = f.V
+	c := cursor{b: b}
+	for len(c.b) > 0 {
+		f, err := c.next()
+		if err != nil {
+			return BatchAck{}, Err
 		}
-		if f.N == 2 {
-			items, _ := Read(f.B)
+		switch f.N {
+		case 1:
+			if out.Seq != 0 || f.Wire != 0 || f.V == 0 {
+				return BatchAck{}, Err
+			}
+			out.Seq = f.V
+		case 2:
+			if f.Wire != 2 || len(out.Acks) >= 128 {
+				return BatchAck{}, Err
+			}
+			item := cursor{b: f.B}
 			var a CaptureAck
-			for _, x := range items {
-				if x.N == 1 {
-					a.Capture = x.V
+			var seen uint8
+			for len(item.b) > 0 {
+				x, err := item.next()
+				if err != nil {
+					return BatchAck{}, Err
 				}
-				if x.N == 2 {
-					var err error
+				switch x.N {
+				case 1:
+					if seen&1 != 0 || x.Wire != 0 || x.V == 0 {
+						return BatchAck{}, Err
+					}
+					seen |= 1
+					a.Capture = x.V
+				case 2:
+					if seen&2 != 0 || x.Wire != 2 {
+						return BatchAck{}, Err
+					}
+					seen |= 2
 					a.Ack, err = DecodeAck(x.B)
 					if err != nil {
-						return out, err
+						return BatchAck{}, err
 					}
 				}
 			}
+			if seen != 3 {
+				return BatchAck{}, Err
+			}
 			out.Acks = append(out.Acks, a)
 		}
+	}
+	if out.Seq == 0 {
+		return BatchAck{}, Err
 	}
 	return out, nil
 }

@@ -270,3 +270,24 @@ kubectl --context CONTEXT -n metering set env cronjob/llm-token-stats-usage-work
 同类故障首次立即详细输出，之后每 30 秒汇总重复次数及最近原因，成功后记录恢复。聚合状态、日志队列与单条字段长度均有界，不按请求 ID 建聚合键。输出阻塞或队列满时允许丢日志，Observer/Consumer 的 `/metrics` 提供 `metering_logs_dropped_total`，Observer 另保留归属查询丢失计数。Wasm 日志在 tick 中、业务恢复处理之后输出，每轮最多 8 条；最多缓存 64 条，满时丢弃并在后续汇总。关闭或退出阶段可能丢失尚未输出的日志。
 
 客户端初始化日志不代表外部连接成功；网络连接、Kafka 投递、Doris 可见性和汇总刷新各自记录实际结果。正常取消、正常关闭和空轮询超时不当作依赖故障。
+
+## 网关与 Observer 性能配置
+
+Wasm 的 `metrics_enabled` 默认 `false`，关闭插件自定义 Prometheus Counter/Gauge 的注册及更新，不关闭额度保护、usage、TTFT/TPOT 或 Observer 指标。启用后资源 Gauge 每秒汇总。隔离 Kubernetes 回归显式设为 `true` 以核验插件激活及 Host 筛选；容量对照使用默认关闭配置。
+
+Observer 的 `receive_queue_batches=4096`、`receive_queue_bytes=134217728` 为实例级接收队列总额度，每共享传输最多 128 个待处理批次。先预留解码对象及载荷的保守字节，成功入队后返回累计确认；解析和最终事件处理不阻塞接收确认，满队列只终止采集传输，不重发。累计确认不表示 Kafka 已持久化。
+
+Kafka Producer 使用以下实例配置，应用 pending 与 franz-go 采用相同条数和字节限制：
+
+| kafka 字段 | 默认值 | 含义 |
+| --- | ---: | --- |
+| producer_max_records | 16384 | 待投递事件总条数，JSON 编码前领取槽 |
+| producer_max_bytes | 67108864 | 待投递 key/value 总字节 |
+| producer_batch_bytes | 1048576 | native 单分区批次上限，不超过总字节上限 |
+| producer_linger_ms | 5 | 批次等待窗口；0 表示使用默认值 |
+| producer_delivery_timeout_ms | 10000 | native 事件投递期限 |
+| producer_watchdog_timeout_ms | 12000 | 超龄检查期限，必须晚于投递期限；缺省为投递期限加 2000 ms |
+
+这些队列独立于 Wasm Pod 额度，所有故障继续 fail-open，未知用量保留 null。条数/字节/批量和期限须一起调整；逻辑额度不能替代网关 RSS 增量对照。
+
+Wasm 构建现在同时执行 SDK 的真实 TinyGo/Wasm 缓冲所有权回归，覆盖宿主 malloc 与 Go allocator 两条路径。固定 TinyGo 0.40.1 中，SDK 接管宿主缓冲时解除对应 C 分配登记，保留 Go 引用及零额外复制；升级工具链必须重新验证该运行时适配。SDK 修改记录见 [PATCHES](../third_party/proxy-wasm-go-sdk/PATCHES.md)。

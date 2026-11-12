@@ -3,7 +3,13 @@
     "bootstrap_servers": [
       "kafka:9092"
     ],
-    "topic": "llm-metering-development"
+    "topic": "llm-metering-development",
+    "producer_max_records": 16384,
+    "producer_max_bytes": 67108864,
+    "producer_batch_bytes": 1048576,
+    "producer_linger_ms": 5,
+    "producer_delivery_timeout_ms": 10000,
+    "producer_watchdog_timeout_ms": 12000
   },
   "observer": {
     "wasm_download": {
@@ -48,6 +54,8 @@
       }
     },
     "lookup_timeout_ms": 200,
-    "lookup_max_concurrency": 64
+    "lookup_max_concurrency": 64,
+    "receive_queue_batches": 4096,
+    "receive_queue_bytes": 134217728
   }
 }

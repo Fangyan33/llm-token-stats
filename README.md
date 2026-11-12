@@ -633,3 +633,37 @@ python3 scripts/cleanup_k8s_collection.py
 Observer、Consumer、usage-worker 通过环境变量 `LOG_LEVEL=debug|info|warn|error` 调整日志，默认 `info`，修改后重启生效。Wasm 暂仅输出 INFO/WARN/ERROR，`debug` 与 `info` 相同。日志为可读文本，外部调用错误带调用阶段、耗时和安全的底层原因；同类错误首次详细输出，之后每 30 秒汇总。正文、密钥及完整 DSN 不进入日志。
 
 已有网关需设置 `istio-proxy` 容器的 `LOG_LEVEL`，并在 Pod 模板的 `sidecar.istio.io/componentLogLevel` 注解中合并 `wasm:info`，保留其他组件设置后完成滚动；EnvoyFilter 会将该环境变量传入 Wasm。独立 Envoy 使用 `--component-log-level wasm:info`。完整命令、日志分级及有界输出说明见[组件日志与 LOG_LEVEL](docs/collection-components.md#组件日志与-log_level)。
+
+
+
+## Wasm 采集插件的参数
+
+**Wasm 采集插件的参数**，控制分片、旁路传输和资源保护。触发限制时会停止或跳过相关采集，业务请求继续转发。
+
+| 配置项 | 当前值 | 含义 |
+|---|---:|---|
+| `chunk_bytes` | **16 KiB** | 每次旁路采集的响应正文分片上限。较大的响应回调会拆成多个采集帧。单位为字节。 |
+| `response_body_max_bytes` | **8 MiB** | 单个请求允许累计采集的**响应正文**上限。超过后停止该请求的采集。 |
+| `ack_timeout_ms` | **2 秒** | 已发送批次等待 Observer 累计确认的超时。最早未确认批次超时后，关闭对应共享传输，其承载的观察会受到影响。 |
+| `end_ack_timeout_ms` | **2 秒** | 记录业务结束的 End 帧后，等待该观察关闭确认的时间。超时后清理该观察。 |
+| `observation_max_ms` | **10 分钟** | 单条观察的最长持续时间，从请求头进入时开始计时，包含上传、上游处理和流式响应阶段。 |
+| `tick_ms` | **10 毫秒** | 插件定时任务的调度间隔，用于发送未满批的数据、检查超时、分批清理等。实际执行可能受 Worker 忙碌影响。 |
+| `metadata_max_bytes` | **6 KiB** | 单条非正文采集帧的编码大小上限，包括 Start、响应头、End 等。它不限制业务 HTTP 请求头总大小。 |
+| `ack_max_bytes` | **32 KiB** | Wasm 接收的单条 ACK 批次消息大小上限。超限会按采集协议错误处理。 |
+| `pod_max_observations` | **131072 条** | 单 Pod 内所有 Worker 合计允许保留的观察数量，包含业务已结束但尚未完成确认或清理的观察。达到上限后，新请求跳过采集。 |
+| `pod_inflight_bytes` | **256 MiB** | 单 Pod 所有 Worker 合计的旁路数据逻辑额度，覆盖待发送及已发送未确认的数据，并包含编码开销的保守计账。 |
+| `pod_inflight_messages` | **524288 条** | 单 Pod 合计允许的待发送及未确认**采集帧数量**，不是业务请求数，也不是 gRPC 批次数。 |
+| `transport_streams_per_worker` | **4 条** | 每个 Envoy Worker 使用的长期双向 gRPC 传输流数量。多个请求共享这些流；不等于独立 TCP 连接数。 |
+| `transport_batch_max_bytes` | **32 KiB** | 单个发送批次的编码大小上限，包含协议封装。 |
+| `transport_batch_max_frames` | **128 帧** | 单个发送批次最多容纳的采集帧数量。同一批次可以包含多个请求的数据。 |
+
+批次达到**字节上限或帧数上限**时发送；未满批的数据由约 10 ms 的 tick 刷新。
+
+需要特别注意：
+
+- **1M 输入上下文不受 8 MiB 限制**：请求正文完全透传，`response_body_max_bytes` 只限制响应采集。
+- **2 秒 ACK 超时不是业务请求超时**：60 秒的流可以正常采集，只要旁路批次持续得到确认。
+- **256 MiB 额度不等于 RSS 上限**：Wasm 堆、固定缓冲和 Envoy native 状态还有额外占用，仍须验证“启用减去未启用”的 RSS 增量。
+- 当前实现存在硬校验：例如 `metadata_max_bytes` 必须为 **6144**、`transport_batch_max_bytes` 必须为 **32768**，不能任意调大。
+
+具体定义见[配置校验代码](/root/src/llm-token-stats/pkg/gatewayconfig/config.go:89)。

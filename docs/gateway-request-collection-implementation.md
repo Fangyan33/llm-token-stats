@@ -65,8 +65,8 @@ message CaptureFrame {
   ObservationFrame frame = 2;
 }
 message ObservationAckBatch {
-  uint64 accepted_batch_seq = 1;
-  repeated CaptureAck acks = 2;
+  uint64 accepted_batch_seq = 1; // 连续批次已由 Observer 有界队列接管；不代表解析完成或 Kafka 持久化
+  repeated CaptureAck acks = 2; // 仅接纳、结束和异常状态；普通正文只返回批次累计确认
 }
 message CaptureAck {
   uint64 capture_id = 1;
@@ -156,6 +156,9 @@ message ObservationAck {
 
 ### 3.2 消息顺序、ACK 与缺片
 
+批次累计确认表示连续批次已被 Observer 的有界接收队列接管，允许 Wasm 归还传输额度；不代表解析完成或 Kafka 持久化。普通响应分片不再逐观察回 ACK；接纳、结束和异常才返回 Capture ACK。接收队列同时受实例级 receive_queue_batches（默认 4096）与 receive_queue_bytes（默认 128 MiB）限制，每共享传输最多排队 128 批。字节预留包含 protobuf 对象及载荷的保守开销，处理完成或关闭时归还，队列满立即关闭采集传输。解析、身份冻结、最终事件处理和 Producer 由串行处理端执行，原始分片时间不受队列等待影响。
+
+
 每 Worker 默认 4 条长期双向 gRPC 流。各流批次序号从 1 连续递增；单批最多 32 KiB、128 个 CaptureFrame，tick 每 10 ms 刷新未满批。每个 capture 的帧序号从 1 连续递增：Start、ResponseHeaders、RESPONSE BodyChunk、End。请求正文不在协议上传输；REQUEST 方向保留枚举编号但服务端拒绝该方向。响应片段最多 16 KiB；只有原回调最后一个分片带 EOS，拆片保留相同原回调时间。
 
 ObservationAckBatch 累计确认已处理的最高批次序号，释放待发及未确认记录的逻辑额度。它不保证 Kafka/Doris 持久化。CaptureAck 返回 UUID 和该观察已处理帧序号；close_stream 仅关闭该观察，不关闭共享 gRPC。Observer 按递增 capture_id 的高水位忽略已关闭观察的迟到片段，无长期 tombstone 表。
@@ -171,6 +174,10 @@ Cancel 是独立控制帧，不声称业务 End 或 EOS。单条采集的解析/
 ### 4.2 上下文和状态机
 
 HTTP context 保存必要标志及轻量观察指针，Root 保存观察表、超时堆、固定传输及批次账本。Start 元数据最多 6144 字节。请求正文回调只统计 host 提供的字节数及 EOS，不读正文；所有回调 Continue。响应每次最多读取 16 KiB，逐片进入共享批次，不为每请求保留响应尾部窗口。
+
+Wasm 直接向每条共享传输的固定上限批缓冲编码，先领取 Pod 额度再读取最多 16 KiB 响应；发送和接收缓冲使用后清零。普通确认单遍校验并复用 ACK 数组；累计确认清空记录中的引用并复用队列。通道故障先标记失效，回调最多回收 64 项，tick 合计另回收最多 256 项；通道观察通过双向链表定位，取消控制帧进入共享批次。取消未确认前继续持有 native 额度。卸载没有后续 tick，需要排空残余状态，不将这部分生命周期成本等同于正常回调上限。
+
+metrics_enabled 默认为 false：不定义或更新 Wasm 自定义 metering_* 指标；与采集数据、额度控制独立。true 时 Counter 在事件发生时更新，三个资源 Gauge 每秒汇总，加载和清理时同步最终值。Observer/Consumer 指标及原始回调时间不受此开关影响。
 
 HTTP context 完成后发送 End，Root 在收到关闭 ACK 或超时后释放观察。共享流关闭后清理其观察和账本。指标失败不得 panic。主线程初始化共享账本，Worker 克隆后使用同一账本分块领取额度；vm_id 必须稳定且 Pod 只能安装一个本采集插件实例。
 
@@ -207,7 +214,7 @@ Pod 级 SharedData CAS 账本同时限制观察数、待发及未确认载荷、
 
 ### 5.1 状态管理
 
-每条共享流只有接收、ACK 写入协程及有界队列，不按观察创建永久协程、ticker 或 gRPC 流。归属查询只在开始时产生独立有界任务。观察表及超时堆独立定稿，单次 ACK 最多 32 KiB/128 项，阻塞写超过 2 秒结束传输。
+每条共享流只有接收、ACK 写入和串行处理协程及有界队列，不按观察创建永久协程、ticker 或 gRPC 流。归属查询只在开始时产生独立有界任务。观察表及超时堆独立定稿，单次 ACK 最多 32 KiB/128 项，阻塞写超过 2 秒结束传输。
 
 取消累计 100 ms 墙钟解析期限和输入 16 倍累计预留。每观察按必要状态及实际保留响应缓冲计账；分配前做有界临时预留，解析后按保留容量归还，较大的已完成 SSE 行/事件立即释放。parser_budget_bytes 默认 10 GiB、最大 64 GiB，按内存实际需要配置 Observer 资源；超过额度只取消采集。max_active_observations 默认/最大 1048576，max_connections 默认 1024、最大 4096。
 
@@ -317,7 +324,7 @@ usage 六类 token 的 value/source、raw_usage_json 安全白名单、资格及
 
 ### 6.2 Producer 策略
 
-Observer 共享一个 producer，每事件先非阻塞申请执行槽，初值 256 个；无槽直接丢弃。不会创建一个等待 Kafka 恢复的应用队列。producer 内部网络在途内存仍存在，并受下面参数约束。
+Producer 参数统一配置在 kafka.producer_*，应用 pending 与 native 使用同一条数/字节上限；批次字节不得超过总字节，watchdog 必须晚于投递期限。Observer 共享一个 producer，每事件先非阻塞申请执行槽，默认 16384 个；无槽直接丢弃。不会创建一个等待 Kafka 恢复的应用队列。producer 内部网络在途内存仍存在，并受下面参数约束。
 
 ```go
 // API 基于 franz-go v1.18.1；还需加入 SeedBrokers、TLS/SASL。
@@ -326,10 +333,11 @@ opts := []kgo.Opt{
     kgo.DisableIdempotentWrite(),
     kgo.RecordRetries(1),
     kgo.UnknownTopicRetries(0),
-    kgo.ProducerLinger(0),
-    kgo.MaxBufferedRecords(256),
-    kgo.MaxBufferedBytes(4 << 20),
-    kgo.RecordDeliveryTimeout(2 * time.Second),
+    kgo.ProducerLinger(5 * time.Millisecond),
+    kgo.MaxBufferedRecords(16384),
+    kgo.MaxBufferedBytes(64 << 20),
+    kgo.ProducerBatchMaxBytes(1 << 20),
+    kgo.RecordDeliveryTimeout(10 * time.Second),
     kgo.ProduceRequestTimeout(time.Second),
     kgo.RequestTimeoutOverhead(time.Second),
     kgo.DialTimeout(time.Second),
@@ -339,7 +347,7 @@ opts := []kgo.Opt{
 
 固定 franz-go v1.18.1 的 RecordRetries 按总尝试次数比较，0 会阻止首次发送；实现使用 1，仅允许首次尝试、不重发事件。这里显式关闭 producer 幂等，是为了避免其序列号约束延后失败，业务幂等交给事件键。`RecordDeliveryTimeout` 是粗粒度期限，不是严格墙钟上限；必须测连接黑洞/元数据不可达。执行槽按 promise 完成释放，不能 context 超时就提前复用仍占客户端内存的槽。[固定配置源码](https://github.com/twmb/franz-go/blob/v1.18.1/pkg/kgo/config.go)
 
-增加 3 秒 watchdog：发现超龄发送则进入熔断，停止接纳新事件，对当前 producer 执行有界取消/关闭，丢弃在途集合；重建 producer 后仅接收新事件。取消/关闭若不能在额外 1 秒内释放，Observer 进程退出由 Deployment 重建，不能保留旧 producer 并无限新建。该行为也属于 PoC 故障验收项。
+默认 12 秒 watchdog（必须大于配置的投递期限）：发现超龄发送则进入熔断，停止接纳新事件，对当前 producer 执行有界取消/关闭，丢弃在途集合；重建 producer 后仅接收新事件。取消/关闭若不能在额外 1 秒内释放，Observer 进程退出由 Deployment 重建，不能保留旧 producer 并无限新建。该行为也属于 PoC 故障验收项。
 
 发送结果分 success、definite_failure、uncertain。超时/断连发生在已发送后通常不能证明 broker 未写入，标 uncertain，不补发。熔断恢复只恢复新采集；正常处理期限内的首次网络发送不算恢复补传。鉴权和 metadata 连接可重新建立，但不能携带已丢弃事件恢复发送。
 
@@ -493,7 +501,8 @@ Consumer/Doris 故障可以依赖 Kafka 72 小时保留恢复，与禁止采集�
   "pod_inflight_messages": 524288,
   "transport_streams_per_worker": 4,
   "transport_batch_max_bytes": 32768,
-  "transport_batch_max_frames": 128
+  "transport_batch_max_frames": 128,
+  "metrics_enabled": false
 }
 ```
 

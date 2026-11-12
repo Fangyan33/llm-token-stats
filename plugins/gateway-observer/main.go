@@ -24,7 +24,7 @@ func main() { proxywasm.SetVMContext(&vm{}) }
 type vm struct{ types.DefaultVMContext }
 
 func (*vm) NewPluginContext(id uint32) types.PluginContext {
-	return &root{id: id, states: map[uint64]*state{}, metrics: map[string]proxywasm.MetricCounter{}}
+	return &root{id: id, states: map[uint64]*state{}}
 }
 
 type deadline struct {
@@ -52,6 +52,7 @@ type state struct {
 	seq             uint64
 	id              string
 	ch              *channel
+	prev, next      *state
 	bodySeq, offset [2]uint64
 	eos             [2]bool
 	ending          bool
@@ -70,7 +71,12 @@ type channel struct {
 	batch           []byte
 	bytes, messages int64
 	records         []batchRecord
+	recordHead      int
 	retryAt         time.Time
+	head            *state
+	failed          bool
+	released        bool
+	cleanupReason   string
 }
 type root struct {
 	types.DefaultPluginContext
@@ -87,9 +93,21 @@ type root struct {
 	gauges             map[string]proxywasm.MetricGauge
 	gaugeValues        [3]int64
 	logs               wasmLogger
+	ackStorage         [128]w.CaptureAck
+	metricsDirty       bool
+	metricsAt          time.Time
 }
 
 func (r *root) resourceMetrics() {
+	if r.cfg.MetricsEnabled {
+		r.metricsDirty = true
+	}
+}
+func (r *root) publishResourceMetrics() {
+	if !r.cfg.MetricsEnabled || !r.metricsDirty {
+		return
+	}
+	r.metricsDirty = false
 	if r.gauges == nil {
 		r.gauges = map[string]proxywasm.MetricGauge{}
 	}
@@ -117,6 +135,12 @@ func (r *root) resourceMetrics() {
 }
 
 func (r *root) count(name string) {
+	if !r.cfg.MetricsEnabled {
+		return
+	}
+	if r.metrics == nil {
+		r.metrics = map[string]proxywasm.MetricCounter{}
+	}
 	m, ok := r.metrics[name]
 	if !ok {
 		var err error
@@ -134,6 +158,7 @@ func (r *root) count(name string) {
 func (r *root) OnPluginStart(_ int) types.OnPluginStartStatus {
 	r.initLogging()
 	defer r.flushLogs(maxPendingLogs)
+	defer func() { r.resourceMetrics(); r.publishResourceMetrics() }()
 	r.cleanup()
 	r.instanceID = ""
 	r.resourceMetrics()
@@ -177,12 +202,21 @@ func (r *root) OnPluginStart(_ int) types.OnPluginStartStatus {
 }
 func (r *root) NewHttpContext(id uint32) types.HttpContext { return &httpContext{root: r, id: id} }
 
-func (r *root) active(s *state) bool { return s != nil && r.states[s.capture] == s }
+func (r *root) active(s *state) bool { return s != nil && !s.ch.failed && r.states[s.capture] == s }
 func (r *root) drop(s *state, reason string) {
-	if !r.active(s) {
+	if s == nil || r.states[s.capture] != s {
 		return
 	}
 	delete(r.states, s.capture)
+	if s.prev != nil {
+		s.prev.next = s.next
+	} else {
+		s.ch.head = s.next
+	}
+	if s.next != nil {
+		s.next.prev = s.prev
+	}
+	s.prev, s.next = nil, nil
 	if s.timer != nil && s.timer.idx >= 0 {
 		heap.Remove(&r.q, s.timer.idx)
 	}
@@ -194,6 +228,11 @@ func (r *root) cleanup() {
 	for _, c := range r.channels {
 		if c != nil {
 			r.failChannel(c, "shutdown")
+			// Teardown has no future ticks. Drain owned state, retaining native
+			// credits if cancellation is uncertain.
+			for c.failed && (c.head != nil || c.released && c.recordHead < len(c.records)) {
+				r.reapChannel(c, 256)
+			}
 		}
 	}
 	for _, s := range r.states {
@@ -213,6 +252,7 @@ func (r *root) cleanup() {
 	r.messages = 0
 	r.channels = nil
 	r.budget = nil
+	r.publishResourceMetrics()
 }
 func (r *root) OnPluginDone() bool {
 	r.cleanup()
@@ -222,7 +262,7 @@ func (r *root) OnPluginDone() bool {
 }
 func (r *root) OnDelete() { r.cleanup(); r.flushLogs(maxPendingLogs) }
 func (r *root) openChannel(c *channel) bool {
-	if c.closing {
+	if c.closing || c.failed {
 		return false
 	}
 	if c.token != 0 {
@@ -240,6 +280,7 @@ func (r *root) openChannel(c *channel) bool {
 	}
 	c.token = token
 	c.seq = 0
+	c.released = false
 	r.logRecovered("grpc_open_failed")
 	return true
 }
@@ -247,15 +288,15 @@ func (r *root) failChannel(c *channel, reason string) {
 	if c == nil {
 		return
 	}
+	c.failed = true
+	if c.cleanupReason == "" {
+		c.cleanupReason = reason
+	}
 	if c.token != 0 {
 		if err := proxywasm.CancelGrpcStream(r.id, c.token); err != nil {
 			c.closing = true
 			c.retryAt = time.Now().Add(100 * time.Millisecond)
-			for _, s := range r.states {
-				if s.ch == c {
-					r.drop(s, reason)
-				}
-			}
+			r.reapChannel(c, 64)
 			r.repeatedLog(logsafe.Error, "grpc_cancel_failed", "host_status", hostError(err), "action", "retain_budget")
 			return
 		}
@@ -263,31 +304,63 @@ func (r *root) failChannel(c *channel, reason string) {
 	r.releaseChannel(c, reason)
 }
 func (r *root) releaseChannel(c *channel, reason string) {
+	c.failed = true
+	if c.cleanupReason == "" {
+		c.cleanupReason = reason
+	}
 	c.token = 0
 	c.closing = false
 	c.retryAt = time.Now().Add(100 * time.Millisecond)
-	n, m := c.bytes, c.messages
-	for _, rec := range c.records {
-		n += rec.bytes
-		m += rec.messages
-	}
-	r.inflight -= n
-	r.messages -= m
-	r.budget.give(n, m, 0)
-	clear(c.batch)
-	c.batch = nil
-	c.bytes = 0
-	c.messages = 0
-	c.records = nil
-	for _, s := range r.states {
-		if s.ch == c {
-			r.drop(s, reason)
+	if !c.released {
+		r.inflight -= c.bytes
+		r.messages -= c.messages
+		r.budget.give(c.bytes, c.messages, 0)
+		clear(c.batch)
+		if c.batch != nil {
+			c.batch = c.batch[:11]
 		}
+		c.bytes, c.messages = 0, 0
+		c.released = true
 	}
+	r.reapChannel(c, 64)
 	if reason != "shutdown" {
 		r.repeatedLog(logsafe.Error, "observation_"+reason, "action", "skip_observation")
 	}
 	r.resourceMetrics()
+}
+
+// Invalidation is immediate; reclamation has a fixed work budget per callback.
+// Native write credits remain held until cancellation/closure is confirmed.
+func (r *root) reapChannel(c *channel, limit int) int {
+	used := 0
+	for c.head != nil && used < limit {
+		r.drop(c.head, c.cleanupReason)
+		used++
+	}
+	if !c.released {
+		return used
+	}
+	var n, m int64
+	for c.recordHead < len(c.records) && used < limit {
+		rec := c.records[c.recordHead]
+		c.records[c.recordHead] = batchRecord{}
+		c.recordHead++
+		n += rec.bytes
+		m += rec.messages
+		used++
+	}
+	if n != 0 || m != 0 {
+		r.inflight -= n
+		r.messages -= m
+		r.budget.give(n, m, 0)
+	}
+	if c.head == nil && c.recordHead == len(c.records) {
+		c.records = c.records[:0]
+		c.recordHead = 0
+		c.failed = false
+		c.cleanupReason = ""
+	}
+	return used
 }
 func (r *root) flush(c *channel) bool {
 	if c == nil || c.messages == 0 {
@@ -296,50 +369,75 @@ func (r *root) flush(c *channel) bool {
 	if c.token == 0 {
 		return false
 	}
-	b := w.UInt(nil, 1, c.seq+1)
-	b = append(b, c.batch...)
+	var header [11]byte
+	prefix := w.UInt(header[:0], 1, c.seq+1)
+	start := 11 - len(prefix)
+	copy(c.batch[start:11], prefix)
+	b := c.batch[start:]
 	if err := proxywasm.SendGrpcMessage(c.token, b, false); err != nil {
 		clear(b)
 		r.failChannel(c, "send_failed")
 		return false
 	}
-	clear(b)
 	clear(c.batch)
-	c.batch = c.batch[:0]
+	c.batch = c.batch[:11]
 	c.seq++
+	if c.recordHead > 0 && len(c.records) == cap(c.records) {
+		n := copy(c.records, c.records[c.recordHead:])
+		clear(c.records[n:])
+		c.records = c.records[:n]
+		c.recordHead = 0
+	}
 	c.records = append(c.records, batchRecord{c.seq, c.bytes, c.messages, time.Now()})
 	c.bytes = 0
 	c.messages = 0
 	return true
 }
 func (r *root) send(s *state, kind int, b []byte, end bool) bool {
-	if !r.active(s) || s.ending {
+	c, n, ok := r.prepare(s, kind, len(b))
+	if !ok {
 		return false
 	}
-	f := w.Frame(s.seq+1, kind, b)
-	defer clear(f)
-	if len(f) > 32700 || (kind != 12 && int64(len(f)) > r.cfg.MetadataMaxBytes) {
+	c.batch = w.AppendCaptureHeader(c.batch, s.capture, s.seq+1, kind, len(b))
+	c.batch = append(c.batch, b...)
+	return r.commit(s, end, n)
+}
+
+// prepare claims Pod credits before encoding or copying a response fragment.
+func (r *root) prepare(s *state, kind, payload int) (*channel, int64, bool) {
+	if !r.active(s) || s.ending && kind != 14 {
+		return nil, 0, false
+	}
+	f := w.FrameSize(s.seq+1, kind, payload)
+	if f > 32700 || (kind != 12 && int64(f) > r.cfg.MetadataMaxBytes) {
 		r.cancel(s, "metadata_limit")
-		return false
+		return nil, 0, false
 	}
-	item := w.Bytes(w.UInt(nil, 1, s.capture), 2, f)
-	defer clear(item)
-	enc := w.Bytes(nil, 2, item)
-	defer clear(enc)
+	encoded := w.CaptureFrameSize(s.capture, s.seq+1, kind, payload)
 	c := s.ch
-	if int64(len(c.batch)+len(enc)+16) > r.cfg.TransportBatchMaxBytes || c.messages >= r.cfg.TransportBatchMaxFrames {
+	if int64(max(11, len(c.batch))+encoded) > r.cfg.TransportBatchMaxBytes || c.messages >= r.cfg.TransportBatchMaxFrames {
 		if !r.flush(c) {
-			return false
+			return nil, 0, false
 		}
 	}
-	n := int64(len(enc) + 16)
+	n := int64(encoded + 16)
 	if !r.budget.take(n, 1, 0) {
 		r.count("resource_limit")
 		r.repeatedLog(logsafe.Warn, "observation_resource_limit", "limit_kind", "pod_budget", "action", "skip_observation")
-		r.cancel(s, "resource_limit")
-		return false
+		if kind == 14 {
+			r.failChannel(c, "resource_limit")
+		} else {
+			r.cancel(s, "resource_limit")
+		}
+		return nil, 0, false
 	}
-	c.batch = append(c.batch, enc...)
+	if c.batch == nil {
+		c.batch = make([]byte, 11, int(r.cfg.TransportBatchMaxBytes))
+	}
+	return c, n, true
+}
+func (r *root) commit(s *state, end bool, n int64) bool {
+	c := s.ch
 	c.bytes += n
 	c.messages++
 	r.inflight += n
@@ -364,27 +462,16 @@ func (r *root) cancel(s *state, reason string) {
 	if !r.active(s) {
 		return
 	}
-	// A control-only cancel does not claim EOS or a business End. Reserve a
-	// separate bounded transport write; on failure close this channel.
-	c := s.ch
-	if c.token != 0 {
-		if r.flush(c) {
-			f := w.Frame(s.seq+1, 14, nil)
-			item := w.Bytes(w.UInt(nil, 1, s.capture), 2, f)
-			b := w.Bytes(w.UInt(nil, 1, c.seq+1), 2, item)
-			n := int64(len(b) + 5)
-			if r.budget.take(n, 1, 0) {
-				c.seq++
-				c.records = append(c.records, batchRecord{c.seq, n, 1, time.Now()})
-				r.inflight += n
-				r.messages++
-				if err := proxywasm.SendGrpcMessage(c.token, b, false); err != nil {
-					r.failChannel(c, "send_failed")
-				}
-			} else {
-				r.failChannel(c, "resource_limit")
-			}
-			clear(b)
+	// Cancels share the bounded batch and credits; they never fabricate EOS/End.
+	if c, n, ok := r.prepare(s, 14, 0); ok {
+		c.batch = w.AppendCaptureHeader(c.batch, s.capture, s.seq+1, 14, 0)
+		c.bytes += n
+		c.messages++
+		r.inflight += n
+		r.messages++
+		s.seq++
+		if c.messages >= r.cfg.TransportBatchMaxFrames {
+			r.flush(c)
 		}
 	}
 	r.drop(s, reason)
@@ -409,17 +496,27 @@ func (r *root) OnReceive(token uint32, size int) {
 		r.failChannel(c, "protocol_error")
 		return
 	}
-	a, err := w.DecodeBatchAck(b)
+	a, err := w.DecodeBatchAckInto(b, r.ackStorage[:0])
+	clear(b)
+	defer clear(r.ackStorage[:])
 	if err != nil || a.Seq > c.seq {
 		r.failChannel(c, "protocol_error")
 		return
 	}
-	for len(c.records) > 0 && c.records[0].seq <= a.Seq {
-		rec := c.records[0]
-		c.records = c.records[1:]
-		r.inflight -= rec.bytes
-		r.messages -= rec.messages
-		r.budget.give(rec.bytes, rec.messages, 0)
+	var freedBytes, freedMessages int64
+	for c.recordHead < len(c.records) && c.records[c.recordHead].seq <= a.Seq {
+		rec := c.records[c.recordHead]
+		c.records[c.recordHead] = batchRecord{}
+		c.recordHead++
+		freedBytes += rec.bytes
+		freedMessages += rec.messages
+	}
+	r.inflight -= freedBytes
+	r.messages -= freedMessages
+	r.budget.give(freedBytes, freedMessages, 0)
+	if c.recordHead == len(c.records) {
+		c.records = c.records[:0]
+		c.recordHead = 0
 	}
 	for _, ack := range a.Acks {
 		s := r.states[ack.Capture]
@@ -450,6 +547,7 @@ func (r *root) OnClose(token, status uint32) {
 	}
 }
 func (r *root) OnTick() {
+	remaining := 256
 	for _, c := range r.channels {
 		if c == nil {
 			continue
@@ -458,13 +556,24 @@ func (r *root) OnTick() {
 			if !time.Now().Before(c.retryAt) {
 				r.failChannel(c, "cancel_retry")
 			}
+			if c.failed {
+				remaining -= r.reapChannel(c, remaining)
+			}
 			continue
 		}
-		if len(c.records) > 0 && time.Since(c.records[0].at) > time.Duration(r.cfg.AckTimeoutMS)*time.Millisecond {
+		if c.failed {
+			remaining -= r.reapChannel(c, remaining)
+			continue
+		}
+		if c.recordHead < len(c.records) && time.Since(c.records[c.recordHead].at) > time.Duration(r.cfg.AckTimeoutMS)*time.Millisecond {
 			r.failChannel(c, "timeout")
 		} else {
 			r.flush(c)
 		}
+	}
+	if r.cfg.MetricsEnabled && time.Since(r.metricsAt) >= time.Second {
+		r.metricsAt = time.Now()
+		r.publishResourceMetrics()
 	}
 	for i := 0; i < 256 && len(r.q) > 0 && !r.q[0].at.After(time.Now()); i++ {
 		d := heap.Pop(&r.q).(*deadline)
@@ -571,6 +680,11 @@ func (h *httpContext) OnHttpRequestHeaders(_ int, eos bool) types.Action {
 		return types.ActionContinue
 	}
 	s := &state{capture: r.next, ch: c, started: now}
+	s.next = c.head
+	if c.head != nil {
+		c.head.prev = s
+	}
+	c.head = s
 	h.s = s
 	r.states[s.capture] = s
 	s.eos[0] = eos
@@ -621,23 +735,36 @@ func (h *httpContext) observeResponse(n int, eos bool, at time.Time) {
 	}
 	for from := 0; from < n || (n == 0 && eos && from == 0); {
 		count := min(int(h.cfg.ChunkBytes), n-from)
+		last := eos && from+count == n
+		elapsed := uint64(at.Sub(s.started).Microseconds())
+		payload := 2 + 1 + w.VarSize(s.bodySeq[1]+1) + 1 + w.VarSize(s.offset[1]) + 1 + w.VarSize(uint64(count)) + count + 1 + w.VarSize(elapsed)
+		if last {
+			payload += 2
+		}
+		c, credit, ok := h.root.prepare(s, 12, payload)
+		if !ok {
+			return
+		}
 		var b []byte
 		var err error
 		if count > 0 {
 			b, err = proxywasm.GetHttpResponseBody(from, count)
-			if err != nil {
+			if err != nil || len(b) != count {
+				clear(b)
+				h.root.budget.give(credit, 1, 0)
 				h.root.cancel(s, "body_read_failed")
 				return
 			}
 		}
-		v := w.UInt(w.UInt(w.UInt(nil, 1, 2), 2, s.bodySeq[1]+1), 3, s.offset[1])
+		v := w.AppendCaptureHeader(c.batch, s.capture, s.seq+1, 12, payload)
+		v = w.UInt(w.UInt(w.UInt(v, 1, 2), 2, s.bodySeq[1]+1), 3, s.offset[1])
 		v = w.Bytes(v, 4, b)
-		last := eos && from+count == n
+		clear(b)
 		if last {
 			v = w.UInt(v, 5, 1)
 		}
-		v = w.UInt(v, 6, uint64(at.Sub(s.started).Microseconds()))
-		if !h.root.send(s, 12, v, false) {
+		c.batch = w.UInt(v, 6, elapsed)
+		if !h.root.commit(s, false, credit) {
 			return
 		}
 		s.bodySeq[1]++

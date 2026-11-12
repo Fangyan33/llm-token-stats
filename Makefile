@@ -15,6 +15,7 @@ wasm:
 	mkdir -p dist
 	cd plugins/gateway-observer && tinygo build -target=wasi -buildmode=wasi-legacy -scheduler=none -o ../../dist/gateway-observer-v1.wasm .
 	python3 scripts/check_wasm_abi.py dist/gateway-observer-v1.wasm
+	cd third_party/proxy-wasm-go-sdk && go test -tags=wasmhosttest -run '^TestHostBufferOwnership$$' -count=1 ./proxywasm/internal
 test:
 	python3 scripts/validate_collection_contracts.py
 	python3 -m unittest discover -s tests -p 'test_*.py'

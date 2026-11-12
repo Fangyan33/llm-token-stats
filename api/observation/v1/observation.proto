@@ -16,8 +16,8 @@ message CaptureFrame {
   ObservationFrame frame = 2;
 }
 message ObservationAckBatch {
-  uint64 accepted_batch_seq = 1;
-  repeated CaptureAck acks = 2;
+  uint64 accepted_batch_seq = 1; // 连续批次已由 Observer 有界队列接管；不代表解析完成或 Kafka 持久化
+  repeated CaptureAck acks = 2; // 仅接纳、结束和异常状态；普通正文只返回批次累计确认
 }
 message CaptureAck {
   uint64 capture_id = 1;

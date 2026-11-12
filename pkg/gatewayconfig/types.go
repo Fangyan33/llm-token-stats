@@ -19,6 +19,7 @@ type Config struct {
 	ExtraRequestHeaders       []string `json:"extra_request_headers"`
 	SchemaVersion             int64    `json:"schema_version"`
 	Enabled                   bool     `json:"enabled"`
+	MetricsEnabled            bool     `json:"metrics_enabled"`
 	ConfigVersion             string   `json:"config_version"`
 	ObserverCluster           string   `json:"observer_cluster"`
 	AcceptedRequestHosts      []string `json:"accepted_request_hosts"`

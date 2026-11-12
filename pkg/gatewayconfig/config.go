@@ -34,6 +34,9 @@ func Decode(b []byte) (Config, error) {
 		}
 	}
 	fields, _ := strictjson.Fields(b, 64, 100000)
+	if span, present := fields["metrics_enabled"]; present && strings.TrimSpace(string(b[span.Start:span.End])) == "null" {
+		return c, errors.New("config_metrics")
+	}
 	for _, name := range []string{"user_id_header", "extra_request_headers"} {
 		if span, present := fields[name]; present && strings.TrimSpace(string(b[span.Start:span.End])) == "null" {
 			return c, errors.New("config_request_headers")

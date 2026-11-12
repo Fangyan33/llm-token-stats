@@ -252,6 +252,7 @@ func testHostAndRoot(t *testing.T, route string, change func(map[string]any), na
 	var c map[string]any
 	json.Unmarshal(b, &c)
 	c["enabled"] = true
+	c["metrics_enabled"] = true
 	if change != nil {
 		change(c)
 	}

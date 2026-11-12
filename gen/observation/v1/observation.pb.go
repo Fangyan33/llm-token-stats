@@ -177,8 +177,8 @@ func (x *CaptureFrame) GetFrame() *ObservationFrame {
 
 type ObservationAckBatch struct {
 	state            protoimpl.MessageState `protogen:"open.v1"`
-	AcceptedBatchSeq uint64                 `protobuf:"varint,1,opt,name=accepted_batch_seq,json=acceptedBatchSeq,proto3" json:"accepted_batch_seq,omitempty"`
-	Acks             []*CaptureAck          `protobuf:"bytes,2,rep,name=acks,proto3" json:"acks,omitempty"`
+	AcceptedBatchSeq uint64                 `protobuf:"varint,1,opt,name=accepted_batch_seq,json=acceptedBatchSeq,proto3" json:"accepted_batch_seq,omitempty"` // 连续批次已由 Observer 有界队列接管；不代表解析完成或 Kafka 持久化
+	Acks             []*CaptureAck          `protobuf:"bytes,2,rep,name=acks,proto3" json:"acks,omitempty"`                                                    // 仅接纳、结束和异常状态；普通正文只返回批次累计确认
 	unknownFields    protoimpl.UnknownFields
 	sizeCache        protoimpl.SizeCache
 }

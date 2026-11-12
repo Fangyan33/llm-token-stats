@@ -58,6 +58,11 @@ def infrastructure(namespace):
 
 def bootstrap(root, namespace):
     cfg = json.loads((root / 'deploy/local/envoy.json').read_text())
+    # This isolated suite asserts activation and Host rejection counters.
+    wasm = cfg['static_resources']['listeners'][0]['filter_chains'][0]['filters'][0]['typed_config']['http_filters'][1]['typed_config']['config']
+    settings = json.loads(wasm['configuration']['value'])
+    settings['metrics_enabled'] = True
+    wasm['configuration']['value'] = json.dumps(settings,separators=(',', ':'))
     cfg['node']['metadata'] = {'NAMESPACE': namespace, 'NAME': 'llm-token-stats-e2e-gateway'}
     cfg['node']['id'] = namespace + '/llm-token-stats-e2e-gateway'
     res = cfg['static_resources']

@@ -35,49 +35,68 @@ func Read(b []byte) ([]Field, error) {
 	if len(b) > 32768 {
 		return nil, Err
 	}
+	c := cursor{b: b}
 	out := []Field{}
-	for len(b) > 0 {
-		tag, n, err := Var(b)
-		if err != nil || tag>>3 == 0 || tag>>3 > 536870911 {
-			return nil, Err
-		}
-		b = b[n:]
-		f := Field{N: int(tag >> 3), Wire: int(tag & 7)}
-		switch f.Wire {
-		case 0:
-			f.V, n, err = Var(b)
-			if err != nil {
-				return nil, Err
-			}
-			b = b[n:]
-		case 2:
-			var l uint64
-			l, n, err = Var(b)
-			if err != nil || l > uint64(len(b)-n) {
-				return nil, Err
-			}
-			b = b[n:]
-			f.B = b[:int(l)]
-			b = b[int(l):]
-		case 1:
-			if len(b) < 8 {
-				return nil, Err
-			}
-			b = b[8:]
-		case 5:
-			if len(b) < 4 {
-				return nil, Err
-			}
-			b = b[4:]
-		default:
-			return nil, Err
+	for len(c.b) > 0 {
+		f, err := c.next()
+		if err != nil {
+			return nil, err
 		}
 		out = append(out, f)
-		if len(out) > 256 {
-			return nil, Err
-		}
 	}
 	return out, nil
+}
+
+// cursor validates the wire while walking it once, without allocating Fields.
+type cursor struct {
+	b []byte
+	n int
+}
+
+func (c *cursor) next() (Field, error) {
+	var f Field
+	c.n++
+	if c.n > 256 {
+		return f, Err
+	}
+	b := c.b
+	tag, n, err := Var(b)
+	if err != nil || tag>>3 == 0 || tag>>3 > 536870911 {
+		return f, Err
+	}
+	b = b[n:]
+	f = Field{N: int(tag >> 3), Wire: int(tag & 7)}
+	switch f.Wire {
+	case 0:
+		f.V, n, err = Var(b)
+		if err != nil {
+			return f, Err
+		}
+		b = b[n:]
+	case 2:
+		var l uint64
+		l, n, err = Var(b)
+		if err != nil || l > uint64(len(b)-n) {
+			return f, Err
+		}
+		b = b[n:]
+		f.B = b[:int(l)]
+		b = b[int(l):]
+	case 1:
+		if len(b) < 8 {
+			return f, Err
+		}
+		b = b[8:]
+	case 5:
+		if len(b) < 4 {
+			return f, Err
+		}
+		b = b[4:]
+	default:
+		return f, Err
+	}
+	c.b = b
+	return f, nil
 }
 func AppendVar(b []byte, v uint64) []byte {
 	for v >= 128 {
@@ -87,6 +106,39 @@ func AppendVar(b []byte, v uint64) []byte {
 	return append(b, byte(v))
 }
 func UInt(b []byte, n int, v uint64) []byte { b = AppendVar(b, uint64(n<<3)); return AppendVar(b, v) }
+func VarSize(v uint64) int {
+	n := 1
+	for v >= 128 {
+		n++
+		v >>= 7
+	}
+	return n
+}
+func BytesHeader(b []byte, n, size int) []byte {
+	b = AppendVar(b, uint64(n<<3|2))
+	return AppendVar(b, uint64(size))
+}
+func FrameSize(seq uint64, kind, payload int) int {
+	return 2 + 1 + VarSize(seq) + VarSize(uint64(kind<<3|2)) + VarSize(uint64(payload)) + payload
+}
+func CaptureFrameSize(capture, seq uint64, kind, payload int) int {
+	f := FrameSize(seq, kind, payload)
+	i := 1 + VarSize(capture) + 1 + VarSize(uint64(f)) + f
+	return 1 + VarSize(uint64(i)) + i
+}
+
+// AppendCaptureHeader writes wrappers directly into a pre-sized batch buffer.
+// The caller appends exactly payload bytes after this header.
+func AppendCaptureHeader(b []byte, capture, seq uint64, kind, payload int) []byte {
+	f := FrameSize(seq, kind, payload)
+	i := 1 + VarSize(capture) + 1 + VarSize(uint64(f)) + f
+	b = BytesHeader(b, 2, i)
+	b = UInt(b, 1, capture)
+	b = BytesHeader(b, 2, f)
+	b = UInt(b, 1, 1)
+	b = UInt(b, 3, seq)
+	return BytesHeader(b, kind, payload)
+}
 func Bytes(b []byte, n int, v []byte) []byte {
 	b = AppendVar(b, uint64(n<<3|2))
 	b = AppendVar(b, uint64(len(v)))
@@ -244,11 +296,26 @@ type Ack struct {
 
 func DecodeAck(b []byte) (Ack, error) {
 	var a Ack
-	if len(b) > 1024 || Validate(b, "ack") != nil {
+	if len(b) > 1024 {
 		return a, Err
 	}
-	fs, _ := Read(b)
-	for _, f := range fs {
+	c := cursor{b: b}
+	var seen uint8
+	for len(c.b) > 0 {
+		f, err := c.next()
+		if err != nil {
+			return Ack{}, err
+		}
+		if f.N >= 1 && f.N <= 4 {
+			bit := uint8(1 << uint(f.N-1))
+			if seen&bit != 0 {
+				return Ack{}, Err
+			}
+			seen |= bit
+			if (f.N == 1 || f.N == 4) && (f.Wire != 2 || !utf8.Valid(f.B)) || (f.N == 2 || f.N == 3) && f.Wire != 0 {
+				return Ack{}, Err
+			}
+		}
 		switch f.N {
 		case 1:
 			a.ID = string(f.B)

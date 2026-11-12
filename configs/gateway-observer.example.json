@@ -41,5 +41,6 @@
   "pod_inflight_messages": 524288,
   "transport_streams_per_worker": 4,
   "transport_batch_max_bytes": 32768,
-  "transport_batch_max_frames": 128
+  "transport_batch_max_frames": 128,
+  "metrics_enabled": false
 }

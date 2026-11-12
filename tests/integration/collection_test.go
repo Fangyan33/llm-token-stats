@@ -389,7 +389,9 @@ func TestProducerBlackholeIsBounded(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	h := &health.State{}
-	p, err := producer.New(ctx, config.Kafka{Brokers: []string{l.Addr().String()}, Topic: "llm-metering-development"}, h, func() { t.Error("producer failed to close within watchdog budget") })
+	// Saturate an explicitly configured small queue; production defaults can
+	// increase without silently removing this overload/fail-open assertion.
+	p, err := producer.New(ctx, config.Kafka{Brokers: []string{l.Addr().String()}, Topic: "llm-metering-development", ProducerMaxRecords: 256, ProducerMaxBytes: 4 << 20, ProducerDeliveryMS: 2000, ProducerWatchdogMS: 3000}, h, func() { t.Error("producer failed to close within watchdog budget") })
 	if err != nil {
 		t.Fatal(err)
 	}

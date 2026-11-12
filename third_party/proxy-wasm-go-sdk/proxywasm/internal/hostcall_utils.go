@@ -25,18 +25,22 @@ import (
 
 func RawBytePtrToString(raw *byte, size int) string {
 	//nolint
-	return *(*string)(unsafe.Pointer(&reflect.SliceHeader{
+	value := *(*string)(unsafe.Pointer(&reflect.SliceHeader{
 		Data: uintptr(unsafe.Pointer(raw)),
 		Len:  size,
 		Cap:  size,
 	}))
+	adoptHostAllocation(raw)
+	return value
 }
 
 func RawBytePtrToByteSlice(raw *byte, size int) []byte {
 	//nolint
-	return *(*[]byte)(unsafe.Pointer(&reflect.SliceHeader{
+	value := *(*[]byte)(unsafe.Pointer(&reflect.SliceHeader{
 		Data: uintptr(unsafe.Pointer(raw)),
 		Len:  size,
 		Cap:  size,
 	}))
+	adoptHostAllocation(raw)
+	return value
 }

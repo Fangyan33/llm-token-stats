@@ -77,7 +77,7 @@ type Observer struct {
 	Listen                string        `json:"listen"`
 	Health                string        `json:"health_listen"`
 	ProducerID            string        `json:"producer_id"`
-	MaxActive             int           `json:"max_active_streams"`
+	MaxActive             int           `json:"max_active_observations"`
 	ParserBudget          int64         `json:"parser_budget_bytes"`
 	MaxObservationMS      int           `json:"max_observation_ms"`
 	AcceptedConfigs       []string      `json:"accepted_config_versions"`
@@ -185,21 +185,21 @@ func (c *Config) ObserverDefaults() error {
 		c.Observer.Health = ":9091"
 	}
 	if c.Observer.MaxActive == 0 {
-		c.Observer.MaxActive = 4096
+		c.Observer.MaxActive = 1048576
 	}
 	if c.Observer.ParserBudget == 0 {
-		c.Observer.ParserBudget = 256 << 20
+		c.Observer.ParserBudget = 10 << 30
 	}
 	if c.Observer.MaxObservationMS == 0 {
 		c.Observer.MaxObservationMS = 605000
 	}
 	if c.Observer.MaxConnections == 0 {
-		c.Observer.MaxConnections = 128
+		c.Observer.MaxConnections = 1024
 	}
 	if c.Observer.ProducerID == "" {
 		c.Observer.ProducerID = os.Getenv("POD_UID")
 	}
-	if !text(c.Observer.ClusterName, 128) || !Environment(c.Observer.DeploymentEnvironment) || !LookupURI(c.Observer.ServiceLookup.URI) || !LookupURI(c.Observer.CustomerLookup.URI) || !text(c.Observer.ProducerID, 128) || c.Observer.MaxActive < 1 || c.Observer.MaxActive > 4096 || c.Observer.ParserBudget < 3*32768 || c.Observer.ParserBudget > 256<<20 || c.Observer.MaxObservationMS < 1 || c.Observer.MaxObservationMS > 605000 || c.Observer.MaxConnections < 1 || c.Observer.MaxConnections > 128 || !registration(c.Observer.AcceptedConfigs) || len(c.Observer.AcceptedAdapters) != 1 || c.Observer.AcceptedAdapters[0] != "chat_completions_v1" || !codes(c.Observer.Flags) || !codes(c.Observer.Details) {
+	if !text(c.Observer.ClusterName, 128) || !Environment(c.Observer.DeploymentEnvironment) || !LookupURI(c.Observer.ServiceLookup.URI) || !LookupURI(c.Observer.CustomerLookup.URI) || !text(c.Observer.ProducerID, 128) || c.Observer.MaxActive < 1 || c.Observer.MaxActive > 1048576 || c.Observer.ParserBudget < 3*32768 || c.Observer.ParserBudget > 64<<30 || c.Observer.MaxObservationMS < 1 || c.Observer.MaxObservationMS > 605000 || c.Observer.MaxConnections < 1 || c.Observer.MaxConnections > 4096 || !registration(c.Observer.AcceptedConfigs) || len(c.Observer.AcceptedAdapters) != 1 || c.Observer.AcceptedAdapters[0] != "chat_completions_v1" || !codes(c.Observer.Flags) || !codes(c.Observer.Details) {
 		return logging.WithCause("config_observer", nil)
 	}
 	return nil

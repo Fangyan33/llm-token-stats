@@ -32,7 +32,7 @@ flowchart LR
 | 组件 | 职责 | 运行方式与实现情况 |
 | --- | --- | --- |
 | Istio / Envoy 网关 | 执行鉴权、路由和业务转发，向 Wasm 提供入口 Host、路由和 Bearer 凭证 | 复用现有入口网关；本地使用 `istio/proxyv2:1.13.5` 中的 Envoy |
-| Gateway Observer Wasm | 按 POST 与精确路径白名单选择请求，`route_name: "*"` 忽略路由名；在资源限制内观察正文，必要时补充 `stream_options.include_usage`，旁路发送观察消息 | 已实现；在网关内加载和运行，不单独部署，也不直接连接 Kafka |
+| Gateway Observer Wasm | 按 POST 与精确路径白名单选择请求，`route_name: "*"` 忽略路由名；跳过请求正文；有界旁路发送响应片段，在共享 gRPC 流中复用多个观察 | 已实现；在网关内加载和运行，不单独部署，也不直接连接 Kafka |
 | Observer | 接收观察流，分配请求 ID，解析 JSON / SSE usage，生成 `request_started`、`usage_observed` 事件，通过原生 Producer 发送 Kafka | 已实现；入口为 `cmd/observer/`，提供 gRPC、两类归属查询占位、健康检查、指标及独立 HTTP Wasm 下载端口 |
 | Kafka | 缓冲结构化事件，按分区保存消费位置，为 Consumer 重放提供数据 | 外部基础设施；本地由 Compose 启动 |
 | Consumer | 校验事件与摘要，去重并保留冲突证据；将明细、拒绝诊断、日期通知和批次凭据写入 Doris，确认全部可见后提交 offset | 已实现；入口为 `cmd/consumer/`，多个副本使用同一 consumer group 分摊分区 |
@@ -175,7 +175,7 @@ git push origin v0.1.0
 
 工作流先创建草稿并上传全部附件，上传成功才发布；含短横线的 tag（如 `v0.1.0-rc.1`）标记为预发布。已有 Release 时拒绝覆盖。上传失败可能留下草稿，删除该草稿后可以重跑；已发布版本的变更使用新 tag。构建失败时查看 Actions 日志，发布成功不代表生产部署验收完成。
 
-采集插件对受支持的流式 JSON 请求自动添加 `stream_options.include_usage=true`。改写默认最多等待 450 ms，每 10 ms 检查超时；失败或超时原文转发，调度拥塞或恢复调用短暂失败时可能超过 500 ms。旧合法配置的较大超时在运行时收紧。详见[请求改写与故障恢复](docs/gateway-request-collection-implementation.md#43-请求-usage-参数补充与回调伪代码)。
+采集插件不读取或改写请求正文，`request_model` 保存为 null。模型服务应保证流式响应返回 usage；上游缺失时保持 null/unknown。Wasm 每 Worker 默认使用 4 条共享传输流，Pod 级默认限制为 131072 个观察、256 MiB 待发及未确认载荷、524288 条记录。输入 1M token 不引入正文采集副本；2048 MiB 额外 RSS 上限仍须完成带/不带插件的对照验收。回归使用 `make collection-regression`，容量使用 `make capacity-test`，见[测试说明](docs/collection-capacity-test.md)。详见[响应采集与资源边界](docs/gateway-request-collection-implementation.md)和[本轮验证结果](docs/spec/plan/gateway-response-collection-verification.md)。
 
 ### Wasm 打包、下载与摘要
 
@@ -571,7 +571,7 @@ kubectl delete -f "$DEPLOY_DIR/envoyfilter.disabled.yaml"
 
 同一命名空间中匹配标签的网关副本共用一个 EnvoyFilter，实例身份由各自运行时读取。升级旧包时先删除旧包 `gateway/disabled/` 中按 UID 命名或固定名 `gateway-observer` 的过滤器，再安装新版，避免重复采集；这会有短暂采集中断。修改选择器会生成新资源，需先移除旧清单对应的过滤器；正式与灰度网关应使用互斥标签。旧 JSON 中的 `gateway_instance_id` 已移除，配置必须与新版 Wasm 配套发布。关闭配置直接透传。启用态通过 ECDS 与 Lua 默认配置隔离加载等待和配置拒绝，但不承诺 Envoy 进程崩溃、OOM 等宿主故障下仍可转发。
 
-本地集成结果仅覆盖本地环境。扩大灰度前，需在真实环境验证改写、解析和故障恢复；生产验收还包括性能、数据质量和回退检查。完整 G0 至 G5 要求见[闭环与验收清单](docs/gateway-collection-design-closure.md)，已有本地证据见[验证记录](docs/spec/plan/gateway-collection-verification.md)。
+本地集成结果仅覆盖本地环境。扩大灰度前，需在真实环境验证共享传输、解析和故障恢复；生产验收还包括性能、数据质量和回退检查。资源与容量目标见[当前实现方案](docs/gateway-request-collection-implementation.md)，已有本地证据见[验证记录](docs/spec/plan/gateway-collection-verification.md)。
 
 ## 本地 Kubernetes / Istio 部署验证
 

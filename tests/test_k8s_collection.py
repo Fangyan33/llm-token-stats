@@ -143,14 +143,17 @@ class KubernetesCollectionTests(unittest.TestCase):
         self.assertEqual(observer['kafka']['bootstrap_servers'], ['llm-token-stats-kafka:9092'])
 
     def test_acceptance_rejects_compose_producer_wrong_topic_and_unknown_zero(self):
-        results = [{'scenario': 'unknown', 'x_request_id': 'request'}]
+        results = [{'scenario': 'unknown', 'logical_request_id': 'request'}]
         rows = [['request', 'request_started', 'logical', 'unknown', 'NULL', 'NULL',
                  'complete', '0', 'gateway-test/gateway-pod', 'observer-pod-uid', 'test-topic', 'synthetic-model-route'],
                 ['request', 'usage_observed', 'logical', 'unknown', 'NULL', 'NULL',
                  'complete', '0', 'gateway-test/gateway-pod', 'observer-pod-uid', 'test-topic', 'synthetic-model-route']]
         for row in rows:
-            row.extend(['NULL'] * 4 + ['lookup_not_implemented'] * 2 + ['kind','stg','wasm-verify.local','NULL','NULL'])
-        k8s.validate_events(copy.deepcopy(results), rows, 'gateway-test/gateway-pod', {'observer-pod-uid'}, 'test-topic')
+            row.extend(['NULL'] * 4 + ['lookup_not_implemented'] * 2 + ['kind','stg','wasm-verify.local','NULL','NULL','gateway-visible-id'])
+        checked = copy.deepcopy(results)
+        k8s.validate_events(checked, rows, 'gateway-test/gateway-pod', {'observer-pod-uid'}, 'test-topic')
+        self.assertEqual(checked[0]['x_request_id'], 'gateway-visible-id')
+        self.assertEqual(checked[0]['logical_request_id'], 'request')
         missing = copy.deepcopy(rows)
         for row in missing:
             row[11] = 'unknown'
@@ -158,7 +161,7 @@ class KubernetesCollectionTests(unittest.TestCase):
         known = copy.deepcopy(rows)
         known[1][3:6] = ['known', '10', '4']
         known[1][7] = '1'
-        k8s.validate_events([{'scenario': 'json', 'x_request_id': 'request'}], known,
+        k8s.validate_events([{'scenario': 'json', 'logical_request_id': 'request'}], known,
                             'gateway-test/gateway-pod', {'observer-pod-uid'}, 'test-topic')
         for column, value in ((9, 'compose-observer'), (10, 'llm-metering-events'), (4, '0'), (11, '*'), (11, 'llm-chat')):
             invalid = copy.deepcopy(rows)

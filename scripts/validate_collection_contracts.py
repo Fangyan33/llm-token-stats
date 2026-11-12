@@ -8,7 +8,6 @@ import argparse
 import hashlib
 import ipaddress
 import json
-import math
 import re
 import sys
 from datetime import datetime, timezone
@@ -340,17 +339,10 @@ def validate_config(config, release=False):
         for path in rule["paths"]:
             require(utf8_size(path) <= 1024 and not any(c.isspace() for c in path), "path_bytes_or_whitespace")
     require(len(names) == len(set(names)), "duplicate_route")
-    for dimension in ("bytes", "messages"):
-        require(config["stream_inflight_" + dimension] <= config["root_inflight_" + dimension], "stream_exceeds_root")
-    require(config["callback_max_bytes"] <= config["chunk_bytes"] * config["callback_max_chunks"], "callback_chunk_capacity")
-    require(config["stream_inflight_messages"] > 4 and config["stream_inflight_bytes"] > 8192, "control_reservation")
-    require(config["chunk_bytes"] + 256 <= 32768, "protobuf_frame_capacity")
-    chunks = math.ceil(config["request_body_max_bytes"] / config["chunk_bytes"])
-    require(chunks + 4 <= config["stream_inflight_messages"], "rewrite_message_capacity")
-    require(config["request_body_max_bytes"] + chunks * 256 + 8192 <= config["stream_inflight_bytes"], "rewrite_byte_capacity")
-    require(config["rewrite_reservation_bytes"] >= 4 * config["request_body_max_bytes"], "rewrite_copy_capacity")
-    require(config["rewrite_reservation_bytes"] * config["root_max_rewrites"] <= config["root_rewrite_budget_bytes"], "rewrite_root_capacity")
-    require(config["tick_ms"] <= min(config["rewrite_timeout_ms"], config["ack_timeout_ms"], config["end_ack_timeout_ms"]), "tick_deadline_capacity")
+    require(config['pod_inflight_bytes'] >= 65536, 'pod_byte_capacity')
+    require(config['pod_inflight_messages'] >= 128, 'pod_message_capacity')
+    require(config['chunk_bytes'] + 256 <= config['transport_batch_max_bytes'], 'protobuf_frame_capacity')
+    require(config['tick_ms'] <= min(config['ack_timeout_ms'], config['end_ack_timeout_ms']), 'tick_deadline_capacity')
     if release:
         require(".example." not in config["observer_cluster"], "unresolved_observer_cluster")
         if config["enabled"]:
@@ -374,7 +366,7 @@ def validate_repository():
         reserved = [number for clause in re.findall(r"reserved\s+([\d,\s]+);", message)
                     for number in re.findall(r"\d+", clause)]
         require(not set(numbers).intersection(reserved), "reserved_proto_field_reused")
-    require("reserved 2;" in proto and "rpc Observe(stream ObservationFrame) returns (stream ObservationAck);" in proto, "proto_service_contract")
+    require("reserved 2;" in proto and "rpc Observe(stream ObservationBatch) returns (stream ObservationAckBatch);" in proto, "proto_service_contract")
     config = load(ROOT / "configs/gateway-observer.example.json")
     json_blocks = [strict_json(x) for x in re.findall(fence + r"json\n(.*?)\n" + fence, doc, re.S)]
     require(next(x for x in json_blocks if "observer_cluster" in x) == config, "config_document_drift")

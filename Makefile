@@ -4,7 +4,7 @@ GOPATH ?= /tmp/metering-go
 export GOCACHE GOMODCACHE GOPATH
 PROTOC ?= protoc
 PACKAGE_DIR ?= dist/package
-.PHONY: build wasm test generate local-infra-up local-up k8s-test-build k8s-test k8s-clean manifest package summary-test local-summary
+.PHONY: build wasm test generate local-infra-up local-up k8s-test-build k8s-test k8s-clean manifest package summary-test local-summary capacity-build capacity-test collection-regression collection-fault-test
 build:
 	mkdir -p dist
 	CGO_ENABLED=0 go build -trimpath -o dist/observer ./cmd/observer
@@ -41,3 +41,14 @@ manifest:
 	python3 scripts/collection_manifest.py
 package: wasm
 	python3 scripts/package_distribution.py --output "$(PACKAGE_DIR)" $(PACKAGE_ARGS)
+
+capacity-build:
+	mkdir -p dist
+	CGO_ENABLED=0 go build -trimpath -o dist/collection-load ./tests/capacity
+capacity-test: build wasm capacity-build
+	python3 scripts/collection_capacity.py $(CAPACITY_ARGS)
+collection-regression: build wasm capacity-build
+	python3 scripts/collection_capacity.py --mode regression $(CAPACITY_ARGS)
+
+collection-fault-test: build wasm capacity-build
+	python3 scripts/collection_capacity.py --mode faults $(CAPACITY_ARGS)

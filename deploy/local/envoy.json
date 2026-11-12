@@ -73,7 +73,11 @@
                           "vm_config": {
                             "vm_id": "gateway-observer-v1",
                             "runtime": "envoy.wasm.runtime.v8",
-                            "environment_variables": {"host_env_keys": ["LOG_LEVEL"]},
+                            "environment_variables": {
+                              "host_env_keys": [
+                                "LOG_LEVEL"
+                              ]
+                            },
                             "code": {
                               "remote": {
                                 "http_uri": {
@@ -90,7 +94,7 @@
                           },
                           "configuration": {
                             "@type": "type.googleapis.com/google.protobuf.StringValue",
-                            "value": "{\"schema_version\":1,\"enabled\":true,\"config_version\":\"collection-v1\",\"observer_cluster\":\"observer\",\"routes\":[{\"route_name\":\"*\",\"enabled\":true,\"methods\":[\"POST\"],\"paths\":[\"/v1/chat/completions\"],\"adapter_id\":\"chat_completions_v1\"}],\"chunk_bytes\":16384,\"callback_max_bytes\":65536,\"callback_max_chunks\":4,\"request_body_max_bytes\":262144,\"rewrite_timeout_ms\":450,\"rewrite_reservation_bytes\":1048576,\"root_rewrite_budget_bytes\":16777216,\"root_max_rewrites\":16,\"response_body_max_bytes\":8388608,\"stream_inflight_bytes\":524288,\"stream_inflight_messages\":32,\"root_max_streams\":512,\"root_inflight_bytes\":16777216,\"root_inflight_messages\":8192,\"ack_timeout_ms\":2000,\"end_ack_timeout_ms\":2000,\"observation_max_ms\":600000,\"tick_ms\":10,\"metadata_max_bytes\":6144,\"ack_max_bytes\":1024,\"accepted_request_hosts\":[\"model.example.invalid\",\"*.example.invalid\"],\"logical_request_id_headers\":[\"x-client-request-id\",\"request_id\"],\"user_id_header\":[\"user-id\"],\"extra_request_headers\":[]}"
+                            "value": "{\"schema_version\":1,\"enabled\":true,\"config_version\":\"collection-v1\",\"observer_cluster\":\"observer\",\"routes\":[{\"route_name\":\"*\",\"enabled\":true,\"methods\":[\"POST\"],\"paths\":[\"/v1/chat/completions\"],\"adapter_id\":\"chat_completions_v1\"}],\"chunk_bytes\":16384,\"response_body_max_bytes\":8388608,\"ack_timeout_ms\":2000,\"end_ack_timeout_ms\":2000,\"observation_max_ms\":600000,\"tick_ms\":10,\"metadata_max_bytes\":6144,\"ack_max_bytes\":32768,\"accepted_request_hosts\":[\"model.example.invalid\",\"*.example.invalid\"],\"logical_request_id_headers\":[\"x-client-request-id\",\"request_id\"],\"user_id_header\":[\"user-id\"],\"extra_request_headers\":[],\"pod_max_observations\":131072,\"pod_inflight_bytes\":268435456,\"pod_inflight_messages\":524288,\"transport_streams_per_worker\":4,\"transport_batch_max_bytes\":32768,\"transport_batch_max_frames\":128}"
                           },
                           "fail_open": true
                         }

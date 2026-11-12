@@ -9,22 +9,15 @@ import (
 	"testing"
 )
 
-func TestRewriteTimingCapsPreserveLegacyConfiguration(t *testing.T) {
-	data, err := os.ReadFile("../../configs/gateway-observer.example.json")
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, tc := range []struct{ timeout, tick, wantTimeout, wantTick int64 }{
-		{2000, 100, 450, 10}, {500, 100, 450, 10}, {450, 10, 450, 10}, {5, 5, 5, 5},
-	} {
+func TestResponseTransportConfiguration(t *testing.T) {
+	data, _ := os.ReadFile("../../configs/gateway-observer.example.json")
+	for _, key := range []string{"request_body_max_bytes", "rewrite_timeout_ms", "stream_inflight_messages"} {
 		var raw map[string]any
 		json.Unmarshal(data, &raw)
-		raw["enabled"] = true
-		raw["rewrite_timeout_ms"], raw["tick_ms"] = tc.timeout, tc.tick
+		raw[key] = 1
 		b, _ := json.Marshal(raw)
-		c, err := Decode(b)
-		if err != nil || !c.Enabled || c.RewriteTimeoutMS != tc.wantTimeout || c.TickMS != tc.wantTick {
-			t.Fatalf("timing %d/%d: decoded %d/%d enabled=%t err=%v", tc.timeout, tc.tick, c.RewriteTimeoutMS, c.TickMS, c.Enabled, err)
+		if _, err := Decode(b); err == nil {
+			t.Fatal("removed field accepted", key)
 		}
 	}
 }

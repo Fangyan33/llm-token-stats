@@ -12,7 +12,6 @@ import (
 	"reflect"
 	"strings"
 	"testing"
-	"time"
 )
 
 func TestBearerStartAndUnchangedAuthorization(t *testing.T) {
@@ -39,7 +38,7 @@ func TestBearerStartAndUnchangedAuthorization(t *testing.T) {
 				headers = append(headers, [2]string{"authorization", v})
 			}
 			h.CallOnRequestHeaders(id, headers, false)
-			calls := proxytest.GrpcCalls()
+			calls := captureCalls(t)
 			if len(calls) != 1 || len(calls[0].Messages) != 1 {
 				t.Fatal("missing Start")
 			}
@@ -101,7 +100,7 @@ func TestClientRequestIDPriorityAndMissingValues(t *testing.T) {
 			if h.CallOnRequestHeaders(id, headers, true) != types.ActionContinue {
 				t.Fatal("client ID extraction blocked business traffic")
 			}
-			calls := proxytest.GrpcCalls()
+			calls := captureCalls(t)
 			if len(calls) != 1 || len(calls[0].Messages) != 1 {
 				t.Fatal("missing Start")
 			}
@@ -124,12 +123,12 @@ func TestResponseDoesNotExposeObservationID(t *testing.T) {
 	h := testHost(t)
 	id := h.InitializeHttpContext()
 	h.CallOnRequestHeaders(id, [][2]string{{":method", "POST"}, {":path", "/v1/chat/completions"}, {":authority", "model.example.invalid"}}, true)
-	calls := proxytest.GrpcCalls()
+	calls := captureCalls(t)
 	a, err := proto.Marshal(&pb.ObservationAck{ObservationId: "7f6c2a90-4b13-4b68-9d21-67283e0c5f44", AcceptedFrameSeq: 1, Reason: "accepted"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	proxytest.EmitGrpcReceive(proxytest.PluginContextID, calls[0].Token, a)
+	emitCaptureAck(t, calls[0].Token, 1, a)
 	headers := [][2]string{{":status", "200"}, {"content-type", "application/json"}, {"x-business", "unchanged"}}
 	h.CallOnResponseHeaders(id, headers, true)
 	if !reflect.DeepEqual(h.GetCurrentResponseHeaders(id), headers) {
@@ -176,12 +175,12 @@ func TestHostAllowlistBeforeAllocation(t *testing.T) {
 				t.Fatal("headers paused")
 			}
 			if tc.want {
-				if len(proxytest.GrpcCalls()) != 1 {
+				if len(captureCalls(t)) != 1 {
 					t.Fatal("accepted host did not open observation")
 				}
 				h.CallOnRequestBody(id, body, true)
-				if !bytes.Contains(h.GetCurrentRequestBody(id), []byte(`"include_usage":true`)) {
-					t.Fatal("accepted host did not enter rewrite path")
+				if !bytes.Equal(h.GetCurrentRequestBody(id), body) {
+					t.Fatal("request body changed")
 				}
 				return
 			}
@@ -194,10 +193,10 @@ func TestHostAllowlistBeforeAllocation(t *testing.T) {
 			h.CallOnResponseHeaders(id, [][2]string{{":status", "200"}}, false)
 			h.CallOnResponseBody(id, []byte("unchanged"), true)
 			h.CompleteHttpContext(id)
-			if len(proxytest.GrpcCalls()) != 0 {
+			if len(captureCalls(t)) != 0 {
 				t.Fatal("ignored host created observation")
 			}
-			for _, name := range []string{"active_streams", "inflight_bytes", "inflight_messages", "active_rewrites", "rewrite_reserved_bytes"} {
+			for _, name := range []string{"active_streams", "inflight_bytes", "inflight_messages"} {
 				if n, err := h.GetGaugeMetric("metering_" + name); err != nil || n != 0 {
 					t.Fatalf("resource %s=%d: %v", name, n, err)
 				}
@@ -273,6 +272,7 @@ func testHostAndRoot(t *testing.T, route string, change func(map[string]any), na
 	if host.StartVM() != types.OnVMStartStatusOK || host.StartPlugin() != types.OnPluginStartStatusOK {
 		t.Fatal("start")
 	}
+	testRoot = v.root
 	return host, v.root
 }
 
@@ -282,7 +282,7 @@ func TestWildcardSelectsWithoutRouteMetadata(t *testing.T) {
 			h := testHostWithRoute(t, route)
 			id := h.InitializeHttpContext()
 			h.CallOnRequestHeaders(id, [][2]string{{":method", "POST"}, {":path", "/v1/chat/completions?x=y"}, {":authority", "model.example.invalid"}, {"content-type", "application/json"}}, false)
-			calls := proxytest.GrpcCalls()
+			calls := captureCalls(t)
 			if len(calls) != 1 || len(calls[0].Messages) != 1 {
 				t.Fatal("matching method/path did not send Start")
 			}
@@ -319,77 +319,6 @@ func TestGrpcUpstreamAuthority(t *testing.T) {
 	}
 }
 
-func TestRewriteTimeoutResumesAndStopsAmbiguousObservation(t *testing.T) {
-	h := testHost(t)
-	id := h.InitializeHttpContext()
-	h.CallOnRequestHeaders(id, [][2]string{{":method", "POST"}, {":path", "/v1/chat/completions"}, {":authority", "model.example.invalid"}, {"content-type", "application/json"}}, false)
-	prefix := []byte(`{"stream":false,`)
-	calls := proxytest.GrpcCalls()
-	a := w.String(nil, 1, "7f6c2a90-4b13-4b68-9d21-67283e0c5f44")
-	a = w.UInt(a, 2, 1)
-	a = w.String(a, 4, "accepted")
-	proxytest.EmitGrpcReceive(proxytest.PluginContextID, calls[0].Token, a)
-	if h.CallOnRequestBody(id, prefix, false) != types.ActionPause {
-		t.Fatal("body did not pause")
-	}
-	time.Sleep(470 * time.Millisecond)
-	h.Tick()
-	if h.GetCurrentHttpStreamAction(id) != types.ActionContinue {
-		t.Fatal("timeout did not resume")
-	}
-	tail := []byte(`"messages":[]}`)
-	if h.CallOnRequestBody(id, tail, true) != types.ActionContinue {
-		t.Fatal("tail did not continue")
-	}
-	var seen []byte
-	for _, b := range proxytest.GrpcCalls()[0].Messages {
-		var f pb.ObservationFrame
-		if proto.Unmarshal(b, &f) != nil {
-			t.Fatal("wire")
-		}
-		if c := f.GetBodyChunk(); c != nil && c.Direction == pb.Direction_REQUEST {
-			seen = append(seen, c.Data...)
-		}
-	}
-	if len(seen) != 0 || !calls[0].Cancelled {
-		t.Fatalf("timeout resume must not copy prefix or retain observation: bytes=%d cancelled=%t", len(seen), calls[0].Cancelled)
-	}
-}
-func TestFullRequestBoundaryAndControlReserve(t *testing.T) {
-	h := testHost(t)
-	id := h.InitializeHttpContext()
-	h.CallOnRequestHeaders(id, [][2]string{{":method", "POST"}, {":path", "/v1/chat/completions"}, {":authority", "model.example.invalid"}, {"content-type", "application/json"}}, false)
-	prefix, suffix := `{"stream":false,"messages":[{"content":"`, `"}]}`
-	body := []byte(prefix + strings.Repeat("x", 262144-len(prefix)-len(suffix)) + suffix)
-	if h.CallOnRequestBody(id, body, true) != types.ActionContinue {
-		t.Fatal("large request paused")
-	}
-	if string(h.GetCurrentRequestBody(id)) != string(body) {
-		t.Fatal("non-stream body changed")
-	}
-	calls := proxytest.GrpcCalls()
-	if len(calls) != 1 || len(calls[0].Messages) != 17 || calls[0].Cancelled {
-		t.Fatal("full request did not fit reserved budget")
-	}
-	a := w.String(nil, 1, "7f6c2a90-4b13-4b68-9d21-67283e0c5f44")
-	a = w.UInt(a, 2, 1)
-	a = w.String(a, 4, "accepted")
-	proxytest.EmitGrpcReceive(proxytest.PluginContextID, calls[0].Token, a)
-	h.CallOnResponseHeaders(id, [][2]string{{":status", "200"}, {":authority", "model.example.invalid"}, {"content-type", "application/json"}, {"x-metering-request-id", "forged"}, {"x-metering-request-id", "second"}}, true)
-	var values []string
-	for _, p := range h.GetCurrentResponseHeaders(id) {
-		if p[0] == "x-metering-request-id" {
-			values = append(values, p[1])
-		}
-	}
-	if !reflect.DeepEqual(values, []string{"forged", "second"}) {
-		t.Fatalf("upstream response headers changed: values=%v", values)
-	}
-	h.CompleteHttpContext(id)
-	if !calls[0].End[len(calls[0].End)-1] {
-		t.Fatal("End did not fit")
-	}
-}
 func TestIgnoreBeforeAllocation(t *testing.T) {
 	for _, tc := range []struct{ method, path string }{
 		{"GET", "/v1/chat/completions"}, {"HEAD", "/v1/chat/completions"},
@@ -404,53 +333,16 @@ func TestIgnoreBeforeAllocation(t *testing.T) {
 			h.CallOnRequestBody(id, []byte("invalid"), true)
 			h.CallOnResponseHeaders(id, [][2]string{{":status", "200"}}, false)
 			h.CallOnResponseBody(id, []byte("ignored"), true)
-			if len(proxytest.GrpcCalls()) != 0 || string(h.GetCurrentRequestBody(id)) != "invalid" {
+			if len(captureCalls(t)) != 0 || string(h.GetCurrentRequestBody(id)) != "invalid" {
 				t.Fatal("ignored request opened grpc or changed business body")
 			}
 			h.CompleteHttpContext(id)
-			if len(proxytest.GrpcCalls()) != 0 {
+			if len(captureCalls(t)) != 0 {
 				t.Fatal("ignored request completion sent event")
 			}
 		})
 	}
 }
-func TestRewriteEOSAndLateACK(t *testing.T) {
-	h := testHost(t)
-	id := h.InitializeHttpContext()
-	if h.CallOnRequestHeaders(id, [][2]string{{":method", "POST"}, {":path", "/v1/chat/completions?x=y"}, {":authority", "model.example.invalid"}, {"content-type", "application/json"}, {"content-length", "1"}}, false) != types.ActionContinue {
-		t.Fatal("headers not continued")
-	}
-	h.CallOnRequestBody(id, []byte(`{"stream":true,"messages":[],"n":9007199254740993}`), true)
-	calls := proxytest.GrpcCalls()
-	if len(calls) != 1 || len(calls[0].Messages) != 2 {
-		t.Fatal("frames", len(calls))
-	}
-	if string(h.GetCurrentRequestBody(id)) != `{"stream":true,"messages":[],"n":9007199254740993,"stream_options":{"include_usage":true}}` {
-		t.Fatal("rewrite")
-	}
-	h.CallOnResponseHeaders(id, [][2]string{{":status", "200"}, {"content-type", "text/event-stream"}}, false)
-	h.CallOnResponseBody(id, []byte("data: [DONE]\n\n"), false)
-	h.CallOnResponseTrailers(id, [][2]string{{"secret", "ignored"}})
-	last := calls[0].Messages[len(calls[0].Messages)-1]
-	fs, _ := w.Read(last)
-	if fs[len(fs)-1].N != 12 {
-		t.Fatal("not EOS frame")
-	}
-	h.CompleteHttpContext(id)
-	if !calls[0].End[len(calls[0].End)-1] {
-		t.Fatal("not half closed")
-	}
-	a := w.String(nil, 1, "7f6c2a90-4b13-4b68-9d21-67283e0c5f44")
-	a = w.UInt(a, 2, uint64(len(calls[0].Messages)))
-	a = w.UInt(a, 3, 1)
-	a = w.String(a, 4, "finalized")
-	proxytest.EmitGrpcReceive(proxytest.PluginContextID, calls[0].Token, a)
-	proxytest.EmitGrpcReceive(proxytest.PluginContextID, calls[0].Token, a)
-	if !calls[0].Cancelled {
-		t.Fatal("not released")
-	}
-}
-
 func TestRuntimeGatewayIdentity(t *testing.T) {
 	for _, tc := range []struct {
 		namespace, name string
@@ -484,7 +376,7 @@ func TestRuntimeGatewayIdentity(t *testing.T) {
 			if action := h.CallOnRequestHeaders(id, headers, false); action != types.ActionContinue {
 				t.Fatalf("business request blocked: %v", action)
 			}
-			calls := proxytest.GrpcCalls()
+			calls := captureCalls(t)
 			if !tc.valid {
 				if len(calls) != 0 {
 					t.Fatal("invalid identity emitted observations")
@@ -518,7 +410,7 @@ func TestReloadCannotRetainInvalidGatewayIdentity(t *testing.T) {
 	}
 	id := h.InitializeHttpContext()
 	h.CallOnRequestHeaders(id, [][2]string{{":method", "POST"}, {":path", "/v1/chat/completions"}, {":authority", "model.example.invalid"}}, false)
-	if len(proxytest.GrpcCalls()) != 0 {
+	if len(captureCalls(t)) != 0 {
 		t.Fatal("stale identity emitted observations after reload")
 	}
 }
@@ -527,7 +419,7 @@ func TestConfiguredGatewayIdentityRejected(t *testing.T) {
 	h := testHostWithConfig(t, "llm-chat", func(c map[string]any) { c["gateway_instance_id"] = "legacy-shared-id" })
 	id := h.InitializeHttpContext()
 	h.CallOnRequestHeaders(id, [][2]string{{":method", "POST"}, {":path", "/v1/chat/completions"}, {":authority", "model.example.invalid"}}, false)
-	if len(proxytest.GrpcCalls()) != 0 {
+	if len(captureCalls(t)) != 0 {
 		t.Fatal("configured identity was accepted")
 	}
 	if n, err := h.GetCounterMetric("metering_config_invalid_total"); err != nil || n != 1 {
@@ -541,12 +433,12 @@ func TestResponseChunksShareCallbackTime(t *testing.T) {
 	h.CallOnRequestHeaders(id, [][2]string{{":method", "POST"}, {":path", "/v1/chat/completions"}, {":authority", "model.example.invalid"}, {"content-type", "application/json"}}, false)
 	h.CallOnRequestBody(id, []byte(`{"stream":true}`), true)
 	h.CallOnResponseHeaders(id, [][2]string{{":status", "200"}, {"content-type", "text/event-stream"}}, false)
-	if h.CallOnResponseBody(id, bytes.Repeat([]byte("x"), 40000), true) != types.ActionContinue {
+	if h.CallOnResponseBody(id, bytes.Repeat([]byte("x"), 200000), true) != types.ActionContinue {
 		t.Fatal("timing paused response")
 	}
 	var elapsed *int64
 	count := 0
-	calls := proxytest.GrpcCalls()
+	calls := captureCalls(t)
 	if len(calls) != 1 {
 		t.Fatalf("observation streams=%d", len(calls))
 	}
@@ -574,7 +466,59 @@ func TestResponseChunksShareCallbackTime(t *testing.T) {
 		elapsed = c.ObservedElapsedUs
 		count++
 	}
-	if count != 3 {
+	if count != 13 {
 		t.Fatalf("chunks=%d", count)
 	}
+}
+
+// Decode batches for tests whose assertions concern Start metadata rather than
+// transport multiplexing. Transport tests inspect the original batches directly.
+var testRoot *root
+
+func captureCalls(t *testing.T) []*proxytest.GrpcCall {
+	t.Helper()
+	for _, c := range testRoot.channels {
+		if c != nil {
+			testRoot.flush(c)
+		}
+	}
+	var calls []*proxytest.GrpcCall
+	for _, c := range proxytest.GrpcCalls() {
+		copy := *c
+		copy.Messages = nil
+		copy.End = nil
+		for _, data := range c.Messages {
+			var batch pb.ObservationBatch
+			if err := proto.Unmarshal(data, &batch); err != nil {
+				t.Fatal(err)
+			}
+			for _, item := range batch.Frames {
+				b, err := proto.Marshal(item.Frame)
+				if err != nil {
+					t.Fatal(err)
+				}
+				copy.Messages = append(copy.Messages, b)
+			}
+		}
+		calls = append(calls, &copy)
+	}
+	return calls
+}
+func emitCaptureAck(t *testing.T, token uint32, capture uint64, data []byte) {
+	t.Helper()
+	var ack pb.ObservationAck
+	if err := proto.Unmarshal(data, &ack); err != nil {
+		t.Fatal(err)
+	}
+	var seq uint64
+	for _, c := range testRoot.channels {
+		if c != nil && c.token == token {
+			seq = c.seq
+		}
+	}
+	b, err := proto.Marshal(&pb.ObservationAckBatch{AcceptedBatchSeq: seq, Acks: []*pb.CaptureAck{{CaptureId: capture, Ack: &ack}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxytest.EmitGrpcReceive(proxytest.PluginContextID, token, b)
 }

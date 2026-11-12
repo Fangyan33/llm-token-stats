@@ -73,7 +73,7 @@ def checks(h, original):
                         for k, v in stats.items()), '故障未触发真实 ECDS/插件配置拒绝')
             time.sleep(1)
             quoted = ','.join("'" + i + "'" for i in ids)
-            require(h.sql('SELECT COUNT(*) FROM metering.events_raw WHERE x_request_id IN (' + quoted + ');').strip() == '0',
+            require(h.sql('SELECT COUNT(*) FROM metering.events_raw WHERE logical_request_id IN (' + quoted + ');').strip() == '0',
                     '默认透传产生了采集事件')
             result = {'scenario': scenario, 'business_requests': len(ids), 'elapsed_seconds': elapsed}
             if scenario in ('slow', 'invalid_config'):
@@ -96,8 +96,8 @@ def checks(h, original):
                     request_id = str(uuid.uuid4())
                     status, payload, _ = h.request('/v1/chat/completions', {'model': 'fixture', 'stream': True,
                                                    'messages': [{'role': 'user', 'content': 'synthetic ECDS recovery'}]}, request_id)
-                    require(status == 200 and b'[DONE]' in payload, '原地恢复后未执行 SSE usage 改写')
-                    wait_for('恢复后的实际采集入库', lambda: h.sql("SELECT COUNT(*) FROM metering.events_raw WHERE x_request_id='" + request_id + "' AND event_type='usage_observed' AND usage_status='known';").strip() == '1')
+                    require(status == 200 and b'[DONE]' in payload, '原地恢复后 SSE 响应不完整')
+                    wait_for('恢复后的实际采集入库', lambda: h.sql("SELECT COUNT(*) FROM metering.events_raw WHERE logical_request_id='" + request_id + "' AND event_type='usage_observed' AND usage_status='known';").strip() == '1')
                     # A rejected runtime update must retain the last valid extension while traffic continues.
                     if scenario == 'slow':
                         broken = copy.deepcopy(temporary)
@@ -135,7 +135,7 @@ def checks(h, original):
                 require(status == 200 and headers['x-test-body-sha256'] == hashlib.sha256(json.dumps(body).encode()).hexdigest(),
                         '关闭态未原样转发')
                 time.sleep(1)
-                require(h.sql("SELECT COUNT(*) FROM metering.events_raw WHERE x_request_id='" + disabled_id + "';").strip() == '0',
+                require(h.sql("SELECT COUNT(*) FROM metering.events_raw WHERE logical_request_id='" + disabled_id + "';").strip() == '0',
                         '关闭态仍产生采集事件')
             results.append(result)
             h.kubectl('-n', h.namespace, 'delete', 'envoyfilter', current_name)

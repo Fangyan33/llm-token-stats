@@ -9,3 +9,5 @@ native emulator 增加 gRPC 调用与迟到 ACK 注入；Resume 清空已转发�
 原生 emulator 支持 request/headers/<name> 属性，按固定 Envoy CEL HeadersWrapper 用逗号合并同名值；用于验证 Authorization 重复头拒绝，不读取整个请求头集合。运行插件通过指定属性读取，避开旧 get_header_map_value 只取首值的行为。
 
 新增非 panic 的 TryDefineCounterMetric/TryDefineGaugeMetric/TryIncrement/TryAdd，指标 hostcall 失败由观察插件忽略，不中断业务恢复。原有指标接口保持兼容。native emulator 新增可计数的 hostcall 故障注入，用于覆盖正文读取/替换、恢复请求、上下文切换、指标及 tick 注册失败。
+
+- 2026-11-10：本地 host emulator 增加 grpc_open/grpc_send/grpc_cancel 故障注入，以及 RemainingHostFailures，用于证明请求正文读写和暂停恢复 hostcall 完全未被调用，验证共享传输故障时业务透传。

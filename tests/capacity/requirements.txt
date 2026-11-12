@@ -1,0 +1,2 @@
+# Optional offline test tooling; not a production tokenizer dependency.
+tiktoken==0.12.0

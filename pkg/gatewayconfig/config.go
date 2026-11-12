@@ -11,9 +11,7 @@ import (
 	"unicode/utf8"
 )
 
-// Leave scheduling headroom below the 500ms business pause target. Legacy
-// valid configurations remain readable, but cannot extend these runtime caps.
-const MaxRewriteTimeoutMS int64 = 450
+// Flush shared transport batches within 10ms without pausing business traffic.
 const MaxTickMS int64 = 10
 
 func Decode(b []byte) (Config, error) {
@@ -80,20 +78,14 @@ func Decode(b []byte) (Config, error) {
 			paths[p] = true
 		}
 	}
-	if c.TickMS > c.RewriteTimeoutMS || c.TickMS > c.EndAckTimeoutMS {
-		return c, errors.New("config_budget")
-	}
-	for _, n := range []int64{c.ChunkBytes, c.CallbackMaxBytes, c.CallbackMaxChunks, c.RequestBodyMaxBytes, c.RewriteTimeoutMS, c.RewriteReservationBytes, c.RootRewriteBudgetBytes, c.RootMaxRewrites, c.ResponseBodyMaxBytes, c.StreamInflightBytes, c.StreamInflightMessages, c.RootMaxStreams, c.RootInflightBytes, c.RootInflightMessages, c.AckTimeoutMS, c.EndAckTimeoutMS, c.ObservationMaxMS, c.TickMS, c.MetadataMaxBytes, c.AckMaxBytes} {
+	for _, n := range []int64{c.ChunkBytes, c.ResponseBodyMaxBytes, c.PodMaxObservations, c.PodInflightBytes, c.PodInflightMessages, c.TransportStreamsPerWorker, c.TransportBatchMaxBytes, c.TransportBatchMaxFrames, c.AckTimeoutMS, c.EndAckTimeoutMS, c.ObservationMaxMS, c.TickMS, c.MetadataMaxBytes, c.AckMaxBytes} {
 		if n < 1 || n > 2147483647 {
 			return c, errors.New("config_limit")
 		}
 	}
-	chunks := (c.RequestBodyMaxBytes + c.ChunkBytes - 1) / c.ChunkBytes
-	if c.ChunkBytes > 16384 || c.RequestBodyMaxBytes > 262144 || c.ResponseBodyMaxBytes > 8388608 || c.RewriteTimeoutMS > 2000 || c.ObservationMaxMS > 600000 || c.AckMaxBytes > 1024 || c.MetadataMaxBytes < 6144 || c.MetadataMaxBytes > 6144 || c.CallbackMaxBytes > c.ChunkBytes*c.CallbackMaxChunks || c.StreamInflightBytes < c.RequestBodyMaxBytes+chunks*256+8192 || c.StreamInflightMessages < chunks+4 || c.RootInflightBytes < c.StreamInflightBytes || c.RootInflightMessages < c.StreamInflightMessages || c.RewriteReservationBytes < c.RequestBodyMaxBytes*4 || c.RootRewriteBudgetBytes < c.RewriteReservationBytes*c.RootMaxRewrites || c.TickMS > c.AckTimeoutMS || c.ObserverCluster == "" {
+	if c.ChunkBytes > 16384 || c.ResponseBodyMaxBytes > 8388608 || c.ObservationMaxMS > 600000 || c.TransportStreamsPerWorker > 16 || c.TransportBatchMaxBytes != 32768 || c.TransportBatchMaxFrames > 128 || c.PodInflightBytes < 65536 || c.PodInflightMessages < 128 || c.MetadataMaxBytes != 6144 || c.AckMaxBytes > 32768 || c.AckTimeoutMS > 2000 || c.EndAckTimeoutMS > 2000 || c.TickMS > MaxTickMS || c.TickMS > c.AckTimeoutMS || c.TickMS > c.EndAckTimeoutMS {
 		return c, errors.New("config_budget")
 	}
-	c.RewriteTimeoutMS = min(c.RewriteTimeoutMS, MaxRewriteTimeoutMS)
-	c.TickMS = min(c.TickMS, MaxTickMS, c.RewriteTimeoutMS)
 	return c, nil
 }
 func str(s string, max int) bool { return len(s) > 0 && len(s) <= max && utf8.ValidString(s) }

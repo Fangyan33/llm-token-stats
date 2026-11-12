@@ -16,12 +16,18 @@ var grpcRecords = map[uint32]*GrpcCall{}
 var grpcBuffer []byte
 
 func (h *hostEmulator) ProxyGrpcStream(u *byte, ul int, s *byte, sl int, m *byte, ml int, md *byte, mdl int, t *uint32) internal.Status {
+	if failHostCall("grpc_open") {
+		return internal.StatusInternalFailure
+	}
 	grpcNext++
 	*t = grpcNext
 	grpcRecords[*t] = &GrpcCall{Token: *t, Upstream: append([]byte{}, internal.RawBytePtrToByteSlice(u, ul)...), Service: string(internal.RawBytePtrToByteSlice(s, sl)), Method: string(internal.RawBytePtrToByteSlice(m, ml))}
 	return internal.StatusOK
 }
 func (h *hostEmulator) ProxyGrpcSend(t uint32, b *byte, n int, e uint32) internal.Status {
+	if failHostCall("grpc_send") {
+		return internal.StatusInternalFailure
+	}
 	c := grpcRecords[t]
 	if c == nil || c.Cancelled {
 		return internal.StatusNotFound
@@ -32,6 +38,9 @@ func (h *hostEmulator) ProxyGrpcSend(t uint32, b *byte, n int, e uint32) interna
 }
 func (h *hostEmulator) ProxyGrpcClose(t uint32) internal.Status { return h.ProxyGrpcCancel(t) }
 func (h *hostEmulator) ProxyGrpcCancel(t uint32) internal.Status {
+	if failHostCall("grpc_cancel") {
+		return internal.StatusInternalFailure
+	}
 	if c := grpcRecords[t]; c != nil {
 		c.Cancelled = true
 	}

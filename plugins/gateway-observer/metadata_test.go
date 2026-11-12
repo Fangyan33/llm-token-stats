@@ -1,7 +1,6 @@
 package main
 
 import (
-	"encoding/json"
 	"reflect"
 	"strconv"
 	"strings"
@@ -10,15 +9,14 @@ import (
 	pb "github.com/Fangyan33/llm-token-stats/gen/observation/v1"
 	w "github.com/Fangyan33/llm-token-stats/pkg/observationwire"
 	"github.com/Fangyan33/llm-token-stats/pkg/requestmeta"
-	"github.com/tetratelabs/proxy-wasm-go-sdk/proxywasm/proxytest"
 	"github.com/tetratelabs/proxy-wasm-go-sdk/proxywasm/types"
 	"google.golang.org/protobuf/proto"
 )
 
-func TestRequestHeaderSnapshotPrecedesBodyRewrite(t *testing.T) {
+func TestRequestHeaderSnapshotAndBodyRemainUnchanged(t *testing.T) {
 	for _, body := range []string{`{"stream":true,"messages":[]}`, `{"stream":true,broken`} {
 		t.Run(body, func(t *testing.T) {
-			h, r := testHostAndRoot(t, "", func(c map[string]any) {
+			h, _ := testHostAndRoot(t, "", func(c map[string]any) {
 				c["user_id_header"] = []string{"content-length"}
 				c["logical_request_id_headers"] = []string{"content-length"}
 				c["extra_request_headers"] = []string{"Content-Length"}
@@ -29,7 +27,7 @@ func TestRequestHeaderSnapshotPrecedesBodyRewrite(t *testing.T) {
 			if h.CallOnRequestHeaders(id, headers, false) != types.ActionContinue {
 				t.Fatal("header snapshot blocked business traffic")
 			}
-			calls := proxytest.GrpcCalls()
+			calls := captureCalls(t)
 			if len(calls) != 1 || len(calls[0].Messages) != 1 {
 				t.Fatal("missing Start")
 			}
@@ -41,28 +39,16 @@ func TestRequestHeaderSnapshotPrecedesBodyRewrite(t *testing.T) {
 			if st.RequestHeaders["content-length"] != length || st.GetUserId() != length || st.GetLogicalRequestId() != length {
 				t.Fatal("snapshot lost original Content-Length")
 			}
-			for _, pair := range h.GetCurrentRequestHeaders(id) {
-				if strings.EqualFold(pair[0], "content-length") {
-					t.Fatal("rewrite retained stale Content-Length")
-				}
+			if !reflect.DeepEqual(h.GetCurrentRequestHeaders(id), headers) {
+				t.Fatal("headers changed")
 			}
 			if h.CallOnRequestBody(id, []byte(body), true) != types.ActionContinue {
 				t.Fatal("body forwarding blocked")
 			}
-			forwarded := h.GetCurrentRequestBody(id)
-			if json.Valid([]byte(body)) {
-				var result struct {
-					StreamOptions struct {
-						IncludeUsage bool `json:"include_usage"`
-					} `json:"stream_options"`
-				}
-				if json.Unmarshal(forwarded, &result) != nil || !result.StreamOptions.IncludeUsage {
-					t.Fatal("usage rewrite did not complete")
-				}
-			} else if string(forwarded) != body {
-				t.Fatal("rewrite failure changed original body")
+			if string(h.GetCurrentRequestBody(id)) != body {
+				t.Fatal("body changed")
 			}
-			assertReleased(t, r)
+
 		})
 	}
 }
@@ -96,7 +82,7 @@ func TestRequestHeaderSnapshots(t *testing.T) {
 			if h.CallOnRequestHeaders(id, headers, true) != types.ActionContinue {
 				t.Fatal("business blocked")
 			}
-			calls := proxytest.GrpcCalls()
+			calls := captureCalls(t)
 			if len(calls) != 1 || len(calls[0].Messages) != 1 {
 				t.Fatal("missing Start")
 			}
@@ -125,7 +111,7 @@ func TestRequestMetadataBudgetPreservesStart(t *testing.T) {
 	if h.CallOnRequestHeaders(id, headers, true) != types.ActionContinue {
 		t.Fatal("business blocked")
 	}
-	calls := proxytest.GrpcCalls()
+	calls := captureCalls(t)
 	if len(calls) != 1 || len(calls[0].Messages) != 1 {
 		t.Fatal("optional fields dropped observation")
 	}

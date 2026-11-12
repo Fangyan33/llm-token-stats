@@ -432,7 +432,7 @@ func (r *stalledBody) Read(b []byte) (int, error) {
 	}
 	return 0, io.EOF
 }
-func TestHTTPRewriteBoundariesAndTimeout(t *testing.T) {
+func TestHTTPRequestPassthroughBoundariesAndSlowUpload(t *testing.T) {
 	db := database(t)
 	prefix, suffix := `{"stream":false,"messages":[{"content":"`, `"}]}`
 	for _, tc := range []struct {
@@ -440,7 +440,7 @@ func TestHTTPRewriteBoundariesAndTimeout(t *testing.T) {
 		size   int
 		slow   bool
 		stream bool
-	}{{"boundary", 262144, false, false}, {"over_limit", 262145, false, false}, {"one_megabyte", 1 << 20, false, false}, {"timeout", 128, true, false}, {"slow_response_without_id_header", 128, false, true}} {
+	}{{"boundary", 262144, false, false}, {"over_limit", 262145, false, false}, {"one_megabyte", 1 << 20, false, false}, {"slow_upload", 128, true, false}, {"slow_response_without_id_header", 128, false, true}} {
 		t.Run(tc.name, func(t *testing.T) {
 			body := []byte(prefix + strings.Repeat("x", tc.size-len(prefix)-len(suffix)) + suffix)
 			if tc.stream {
@@ -479,7 +479,7 @@ func TestHTTPRewriteBoundariesAndTimeout(t *testing.T) {
 					var status string
 					var input sql.NullInt64
 					var terminal, eligible int
-					return db.QueryRow("SELECT observation_status,input_tokens,terminal_observed,usage_eligible FROM metering_development.events_raw WHERE x_request_id=? AND event_type='usage_observed'", xid).Scan(&status, &input, &terminal, &eligible) == nil && status != "complete" && !input.Valid && terminal == 0 && eligible == 0
+					return db.QueryRow("SELECT observation_status,input_tokens,terminal_observed,usage_eligible FROM metering_development.events_raw WHERE x_request_id=? AND event_type='usage_observed'", xid).Scan(&status, &input, &terminal, &eligible) == nil && status == "complete" && input.Valid && input.Int64 == 10 && terminal == 1 && eligible == 1
 				})
 			}
 		})

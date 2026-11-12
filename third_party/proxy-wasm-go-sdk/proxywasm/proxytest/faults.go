@@ -16,8 +16,11 @@ var hostFailures map[string]int
 
 // FailNextHostCalls fails the next n calls with InternalFailure. Supported
 // operations: continue_request, effective_context, read_request_body,
-// replace_request_body, define_metric, increment_metric, tick_period.
+// replace_request_body, define_metric, increment_metric, tick_period, grpc_open, grpc_send, grpc_cancel.
 func FailNextHostCalls(operation string, n int) { hostFailures[operation] = n }
+
+// RemainingHostFailures proves that an operation was never attempted.
+func RemainingHostFailures(operation string) int { return hostFailures[operation] }
 
 func failHostCall(operation string) bool {
 	if hostFailures[operation] > 0 {

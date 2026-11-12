@@ -177,6 +177,8 @@ func descriptor(kind string, n int) (int, bool, string, bool) {
 			return 2, true, "chunk", false
 		case 13:
 			return 2, true, "end", false
+		case 14:
+			return 2, true, "cancel", false
 		}
 	case "start":
 		if n == 1 || n == 14 {
@@ -213,6 +215,9 @@ func descriptor(kind string, n int) (int, bool, string, bool) {
 			return 0, true, "", false
 		}
 	case "end":
+		if n == 2 {
+			return -1, true, "", false
+		}
 		if n >= 1 && n <= 9 {
 			return 0, true, "", false
 		}

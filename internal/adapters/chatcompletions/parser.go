@@ -20,55 +20,46 @@ type Parser struct {
 	timingBroken                bool
 	previousUS                  *int64
 
-	Request, Response, line, data              []byte
-	SSE, Done, ReqSupported, RespSupported     bool
-	RequestModel, ResponseModel                *string
-	Usage                                      *events.Usage
-	Raw                                        string
-	Truncated, Conflict, hasCandidate          bool
-	Anomalies                                  []string
-	ResponseBytes                              int
-	MaxRequest, MaxJSON, MaxEvent, MaxResponse int
+	Response, line, data              []byte
+	SSE, Done, RespSupported          bool
+	ResponseModel                     *string
+	Usage                             *events.Usage
+	Raw                               string
+	Truncated, Conflict, hasCandidate bool
+	Anomalies                         []string
+	ResponseBytes                     int
+	MaxJSON, MaxEvent, MaxResponse    int
 }
 
 func New() *Parser {
-	return &Parser{Usage: events.Unknown(), Raw: "{}", MaxRequest: 262144, MaxJSON: 1048576, MaxEvent: 262144, MaxResponse: 8388608}
+	return &Parser{Usage: events.Unknown(), Raw: "{}", MaxJSON: 1048576, MaxEvent: 262144, MaxResponse: 8388608}
+}
+
+// BufferedBytes accounts for retained response buffers, not the total bytes
+// processed by a long-lived stream. Request bodies never enter this parser.
+func (p *Parser) BufferedBytes() int64 {
+	return int64(cap(p.Response) + cap(p.line) + cap(p.data))
 }
 func (p *Parser) Anomaly(a string) { p.Anomalies = events.Add(p.Anomalies, a) }
-func (p *Parser) Content(request bool, ct, enc string) {
+func (p *Parser) Content(ct, enc string) {
 	supported := true
 	if enc != "" && !strings.EqualFold(enc, "identity") {
 		p.Anomaly("unsupported_encoding")
 		supported = false
 	}
 	mt, _, err := mime.ParseMediaType(strings.ToLower(ct))
-	if err != nil || (mt != "application/json" && (!request && mt != "text/event-stream" || request)) {
+	if err != nil || (mt != "application/json" && mt != "text/event-stream") {
 		p.Anomaly("unsupported_content_type")
 		supported = false
 	}
-	if request {
-		p.ReqSupported = supported
-	} else {
-		p.RespSupported = supported
-		p.SSE = mt == "text/event-stream"
-		if err == nil && (mt == "application/json" || p.SSE) {
-			p.ResponseStreaming = events.Ptr(p.SSE)
-		}
+	p.RespSupported = supported
+	p.SSE = mt == "text/event-stream"
+	if err == nil && (mt == "application/json" || p.SSE) {
+		p.ResponseStreaming = events.Ptr(p.SSE)
 	}
+
 }
-func (p *Parser) Feed(request bool, b []byte, eos bool) error {
-	if request {
-		if p.ReqSupported {
-			if len(p.Request)+len(b) > p.MaxRequest {
-				return ErrLimit
-			}
-			p.Request = append(p.Request, b...)
-			if eos {
-				return p.request()
-			}
-		}
-		return nil
-	}
+func (p *Parser) Feed(b []byte, eos bool) error {
 	p.ResponseBytes += len(b)
 	if p.ResponseBytes > p.MaxResponse {
 		return ErrLimit
@@ -82,7 +73,9 @@ func (p *Parser) Feed(request bool, b []byte, eos bool) error {
 		}
 		p.Response = append(p.Response, b...)
 		if eos {
-			return p.document(p.Response, false)
+			err := p.document(p.Response, false)
+			p.Response = nil
+			return err
 		}
 		return nil
 	}
@@ -92,6 +85,9 @@ func (p *Parser) Feed(request bool, b []byte, eos bool) error {
 				return err
 			}
 			p.line = p.line[:0]
+			if cap(p.line) > 16384 {
+				p.line = nil
+			}
 		} else {
 			if len(p.line)+len(p.data)+1 > p.MaxEvent {
 				return ErrLimit
@@ -115,24 +111,6 @@ func (p *Parser) Feed(request bool, b []byte, eos bool) error {
 			p.Anomaly("protocol_incomplete")
 		}
 	}
-	return nil
-}
-func (p *Parser) request() error {
-	var m map[string]json.RawMessage
-	if strictjson.Decode(p.Request, &m) != nil || m == nil {
-		p.Anomaly("invalid_model")
-		p.Anomaly("protocol_error")
-		return errors.New("protocol_error")
-	}
-	p.RequestModel = p.model(m["model"])
-	if v, ok := m["stream"]; ok {
-		var flag bool
-		if json.Unmarshal(v, &flag) != nil || bytes.Equal(v, []byte("null")) {
-			p.Anomaly("protocol_error")
-			return errors.New("protocol_error")
-		}
-	}
-	p.Request = nil
 	return nil
 }
 func (p *Parser) model(b []byte) *string {
@@ -170,7 +148,13 @@ func (p *Parser) event() error {
 		return nil
 	}
 	d := bytes.TrimSuffix(p.data, []byte("\n"))
-	defer func() { p.data = p.data[:0] }()
+	defer func() {
+		if cap(p.data) > 16384 {
+			p.data = nil
+		} else {
+			p.data = p.data[:0]
+		}
+	}()
 	if !utf8.Valid(d) {
 		return errors.New("protocol_error")
 	}
@@ -293,7 +277,6 @@ func (p *Parser) Finalize() {
 	if s == "unknown" {
 		p.Anomaly("missing_usage")
 	}
-	p.Request = nil
 	p.Response = nil
 	p.line = nil
 	p.data = nil

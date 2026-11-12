@@ -146,9 +146,7 @@ func TestWasmHostAllowlist(t *testing.T) {
 		wantStatus := http.StatusOK
 		if tc.stream {
 			body = []byte(`{"model":"fixture","stream":true}`)
-			// The fixture requires include_usage for SSE. An ignored request must
-			// preserve its original 422 response instead of being rewritten to 200.
-			wantStatus = http.StatusUnprocessableEntity
+			// The server returns usage; both selected and ignored bodies stay unchanged.
 		}
 		req, _ := http.NewRequest("POST", "http://llm-token-stats-e2e-gateway:8080/v1/chat/completions", bytes.NewReader(body))
 		req.Host = tc.host

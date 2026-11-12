@@ -22,7 +22,7 @@ import (
 
 // Uses the pinned real Envoy with an unavailable observation upstream. Does not
 // require Kafka/Doris: the assertions are about actual business forwarding.
-func TestWasmRewriteFailOpen(t *testing.T) {
+func TestWasmRequestPassthroughFailOpen(t *testing.T) {
 	var firstReads sync.Map
 	upstream := reachableServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == "GET" {
@@ -63,7 +63,7 @@ func TestWasmRewriteFailOpen(t *testing.T) {
 	listener["address"] = addr(business)
 	hcm := listener["filter_chains"].([]any)[0].(map[string]any)["filters"].([]any)[0].(map[string]any)["typed_config"].(map[string]any)
 	// HTTP/1 trailers are disabled by default in Envoy on both sides. Enable
-	// them here so the test exercises the plugin's trailers downgrade path.
+	// them here so the test exercises the plugin's trailers passthrough path.
 	hcm["http_protocol_options"] = map[string]any{"enable_trailers": true}
 	filters := hcm["http_filters"].([]any)
 	hcm["http_filters"] = filters[1:] // Isolate metering, independent of fixture auth.
@@ -101,16 +101,20 @@ func TestWasmRewriteFailOpen(t *testing.T) {
 				defer tr.CloseIdleConnections()
 				transport = tr
 			}
-			client := &http.Client{Transport: transport, Timeout: 5 * time.Second}
-			for _, scenario := range []string{"rewrite", "invalid_json", "oversized", "trailers", "timeout"} {
+			client := &http.Client{Transport: transport, Timeout: 30 * time.Second}
+			for _, scenario := range []string{"streaming_json", "invalid_json", "oversized", "32_mebibytes", "trailers", "slow_upload"} {
 				t.Run(scenario, func(t *testing.T) {
 					body := []byte(`{"stream":true,"messages":[]}`)
-					want := []byte(`{"stream":true,"messages":[],"stream_options":{"include_usage":true}}`)
+					want := body
 					if scenario == "invalid_json" {
 						body = []byte(`{"stream":true,invalid`)
 						want = body
 					} else if scenario == "oversized" {
 						body = []byte(`{"stream":true,"prompt":"` + strings.Repeat("x", 262144) + `"}`)
+						want = body
+					}
+					if scenario == "32_mebibytes" {
+						body = bytes.Repeat([]byte("x"), 32<<20)
 						want = body
 					}
 					id := protocol + "-" + scenario
@@ -119,7 +123,7 @@ func TestWasmRewriteFailOpen(t *testing.T) {
 					defer firstReads.Delete(id)
 					var reader io.Reader = bytes.NewReader(body)
 					var writer *io.PipeWriter
-					if scenario == "timeout" {
+					if scenario == "slow_upload" {
 						var pipe *io.PipeReader
 						pipe, writer = io.Pipe()
 						defer pipe.Close()
@@ -160,8 +164,8 @@ func TestWasmRewriteFailOpen(t *testing.T) {
 						select {
 						case at := <-first:
 							t.Logf("upstream received original prefix before tail at %s", at.Sub(started))
-						case <-time.After(1200 * time.Millisecond):
-							t.Fatal("paused body was not released; tail is deliberately withheld")
+						case <-time.After(400 * time.Millisecond):
+							t.Fatal("request prefix did not reach upstream while tail was withheld")
 						}
 						if _, err := writer.Write(body[10:]); err != nil {
 							t.Fatal(err)

@@ -7,6 +7,7 @@ import (
 	"github.com/Fangyan33/llm-token-stats/internal/events"
 	"github.com/Fangyan33/llm-token-stats/internal/health"
 	"github.com/Fangyan33/llm-token-stats/internal/identitylookup"
+	"github.com/Fangyan33/llm-token-stats/internal/observation/testutil"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/test/bufconn"
@@ -48,7 +49,7 @@ func TestObserveEOSAndOnceFinalization(t *testing.T) {
 				})
 			}
 			if limited {
-				srv.Cfg.ParserBudget = 3 * 32768
+				srv.Cfg.ParserBudget = 3*32768 + 4096
 			}
 			g := grpc.NewServer(grpc.ForceServerCodec(Codec{}))
 			pb.RegisterObservationServiceServer(g, srv)
@@ -61,7 +62,7 @@ func TestObserveEOSAndOnceFinalization(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer c.Close()
-			stream, err := pb.NewObservationServiceClient(c).Observe(ctx)
+			stream, err := testutil.New(c).Observe(ctx)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -95,9 +96,10 @@ func TestObserveEOSAndOnceFinalization(t *testing.T) {
 			}
 			req := []byte(`{"model":"test","stream":false}`)
 			resp := []byte(`{"model":"test","usage":{"prompt_tokens":0,"completion_tokens":4,"total_tokens":4}}`)
-			frames := []*pb.ObservationFrame{{Payload: &pb.ObservationFrame_BodyChunk{BodyChunk: &pb.BodyChunk{Direction: pb.Direction_REQUEST, BodySeq: 1, Data: req, EndStream: true}}}, {Payload: &pb.ObservationFrame_ResponseHeaders{ResponseHeaders: &pb.ResponseHeaders{HttpStatus: 200, ContentType: "application/json"}}}, {Payload: &pb.ObservationFrame_BodyChunk{BodyChunk: &pb.BodyChunk{Direction: pb.Direction_RESPONSE, BodySeq: 1, Data: resp}}}, {Payload: &pb.ObservationFrame_BodyChunk{BodyChunk: &pb.BodyChunk{Direction: pb.Direction_RESPONSE, BodySeq: 2, Offset: uint64(len(resp)), EndStream: true}}}, {Payload: &pb.ObservationFrame_End{End: &pb.End{RequestFinishedAtMs: time.Now().UnixMilli(), LastRequestBodySeq: 1, LastResponseBodySeq: 2, RequestBytesSeen: uint64(len(req)), ResponseBytesSeen: uint64(len(resp)), RequestEndStreamSeen: true, ResponseEndStreamSeen: !badEnd}}}}
+			frames := []*pb.ObservationFrame{{Payload: &pb.ObservationFrame_ResponseHeaders{ResponseHeaders: &pb.ResponseHeaders{HttpStatus: 200, ContentType: "application/json"}}}, {Payload: &pb.ObservationFrame_BodyChunk{BodyChunk: &pb.BodyChunk{Direction: pb.Direction_RESPONSE, BodySeq: 1, Data: resp}}}, {Payload: &pb.ObservationFrame_BodyChunk{BodyChunk: &pb.BodyChunk{Direction: pb.Direction_RESPONSE, BodySeq: 2, Offset: uint64(len(resp)), EndStream: true}}}, {Payload: &pb.ObservationFrame_End{End: &pb.End{RequestFinishedAtMs: time.Now().UnixMilli(), LastResponseBodySeq: 2, RequestBytesSeen: uint64(len(req)), ResponseBytesSeen: uint64(len(resp)), RequestEndStreamSeen: true, ResponseEndStreamSeen: !badEnd}}}}
 			if limited {
-				frames = frames[:1]
+				frames = frames[:2]
+				frames[1].GetBodyChunk().Data = []byte(strings.Repeat("x", 16384))
 			}
 			for i, f := range frames {
 				f.SchemaVersion = 1
@@ -207,7 +209,7 @@ func TestLookupDoesNotDelayAcksAndHasNoQueue(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer c.Close()
-	stream, err := pb.NewObservationServiceClient(c).Observe(ctx)
+	stream, err := testutil.New(c).Observe(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}

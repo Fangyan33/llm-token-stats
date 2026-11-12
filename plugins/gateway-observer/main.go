@@ -2,7 +2,11 @@ package main
 
 import (
 	"container/heap"
-	"errors"
+	"strconv"
+	"strings"
+	"time"
+	"unicode/utf8"
+
 	"github.com/Fangyan33/llm-token-stats/pkg/credentials"
 	"github.com/Fangyan33/llm-token-stats/pkg/gatewayconfig"
 	"github.com/Fangyan33/llm-token-stats/pkg/logsafe"
@@ -11,14 +15,8 @@ import (
 	"github.com/Fangyan33/llm-token-stats/pkg/requestid"
 	"github.com/Fangyan33/llm-token-stats/pkg/requestmeta"
 	"github.com/Fangyan33/llm-token-stats/pkg/routeinfo"
-	"github.com/Fangyan33/llm-token-stats/pkg/strictjson"
 	"github.com/tetratelabs/proxy-wasm-go-sdk/proxywasm"
 	"github.com/tetratelabs/proxy-wasm-go-sdk/proxywasm/types"
-	"mime"
-	"strconv"
-	"strings"
-	"time"
-	"unicode/utf8"
 )
 
 func main() { proxywasm.SetVMContext(&vm{}) }
@@ -26,12 +24,12 @@ func main() { proxywasm.SetVMContext(&vm{}) }
 type vm struct{ types.DefaultVMContext }
 
 func (*vm) NewPluginContext(id uint32) types.PluginContext {
-	return &root{id: id, states: map[uint32]*state{}, requests: map[uint32]*httpContext{}, metrics: map[string]proxywasm.MetricCounter{}}
+	return &root{id: id, states: map[uint64]*state{}, metrics: map[string]proxywasm.MetricCounter{}}
 }
 
 type deadline struct {
 	at  time.Time
-	id  uint32
+	id  uint64
 	idx int
 }
 type deadlines []*deadline
@@ -49,48 +47,54 @@ func (q *deadlines) Pop() any {
 	return n
 }
 
-type frame struct {
-	seq   uint64
-	bytes int64
-	at    time.Time
-}
 type state struct {
-	token           uint32
+	capture         uint64
 	seq             uint64
 	id              string
-	frames          []frame
-	bytes           int64
+	ch              *channel
 	bodySeq, offset [2]uint64
 	eos             [2]bool
 	ending          bool
 	started         time.Time
 	timer           *deadline
 }
+type batchRecord struct {
+	seq             uint64
+	bytes, messages int64
+	at              time.Time
+}
+type channel struct {
+	token           uint32
+	closing         bool
+	seq             uint64
+	batch           []byte
+	bytes, messages int64
+	records         []batchRecord
+	retryAt         time.Time
+}
 type root struct {
 	types.DefaultPluginContext
-	id           uint32
-	cfg          gatewayconfig.Config
-	instanceID   string
-	states       map[uint32]*state
-	requests     map[uint32]*httpContext
-	inflight     int64
-	messages     int64
-	rewrites     int64
-	rewriteBytes int64
-	q            deadlines
-	rewriteQ     deadlines
-	metrics      map[string]proxywasm.MetricCounter
-	gauges       map[string]proxywasm.MetricGauge
-	gaugeValues  [5]int64
-	logs         wasmLogger
+	id                 uint32
+	cfg                gatewayconfig.Config
+	instanceID         string
+	states             map[uint64]*state
+	channels           []*channel
+	next               uint64
+	inflight, messages int64
+	q                  deadlines
+	budget             *podBudget
+	metrics            map[string]proxywasm.MetricCounter
+	gauges             map[string]proxywasm.MetricGauge
+	gaugeValues        [3]int64
+	logs               wasmLogger
 }
 
 func (r *root) resourceMetrics() {
 	if r.gauges == nil {
 		r.gauges = map[string]proxywasm.MetricGauge{}
 	}
-	values := [5]int64{int64(len(r.states)), r.inflight, r.messages, r.rewrites, r.rewriteBytes}
-	for i, name := range []string{"active_streams", "inflight_bytes", "inflight_messages", "active_rewrites", "rewrite_reserved_bytes"} {
+	values := [3]int64{int64(len(r.states)), r.inflight, r.messages}
+	for i, name := range []string{"active_streams", "inflight_bytes", "inflight_messages"} {
 		value := values[i]
 		g, ok := r.gauges[name]
 		if !ok {
@@ -159,43 +163,56 @@ func (r *root) OnPluginStart(_ int) types.OnPluginStartStatus {
 		r.cfg.Enabled = false
 		r.count("config_invalid")
 	}
+	if r.cfg.Enabled {
+		var budgetErr error
+		r.budget, budgetErr = newPodBudget(r.cfg, r.instanceID)
+		if budgetErr != nil {
+			r.cfg.Enabled = false
+			r.count("budget_unavailable")
+		}
+		r.channels = make([]*channel, int(r.cfg.TransportStreamsPerWorker))
+	}
 	r.log(logsafe.Info, "plugin_configured", "enabled", strconv.FormatBool(r.cfg.Enabled), "config_version", r.cfg.ConfigVersion, "observer_cluster", r.cfg.ObserverCluster, "log_level", r.logs.level.String())
 	return types.OnPluginStartStatusOK
 }
 func (r *root) NewHttpContext(id uint32) types.HttpContext { return &httpContext{root: r, id: id} }
+
+func (r *root) active(s *state) bool { return s != nil && r.states[s.capture] == s }
 func (r *root) drop(s *state, reason string) {
-	if s == nil {
+	if !r.active(s) {
 		return
 	}
-	if _, ok := r.states[s.token]; !ok {
-		return
-	}
-	delete(r.states, s.token)
+	delete(r.states, s.capture)
 	if s.timer != nil && s.timer.idx >= 0 {
 		heap.Remove(&r.q, s.timer.idx)
 	}
-	r.inflight -= s.bytes
-	r.messages -= int64(len(s.frames))
-	s.bytes = 0
-	s.frames = nil
-	r.resourceMetrics()
-	proxywasm.CancelGrpcStream(r.id, s.token)
+	r.budget.give(0, 0, 1)
 	r.count("dropped_" + reason)
-	switch reason {
-	case "closed", "shutdown", "context_deleted":
-	case "transport_lost", "send_failed", "protocol_error", "timeout":
-		r.repeatedLog(logsafe.Error, "observation_"+reason, "observer_cluster", r.cfg.ObserverCluster, "grpc_stream", strconv.FormatUint(uint64(s.token), 10))
-	default:
-		r.repeatedLog(logsafe.Warn, "observation_"+reason, "action", "skip_observation")
-	}
+	r.resourceMetrics()
 }
 func (r *root) cleanup() {
-	for _, h := range r.requests {
-		h.downgrade(true)
+	for _, c := range r.channels {
+		if c != nil {
+			r.failChannel(c, "shutdown")
+		}
 	}
 	for _, s := range r.states {
 		r.drop(s, "shutdown")
 	}
+	if r.budget != nil {
+		if r.inflight == 0 && r.messages == 0 {
+			r.budget.close()
+		} else {
+			// A failed native cancel does not prove its send buffers are gone.
+			// Keep those shared credits claimed across reloads; a Pod restart
+			// clears the uncertain native state and the ledger together.
+			r.budget.give(0, 0, 0)
+		}
+	}
+	r.inflight = 0
+	r.messages = 0
+	r.channels = nil
+	r.budget = nil
 }
 func (r *root) OnPluginDone() bool {
 	r.cleanup()
@@ -203,142 +220,269 @@ func (r *root) OnPluginDone() bool {
 	r.flushLogs(maxPendingLogs)
 	return true
 }
-func (r *root) OnDelete()            { r.cleanup(); r.flushLogs(maxPendingLogs) }
-func (r *root) active(s *state) bool { return s != nil && r.states[s.token] == s }
-func (r *root) schedule(s *state) {
-	if !r.active(s) {
+func (r *root) OnDelete() { r.cleanup(); r.flushLogs(maxPendingLogs) }
+func (r *root) openChannel(c *channel) bool {
+	if c.closing {
+		return false
+	}
+	if c.token != 0 {
+		return true
+	}
+	if time.Now().Before(c.retryAt) {
+		return false
+	}
+	token, err := proxywasm.OpenGrpcStream(r.id, grpcUpstream(r.cfg.ObserverCluster), "metering.v1.ObservationService", "Observe", r)
+	if err != nil {
+		c.retryAt = time.Now().Add(100 * time.Millisecond)
+		r.count("dropped_open_failed")
+		r.repeatedLog(logsafe.Error, "grpc_open_failed", "host_status", hostError(err))
+		return false
+	}
+	c.token = token
+	c.seq = 0
+	r.logRecovered("grpc_open_failed")
+	return true
+}
+func (r *root) failChannel(c *channel, reason string) {
+	if c == nil {
 		return
 	}
-	at := s.started.Add(time.Duration(r.cfg.ObservationMaxMS) * time.Millisecond)
-	if len(s.frames) > 0 {
-		d := s.frames[0].at.Add(time.Duration(r.cfg.AckTimeoutMS) * time.Millisecond)
-		if d.Before(at) {
-			at = d
-		}
-		if s.ending {
-			d = s.frames[len(s.frames)-1].at.Add(time.Duration(r.cfg.EndAckTimeoutMS) * time.Millisecond)
-			if d.Before(at) {
-				at = d
+	if c.token != 0 {
+		if err := proxywasm.CancelGrpcStream(r.id, c.token); err != nil {
+			c.closing = true
+			c.retryAt = time.Now().Add(100 * time.Millisecond)
+			for _, s := range r.states {
+				if s.ch == c {
+					r.drop(s, reason)
+				}
 			}
+			r.repeatedLog(logsafe.Error, "grpc_cancel_failed", "host_status", hostError(err), "action", "retain_budget")
+			return
 		}
 	}
-	if s.timer == nil {
-		s.timer = &deadline{at: at, id: s.token, idx: -1}
-		heap.Push(&r.q, s.timer)
-	} else {
-		s.timer.at = at
-		if s.timer.idx >= 0 {
-			heap.Fix(&r.q, s.timer.idx)
-		} else {
-			heap.Push(&r.q, s.timer)
+	r.releaseChannel(c, reason)
+}
+func (r *root) releaseChannel(c *channel, reason string) {
+	c.token = 0
+	c.closing = false
+	c.retryAt = time.Now().Add(100 * time.Millisecond)
+	n, m := c.bytes, c.messages
+	for _, rec := range c.records {
+		n += rec.bytes
+		m += rec.messages
+	}
+	r.inflight -= n
+	r.messages -= m
+	r.budget.give(n, m, 0)
+	clear(c.batch)
+	c.batch = nil
+	c.bytes = 0
+	c.messages = 0
+	c.records = nil
+	for _, s := range r.states {
+		if s.ch == c {
+			r.drop(s, reason)
 		}
 	}
+	if reason != "shutdown" {
+		r.repeatedLog(logsafe.Error, "observation_"+reason, "action", "skip_observation")
+	}
+	r.resourceMetrics()
+}
+func (r *root) flush(c *channel) bool {
+	if c == nil || c.messages == 0 {
+		return true
+	}
+	if c.token == 0 {
+		return false
+	}
+	b := w.UInt(nil, 1, c.seq+1)
+	b = append(b, c.batch...)
+	if err := proxywasm.SendGrpcMessage(c.token, b, false); err != nil {
+		clear(b)
+		r.failChannel(c, "send_failed")
+		return false
+	}
+	clear(b)
+	clear(c.batch)
+	c.batch = c.batch[:0]
+	c.seq++
+	c.records = append(c.records, batchRecord{c.seq, c.bytes, c.messages, time.Now()})
+	c.bytes = 0
+	c.messages = 0
+	return true
 }
 func (r *root) send(s *state, kind int, b []byte, end bool) bool {
 	if !r.active(s) || s.ending {
 		return false
 	}
-	encoded := w.Frame(s.seq+1, kind, b)
-	if kind == 10 {
-		defer clear(encoded)
-	}
-	n := int64(len(encoded) + 5)
-	maxB, maxM := r.cfg.StreamInflightBytes, r.cfg.StreamInflightMessages
-	if kind == 12 {
-		maxB -= 8192
-		maxM -= 4
-	}
-	if len(encoded) > 32768 || (kind != 12 && int64(len(encoded)) > r.cfg.MetadataMaxBytes) || s.bytes+n > maxB || int64(len(s.frames))+1 > maxM || r.inflight+n > r.cfg.RootInflightBytes || r.messages+1 > r.cfg.RootInflightMessages {
-		r.drop(s, "resource_limit")
+	f := w.Frame(s.seq+1, kind, b)
+	defer clear(f)
+	if len(f) > 32700 || (kind != 12 && int64(len(f)) > r.cfg.MetadataMaxBytes) {
+		r.cancel(s, "metadata_limit")
 		return false
 	}
+	item := w.Bytes(w.UInt(nil, 1, s.capture), 2, f)
+	defer clear(item)
+	enc := w.Bytes(nil, 2, item)
+	defer clear(enc)
+	c := s.ch
+	if int64(len(c.batch)+len(enc)+16) > r.cfg.TransportBatchMaxBytes || c.messages >= r.cfg.TransportBatchMaxFrames {
+		if !r.flush(c) {
+			return false
+		}
+	}
+	n := int64(len(enc) + 16)
+	if !r.budget.take(n, 1, 0) {
+		r.count("resource_limit")
+		r.repeatedLog(logsafe.Warn, "observation_resource_limit", "limit_kind", "pod_budget", "action", "skip_observation")
+		r.cancel(s, "resource_limit")
+		return false
+	}
+	c.batch = append(c.batch, enc...)
+	c.bytes += n
+	c.messages++
 	r.inflight += n
 	r.messages++
-	s.bytes += n
 	s.seq++
-	s.frames = append(s.frames, frame{s.seq, n, time.Now()})
-	r.resourceMetrics()
-	if err := proxywasm.SendGrpcMessage(s.token, encoded, end); err != nil {
-		r.repeatedLog(logsafe.Error, "grpc_send_failed", "host_status", hostError(err), "observer_cluster", r.cfg.ObserverCluster)
-		r.drop(s, "send_failed")
-		return false
-	}
-	r.logRecovered("grpc_send_failed")
 	s.ending = end
-	r.schedule(s)
+	if s.timer == nil {
+		s.timer = &deadline{at: s.started.Add(time.Duration(r.cfg.ObservationMaxMS) * time.Millisecond), id: s.capture, idx: -1}
+		heap.Push(&r.q, s.timer)
+	}
+	if end {
+		s.timer.at = time.Now().Add(time.Duration(r.cfg.EndAckTimeoutMS) * time.Millisecond)
+		heap.Fix(&r.q, s.timer.idx)
+	}
+	r.resourceMetrics()
+	if c.messages >= r.cfg.TransportBatchMaxFrames {
+		return r.flush(c)
+	}
 	return true
 }
+func (r *root) cancel(s *state, reason string) {
+	if !r.active(s) {
+		return
+	}
+	// A control-only cancel does not claim EOS or a business End. Reserve a
+	// separate bounded transport write; on failure close this channel.
+	c := s.ch
+	if c.token != 0 {
+		if r.flush(c) {
+			f := w.Frame(s.seq+1, 14, nil)
+			item := w.Bytes(w.UInt(nil, 1, s.capture), 2, f)
+			b := w.Bytes(w.UInt(nil, 1, c.seq+1), 2, item)
+			n := int64(len(b) + 5)
+			if r.budget.take(n, 1, 0) {
+				c.seq++
+				c.records = append(c.records, batchRecord{c.seq, n, 1, time.Now()})
+				r.inflight += n
+				r.messages++
+				if err := proxywasm.SendGrpcMessage(c.token, b, false); err != nil {
+					r.failChannel(c, "send_failed")
+				}
+			} else {
+				r.failChannel(c, "resource_limit")
+			}
+			clear(b)
+		}
+	}
+	r.drop(s, reason)
+}
 func (r *root) OnReceive(token uint32, size int) {
-	s := r.states[token]
-	if s == nil {
+	var c *channel
+	for _, x := range r.channels {
+		if x != nil && x.token == token {
+			c = x
+			break
+		}
+	}
+	if c == nil || c.closing {
 		return
 	}
 	if size < 1 || int64(size) > r.cfg.AckMaxBytes {
-		r.drop(s, "protocol_error")
+		r.failChannel(c, "protocol_error")
 		return
 	}
 	b, err := proxywasm.GetGrpcReceiveBuffer(size)
 	if err != nil {
-		r.drop(s, "protocol_error")
+		r.failChannel(c, "protocol_error")
 		return
 	}
-	a, err := w.DecodeAck(b)
-	if err != nil || a.Seq > s.seq || s.id != "" && s.id != a.ID {
-		r.drop(s, "protocol_error")
+	a, err := w.DecodeBatchAck(b)
+	if err != nil || a.Seq > c.seq {
+		r.failChannel(c, "protocol_error")
 		return
 	}
-	s.id = a.ID
-	for len(s.frames) > 0 && s.frames[0].seq <= a.Seq {
-		n := s.frames[0].bytes
-		s.frames = s.frames[1:]
-		s.bytes -= n
-		r.inflight -= n
-		r.messages--
+	for len(c.records) > 0 && c.records[0].seq <= a.Seq {
+		rec := c.records[0]
+		c.records = c.records[1:]
+		r.inflight -= rec.bytes
+		r.messages -= rec.messages
+		r.budget.give(rec.bytes, rec.messages, 0)
 	}
-	if a.Close {
-		r.drop(s, "closed")
-		return
+	for _, ack := range a.Acks {
+		s := r.states[ack.Capture]
+		if s == nil {
+			continue
+		}
+		if s.ch != c {
+			r.failChannel(c, "protocol_error")
+			return
+		}
+		if ack.Seq > s.seq || (s.id != "" && s.id != ack.ID) {
+			r.cancel(s, "protocol_error")
+			continue
+		}
+		s.id = ack.ID
+		if ack.Close {
+			r.drop(s, "closed")
+		}
 	}
 	r.resourceMetrics()
-	r.schedule(s)
 }
 func (r *root) OnClose(token, status uint32) {
-	if r.states[token] != nil && status != 0 {
-		r.repeatedLog(logsafe.Error, "grpc_closed", "grpc_status", strconv.FormatUint(uint64(status), 10), "observer_cluster", r.cfg.ObserverCluster)
+	for _, c := range r.channels {
+		if c != nil && c.token == token {
+			r.releaseChannel(c, "transport_lost")
+			return
+		}
 	}
-	r.drop(r.states[token], "transport_lost")
 }
 func (r *root) OnTick() {
-	// Business resumes have their own queue: a backlog of observation ACK
-	// timeouts must not consume their processing budget.
-	for i := 0; i < 256 && len(r.rewriteQ) > 0 && !r.rewriteQ[0].at.After(time.Now()); i++ {
-		d := heap.Pop(&r.rewriteQ).(*deadline)
-		if h := r.requests[d.id]; h != nil {
-			h.downgrade(true)
+	for _, c := range r.channels {
+		if c == nil {
+			continue
+		}
+		if c.closing {
+			if !time.Now().Before(c.retryAt) {
+				r.failChannel(c, "cancel_retry")
+			}
+			continue
+		}
+		if len(c.records) > 0 && time.Since(c.records[0].at) > time.Duration(r.cfg.AckTimeoutMS)*time.Millisecond {
+			r.failChannel(c, "timeout")
+		} else {
+			r.flush(c)
 		}
 	}
 	for i := 0; i < 256 && len(r.q) > 0 && !r.q[0].at.After(time.Now()); i++ {
 		d := heap.Pop(&r.q).(*deadline)
-		r.drop(r.states[d.id], "timeout")
+		r.cancel(r.states[d.id], "timeout")
 	}
 	r.flushLogs(8)
 }
 
 type httpContext struct {
 	types.DefaultHttpContext
-	root         *root
-	id           uint32
-	selected     bool
-	cfg          gatewayconfig.Config
-	instanceID   string
-	s            *state
-	rewrite      bool
-	paused       bool
-	passthrough  bool
-	rewriteUntil time.Time
-	timer        *deadline
-	status       uint64
-	closed       bool
+	root       *root
+	id         uint32
+	selected   bool
+	cfg        gatewayconfig.Config
+	instanceID string
+	s          *state
+	status     uint64
+	closed     bool
 }
 
 func header(k string) string         { v, _ := proxywasm.GetHttpRequestHeader(k); return v }
@@ -377,6 +521,7 @@ func gatewayInstanceID(namespace, name string) string {
 	}
 	return namespace + "/" + name
 }
+
 func (h *httpContext) OnHttpRequestHeaders(_ int, eos bool) types.Action {
 	now := time.Now()
 	r := h.root
@@ -390,7 +535,6 @@ func (h *httpContext) OnHttpRequestHeaders(_ int, eos bool) types.Action {
 		r.count("requests_ignored_" + reason)
 		return types.ActionContinue
 	}
-	// Select before allocating rewrite/observation resources or reading credentials.
 	authority := header(":authority")
 	host := requesthost.Normalize(authority)
 	if host == "" {
@@ -405,60 +549,145 @@ func (h *httpContext) OnHttpRequestHeaders(_ int, eos bool) types.Action {
 	h.cfg = r.cfg
 	h.instanceID = r.instanceID
 	r.count("requests_selected")
-	ct, enc := header("content-type"), header("content-encoding")
-	// Freeze the bounded snapshot while all client headers still exist. Body
-	// rewriting must also remain available when observation admission/open fails.
-	var start []byte
-	if int64(len(r.states)) < h.cfg.RootMaxStreams {
-		start = h.startPayload(now, eos, authority, actualRoute, rule.AdapterID, ct, enc)
-		defer clear(start)
+	if r.budget == nil || !r.budget.take(0, 0, 1) {
+		r.count("dropped_stream_limit")
+		return types.ActionContinue
 	}
-	mt, _, err := mime.ParseMediaType(strings.ToLower(ct))
-	action := types.ActionContinue
-	if !eos && err == nil && mt == "application/json" && (enc == "" || strings.EqualFold(enc, "identity")) {
-		if r.rewrites < h.cfg.RootMaxRewrites && r.rewriteBytes+h.cfg.RewriteReservationBytes <= h.cfg.RootRewriteBudgetBytes {
-			r.rewrites++
-			r.rewriteBytes += h.cfg.RewriteReservationBytes
-			r.resourceMetrics()
-			h.rewrite = true
-			r.requests[h.id] = h
-			h.rewriteUntil = now.Add(time.Duration(h.cfg.RewriteTimeoutMS) * time.Millisecond)
-			h.timer = &deadline{at: h.rewriteUntil, id: h.id, idx: -1}
-			heap.Push(&r.rewriteQ, h.timer)
-			if err := proxywasm.RemoveHttpRequestHeader("content-length"); err == nil {
-				action = types.ActionContinue
-			} else {
-				h.releaseRewrite()
-				r.count("rewrite_header_failed")
-				r.repeatedLog(logsafe.Warn, "rewrite_header_failed", "host_status", hostError(err), "action", "original_body")
-			}
-		} else {
-			r.count("rewrite_resource_limit")
-			r.repeatedLog(logsafe.Warn, "rewrite_resource_limit", "action", "original_body")
+	r.next++
+	var c *channel
+	for i := 0; i < len(r.channels); i++ {
+		k := int((r.next + uint64(i)) % uint64(len(r.channels)))
+		if r.channels[k] == nil {
+			r.channels[k] = &channel{}
+		}
+		x := r.channels[k]
+		if r.openChannel(x) {
+			c = x
+			break
 		}
 	}
-	if int64(len(r.states)) >= h.cfg.RootMaxStreams {
-		r.repeatedLog(logsafe.Warn, "observation_stream_limit", "action", "skip_observation")
-		return action
+	if c == nil {
+		r.budget.give(0, 0, 1)
+		return types.ActionContinue
 	}
-	upstream := grpcUpstream(h.cfg.ObserverCluster)
-	token, err := proxywasm.OpenGrpcStream(r.id, upstream, "metering.v1.ObservationService", "Observe", r)
-	if err != nil {
-		r.count("dropped_open_failed")
-		r.repeatedLog(logsafe.Error, "grpc_open_failed", "host_status", hostError(err), "observer_cluster", h.cfg.ObserverCluster)
-		return action
-	}
-	r.logRecovered("grpc_open_failed")
-	s := &state{token: token, started: now}
+	s := &state{capture: r.next, ch: c, started: now}
 	h.s = s
-	r.states[token] = s
-	r.resourceMetrics()
+	r.states[s.capture] = s
 	s.eos[0] = eos
-	r.send(s, 10, start, false)
-	return action
+	b := h.startPayload(now, eos, authority, actualRoute, rule.AdapterID, header("content-type"), header("content-encoding"))
+	r.send(s, 10, b, false)
+	clear(b)
+	return types.ActionContinue
 }
-
-// startPayload freezes request headers before rewrite preparation changes them.
+func (h *httpContext) OnHttpRequestBody(n int, eos bool) types.Action {
+	if n >= 0 && h.root.active(h.s) {
+		h.s.offset[0] += uint64(n)
+		h.s.eos[0] = eos
+	}
+	return types.ActionContinue
+}
+func (h *httpContext) OnHttpRequestTrailers(_ int) types.Action {
+	if h.root.active(h.s) {
+		h.s.eos[0] = true
+	}
+	return types.ActionContinue
+}
+func (h *httpContext) OnHttpResponseHeaders(_ int, eos bool) types.Action {
+	if !h.root.active(h.s) {
+		return types.ActionContinue
+	}
+	n, err := strconv.ParseUint(responseHeader(":status"), 10, 32)
+	if err != nil || n < 200 || n > 599 {
+		return types.ActionContinue
+	}
+	h.status = n
+	b := w.String(w.String(w.UInt(nil, 1, n), 2, responseHeader("content-type")), 3, responseHeader("content-encoding"))
+	if eos {
+		b = w.UInt(b, 4, 1)
+	}
+	if h.root.send(h.s, 11, b, false) {
+		h.s.eos[1] = eos
+	}
+	return types.ActionContinue
+}
+func (h *httpContext) observeResponse(n int, eos bool, at time.Time) {
+	s := h.s
+	if !h.root.active(s) || s.eos[1] {
+		return
+	}
+	if n < 0 || s.offset[1] > uint64(h.cfg.ResponseBodyMaxBytes) || uint64(n) > uint64(h.cfg.ResponseBodyMaxBytes)-s.offset[1] {
+		h.root.cancel(s, "body_limit")
+		return
+	}
+	for from := 0; from < n || (n == 0 && eos && from == 0); {
+		count := min(int(h.cfg.ChunkBytes), n-from)
+		var b []byte
+		var err error
+		if count > 0 {
+			b, err = proxywasm.GetHttpResponseBody(from, count)
+			if err != nil {
+				h.root.cancel(s, "body_read_failed")
+				return
+			}
+		}
+		v := w.UInt(w.UInt(w.UInt(nil, 1, 2), 2, s.bodySeq[1]+1), 3, s.offset[1])
+		v = w.Bytes(v, 4, b)
+		last := eos && from+count == n
+		if last {
+			v = w.UInt(v, 5, 1)
+		}
+		v = w.UInt(v, 6, uint64(at.Sub(s.started).Microseconds()))
+		if !h.root.send(s, 12, v, false) {
+			return
+		}
+		s.bodySeq[1]++
+		s.offset[1] += uint64(count)
+		s.eos[1] = last
+		from += count
+		if count == 0 {
+			break
+		}
+	}
+}
+func (h *httpContext) OnHttpResponseBody(n int, eos bool) types.Action {
+	h.observeResponse(n, eos, time.Now())
+	return types.ActionContinue
+}
+func (h *httpContext) OnHttpResponseTrailers(_ int) types.Action {
+	h.observeResponse(0, true, time.Now())
+	return types.ActionContinue
+}
+func (h *httpContext) OnHttpStreamDone() {
+	if h.closed {
+		return
+	}
+	h.closed = true
+	s := h.s
+	if !h.root.active(s) {
+		return
+	}
+	b := w.UInt(nil, 1, uint64(time.Now().UnixMilli()))
+	b = w.UInt(b, 3, s.bodySeq[1])
+	b = w.UInt(b, 4, s.offset[0])
+	b = w.UInt(b, 5, s.offset[1])
+	if s.eos[0] {
+		b = w.UInt(b, 6, 1)
+	}
+	if s.eos[1] {
+		b = w.UInt(b, 7, 1)
+	}
+	if h.status >= 200 {
+		b = w.UInt(b, 8, h.status)
+	}
+	h.root.send(s, 13, b, true)
+	h.s = nil
+}
+func (h *httpContext) OnDelete() {
+	if !h.closed {
+		h.root.cancel(h.s, "context_deleted")
+	}
+	h.s = nil
+}
 func (h *httpContext) startPayload(now time.Time, eos bool, authority, route, adapter, ct, enc string) []byte {
 	b := w.UInt(nil, 1, uint64(now.UnixMilli()))
 	b = w.String(b, 2, h.instanceID)
@@ -515,304 +744,6 @@ func grpcUpstream(cluster string) []byte {
 	}
 	envoy := w.String(nil, 1, cluster)
 	return w.Bytes(nil, 1, w.String(envoy, 2, authority))
-}
-func (h *httpContext) releaseRewrite() {
-	if !h.rewrite {
-		return
-	}
-	h.rewrite = false
-	h.paused = false
-	delete(h.root.requests, h.id)
-	h.root.rewrites--
-	h.root.rewriteBytes -= h.cfg.RewriteReservationBytes
-	if h.timer != nil && h.timer.idx >= 0 {
-		heap.Remove(&h.root.rewriteQ, h.timer.idx)
-	}
-	h.root.resourceMetrics()
-}
-
-func (h *httpContext) retryResume() {
-	// Preserve the reservation and request until Resume succeeds or the HTTP
-	// context is deleted. Once passthrough is set, no callback may pause again.
-	h.timer.at = time.Now().Add(time.Duration(gatewayconfig.MaxTickMS) * time.Millisecond)
-	if h.timer.idx < 0 {
-		heap.Push(&h.root.rewriteQ, h.timer)
-	} else {
-		heap.Fix(&h.root.rewriteQ, h.timer.idx)
-	}
-}
-
-func (h *httpContext) downgrade(resume bool) {
-	if !h.rewrite {
-		return
-	}
-	h.passthrough = true
-	if resume && h.paused {
-		old := proxywasm.CurrentEffectiveContext()
-		defer proxywasm.SetEffectiveContext(old)
-		if err := proxywasm.SetEffectiveContext(h.id); err != nil {
-			if errors.Is(err, types.ErrorStatusNotFound) {
-				h.releaseRewrite() // The request no longer exists in the host.
-			} else {
-				h.retryResume()
-			}
-			h.root.count("rewrite_context_failed")
-			h.root.repeatedLog(logsafe.Error, "rewrite_context_failed", "host_status", hostError(err), "action", "retry_resume")
-			h.root.drop(h.s, "context_lost")
-			return
-		}
-		// Resume before reading/copying buffers, observation I/O or metrics.
-		// Envoy owns the original buffer; no replacement is needed to pass it on.
-		if err := proxywasm.ResumeHttpRequest(); err != nil {
-			h.retryResume()
-			h.root.count("rewrite_resume_failed")
-			h.root.repeatedLog(logsafe.Error, "rewrite_resume_failed", "host_status", hostError(err), "action", "retry_resume")
-			h.root.drop(h.s, "rewrite_timeout_boundary")
-			return
-		}
-	}
-	h.releaseRewrite()
-	h.root.logRecovered("rewrite_context_failed")
-	h.root.logRecovered("rewrite_resume_failed")
-	h.root.repeatedLog(logsafe.Warn, "rewrite_passthrough", "action", "original_body")
-	h.root.count("rewrite_passthrough")
-	// Async resume may bypass later body callbacks in the pinned Envoy. Do not
-	// delay business resume to copy the buffered prefix or claim completeness.
-	h.root.drop(h.s, "rewrite_timeout_boundary")
-}
-func (h *httpContext) OnHttpRequestBody(n int, eos bool) types.Action {
-	if !h.selected {
-		return types.ActionContinue
-	}
-	// This callback can release any existing pause by returning Continue.
-	h.paused = false
-	if h.rewrite && (h.passthrough || !time.Now().Before(h.rewriteUntil)) {
-		h.downgrade(false)
-		return types.ActionContinue
-	}
-	h.root.count("request_body_callbacks")
-	if eos {
-		h.root.count("request_body_eos")
-	} else {
-		h.root.count("request_body_not_eos")
-	}
-	if n > 0 {
-		h.root.count("request_body_nonempty")
-	}
-	if h.rewrite {
-		if n > int(h.cfg.RequestBodyMaxBytes) {
-			h.releaseRewrite()
-			h.root.drop(h.s, "body_limit")
-			h.root.count("rewrite_body_limit")
-			h.root.repeatedLog(logsafe.Warn, "rewrite_body_limit", "action", "original_body")
-			return types.ActionContinue
-		}
-		if !eos {
-			h.paused = true
-			return types.ActionPause
-		}
-		b, err := proxywasm.GetHttpRequestBody(0, n)
-		if err != nil {
-			h.releaseRewrite()
-			h.root.drop(h.s, "body_read_failed")
-			return types.ActionContinue
-		}
-		out, err := strictjson.RewriteUsage(b, int(h.cfg.RequestBodyMaxBytes))
-		// Parsing/serialization also consumes the same absolute budget. Never
-		// commit a late rewrite, even when the timer could not run in between.
-		if !time.Now().Before(h.rewriteUntil) {
-			h.downgrade(false)
-			return types.ActionContinue
-		}
-		if err != nil {
-			out = b
-			h.root.count("rewrite_invalid_json")
-			h.root.repeatedLog(logsafe.Warn, "rewrite_invalid_json", "action", "original_body")
-		}
-		if err == nil {
-			if err := proxywasm.ReplaceHttpRequestBody(out); err != nil {
-				h.root.repeatedLog(logsafe.Error, "rewrite_replace_failed", "host_status", hostError(err), "action", "original_body")
-				h.root.drop(h.s, "rewrite_replace_failed")
-				h.releaseRewrite()
-				return types.ActionContinue
-			}
-		}
-		h.releaseRewrite()
-		h.observeBytes(0, out, eos, true)
-		return types.ActionContinue
-	}
-	h.observeBuffer(0, n, eos)
-	return types.ActionContinue
-}
-func (h *httpContext) observeBuffer(d, n int, eos bool) {
-	h.observeBufferAt(d, n, eos, time.Now())
-}
-func (h *httpContext) observeBufferAt(d, n int, eos bool, observedAt time.Time) {
-	if !h.root.active(h.s) {
-		return
-	}
-	if int64(n) > h.cfg.CallbackMaxBytes || (n+int(h.cfg.ChunkBytes)-1)/int(h.cfg.ChunkBytes) > int(h.cfg.CallbackMaxChunks) {
-		h.root.drop(h.s, "callback_limit")
-		return
-	}
-	if !h.bodyCapacity(d, n, eos) {
-		return
-	}
-	var b []byte
-	var err error
-	if d == 0 {
-		b, err = proxywasm.GetHttpRequestBody(0, n)
-	} else {
-		b, err = proxywasm.GetHttpResponseBody(0, n)
-	}
-	if err != nil && n > 0 {
-		h.root.drop(h.s, "body_read_failed")
-		return
-	}
-	h.observeBytesAt(d, b, eos, observedAt)
-}
-func (h *httpContext) observeBytes(d int, b []byte, eos, full bool) {
-	h.observeBytesAt(d, b, eos, time.Now())
-}
-func (h *httpContext) observeBytesAt(d int, b []byte, eos bool, observedAt time.Time) {
-	s, r := h.s, h.root
-	if !r.active(s) || s.eos[d] {
-		return
-	}
-	if !h.bodyCapacity(d, len(b), eos) {
-		return
-	}
-	observed := observedAt.Sub(s.started).Microseconds()
-	chunks := (len(b) + int(h.cfg.ChunkBytes) - 1) / int(h.cfg.ChunkBytes)
-	if chunks == 0 && eos {
-		chunks = 1
-	}
-	for i := 0; i < chunks; i++ {
-		from := i * int(h.cfg.ChunkBytes)
-		to := min(from+int(h.cfg.ChunkBytes), len(b))
-		v := w.UInt(nil, 1, uint64(d+1))
-		v = w.UInt(v, 2, s.bodySeq[d]+1)
-		v = w.UInt(v, 3, s.offset[d])
-		v = w.Bytes(v, 4, b[from:to])
-		if d == 1 {
-			v = w.UInt(v, 6, uint64(observed))
-		}
-		end := eos && i == chunks-1
-		if end {
-			v = w.UInt(v, 5, 1)
-		}
-		if !r.send(s, 12, v, false) {
-			return
-		}
-		s.bodySeq[d]++
-		s.offset[d] += uint64(to - from)
-		s.eos[d] = end
-	}
-}
-
-// Call before copying streaming buffers. Root callbacks execute serially, so
-// this check reserves capacity for this callback until the exact send ledger
-// replaces the conservative estimate. The rewrite copy has its own budget.
-func (h *httpContext) bodyCapacity(d, n int, eos bool) bool {
-	s, r := h.s, h.root
-	if !r.active(s) || s.eos[d] || n < 0 {
-		return false
-	}
-	max := h.cfg.RequestBodyMaxBytes
-	if d == 1 {
-		max = h.cfg.ResponseBodyMaxBytes
-	}
-	if s.offset[d] > uint64(max) || uint64(n) > uint64(max)-s.offset[d] {
-		r.drop(s, "body_limit")
-		return false
-	}
-	chunks := (n + int(h.cfg.ChunkBytes) - 1) / int(h.cfg.ChunkBytes)
-	if chunks == 0 && eos {
-		chunks = 1
-	}
-	estimate := int64(n) + int64(chunks)*256
-	if s.bytes+estimate > h.cfg.StreamInflightBytes-8192 || int64(len(s.frames))+int64(chunks) > h.cfg.StreamInflightMessages-4 || r.inflight+estimate > h.cfg.RootInflightBytes || r.messages+int64(chunks) > h.cfg.RootInflightMessages {
-		r.drop(s, "resource_limit")
-		return false
-	}
-	return true
-}
-func (h *httpContext) OnHttpResponseHeaders(_ int, eos bool) types.Action {
-	if !h.selected {
-		return types.ActionContinue
-	}
-	n, err := strconv.ParseUint(responseHeader(":status"), 10, 32)
-	if err != nil || n < 200 || n > 599 {
-		return types.ActionContinue
-	}
-	h.status = n
-	b := w.UInt(nil, 1, n)
-	b = w.String(b, 2, responseHeader("content-type"))
-	b = w.String(b, 3, responseHeader("content-encoding"))
-	if eos {
-		b = w.UInt(b, 4, 1)
-	}
-	if h.root.send(h.s, 11, b, false) {
-		h.s.eos[1] = eos
-	}
-	return types.ActionContinue
-}
-func (h *httpContext) OnHttpResponseBody(n int, eos bool) types.Action {
-	observedAt := time.Now()
-	if h.selected {
-		h.observeBufferAt(1, n, eos, observedAt)
-	}
-	return types.ActionContinue
-}
-func (h *httpContext) OnHttpRequestTrailers(_ int) types.Action {
-	if h.selected {
-		if h.rewrite {
-			h.downgrade(false)
-			h.root.count("rewrite_trailers_unsupported")
-		}
-		h.observeBytes(0, nil, true, false)
-	}
-	return types.ActionContinue
-}
-func (h *httpContext) OnHttpResponseTrailers(_ int) types.Action {
-	if h.selected {
-		h.observeBytes(1, nil, true, false)
-	}
-	return types.ActionContinue
-}
-func (h *httpContext) OnHttpStreamDone() {
-	if h.closed {
-		return
-	}
-	h.closed = true
-	h.releaseRewrite()
-	if !h.selected || !h.root.active(h.s) {
-		return
-	}
-	s := h.s
-	b := w.UInt(nil, 1, uint64(time.Now().UnixMilli()))
-	b = w.UInt(b, 2, s.bodySeq[0])
-	b = w.UInt(b, 3, s.bodySeq[1])
-	b = w.UInt(b, 4, s.offset[0])
-	b = w.UInt(b, 5, s.offset[1])
-	if s.eos[0] {
-		b = w.UInt(b, 6, 1)
-	}
-	if s.eos[1] {
-		b = w.UInt(b, 7, 1)
-	}
-	if h.status >= 200 {
-		b = w.UInt(b, 8, h.status)
-	}
-	h.root.send(s, 13, b, true)
-	h.s = nil
-}
-func (h *httpContext) OnDelete() {
-	h.releaseRewrite()
-	if !h.closed {
-		h.root.drop(h.s, "context_deleted")
-	}
-	h.s = nil
 }
 
 // requestMetadata appends optional fields only while both budgets allow them.

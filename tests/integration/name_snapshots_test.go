@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"encoding/pem"
+	"github.com/Fangyan33/llm-token-stats/internal/observation/testutil"
 	"io"
 	"net"
 	"net/http"
@@ -152,7 +153,7 @@ func testNamesThroughKafkaToDoris(t *testing.T, secure, cached bool) {
 	defer conn.Close()
 	collect := func() string {
 		t.Helper()
-		stream, err := pb.NewObservationServiceClient(conn).Observe(ctx)
+		stream, err := testutil.New(conn).Observe(ctx)
 		if err != nil {
 			t.Fatal(err)
 		}

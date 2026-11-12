@@ -15,9 +15,9 @@
     },
     "listen": ":9090",
     "health_listen": ":9091",
-    "max_connections": 128,
-    "max_active_streams": 4096,
-    "parser_budget_bytes": 268435456,
+    "max_connections": 1024,
+    "max_active_observations": 1048576,
+    "parser_budget_bytes": 10737418240,
     "max_observation_ms": 605000,
     "accepted_config_versions": [
       "collection-v1"

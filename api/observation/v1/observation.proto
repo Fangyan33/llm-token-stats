@@ -3,7 +3,25 @@ package metering.v1;
 option go_package = "github.com/Fangyan33/llm-token-stats/gen/observation/v1;observationv1";
 
 service ObservationService {
-  rpc Observe(stream ObservationFrame) returns (stream ObservationAck);
+  rpc Observe(stream ObservationBatch) returns (stream ObservationAckBatch);
+}
+
+// 一个长期传输流承载多个独立观察；捕获键仅在该传输流内有效。
+message ObservationBatch {
+  uint64 batch_seq = 1;
+  repeated CaptureFrame frames = 2;
+}
+message CaptureFrame {
+  uint64 capture_id = 1; // 每个传输流内新观察严格递增，关闭后不复用
+  ObservationFrame frame = 2;
+}
+message ObservationAckBatch {
+  uint64 accepted_batch_seq = 1;
+  repeated CaptureAck acks = 2;
+}
+message CaptureAck {
+  uint64 capture_id = 1;
+  ObservationAck ack = 2;
 }
 
 enum Direction {
@@ -15,14 +33,18 @@ enum Direction {
 message ObservationFrame {
   uint32 schema_version = 1;       // 一期采集子项固定 1
   reserved 2;                      // 不复用原草案中由网关填写的请求 ID 字段
-  uint64 frame_seq = 3;            // 从 1 开始，整个流严格递增
+  uint64 frame_seq = 3;            // 每个 capture_id 从 1 开始，严格递增
   oneof payload {
     Start start = 10;
     ResponseHeaders response_headers = 11;
     BodyChunk body_chunk = 12;
     End end = 13;
+    Cancel cancel = 14;
   }
 }
+
+// 采集取消不表示业务请求结束，不能替代有效 End。
+message Cancel {}
 
 message Start {
   reserved 5, 7, 8, 9, 10;
@@ -63,7 +85,7 @@ message BodyChunk {
 
 message End {
   int64 request_finished_at_ms = 1;
-  uint64 last_request_body_seq = 2;
+  reserved 2;
   uint64 last_response_body_seq = 3;
   uint64 request_bytes_seen = 4;
   uint64 response_bytes_seen = 5;
@@ -78,6 +100,6 @@ message End {
 message ObservationAck {
   string observation_id = 1;       // Observer 在有效 Start 后分配，后续 ACK 保持一致
   uint64 accepted_frame_seq = 2;   // 连续处理完成的最高 frame_seq
-  bool close_stream = 3;
+  bool close_stream = 3;          // 仅关闭该观察，不关闭共享传输流
   string reason = 4;              // 固定原因码，禁止透传异常文本
 }

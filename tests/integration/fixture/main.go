@@ -78,7 +78,7 @@ func main() {
 	})
 	http.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) { fmt.Fprint(w, "ok") })
 	http.HandleFunc("/v1/chat/completions", func(out http.ResponseWriter, r *http.Request) {
-		b, err := io.ReadAll(io.LimitReader(r.Body, 2<<20))
+		b, err := io.ReadAll(io.LimitReader(r.Body, 40<<20))
 		if err != nil {
 			out.WriteHeader(400)
 			return
@@ -99,10 +99,6 @@ func main() {
 			time.Sleep(200 * time.Millisecond)
 		}
 		if req.Stream {
-			if !req.Options.Include {
-				out.WriteHeader(422)
-				return
-			}
 			out.Header().Set("Content-Type", "text/event-stream")
 			out.Header().Set("Trailer", "x-test-end")
 			performance := strings.HasPrefix(req.TestCase, "performance")

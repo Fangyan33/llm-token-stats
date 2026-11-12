@@ -1,6 +1,7 @@
 package observation
 
 import (
+	"container/heap"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -23,7 +24,6 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 	"io"
-	"math"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -35,8 +35,13 @@ type Codec struct{}
 func (Codec) Name() string                  { return "proto" }
 func (Codec) Marshal(v any) ([]byte, error) { return proto.Marshal(v.(proto.Message)) }
 func (Codec) Unmarshal(b []byte, v any) error {
-	if _, ok := v.(*pb.ObservationFrame); ok {
-		if observationwire.Validate(b, "frame") != nil {
+	switch v.(type) {
+	case *pb.ObservationBatch:
+		if observationwire.ValidateBatch(b, false) != nil {
+			return errors.New("protocol_error")
+		}
+	case *pb.ObservationAckBatch:
+		if observationwire.ValidateBatch(b, true) != nil {
 			return errors.New("protocol_error")
 		}
 	}
@@ -48,8 +53,7 @@ type Server struct {
 	Cfg              config.Observer
 	Sink             producer.Sink
 	Health           *health.State
-	active           atomic.Int64
-	bytes            atomic.Int64
+	active, bytes    atomic.Int64
 	Random           io.Reader
 	ServiceResolver  identitylookup.ServiceResolver
 	CustomerResolver identitylookup.CustomerResolver
@@ -57,13 +61,13 @@ type Server struct {
 	lookupSlots      chan struct{}
 	lookups          *lookupState
 	lookupInitErr    error
-	lookupNow        func() time.Time // Optional cache clock for deterministic tests.
+	lookupNow        func() time.Time
 }
 
 func (s *Server) reserve(n int64) bool {
 	for {
 		old := s.bytes.Load()
-		if n > s.Cfg.ParserBudget-old {
+		if n < 0 || n > s.Cfg.ParserBudget-old {
 			return false
 		}
 		if s.bytes.CompareAndSwap(old, old+n) {
@@ -89,110 +93,101 @@ func (s *Server) newID() (string, error) {
 	return h[:8] + "-" + h[8:12] + "-" + h[12:16] + "-" + h[16:20] + "-" + h[20:], nil
 }
 
-type received struct {
-	f   *pb.ObservationFrame
-	err error
+type observation struct {
+	s                 *Server
+	capture           uint64
+	e                 *events.Event
+	p                 *chatcompletions.Parser
+	lookup            <-chan events.Event
+	frozen            bool
+	started           time.Time
+	seq               uint64
+	bodySeq, offset   [2]uint64
+	eos               [2]bool
+	headers           bool
+	statusCode        *int64
+	end               *pb.End
+	reason            string
+	reservation, base int64
+	timer             *observationDeadline
 }
-type ackWrite struct {
-	a    *pb.ObservationAck
-	done chan error
+type observationDeadline struct {
+	at      time.Time
+	capture uint64
+	idx     int
 }
+type observationDeadlines []*observationDeadline
 
-func (s *Server) Observe(stream pb.ObservationService_ObserveServer) (result error) {
-	started := time.Now()
-	defer func() {
-		if result != nil && stream.Context().Err() == nil {
-			logging.Warn("observation_ended_early", "observation", "grpc_status", int(status.Code(result)), "duration_ms", time.Since(started).Milliseconds())
+func (q observationDeadlines) Len() int           { return len(q) }
+func (q observationDeadlines) Less(i, j int) bool { return q[i].at.Before(q[j].at) }
+func (q observationDeadlines) Swap(i, j int)      { q[i], q[j] = q[j], q[i]; q[i].idx = i; q[j].idx = j }
+func (q *observationDeadlines) Push(x any) {
+	d := x.(*observationDeadline)
+	d.idx = len(*q)
+	*q = append(*q, d)
+}
+func (q *observationDeadlines) Pop() any {
+	a := *q
+	d := a[len(a)-1]
+	a[len(a)-1] = nil
+	*q = a[:len(a)-1]
+	d.idx = -1
+	return d
+}
+func (s *Server) start(ctx context.Context, id uint64, f *pb.ObservationFrame) (*observation, error) {
+	st := f.GetStart()
+	if st == nil || f.SchemaVersion != 1 || f.FrameSeq != 1 || proto.Size(f) > 6144 || !s.validStart(st) {
+		if st != nil {
+			clear(st.ApiKey)
 		}
-	}()
-	s.Health.GaugeFunc("observer_active_streams", s.active.Load)
-	s.Health.GaugeFunc("observer_parser_reserved_bytes", s.bytes.Load)
+		return nil, errors.New("protocol_error")
+	}
 	if s.active.Add(1) > int64(s.Cfg.MaxActive) {
-		logging.Warn("observation_rejected", "observer_capacity", "reason", "active_stream_limit")
 		s.active.Add(-1)
-		return status.Error(codes.ResourceExhausted, "resource_limit")
+		clear(st.ApiKey)
+		return nil, errors.New("resource_limit")
 	}
-	defer s.active.Add(-1)
-	// Allow for the decoded frame, one queued frame, and a receive in progress.
-	reservation := int64(3 * 32768)
-	if !s.reserve(reservation) {
-		logging.Warn("observation_rejected", "observer_capacity", "reason", "parser_budget")
-		return status.Error(codes.ResourceExhausted, "resource_limit")
+	base := int64(2048 + 2*proto.Size(st))
+	if !s.reserve(base) {
+		s.active.Add(-1)
+		clear(st.ApiKey)
+		return nil, errors.New("resource_limit")
 	}
-	defer func() { s.bytes.Add(-reservation) }()
-	ctx, cancel := context.WithTimeout(stream.Context(), time.Duration(s.Cfg.MaxObservationMS)*time.Millisecond)
-	defer cancel()
-	recv := make(chan received, 1)
-	go func() {
-		for {
-			f, err := stream.Recv()
-			select {
-			case recv <- received{f, err}:
-			case <-ctx.Done():
-				if st := f.GetStart(); st != nil {
-					clear(st.ApiKey)
-					st.ApiKey = nil
-				}
-				return
-			}
-			if err != nil {
-				return
-			}
-		}
-	}()
-	acks := make(chan ackWrite, 1)
-	var writing atomic.Int64
-	go func() {
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case a := <-acks:
-				writing.Store(time.Now().UnixNano())
-				err := stream.Send(a.a)
-				writing.Store(0)
-				if a.done != nil {
-					a.done <- err
-				}
-				if err != nil {
-					logging.Failure("observation_ack_failed", "observer_ack", err, "grpc_status", int(status.Code(err)))
-					cancel()
-					return
-				}
-			}
-		}
-	}()
-	ticker := time.NewTicker(10 * time.Millisecond)
-	defer ticker.Stop()
-	var start *pb.Start
-	var e *events.Event
-	var lookup <-chan events.Event
-	var acceptedEnd *pb.End
-	finalized := false
-	p := chatcompletions.New()
-	var seq uint64
-	var bodySeq, offset [2]uint64
-	var eos [2]bool
-	headers := false
-	var statusCode *int64
-	var latest *pb.ObservationAck
-	work := time.Duration(0)
-	queue := func(a *pb.ObservationAck) {
-		select {
-		case acks <- ackWrite{a: a}:
-		default:
-			select {
-			case <-acks:
-			default:
-			}
-			select {
-			case acks <- ackWrite{a: a}:
-			default:
-			}
-		}
+	uuid, err := s.newID()
+	if err != nil {
+		s.active.Add(-1)
+		s.bytes.Add(-base)
+		clear(st.ApiKey)
+		return nil, err
 	}
-	freezeLookup := func(snapshot events.Event) {
-		lookup = nil
+	e := s.emptySnapshot(st, "lookup_timeout")
+	lookup := s.beginResolve(ctx, st)
+	clear(st.ApiKey)
+	st.ApiKey = nil
+	st.RouteName = routeinfo.Name(st.RouteName)
+	e.SchemaVersion, e.EventID, e.EventType = events.SchemaVersion, uuid+":start", "request_started"
+	e.LogicalRequestID, e.ObservationID, e.ObservationScope = st.LogicalRequestId, uuid, "gateway_response"
+	e.UserID, e.UserAgent = st.UserId, st.UserAgent
+	e.RequestHeaders = st.RequestHeaders
+	e.XRequestID, e.ProducerID, e.GatewayInstanceID = st.XRequestId, s.Cfg.ProducerID, st.GatewayInstanceId
+	e.ConfigVersion, e.AdapterID, e.RouteName = st.ConfigVersion, st.AdapterId, st.RouteName
+	e.RequestStartedAtMs, e.EventCreatedAtMs = st.RequestStartedAtMs, time.Now().UnixMilli()
+	e.UsageStatus, e.RawUsageJSON = "not_applicable", "{}"
+	e.AnomalyCodes = []string{}
+	if st.RequestStartedAtMs < time.Now().UnixMilli()-300000 {
+		e.AnomalyCodes = events.Add(e.AnomalyCodes, "clock_anomaly")
+	}
+	o := &observation{s: s, capture: id, e: &e, p: chatcompletions.New(), lookup: lookup, started: time.Now(), seq: 1, base: base, reservation: base}
+	o.eos[0] = st.RequestEndStream
+	return o, nil
+}
+func (o *observation) pollLookup() bool {
+	if o.frozen {
+		return true
+	}
+	select {
+	case snapshot := <-o.lookup:
+		e := o.e
 		e.ServiceID, e.ServiceName, e.ProviderID, e.ProviderName = snapshot.ServiceID, snapshot.ServiceName, snapshot.ProviderID, snapshot.ProviderName
 		e.ApiKeyID, e.CustomerID, e.CustomerName = snapshot.ApiKeyID, snapshot.CustomerID, snapshot.CustomerName
 		e.MappingStatus, e.MappingVersion = snapshot.MappingStatus, snapshot.MappingVersion
@@ -201,310 +196,418 @@ func (s *Server) Observe(stream pb.ObservationService_ObserveServer) (result err
 			e.AnomalyCodes = events.Add(e.AnomalyCodes, "identity_invalid")
 		}
 		copy := *e
-		s.Sink.Emit(&copy)
+		o.s.Sink.Emit(&copy)
+		o.frozen = true
+		o.lookup = nil
+		return true
+	default:
+		return false
 	}
-	final := func(reason string, end *pb.End) {
-		if finalized || e == nil {
-			return
+}
+func (o *observation) feed(f *pb.ObservationFrame) string {
+	if f == nil || f.SchemaVersion != 1 || f.FrameSeq != o.seq+1 || f.Payload == nil {
+		return "protocol_error"
+	}
+	if st := f.GetStart(); st != nil {
+		clear(st.ApiKey)
+		return "protocol_error"
+	}
+	if f.GetCancel() != nil {
+		o.seq = f.FrameSeq
+		return "transport_lost"
+	}
+	if h := f.GetResponseHeaders(); h != nil {
+		if o.headers || h.HttpStatus < 200 || h.HttpStatus > 599 || len(h.ContentType) > 128 || len(h.ContentEncoding) > 128 {
+			return "protocol_error"
 		}
-		finalized = true
-		if end == nil {
-			end = acceptedEnd
+		o.headers = true
+		o.eos[1] = h.EndStream
+		o.statusCode = events.Ptr(int64(h.HttpStatus))
+		o.p.Content(h.ContentType, h.ContentEncoding)
+	}
+	if b := f.GetBodyChunk(); b != nil {
+		if b.Direction != pb.Direction_RESPONSE || !o.headers || o.eos[1] || b.BodySeq != o.bodySeq[1]+1 || b.Offset != o.offset[1] || len(b.Data) > 16384 || (len(b.Data) == 0 && !b.EndStream) {
+			return "protocol_error"
 		}
-		if lookup != nil {
-			// The coordinator has its own deadline; stream cancellation must not
-			// discard one side's already completed attribution.
-			freezeLookup(<-lookup)
+		p := o.p
+		needed := o.base + 2*int64(int(p.BufferedBytes())+len(b.Data))
+		if needed > o.reservation && !o.s.reserve(needed-o.reservation) {
+			return "resource_limit"
 		}
-		for _, a := range e.AnomalyCodes {
-			p.Anomaly(a)
+		if needed > o.reservation {
+			o.reservation = needed
 		}
-		p.Finalize()
-		if reason != "finalized" {
-			// ACK reasons and Kafka anomaly codes are separate closed enums.
-			if reason == "resource_limit" {
-				p.Anomaly("parse_limit")
-			} else {
-				p.Anomaly(reason)
-			}
+		if len(b.Data) > 0 {
+			p.SetElapsed(b.ObservedElapsedUs)
 		}
-		e.EventType = "usage_observed"
-		e.EventID = e.ObservationID + ":usage"
-		e.ObservationEndedAtMs = events.Ptr(time.Now().UnixMilli())
-		e.EventCreatedAtMs = time.Now().UnixMilli()
-		e.RequestModel = p.RequestModel
-		e.ResponseModel = p.ResponseModel
-		e.HTTPStatus = statusCode
-		e.ResponseStreaming = p.ResponseStreaming
-		e.FirstOutputElapsedUS, e.LastOutputElapsedUS = p.FirstOutputUS, p.LastOutputUS
-		e.Usage = p.Usage
-		e.RawUsageJSON = p.Raw
-		e.RawUsageTruncated = p.Truncated
-		if end != nil {
-			e.TerminalObserved = true
-			e.RequestFinishedAtMs = events.Ptr(end.RequestFinishedAtMs)
-			if end.UpstreamAttemptCount != nil {
-				e.UpstreamAttemptCount = events.Ptr(int64(*end.UpstreamAttemptCount))
+		err := p.Feed(b.Data, b.EndStream)
+		target := o.base + p.BufferedBytes()
+		if target < o.reservation {
+			o.s.bytes.Add(target - o.reservation)
+			o.reservation = target
+		}
+		if err != nil {
+			if errors.Is(err, chatcompletions.ErrLimit) {
+				return "parse_limit"
 			}
-			if end.ResponseFlags != nil && events.Has(s.Cfg.Flags, *end.ResponseFlags) {
-				e.ResponseFlags = end.ResponseFlags
-			}
-			if end.ResponseCodeDetails != nil && events.Has(s.Cfg.Details, *end.ResponseCodeDetails) {
-				e.ResponseCodeDetails = end.ResponseCodeDetails
-			}
-			if end.RequestFinishedAtMs < e.RequestStartedAtMs {
-				p.Anomaly("clock_anomaly")
-			}
+			return "protocol_error"
+		}
+		o.bodySeq[1] = b.BodySeq
+		o.offset[1] += uint64(len(b.Data))
+		o.eos[1] = b.EndStream
+	}
+	if end := f.GetEnd(); end != nil {
+		if end.LastResponseBodySeq != o.bodySeq[1] || end.ResponseBytesSeen != o.offset[1] || end.ResponseEndStreamSeen != o.eos[1] || end.RequestFinishedAtMs < 1 || end.RequestFinishedAtMs > 253402300799999 {
+			return "protocol_error"
+		}
+		if end.HttpStatus != nil && (o.statusCode == nil || int64(*end.HttpStatus) != *o.statusCode) {
+			return "protocol_error"
+		}
+		if end.UpstreamAttemptCount != nil && (*end.UpstreamAttemptCount < 1 || *end.UpstreamAttemptCount > 2147483647) {
+			return "protocol_error"
+		}
+		o.end = end
+		o.eos[0] = end.RequestEndStreamSeen
+		o.offset[0] = end.RequestBytesSeen
+	}
+	o.seq = f.FrameSeq
+	if o.end != nil {
+		return "finalized"
+	}
+	return ""
+}
+func (o *observation) finalize() {
+	s, e, p := o.s, o.e, o.p
+	end, reason := o.end, o.reason
+	bodySeq, offset, eos, headers, statusCode := o.bodySeq, o.offset, o.eos, o.headers, o.statusCode
+	_ = bodySeq
+	for _, a := range e.AnomalyCodes {
+		p.Anomaly(a)
+	}
+	p.Finalize()
+	if reason != "finalized" {
+		// ACK reasons and Kafka anomaly codes are separate closed enums.
+		if reason == "resource_limit" {
+			p.Anomaly("parse_limit")
 		} else {
-			p.Anomaly("missing_end")
+			p.Anomaly(reason)
 		}
-		observation := "unknown"
-		business := "unknown"
-		if offset[0]+offset[1] > 0 || headers {
-			observation = "partial"
-			business = "stream_incomplete"
+	}
+	e.EventType = "usage_observed"
+	e.EventID = e.ObservationID + ":usage"
+	e.ObservationEndedAtMs = events.Ptr(time.Now().UnixMilli())
+	e.EventCreatedAtMs = time.Now().UnixMilli()
+	e.RequestModel = nil // Request bodies are deliberately never observed.
+	e.ResponseModel = p.ResponseModel
+	e.HTTPStatus = statusCode
+	e.ResponseStreaming = p.ResponseStreaming
+	e.FirstOutputElapsedUS, e.LastOutputElapsedUS = p.FirstOutputUS, p.LastOutputUS
+	e.Usage = p.Usage
+	e.RawUsageJSON = p.Raw
+	e.RawUsageTruncated = p.Truncated
+	if end != nil {
+		e.TerminalObserved = true
+		e.RequestFinishedAtMs = events.Ptr(end.RequestFinishedAtMs)
+		if end.UpstreamAttemptCount != nil {
+			e.UpstreamAttemptCount = events.Ptr(int64(*end.UpstreamAttemptCount))
 		}
-		if end != nil && eos[0] && eos[1] {
-			observation = "complete"
-			business = "response_complete"
+		if end.ResponseFlags != nil && events.Has(s.Cfg.Flags, *end.ResponseFlags) {
+			e.ResponseFlags = end.ResponseFlags
 		}
-		for _, a := range p.Anomalies {
-			if events.Has([]string{"protocol_error", "protocol_incomplete", "parse_limit", "transport_lost", "observation_timeout"}, a) {
-				if observation == "complete" {
-					observation = "partial"
+		if end.ResponseCodeDetails != nil && events.Has(s.Cfg.Details, *end.ResponseCodeDetails) {
+			e.ResponseCodeDetails = end.ResponseCodeDetails
+		}
+		if end.RequestFinishedAtMs < e.RequestStartedAtMs {
+			p.Anomaly("clock_anomaly")
+		}
+	} else {
+		p.Anomaly("missing_end")
+	}
+	observation := "unknown"
+	business := "unknown"
+	if offset[0]+offset[1] > 0 || headers {
+		observation = "partial"
+		business = "stream_incomplete"
+	}
+	if end != nil && eos[0] && eos[1] {
+		observation = "complete"
+		business = "response_complete"
+	}
+	for _, a := range p.Anomalies {
+		if events.Has([]string{"protocol_error", "protocol_incomplete", "parse_limit", "transport_lost", "observation_timeout"}, a) {
+			if observation == "complete" {
+				observation = "partial"
+			}
+		}
+	}
+	e.ObservationStatus = &observation
+	e.BusinessOutcome = &business
+	e.AnomalyCodes = append([]string{}, p.Anomalies...)
+	if e.IdentityStatus != "known" {
+		e.AnomalyCodes = events.Add(e.AnomalyCodes, "identity_invalid")
+	}
+	e.UsageStatus, _ = events.Status(p.Usage)
+	_, conflict := events.Status(p.Usage)
+	if conflict || p.Conflict {
+		e.UsageStatus = "conflict"
+	}
+	eligible := observation == "complete" && e.UsageStatus == "known"
+	for _, a := range e.AnomalyCodes {
+		if a != "invalid_model" && a != "identity_invalid" {
+			eligible = false
+		}
+	}
+	e.UsageEligible = eligible
+	s.Sink.Emit(e)
+	s.Health.Count("observer_finalized")
+	logging.Debug("observation_finalized", "observation_id", e.ObservationID, "reason", reason, "usage_status", e.UsageStatus, "duration_ms", time.Since(o.started).Milliseconds())
+}
+
+type batchReceived struct {
+	batch *pb.ObservationBatch
+	err   error
+}
+
+func (s *Server) Observe(stream pb.ObservationService_ObserveServer) error {
+	s.Health.GaugeFunc("observer_active_observations", s.active.Load)
+	s.Health.GaugeFunc("observer_parser_reserved_bytes", s.bytes.Load)
+	if !s.reserve(3 * 32768) {
+		return status.Error(codes.ResourceExhausted, "resource_limit")
+	}
+	defer s.bytes.Add(-3 * 32768)
+	ctx, cancel := context.WithCancel(stream.Context())
+	defer cancel()
+	recv := make(chan batchReceived, 1)
+	go func() {
+		for {
+			b, err := stream.Recv()
+			select {
+			case recv <- batchReceived{b, err}:
+			case <-ctx.Done():
+				if b != nil {
+					for _, x := range b.Frames {
+						if st := x.GetFrame().GetStart(); st != nil {
+							clear(st.ApiKey)
+						}
+					}
+				}
+				return
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+	out := make(chan *pb.ObservationAckBatch, 1)
+	writeErrors := make(chan error, 1)
+	var writing atomic.Int64
+	var queued atomic.Int64
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case a := <-out:
+				writing.Store(time.Now().UnixNano())
+				err := stream.Send(a)
+				writing.Store(0)
+				queued.Add(-1)
+				if err != nil {
+					select {
+					case writeErrors <- err:
+					default:
+					}
+					return
 				}
 			}
 		}
-		e.ObservationStatus = &observation
-		e.BusinessOutcome = &business
-		e.AnomalyCodes = append([]string{}, p.Anomalies...)
-		if e.IdentityStatus != "known" {
-			e.AnomalyCodes = events.Add(e.AnomalyCodes, "identity_invalid")
+	}()
+	states := map[uint64]*observation{}
+	pending := map[uint64]*observation{}
+	acks := map[uint64]*pb.ObservationAck{}
+	var deadlines observationDeadlines
+	var batchSeq, sentSeq, lastCapture uint64
+	finish := func(o *observation, reason string) {
+		if o.reason == "" {
+			o.reason = reason
 		}
-		e.UsageStatus, _ = events.Status(p.Usage)
-		_, conflict := events.Status(p.Usage)
-		if conflict || p.Conflict {
-			e.UsageStatus = "conflict"
+		pending[o.capture] = o
+		if o.timer != nil && o.timer.idx >= 0 {
+			heap.Remove(&deadlines, o.timer.idx)
 		}
-		eligible := observation == "complete" && e.UsageStatus == "known"
-		for _, a := range e.AnomalyCodes {
-			if a != "invalid_model" && a != "identity_invalid" {
-				eligible = false
+	}
+	drain := func() {
+		for id, o := range pending {
+			if o.reason != "" && o.pollLookup() {
+				o.finalize()
+				acks[id] = &pb.ObservationAck{ObservationId: o.e.ObservationID, AcceptedFrameSeq: o.seq, CloseStream: true, Reason: ackReason(o.reason)}
+				delete(states, id)
+				delete(pending, id)
+				s.bytes.Add(-o.reservation)
+				s.active.Add(-1)
+			} else if o.reason == "" && o.pollLookup() {
+				delete(pending, id)
 			}
 		}
-		e.UsageEligible = eligible
-		s.Sink.Emit(e)
-		s.Health.Count("observer_finalized")
-		logging.Debug("observation_finalized", "observation_id", e.ObservationID, "reason", reason, "usage_status", e.UsageStatus, "duration_ms", time.Since(started).Milliseconds())
+	}
+	flush := func() {
+		if batchSeq == 0 || (len(acks) == 0 && sentSeq == batchSeq) {
+			return
+		}
+		a := &pb.ObservationAckBatch{AcceptedBatchSeq: batchSeq}
+		ids := []uint64{}
+		for id, ack := range acks {
+			item := &pb.CaptureAck{CaptureId: id, Ack: ack}
+			a.Acks = append(a.Acks, item)
+			if len(a.Acks) > 128 || proto.Size(a) > 32768 {
+				a.Acks = a.Acks[:len(a.Acks)-1]
+				break
+			}
+			ids = append(ids, id)
+		}
+		queued.Add(1)
+		select {
+		case out <- a:
+			sentSeq = batchSeq
+			for _, id := range ids {
+				delete(acks, id)
+			}
+		default:
+			queued.Add(-1)
+		}
 	}
 	defer func() {
-		reason := "transport_lost"
-		if ctx.Err() == context.DeadlineExceeded {
-			reason = "observation_timeout"
+		for _, o := range states {
+			finish(o, "transport_lost")
 		}
-		final(reason, acceptedEnd)
+		deadline := time.Now().Add(2100 * time.Millisecond)
+		for len(states) > 0 && time.Now().Before(deadline) {
+			drain()
+			if len(states) > 0 {
+				time.Sleep(time.Millisecond)
+			}
+		}
+		for id, o := range states {
+			delete(states, id)
+			s.active.Add(-1)
+			s.bytes.Add(-o.reservation)
+		}
 	}()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
 	for {
 		select {
-		case snapshot := <-lookup:
-			freezeLookup(snapshot)
 		case <-ctx.Done():
-			reason := "transport_lost"
-			if ctx.Err() == context.DeadlineExceeded {
-				reason = "observation_timeout"
-			}
-			final(reason, nil)
-			return status.Error(codes.DeadlineExceeded, reason)
+			return ctx.Err()
+		case err := <-writeErrors:
+			s.Health.Count("ack_write_failure")
+			return err
 		case <-ticker.C:
 			if at := writing.Load(); at > 0 && time.Now().UnixNano()-at > int64(2*time.Second) {
-				logging.Failure("observation_ack_timeout", "observer_ack", context.DeadlineExceeded, "timeout_ms", 2000)
-				final("transport_lost", nil)
 				s.Health.Count("ack_write_failure")
 				return status.Error(codes.DeadlineExceeded, "ack_timeout")
 			}
-			if latest != nil {
-				queue(latest)
-				latest = nil
-			}
-		case r := <-recv:
-			if r.err != nil {
-				final("transport_lost", nil)
-				if r.err == io.EOF {
-					return nil
-				}
-				logging.Failure("observation_receive_failed", "observer_receive", r.err, "grpc_status", int(status.Code(r.err)))
-				return status.Error(codes.InvalidArgument, "protocol_error")
-			}
-			f := r.f
-			before := time.Now()
-			valid := f.SchemaVersion == 1 && f.FrameSeq == seq+1 && f.Payload != nil
-			reason := "protocol_error"
-			var end *pb.End
-			if start == nil {
-				st := f.GetStart()
-				if st != nil {
-					defer func() { clear(st.ApiKey); st.ApiKey = nil }()
-				}
-				valid = valid && st != nil && s.validStart(st)
-				if !valid {
-					return status.Error(codes.InvalidArgument, "protocol_error")
-				}
-				id, err := s.newID()
-				if err != nil {
-					return status.Error(codes.Unavailable, "random_source")
-				}
-				snapshot := s.emptySnapshot(st, "lookup_timeout")
-				lookup = s.beginResolve(ctx, st)
-				start = st
-				logging.Debug("observation_started", "observation_id", id, "config_version", st.ConfigVersion)
-				st.RouteName = routeinfo.Name(st.RouteName)
-				e = &snapshot
-				e.SchemaVersion, e.EventID, e.EventType = events.SchemaVersion, id+":start", "request_started"
-				e.LogicalRequestID, e.ObservationID, e.ObservationScope = st.LogicalRequestId, id, "gateway_response"
-				e.UserID, e.UserAgent = st.UserId, st.UserAgent
-				e.RequestHeaders = make(map[string]string, len(st.RequestHeaders))
-				for k, v := range st.RequestHeaders {
-					e.RequestHeaders[k] = v
-				}
-				e.XRequestID, e.ProducerID, e.GatewayInstanceID = st.XRequestId, s.Cfg.ProducerID, st.GatewayInstanceId
-				e.ConfigVersion, e.AdapterID, e.RouteName = st.ConfigVersion, st.AdapterId, st.RouteName
-				e.RequestStartedAtMs, e.EventCreatedAtMs = st.RequestStartedAtMs, time.Now().UnixMilli()
-				e.UsageStatus, e.RawUsageJSON = "not_applicable", "{}"
-				e.AnomalyCodes = []string{}
-				if st.RequestStartedAtMs < time.Now().UnixMilli()-300000 {
-					e.AnomalyCodes = events.Add(e.AnomalyCodes, "clock_anomaly")
-				}
-				eos[0] = st.RequestEndStream
-				p.Content(true, st.RequestContentType, st.RequestContentEncoding)
-				seq = f.FrameSeq
-				queue(&pb.ObservationAck{ObservationId: id, AcceptedFrameSeq: seq, Reason: "accepted"})
-				continue
-			}
-			if st := f.GetStart(); st != nil {
-				clear(st.ApiKey)
-				st.ApiKey = nil
-				valid = false
-			}
-			if h := f.GetResponseHeaders(); h != nil {
-				valid = valid && !headers && h.HttpStatus >= 200 && h.HttpStatus <= 599 && len(h.ContentType) <= 128 && len(h.ContentEncoding) <= 128
-				if valid {
-					headers = true
-					eos[1] = h.EndStream
-					statusCode = events.Ptr(int64(h.HttpStatus))
-					p.Content(false, h.ContentType, h.ContentEncoding)
+			now := time.Now()
+			for len(deadlines) > 0 && !deadlines[0].at.After(now) {
+				d := heap.Pop(&deadlines).(*observationDeadline)
+				if o := states[d.capture]; o != nil {
+					finish(o, "observation_timeout")
 				}
 			}
-			if b := f.GetBodyChunk(); b != nil {
-				d := int(b.Direction) - 1
-				valid = valid && d >= 0 && d < 2
-				if valid {
-					valid = !eos[d] && b.BodySeq == bodySeq[d]+1 && b.Offset == offset[d] && uint64(len(b.Data)) <= math.MaxUint64-offset[d] && len(b.Data) <= 16384 && (len(b.Data) > 0 || b.EndStream) && (d == 0 || headers)
-					if valid {
-						needed := int64(3*32768 + 16*(len(p.Request)+len(p.Response)+len(b.Data)+262144))
-						if needed > reservation {
-							if !s.reserve(needed - reservation) {
-								valid = false
-								reason = "resource_limit"
-							} else {
-								reservation = needed
+			drain()
+			flush()
+		case rec := <-recv:
+			if rec.err != nil {
+				if rec.err == io.EOF {
+					for _, o := range states {
+						finish(o, "transport_lost")
+					}
+					for len(states) > 0 {
+						drain()
+						flush()
+						if len(states) > 0 {
+							select {
+							case <-ctx.Done():
+								return ctx.Err()
+							case <-time.After(time.Millisecond):
 							}
 						}
-						if valid {
-							if d == 1 && len(b.Data) > 0 {
-								p.SetElapsed(b.ObservedElapsedUs)
-							}
-							err := p.Feed(d == 0, b.Data, b.EndStream)
-							if err != nil {
-								valid = false
-								if err == chatcompletions.ErrLimit {
-									reason = "parse_limit"
-								}
-							}
-							bodySeq[d] = b.BodySeq
-							offset[d] += uint64(len(b.Data))
-							eos[d] = b.EndStream
-						}
 					}
-				}
-			}
-			if t := f.GetEnd(); t != nil {
-				valid = valid && t.LastRequestBodySeq == bodySeq[0] && t.LastResponseBodySeq == bodySeq[1] && t.RequestBytesSeen == offset[0] && t.ResponseBytesSeen == offset[1] && t.RequestEndStreamSeen == eos[0] && t.ResponseEndStreamSeen == eos[1] && t.RequestFinishedAtMs > 0 && t.RequestFinishedAtMs <= 253402300799999
-				if t.HttpStatus != nil {
-					valid = valid && statusCode != nil && int64(*t.HttpStatus) == *statusCode
-				}
-				if t.UpstreamAttemptCount != nil {
-					valid = valid && *t.UpstreamAttemptCount >= 1 && *t.UpstreamAttemptCount <= 2147483647
-				}
-				if valid {
-					end = t
-				}
-			}
-			work += time.Since(before)
-			if work > 100*time.Millisecond {
-				valid = false
-				reason = "parse_limit"
-			}
-			if !valid {
-				id := e.ObservationID
-				queue(&pb.ObservationAck{ObservationId: e.ObservationID, AcceptedFrameSeq: seq, Reason: "accepted"})
-				final(reason, nil)
-				queue(&pb.ObservationAck{ObservationId: id, AcceptedFrameSeq: seq, CloseStream: true, Reason: reason})
-				return status.Error(codes.InvalidArgument, reason)
-			}
-			seq = f.FrameSeq
-			latest = &pb.ObservationAck{ObservationId: e.ObservationID, AcceptedFrameSeq: seq, Reason: "accepted"}
-			if end != nil {
-				acceptedEnd = end
-				done := make(chan error, 1)
-				a := ackWrite{a: &pb.ObservationAck{ObservationId: e.ObservationID, AcceptedFrameSeq: seq, Reason: "accepted"}, done: done}
-				select {
-				case <-acks:
-				default:
-				}
-				select {
-				case acks <- a:
-				case <-ctx.Done():
-					return ctx.Err()
-				}
-				select {
-				case err := <-done:
-					if err != nil {
-						final("transport_lost", end)
-						s.Health.Count("ack_write_failure")
-						return status.Error(codes.Unavailable, "ack_write_failure")
-					}
-					final("finalized", end)
-					if e != nil {
-						closed := make(chan error, 1)
-						select {
-						case acks <- ackWrite{a: &pb.ObservationAck{ObservationId: e.ObservationID, AcceptedFrameSeq: seq, CloseStream: true, Reason: "finalized"}, done: closed}:
-						case <-ctx.Done():
+					// Drain the bounded ACK writer before closing the transport.
+					until := time.Now().Add(2 * time.Second)
+					for {
+						flush()
+						if len(acks) == 0 && sentSeq == batchSeq && queued.Load() == 0 {
 							return nil
 						}
+						if time.Now().After(until) {
+							return status.Error(codes.DeadlineExceeded, "ack_timeout")
+						}
 						select {
-						case err := <-closed:
-							if err != nil {
-								s.Health.Count("ack_write_failure")
-							}
 						case <-ctx.Done():
-						case <-time.After(2 * time.Second):
-							s.Health.Count("ack_write_failure")
+							return ctx.Err()
+						case err := <-writeErrors:
+							return err
+						case <-time.After(time.Millisecond):
 						}
 					}
-					return nil
-				case <-ctx.Done():
-					return ctx.Err() // Deferred finalization preserves the valid End.
-				case <-time.After(2 * time.Second):
-					final("transport_lost", nil)
-					s.Health.Count("ack_write_failure")
-					return status.Error(codes.DeadlineExceeded, "ack_timeout")
+				}
+				return rec.err
+			}
+			b := rec.batch
+			if b == nil || b.BatchSeq != batchSeq+1 || len(b.Frames) == 0 || len(b.Frames) > 128 || proto.Size(b) > 32768 {
+				return status.Error(codes.InvalidArgument, "protocol_error")
+			}
+			batchSeq = b.BatchSeq
+			for _, item := range b.Frames {
+				id, f := item.CaptureId, item.Frame
+				if id == 0 || f == nil {
+					return status.Error(codes.InvalidArgument, "protocol_error")
+				}
+				o := states[id]
+				if o == nil {
+					// Capture keys increase within each transport and are never reused.
+					// Late frames after a close/cancel need no unbounded tombstone map.
+					if id <= lastCapture {
+						if st := f.GetStart(); st != nil {
+							clear(st.ApiKey)
+						}
+						continue
+					}
+					lastCapture = id
+					var err error
+					o, err = s.start(ctx, id, f)
+					if err != nil {
+						uuid, randomErr := s.newID()
+						if randomErr != nil {
+							return status.Error(codes.Unavailable, "random_source")
+						}
+						acks[id] = &pb.ObservationAck{ObservationId: uuid, AcceptedFrameSeq: f.FrameSeq, CloseStream: true, Reason: ackReason(err.Error())}
+						continue
+					}
+					states[id] = o
+					pending[id] = o
+					o.timer = &observationDeadline{at: time.Now().Add(time.Duration(s.Cfg.MaxObservationMS) * time.Millisecond), capture: id, idx: -1}
+					heap.Push(&deadlines, o.timer)
+					acks[id] = &pb.ObservationAck{ObservationId: o.e.ObservationID, AcceptedFrameSeq: 1, Reason: "accepted"}
+				} else if o.reason == "" {
+					if reason := o.feed(f); reason != "" {
+						finish(o, reason)
+					}
+					acks[id] = &pb.ObservationAck{ObservationId: o.e.ObservationID, AcceptedFrameSeq: o.seq, Reason: "accepted"}
 				}
 			}
-			if seq%8 == 0 {
-				queue(latest)
-				latest = nil
-			}
+			drain()
+			flush()
 		}
+	}
+}
+func ackReason(reason string) string {
+	switch reason {
+	case "finalized", "protocol_error", "parse_limit", "resource_limit", "observation_timeout":
+		return reason
+	default:
+		return "protocol_error"
 	}
 }
 func validIdentity(s *string) bool     { return s != nil && validString(*s, 128) }

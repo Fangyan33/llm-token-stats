@@ -3,211 +3,225 @@ package main
 import (
 	"bytes"
 	"container/heap"
-	"strings"
+	"encoding/binary"
+	"strconv"
 	"testing"
 	"time"
 
+	pb "github.com/Fangyan33/llm-token-stats/gen/observation/v1"
+	w "github.com/Fangyan33/llm-token-stats/pkg/observationwire"
+	"github.com/tetratelabs/proxy-wasm-go-sdk/proxywasm"
 	"github.com/tetratelabs/proxy-wasm-go-sdk/proxywasm/proxytest"
 	"github.com/tetratelabs/proxy-wasm-go-sdk/proxywasm/types"
+	"google.golang.org/protobuf/proto"
 )
 
-func rewriteHost(t *testing.T) (proxytest.HostEmulator, *root, uint32) {
-	t.Helper()
-	h, r := testHostAndRoot(t, "", nil, "test", "gateway")
+func selectedRequest(h proxytest.HostEmulator) uint32 {
 	id := h.InitializeHttpContext()
 	h.CallOnRequestHeaders(id, [][2]string{{":method", "POST"}, {":path", "/v1/chat/completions"}, {":authority", "model.example.invalid"}, {"content-type", "application/json"}}, false)
-	return h, r, id
+	return id
 }
-
-// Expire deadlines without sleeps; real tick cadence is covered in Envoy E2E.
-func expireRewrite(r *root, id uint32) {
-	h := r.requests[id]
-	h.rewriteUntil = time.Now().Add(-time.Second)
-	h.timer.at = h.rewriteUntil
-	heap.Fix(&r.rewriteQ, h.timer.idx)
-}
-
-func assertReleased(t *testing.T, r *root) {
-	t.Helper()
-	if len(r.requests) != 0 || len(r.rewriteQ) != 0 || r.rewrites != 0 || r.rewriteBytes != 0 {
-		t.Fatal("rewrite reservation or timer leaked")
-	}
-}
-
-func TestExpiredBodyCallbackPassesOriginalWithoutTick(t *testing.T) {
-	for _, eos := range []bool{false, true} {
-		t.Run(map[bool]string{false: "fragment", true: "eos"}[eos], func(t *testing.T) {
-			h, r, id := rewriteHost(t)
-			prefix := []byte(`{"stream":true,`)
-			tail := []byte(`"messages":[]}`)
-			if h.CallOnRequestBody(id, prefix, false) != types.ActionPause {
-				t.Fatal("expected buffered prefix")
+func TestRequestBodyNeverReadOrPaused(t *testing.T) {
+	for _, size := range []int{29, 262145, 1 << 20, 32 << 20, 32<<20 + 1} {
+		t.Run(strconv.Itoa(size), func(t *testing.T) {
+			h, r := testHostAndRoot(t, "", nil, "test", "gateway")
+			id := selectedRequest(h)
+			before := r.inflight
+			for _, op := range []string{"read_request_body", "replace_request_body", "continue_request"} {
+				proxytest.FailNextHostCalls(op, 1)
 			}
-			expireRewrite(r, id)
-			if h.CallOnRequestBody(id, tail, eos) != types.ActionContinue || !bytes.Equal(h.GetCurrentRequestBody(id), append(prefix, tail...)) {
-				t.Fatal("late callback must release original accumulated body")
-			}
-			assertReleased(t, r)
-		})
-	}
-}
-
-func TestRewriteHostFailuresPassOriginal(t *testing.T) {
-	for _, failure := range []string{"read_request_body", "replace_request_body"} {
-		t.Run(failure, func(t *testing.T) {
-			h, r, id := rewriteHost(t)
-			prefix, tail := []byte(`{"stream":true,`), []byte(`"messages":[]}`)
-			h.CallOnRequestBody(id, prefix, false)
-			proxytest.FailNextHostCalls(failure, 1)
-			if h.CallOnRequestBody(id, tail, true) != types.ActionContinue || !bytes.Equal(h.GetCurrentRequestBody(id), append(prefix, tail...)) {
-				t.Fatal("host failure changed or blocked original body")
-			}
-			assertReleased(t, r)
-		})
-	}
-}
-
-func TestBufferedRewriteSurvivesObservationFailure(t *testing.T) {
-	h, r, id := rewriteHost(t)
-	if h.GetTickPeriod() != 10 {
-		t.Fatal("rewrite recovery tick must be 10ms")
-	}
-	prefix, tail := []byte(`{"stream":true,`), []byte(`"messages":[],"stream_options":{"include_usage":false}}`)
-	if h.CallOnRequestBody(id, prefix, false) != types.ActionPause {
-		t.Fatal("prefix was not buffered")
-	}
-	call := proxytest.GrpcCalls()[0]
-	proxytest.EmitGrpcClose(proxytest.PluginContextID, call.Token, 14)
-	if h.CallOnRequestBody(id, tail, true) != types.ActionContinue {
-		t.Fatal("observation failure blocked rewrite")
-	}
-	want := []byte(`{"stream":true,"messages":[],"stream_options":{"include_usage":true}}`)
-	if !bytes.Equal(h.GetCurrentRequestBody(id), want) {
-		t.Fatal("buffered request must still overwrite include_usage after observer failure")
-	}
-	assertReleased(t, r)
-}
-
-func TestRewriteInvalidOrOversizedBodyPassesOriginal(t *testing.T) {
-	for name, body := range map[string][]byte{"invalid": []byte(`{"stream":true,broken`), "oversized": []byte(strings.Repeat("x", 262145))} {
-		t.Run(name, func(t *testing.T) {
-			h, r, id := rewriteHost(t)
+			body := bytes.Repeat([]byte("x"), size)
 			if h.CallOnRequestBody(id, body, true) != types.ActionContinue || !bytes.Equal(h.GetCurrentRequestBody(id), body) {
-				t.Fatal("invalid/oversized body was changed or blocked")
+				t.Fatal("body changed or paused")
 			}
-			assertReleased(t, r)
+			for _, op := range []string{"read_request_body", "replace_request_body", "continue_request"} {
+				if proxytest.RemainingHostFailures(op) != 1 {
+					t.Fatalf("forbidden hostcall %s", op)
+				}
+			}
+			if r.inflight != before || len(r.states) != 1 {
+				t.Fatal("request size consumed observation budget")
+			}
+			for _, call := range captureCalls(t) {
+				for _, raw := range call.Messages {
+					var f pb.ObservationFrame
+					proto.Unmarshal(raw, &f)
+					if f.GetBodyChunk() != nil {
+						t.Fatal("request body entered transport")
+					}
+				}
+			}
 		})
 	}
 }
-
-func TestResumeFailureRetriedOrReleasedByNextBody(t *testing.T) {
-	for _, failure := range []string{"continue_request", "effective_context"} {
-		for _, next := range []string{"tick", "body", "delete", "reload"} {
-			t.Run(failure+"/"+next, func(t *testing.T) {
-				h, r, id := rewriteHost(t)
-				prefix := []byte(`{"stream":true,`)
-				h.CallOnRequestBody(id, prefix, false)
-				expireRewrite(r, id)
-				proxytest.FailNextHostCalls(failure, 1)
-				h.Tick()
-				if h.GetCurrentHttpStreamAction(id) != types.ActionPause || r.requests[id] == nil || !r.requests[id].passthrough || len(r.rewriteQ) != 1 {
-					t.Fatal("failed resume lost its pending recovery")
-				}
-				switch next {
-				case "tick":
-					expireRewrite(r, id)
-					h.Tick()
-					if h.GetCurrentHttpStreamAction(id) != types.ActionContinue {
-						t.Fatal("retry did not resume")
-					}
-				case "body":
-					tail := []byte(`"messages":[]}`)
-					if h.CallOnRequestBody(id, tail, true) != types.ActionContinue || !bytes.Equal(h.GetCurrentRequestBody(id), append(prefix, tail...)) {
-						t.Fatal("pending recovery must not rewrite or pause again")
-					}
-				case "delete":
-					h.CompleteHttpContext(id)
-				case "reload":
-					h.StartPlugin()
-					if h.GetCurrentHttpStreamAction(id) != types.ActionContinue {
-						t.Fatal("reload did not resume")
-					}
-				}
-				assertReleased(t, r)
-			})
-		}
-	}
-}
-
-func TestTimeoutBeforeBodyNeverCallsResume(t *testing.T) {
-	h, r, id := rewriteHost(t)
-	expireRewrite(r, id)
-	proxytest.FailNextHostCalls("continue_request", 1)
-	h.Tick()
-	assertReleased(t, r)
-	body := []byte(`{"stream":true,"messages":[]}`)
-	if h.CallOnRequestBody(id, body, true) != types.ActionContinue || !bytes.Equal(h.GetCurrentRequestBody(id), body) {
-		t.Fatal("late first body must pass through")
-	}
-	if _, err := h.GetCounterMetric("metering_rewrite_resume_failed_total"); err == nil {
-		t.Fatal("timer tried to resume a request that was never paused")
-	}
-}
-
-func TestRewriteRecoveryPrecedesObservationTimeoutBacklog(t *testing.T) {
-	h, r, id := rewriteHost(t)
-	h.CallOnRequestBody(id, []byte(`{"stream":true,`), false)
-	for i := 0; i < 300; i++ {
-		heap.Push(&r.q, &deadline{at: time.Now().Add(-time.Hour), id: uint32(10000 + i), idx: -1})
-	}
-	expireRewrite(r, id)
-	h.Tick()
-	if h.GetCurrentHttpStreamAction(id) != types.ActionContinue || len(r.q) == 0 {
-		t.Fatal("observation backlog delayed the business resume")
-	}
-	assertReleased(t, r)
-}
-
-func TestMetricFailuresCannotPreventRewriteOrResume(t *testing.T) {
-	for _, failure := range []string{"define_metric", "increment_metric"} {
-		for _, timeout := range []bool{false, true} {
-			t.Run(failure+map[bool]string{false: "/rewrite", true: "/timeout"}[timeout], func(t *testing.T) {
-				h, r, id := rewriteHost(t)
-				proxytest.FailNextHostCalls(failure, 1000)
-				if timeout {
-					h.CallOnRequestBody(id, []byte(`{"stream":true,`), false)
-					expireRewrite(r, id)
-					h.Tick()
-				} else {
-					h.CallOnRequestBody(id, []byte(`{"stream":true,"messages":[]}`), true)
-					if !bytes.Contains(h.GetCurrentRequestBody(id), []byte(`"include_usage":true`)) {
-						t.Fatal("metric failure prevented mandatory rewrite")
-					}
-				}
-				if h.GetCurrentHttpStreamAction(id) != types.ActionContinue {
-					t.Fatal("metric failure blocked business")
-				}
-				assertReleased(t, r)
-			})
-		}
-	}
-}
-
-func TestInvalidReloadAndTickFailureReleasePendingRequests(t *testing.T) {
-	for _, failure := range []string{"identity", "tick_period"} {
+func TestCollectionFaultsNeverPauseBusiness(t *testing.T) {
+	for _, failure := range []string{"grpc_open", "grpc_send", "define_metric", "increment_metric", "tick_period"} {
 		t.Run(failure, func(t *testing.T) {
-			h, r, id := rewriteHost(t)
-			h.CallOnRequestBody(id, []byte(`{"stream":true,`), false)
-			if failure == "identity" {
-				h.SetProperty([]string{"node", "metadata", "NAME"}, []byte("invalid/name"))
-			} else {
-				proxytest.FailNextHostCalls("tick_period", 1)
+			h, r := testHostAndRoot(t, "", nil, "test", "gateway")
+			proxytest.FailNextHostCalls(failure, 1000)
+			if failure == "tick_period" {
+				h.StartPlugin()
 			}
-			h.StartPlugin()
-			if h.GetCurrentHttpStreamAction(id) != types.ActionContinue || r.cfg.Enabled {
-				t.Fatal("bad reload failed to resume old request and disable new collection")
+			id := selectedRequest(h)
+			body := []byte(`{"stream":true,"stream_options":{"include_usage":false}}`)
+			if h.CallOnRequestBody(id, body, true) != types.ActionContinue || !bytes.Equal(h.GetCurrentRequestBody(id), body) {
+				t.Fatal("fault changed business request")
 			}
-			assertReleased(t, r)
+			if h.CallOnResponseHeaders(id, [][2]string{{":status", "200"}, {"content-type", "text/event-stream"}}, false) != types.ActionContinue {
+				t.Fatal("headers blocked")
+			}
+			if h.CallOnResponseBody(id, []byte("data: [DONE]\n\n"), true) != types.ActionContinue {
+				t.Fatal("response blocked")
+			}
+			h.CompleteHttpContext(id)
+			h.Tick()
+			r.cleanup()
+			if len(r.states) != 0 || r.inflight != 0 || r.messages != 0 || len(r.q) != 0 {
+				t.Fatal("fault retained resources")
+			}
 		})
+	}
+}
+func TestMultiplexedBatchesAndCumulativeACK(t *testing.T) {
+	h, r := testHostAndRoot(t, "", nil, "test", "gateway")
+	for i := 0; i < 600; i++ {
+		selectedRequest(h)
+	}
+	h.Tick()
+	calls := proxytest.GrpcCalls()
+	if len(calls) != 4 || len(r.states) != 600 {
+		t.Fatalf("channels=%d observations=%d", len(calls), len(r.states))
+	}
+	seen := map[uint64]bool{}
+	for _, c := range calls {
+		var seq uint64
+		for i, raw := range c.Messages {
+			if len(raw) > 32768 || w.ValidateBatch(raw, false) != nil || c.End[i] {
+				t.Fatal("invalid/half-closed batch")
+			}
+			var b pb.ObservationBatch
+			proto.Unmarshal(raw, &b)
+			if b.BatchSeq != seq+1 || len(b.Frames) > 128 {
+				t.Fatal("batch sequence/bound")
+			}
+			seq = b.BatchSeq
+			for _, f := range b.Frames {
+				if seen[f.CaptureId] {
+					t.Fatal("duplicate capture key")
+				}
+				seen[f.CaptureId] = true
+			}
+		}
+		raw, _ := proto.Marshal(&pb.ObservationAckBatch{AcceptedBatchSeq: seq})
+		proxytest.EmitGrpcReceive(proxytest.PluginContextID, c.Token, raw)
+	}
+	if len(seen) != 600 || r.inflight != 0 || r.messages != 0 {
+		t.Fatal("cumulative ACK did not release writes")
+	}
+	s := r.states[1]
+	raw, _ := proto.Marshal(&pb.ObservationAck{ObservationId: "7f6c2a90-4b13-4b68-9d21-67283e0c5f44", AcceptedFrameSeq: 1, CloseStream: true, Reason: "finalized"})
+	emitCaptureAck(t, s.ch.token, 1, raw)
+	if len(r.states) != 599 {
+		t.Fatal("close affected unrelated observations")
+	}
+	for _, c := range calls {
+		if c.Cancelled {
+			t.Fatal("capture close cancelled shared channel")
+		}
+	}
+	// Duplicate and late ACKs are harmless.
+	emitCaptureAck(t, s.ch.token, 1, raw)
+	r.cleanup()
+}
+func TestACKTimeoutAndObservationTimeoutRelease(t *testing.T) {
+	for _, mode := range []string{"ack", "observation"} {
+		t.Run(mode, func(t *testing.T) {
+			h, r := testHostAndRoot(t, "", nil, "test", "gateway")
+			id := selectedRequest(h)
+			h.Tick()
+			if mode == "ack" {
+				for _, c := range r.channels {
+					if c != nil && len(c.records) > 0 {
+						c.records[0].at = time.Now().Add(-3 * time.Second)
+					}
+				}
+			} else {
+				r.q[0].at = time.Now().Add(-time.Second)
+				heap.Fix(&r.q, 0)
+			}
+			h.Tick()
+			if len(r.states) != 0 || len(r.q) != 0 {
+				t.Fatal("expired observation retained")
+			}
+			if h.CallOnRequestBody(id, []byte("unchanged"), true) != types.ActionContinue {
+				t.Fatal("timeout blocked business")
+			}
+			r.cleanup()
+			if r.inflight != 0 || r.messages != 0 {
+				t.Fatal("cleanup leak")
+			}
+		})
+	}
+}
+func TestPodBudgetSharedAcrossOwners(t *testing.T) {
+	_, r := testHostAndRoot(t, "", nil, "test", "gateway")
+	c := r.cfg
+	c.PodInflightBytes = 2 << 20
+	c.PodInflightMessages = 2048
+	c.PodMaxObservations = 512
+	a, err := newPodBudget(c, "test/shared")
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := newPodBudget(c, "test/shared")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !a.take(1<<20, 1024, 256) || !b.take(1<<20, 1024, 256) || a.take(1, 0, 0) || b.take(0, 1, 0) || a.take(0, 0, 1) {
+		t.Fatal("pod-wide limit violated")
+	}
+	a.give(1<<20, 1024, 256)
+	if !b.take(1<<20, 1024, 256) {
+		t.Fatal("released blocks unavailable")
+	}
+	b.close()
+	a.close()
+	data, _, err := proxywasm.GetSharedData(a.key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 3; i++ {
+		if binary.LittleEndian.Uint64(data[24+i*8:]) != 0 {
+			t.Fatal("shared lease leaked")
+		}
+	}
+	c.PodMaxObservations++
+	if _, err = newPodBudget(c, "test/shared"); err == nil {
+		t.Fatal("mismatched budget reset live ledger")
+	}
+}
+
+func TestFailedNativeCancelRetainsCreditsUntilRelease(t *testing.T) {
+	h, r := testHostAndRoot(t, "", nil, "test", "gateway")
+	id := selectedRequest(h)
+	h.Tick()
+	var c *channel
+	for _, s := range r.states {
+		c = s.ch
+		break
+	}
+	reserved := r.budget.used[0]
+	proxytest.FailNextHostCalls("grpc_cancel", 1)
+	r.failChannel(c, "synthetic_failure")
+	if !c.closing || len(r.states) != 0 || r.budget.used[0] != reserved || r.openChannel(c) {
+		t.Fatal("uncertain native buffers were credited/reopened")
+	}
+	if h.CallOnRequestBody(id, []byte("unchanged"), true) != types.ActionContinue {
+		t.Fatal("cancel fault blocked business")
+	}
+	c.retryAt = time.Now().Add(-time.Second)
+	h.Tick()
+	if c.closing || c.token != 0 || r.inflight != 0 || r.messages != 0 || r.budget.used[0] != 0 {
+		t.Fatal("successful retry did not release credits")
 	}
 }

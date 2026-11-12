@@ -282,18 +282,10 @@ class CollectionContractsTest(unittest.TestCase):
         self.assert_config_invalid(lambda c: c.update(accepted_request_hosts=patterns))
 
     def test_config_resource_relationships(self):
-        changes = [
-            ("stream_inflight_bytes", 131072),
-            ("stream_inflight_messages", 19),
-            ("callback_max_chunks", 3),
-            ("root_inflight_bytes", 1),
-            ("root_rewrite_budget_bytes", 1048576),
-            ("rewrite_reservation_bytes", 262144),
-            ("request_body_max_bytes", 262145),
-            ("rewrite_timeout_ms", 451),
-            ("tick_ms", 11),
-            ("chunk_bytes", 0),
-        ]
+        changes = [("pod_inflight_bytes", 1), ("pod_inflight_messages", 1),
+                   ("transport_streams_per_worker", 17), ("transport_batch_max_bytes", 65536),
+                   ("request_body_max_bytes", 262144), ("rewrite_timeout_ms", 450),
+                   ("tick_ms", 11), ("chunk_bytes", 0)]
         for name, value in changes:
             with self.subTest(field=name):
                 self.assert_config_invalid(lambda c: c.update({name: value}))

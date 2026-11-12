@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"github.com/Fangyan33/llm-token-stats/internal/observation/testutil"
 	"net"
 	"testing"
 	"time"
@@ -119,7 +120,7 @@ func TestCancelledStreamRetainsIndependentResults(t *testing.T) {
 			defer conn.Close()
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
-			stream, err := pb.NewObservationServiceClient(conn).Observe(ctx)
+			stream, err := testutil.New(conn).Observe(ctx)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -148,9 +149,8 @@ func TestCancelledStreamRetainsIndependentResults(t *testing.T) {
 				customer = "mapped"
 			}
 			assertFrozenPair(t, k, service, customer)
-			if srv.bytes.Load() != 0 {
-				t.Fatal("parser reservation leaked")
-			}
+			cancel() // Shared transport outlives a single observation deadline.
+			awaitLookup(t, func() bool { return srv.bytes.Load() == 0 })
 		})
 	}
 }
@@ -283,7 +283,7 @@ func TestEndACKFailurePreservesEndAndFinalizesOnce(t *testing.T) {
 				stream.frames <- f
 			}
 			done := make(chan error, 1)
-			go func() { done <- srv.Observe(stream) }()
+			go func() { done <- srv.Observe(&testutil.BatchServer{FrameServer: stream}) }()
 			select {
 			case <-done:
 			case <-time.After(4 * time.Second):

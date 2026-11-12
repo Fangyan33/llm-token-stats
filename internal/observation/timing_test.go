@@ -2,6 +2,7 @@ package observation
 
 import (
 	"context"
+	"github.com/Fangyan33/llm-token-stats/internal/observation/testutil"
 	"io"
 	"net"
 	"testing"
@@ -37,7 +38,7 @@ func TestResponseTimingEvents(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer c.Close()
-			stream, err := pb.NewObservationServiceClient(c).Observe(ctx)
+			stream, err := testutil.New(c).Observe(ctx)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -57,7 +58,6 @@ func TestResponseTimingEvents(t *testing.T) {
 				t.Fatal(err)
 			}
 			req := []byte(`{"stream":true,"model":"test"}`)
-			send(&pb.ObservationFrame{Payload: &pb.ObservationFrame_BodyChunk{BodyChunk: &pb.BodyChunk{Direction: pb.Direction_REQUEST, BodySeq: 1, Data: req, EndStream: true}}})
 			ct := "text/event-stream"
 			if mode == "json" {
 				ct = "application/json"
@@ -86,7 +86,7 @@ func TestResponseTimingEvents(t *testing.T) {
 				bytes += uint64(len(b))
 			}
 			if mode != "missing_end" {
-				send(&pb.ObservationFrame{Payload: &pb.ObservationFrame_End{End: &pb.End{RequestFinishedAtMs: now + 1000, LastRequestBodySeq: 1, LastResponseBodySeq: uint64(len(pieces)), RequestBytesSeen: uint64(len(req)), ResponseBytesSeen: bytes, RequestEndStreamSeen: true, ResponseEndStreamSeen: true}}})
+				send(&pb.ObservationFrame{Payload: &pb.ObservationFrame_End{End: &pb.End{RequestFinishedAtMs: now + 1000, LastResponseBodySeq: uint64(len(pieces)), RequestBytesSeen: uint64(len(req)), ResponseBytesSeen: bytes, RequestEndStreamSeen: true, ResponseEndStreamSeen: true}}})
 			}
 			stream.CloseSend()
 			for {

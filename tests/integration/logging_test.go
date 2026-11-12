@@ -62,17 +62,14 @@ func TestWasmLogLevelsAndFailOpen(t *testing.T) {
 				if !strings.Contains(logs, "event=grpc_open_failed") {
 					return false
 				}
-				if level != "error" && !strings.Contains(logs, "event=rewrite_body_limit") {
-					return false
-				}
 				return true
 			})
 			if strings.Contains(logs, secret) || strings.Contains(logs, "level=DEBUG component=wasm") {
 				t.Fatal("Wasm leaked a body/token or emitted DEBUG")
 			}
 			info := strings.Contains(logs, "level=INFO component=wasm event=plugin_configured")
-			warn := strings.Contains(logs, "level=WARN component=wasm event=rewrite_body_limit")
-			if info != (level != "warn" && level != "error") || warn != (level != "error") {
+			warn := strings.Contains(logs, "level=WARN component=wasm event=invalid_log_level")
+			if info != (level != "warn" && level != "error") || warn != (level == "invalid") {
 				t.Fatalf("LOG_LEVEL not applied through real WASI environment: level=%s info=%v warn=%v logs=%s", level, info, warn, logs)
 			}
 			if level == "invalid" && !strings.Contains(logs, "event=invalid_log_level") {

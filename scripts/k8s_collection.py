@@ -121,7 +121,7 @@ def cluster_configs(topic, group, database="metering_development"):
 
 def validate_events(results, rows, gateway_instance_id, producer_ids, topic):
     for result in results:
-        matches = [row for row in rows if row[0] == result['x_request_id']]
+        matches = [row for row in rows if row[0] == result['logical_request_id']]
         require(len(matches) == 2 and {row[1] for row in matches} == {'request_started', 'usage_observed'},
                 '每个请求必须恰有 request_started 和 usage_observed 两条事件')
         require(all(row[8] == gateway_instance_id and row[9] in producer_ids and row[10] == topic for row in matches),
@@ -137,7 +137,7 @@ def validate_events(results, rows, gateway_instance_id, producer_ids, topic):
         expected = ['unknown', 'NULL', 'NULL'] if result['scenario'] == 'unknown' else ['known', '10', '4']
         require(usage[3:6] == expected and usage[7] == ('0' if result['scenario'] == 'unknown' else '1'),
                 '用量或 unknown/NULL 语义不符合预期')
-        result.update(observation_id=usage[2], usage_status=usage[3],
+        result.update(observation_id=usage[2], x_request_id=usage[23], usage_status=usage[3],
                       input_tokens=None if usage[4] == 'NULL' else int(usage[4]),
                       output_tokens=None if usage[5] == 'NULL' else int(usage[5]),
                       gateway_instance_id=usage[8], observer_producer_id=usage[9],
@@ -391,6 +391,7 @@ class Harness:
         headers = {'Host': 'wasm-verify.local', 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + self.credential}
         if request_id:
             headers['x-request-id'] = request_id
+            headers['x-client-request-id'] = request_id
         request = urllib.request.Request(self.url + path, headers=headers,
                                          data=json.dumps(body).encode() if body is not None else None,
                                          method=method)
@@ -452,14 +453,14 @@ class Harness:
             require(status == 200, '模型请求失败')
             if scenario != 'json':
                 require(b'data: [DONE]' in payload, 'SSE 响应不完整')
-            results.append({'scenario': scenario, 'x_request_id': request_id, 'http_status': status,
+            results.append({'scenario': scenario, 'client_sent_x_request_id': request_id, 'logical_request_id': request_id, 'http_status': status,
                             'content_type': headers.get('Content-Type')})
-        ids = ','.join("'" + r['x_request_id'] + "'" for r in results)
-        sql = ('SELECT x_request_id,event_type,observation_id,usage_status,input_tokens,output_tokens,'
+        ids = ','.join("'" + r['logical_request_id'] + "'" for r in results)
+        sql = ('SELECT logical_request_id,event_type,observation_id,usage_status,input_tokens,output_tokens,'
                'observation_status,usage_eligible,gateway_instance_id,producer_id,kafka_topic,route_name,'
                'service_id,provider_id,api_key_id,customer_id,mapping_status,customer_mapping_status,'
-               'cluster_name,deployment_environment,request_host,mapping_version,customer_mapping_version '
-               'FROM metering.events_raw WHERE x_request_id IN (' + ids + ') ORDER BY x_request_id,event_type;')
+               'cluster_name,deployment_environment,request_host,mapping_version,customer_mapping_version,x_request_id '
+               'FROM metering.events_raw WHERE logical_request_id IN (' + ids + ') ORDER BY logical_request_id,event_type;')
 
         def events():
             rows = [line.split('\t') for line in self.sql(sql).splitlines()]
@@ -468,7 +469,7 @@ class Harness:
         producers = {p['metadata']['uid'] for p in self.pods('llm-token-stats-observer')}
         validate_events(results, rows, gateway_instance_id or self.gateway_instance_id, producers, self.topic)
         require(all(row[18] == self.args.kind_cluster for row in rows), '集群配置未固定')
-        raw = self.sql('SELECT event_json FROM metering.events_raw WHERE x_request_id IN (' + ids + ');')
+        raw = self.sql('SELECT event_json FROM metering.events_raw WHERE logical_request_id IN (' + ids + ');')
         require(self.credential not in raw and '"api_key"' not in raw, '事件包含原始凭证')
         write_json(self.output / output_name, results)
         return results
@@ -523,7 +524,7 @@ class Harness:
         after = selected()
         require(after == before, '非白名单请求触发了采集')
         ids = ','.join("'" + result['x_request_id'] + "'" for result in results)
-        count = self.sql('SELECT COUNT(*) FROM metering.events_raw WHERE x_request_id IN (' + ids + ');').strip()
+        count = self.sql('SELECT COUNT(*) FROM metering.events_raw WHERE logical_request_id IN (' + ids + ');').strip()
         require(count == '0', '非白名单请求产生了事件')
         report = {'requests': results, 'selected_before': before, 'selected_after': after, 'event_count': 0}
         write_json(self.output / 'ignored-requests.result.json', report)

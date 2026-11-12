@@ -24,7 +24,8 @@ spec:
               valueFrom: {secretKeyRef: {name: llm-token-stats-kafka-sasl, key: username}}
             - name: KAFKA_PASSWORD
               valueFrom: {secretKeyRef: {name: llm-token-stats-kafka-sasl, key: password}}
-          resources: {requests: {cpu: '500m', memory: 256Mi}, limits: {cpu: '2', memory: 1Gi}}
+          # 配合 10 GiB 解析预算预留运行时、Producer 及连接内存；按实测调整。
+          resources: {requests: {cpu: '2', memory: 2Gi}, limits: {cpu: '8', memory: 12Gi}}
           readinessProbe: {httpGet: {path: /readyz, port: health}}
           livenessProbe: {httpGet: {path: /livez, port: health}}
           volumeMounts: [{name: config, mountPath: /config, readOnly: true}, {name: kafka-tls, mountPath: /secrets/kafka, readOnly: true}]

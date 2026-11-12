@@ -26,7 +26,7 @@ const (
 //
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 type ObservationServiceClient interface {
-	Observe(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[ObservationFrame, ObservationAck], error)
+	Observe(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[ObservationBatch, ObservationAckBatch], error)
 }
 
 type observationServiceClient struct {
@@ -37,24 +37,24 @@ func NewObservationServiceClient(cc grpc.ClientConnInterface) ObservationService
 	return &observationServiceClient{cc}
 }
 
-func (c *observationServiceClient) Observe(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[ObservationFrame, ObservationAck], error) {
+func (c *observationServiceClient) Observe(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[ObservationBatch, ObservationAckBatch], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	stream, err := c.cc.NewStream(ctx, &ObservationService_ServiceDesc.Streams[0], ObservationService_Observe_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
-	x := &grpc.GenericClientStream[ObservationFrame, ObservationAck]{ClientStream: stream}
+	x := &grpc.GenericClientStream[ObservationBatch, ObservationAckBatch]{ClientStream: stream}
 	return x, nil
 }
 
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
-type ObservationService_ObserveClient = grpc.BidiStreamingClient[ObservationFrame, ObservationAck]
+type ObservationService_ObserveClient = grpc.BidiStreamingClient[ObservationBatch, ObservationAckBatch]
 
 // ObservationServiceServer is the server API for ObservationService service.
 // All implementations must embed UnimplementedObservationServiceServer
 // for forward compatibility.
 type ObservationServiceServer interface {
-	Observe(grpc.BidiStreamingServer[ObservationFrame, ObservationAck]) error
+	Observe(grpc.BidiStreamingServer[ObservationBatch, ObservationAckBatch]) error
 	mustEmbedUnimplementedObservationServiceServer()
 }
 
@@ -65,7 +65,7 @@ type ObservationServiceServer interface {
 // pointer dereference when methods are called.
 type UnimplementedObservationServiceServer struct{}
 
-func (UnimplementedObservationServiceServer) Observe(grpc.BidiStreamingServer[ObservationFrame, ObservationAck]) error {
+func (UnimplementedObservationServiceServer) Observe(grpc.BidiStreamingServer[ObservationBatch, ObservationAckBatch]) error {
 	return status.Errorf(codes.Unimplemented, "method Observe not implemented")
 }
 func (UnimplementedObservationServiceServer) mustEmbedUnimplementedObservationServiceServer() {}
@@ -90,11 +90,11 @@ func RegisterObservationServiceServer(s grpc.ServiceRegistrar, srv ObservationSe
 }
 
 func _ObservationService_Observe_Handler(srv interface{}, stream grpc.ServerStream) error {
-	return srv.(ObservationServiceServer).Observe(&grpc.GenericServerStream[ObservationFrame, ObservationAck]{ServerStream: stream})
+	return srv.(ObservationServiceServer).Observe(&grpc.GenericServerStream[ObservationBatch, ObservationAckBatch]{ServerStream: stream})
 }
 
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
-type ObservationService_ObserveServer = grpc.BidiStreamingServer[ObservationFrame, ObservationAck]
+type ObservationService_ObserveServer = grpc.BidiStreamingServer[ObservationBatch, ObservationAckBatch]
 
 // ObservationService_ServiceDesc is the grpc.ServiceDesc for ObservationService service.
 // It's only intended for direct use with grpc.RegisterService,

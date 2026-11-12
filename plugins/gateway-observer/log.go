@@ -96,10 +96,6 @@ func (r *root) logSummary(previous *wasmRepeat) {
 	previous.at = time.Now()
 }
 func (r *root) flushLogs(limit int) {
-	// Never spend logging work ahead of overdue business recovery attempts.
-	if len(r.rewriteQ) > 0 && !r.rewriteQ[0].at.After(time.Now()) {
-		return
-	}
 	for _, previous := range r.logs.repeated {
 		if time.Since(previous.at) >= 30*time.Second {
 			r.logSummary(previous)

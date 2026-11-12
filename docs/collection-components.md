@@ -12,7 +12,7 @@
 
 需要 Go 1.25.0、TinyGo 0.40.1、Python 3.10+、Docker、kind、kubectl、istioctl。插件使用独立模块及仓库内 SDK v0.24.0 扩展副本，依赖由 go.mod/go.sum 锁定。
 
-已安装 Kubernetes 1.22.17 / Istio 1.13.5 的 kind 环境执行 `make k8s-test`：Kafka、Doris、Observer、Consumer、fixture、测试网关及集成测试 Job 全部在隔离命名空间内运行。原有本地 E2E 的下载故障、改写 fail-open、批量/rebalance、写入确认丢失、请求 ID、归属和名称缓存场景均由该入口执行。前置条件和断言见[本地 Kubernetes 测试用例](kubernetes-collection-test.md)。
+已安装 Kubernetes 1.22.17 / Istio 1.13.5 的 kind 环境执行 `make k8s-test`：Kafka、Doris、Observer、Consumer、fixture、测试网关及集成测试 Job 全部在隔离命名空间内运行。原有本地 E2E 的下载故障、正文透传 fail-open、批量/rebalance、写入确认丢失、请求 ID、归属和名称缓存场景均由该入口执行。前置条件和断言见[本地 Kubernetes 测试用例](kubernetes-collection-test.md)。
 
 ```sh
 make test k8s-test
@@ -118,22 +118,19 @@ make generate
 
 `make package` 和 Release 发布脚本会在省略 Host 参数时显式写入 `["*"]`；生成的配置因此匹配全部合法 DNS Host。直接提供给 Wasm 的配置仍按上述缺省、空名单规则处理。
 
-Host 无效或不匹配时，在提取凭据、建立观察流、缓存或改写正文之前直接透传，分别记录 `metering_requests_ignored_invalid_host_total`、`metering_requests_ignored_host_total`，无域名标签。Observer / Consumer 不维护服务或 Host 白名单，仍校验配置版本、协议和字段状态一致性；历史空 Host 诊断事件仍按原事件契约处理。
+Host 无效或不匹配时，在提取凭据、建立观察流、处理响应之前直接透传，分别记录 `metering_requests_ignored_invalid_host_total`、`metering_requests_ignored_host_total`，无域名标签。Observer / Consumer 不维护服务或 Host 白名单，仍校验配置版本、协议和字段状态一致性；历史空 Host 诊断事件仍按原事件契约处理。
 
 升级时先构建新 Wasm、按新摘要渲染并启用含 Host 名单的 EnvoyFilter，再更新 Observer / Consumer 二进制和删除旧名单的配置。下游不接受 `accepted_service_ids` 或 `accepted_request_hosts` 字段。已有离线包必须重新生成；这些校验不代表生产验收。
 
-## 已确认的旧版网关处理
+## 网关响应采集
 
-- 请求头 Continue；符合条件的正文在非 EOS 回调 Pause，EOS 时只修改 `stream_options.include_usage`。请求头可先到上游。这是用户在真实旧版 ext_authz PoC 后确认的调整：暂停头会延迟已缓冲正文回调直到改写超时。
-- 改写从请求头开始计时，默认/最大 450 ms，tick 默认/最大 10 ms，目标在 500 ms 内原文放行；允许调度拥塞或恢复调用暂时失败时短暂超出。正文回调及解析结束均检查截止时间。旧合法配置中的 2000 ms/100 ms 在运行时收紧，新发布配置须通过更严格校验。
-- 超时优先恢复业务，不复制缓冲前缀、不等待旁路清理；恢复失败保留状态并在后续 tick 重试，下一次正文回调直接透传。改写恢复队列独立于观察超时，指标失败不会 panic。配置更新先恢复存量请求；取消的观察保持 partial/unknown。VM 或 Envoy 自身失效仍不能由插件定时器保证恢复。
-- 改写预算与观察预算独立；Observer 不可用仍可补充参数。超限、超时或 JSON 无效时恢复原文，响应正文一直 Continue。旧版真实慢上传 PoC 中，Root 异步 Resume 后尾片可能不再完整经过 Wasm 回调，因此超时恢复会取消观察且不再复制缓冲前缀，结果保留 partial/unknown，不宣称完整用量。JSON 校验限制深度 64、元素 100000、单对象键 8192；超限取消解析/原文放行。这些额外保护可能使复杂合法 JSON 降级，不能宣称所有请求均能改写。
-- 当前 Wasm 配置资源整数还限制在有符号 32 位正值范围，防止 TinyGo wasm32 的长度转换溢出；给出的初值全部满足。预发布仍必须运行 Schema 与关系校验。
-- 当前默认规则为 `route_name: "*"`，忽略路由名，采集匹配顶层 `accepted_request_hosts` 的 `POST /v1/chat/completions`；路由属性或 metadata 缺失也可命中。路径去掉查询串后精确匹配，其它方法、尾斜杠、子路径和不同路径均忽略。精确路由规则仍支持：先读取可信 `route_name`，缺失时读取 `route_metadata.filter_metadata.metering.route_name`，都不可读时该精确规则不命中。规则按配置顺序选择，不读取客户端提供的路由或身份头。
-服务及供应商由 Observer 的服务查询接口解析，客户/API Key ID 由客户接口解析；空 URI 为占位，启用 HTTP/HTTPS 适配后同时保存名称。route_name 仅诊断，不参与身份摘要；旧 accepted_routes、身份元数据配置及规则 service_id 已删除。同一事件不同内容仍冲突。
-- trailers 只产生零字节 EOS BodyChunk，不上传其内容。End 校验两个方向的片序、偏移、字节总数及 EOS；HTTP context 删除后只由 Root+token 处理迟到 ACK，不能延长业务生命周期。
-- 上游重复伪造的计量响应头先全部移除；Start ACK 已到才加入一个 Observer UUID。快响应允许头缺失；有头也不保证事件已入 Kafka/Doris。
-- 固定 franz-go 的 `RecordRetries(0)` 阻止首次发送，实际使用 1 表示仅一次尝试。发送超时/重试次数耗尽保守计为 uncertain，不补发。3 秒 watchdog 关闭超龄 Producer，额外 1 秒内不能释放则退出进程。
+请求头和正文直接 Continue，不读取、解析、缓冲或改写请求正文。模型服务负责返回 usage；缺失时保存 null/unknown，request_model 固定 null。响应按最多 16 KiB 分片旁路发送，保留原回调时间；SSE/usage/TTFT/TPOT 解析均在 Observer。
+
+每个 Worker 默认 4 条长期 gRPC 流复用独立观察；批次最多 32 KiB、128 帧或等待 10 ms，采用累计批次 ACK。单个观察的关闭不关闭共享传输；ACK 超过 2 秒、传输故障或 Pod 级额度不足时放弃受影响观察并放行业务。观察最大 600 秒，Observer 为 605 秒。
+
+SharedData CAS 分块额度覆盖 Pod 中同 vm_id 的所有 Worker：默认 131072 个观察、256 MiB 待发及未确认载荷、524288 条记录。vm_id 必须稳定且该 Pod 只能安装一个采集实例；不能按 Worker 或发布代数重复配置额度。额度配置不同会停用新实例采集，调整额度须重启 Pod。详细协议、配置和 RSS 验收边界见[实现方案](gateway-request-collection-implementation.md)。
+
+本次直接替换 Wasm–Observer 内部协议，不兼容旧逐请求传输端点；两端必须配套更新。Kafka/Doris 事件格式不变，升级期间仍须验证业务透传。Observer 默认允许 1048576 个观察，parser_budget_bytes 为 10 GiB（实际保留内存按需计账），可配置至 64 GiB；生产应按实际响应并发配置资源和实例数。
 
 ## 服务配置与部署
 
@@ -190,7 +187,7 @@ sha256sum dist/gateway-observer-v1.wasm dist/gateway-observer.download.wasm
 
 ECDS 内部名称按配置摘要隔离；Kubernetes EnvoyFilter 名称仍固定。重推时原子更新 EXTENSION_CONFIG 和 HTTP_FILTER 的订阅名称，保留 Wasm 参数与 VM 初始化配置，避免反复复用旧监听器上下文。固定旧版 Envoy 存在 [ECDS 上下文生命周期问题](https://github.com/envoyproxy/envoy/issues/14930#issuecomment-1240343729)，本地曾复现，不能仅凭 fail_open 或缓存开关认定更新安全；本次回归要求无意外重启。
 
-首次缓存缺失会 NACK 并后台下载。旧版控制面不因 NACK 自动重推；首次安装、下载恢复、网关重启或扩容后运行 `python3 scripts/reload_gateway_filter.py --context CONTEXT --gateway-namespace NAMESPACE --envoyfilter-name NAME`。命令默认等待 120 秒，每 15 秒重试，不重启 Pod，随分发包携带。使用目标 ECDS 加载计数及配置/身份错误增量确认加载；实际激活仍需用 SSE 改写与 Kafka/Doris 事件验证，普通 `config_dump` 中的订阅或业务 200 都不足以证明采集已工作。
+首次缓存缺失会 NACK 并后台下载。旧版控制面不因 NACK 自动重推；首次安装、下载恢复、网关重启或扩容后运行 `python3 scripts/reload_gateway_filter.py --context CONTEXT --gateway-namespace NAMESPACE --envoyfilter-name NAME`。命令默认等待 120 秒，每 15 秒重试，不重启 Pod，随分发包携带。使用目标 ECDS 加载计数及配置/身份错误增量确认加载；实际激活仍需用 SSE 响应采集与 Kafka/Doris 事件验证，普通 `config_dump` 中的订阅或业务 200 都不足以证明采集已工作。
 
 清单使用块式 YAML，插件参数通过 `Struct` YAML 映射传入；旧版 Envoy 将 Struct 作为 Protobuf 二进制传递，新 Wasm 已支持该格式；既有独立 JSON 输入继续支持。新 Wasm 支持有界 Protobuf Struct 和严格 JSON，并复用字段、Host、身份与预算校验；解析失败只禁用采集，保持业务透传。Struct 解码无反射并有深度/节点界限，拒绝重复键、非法 UTF-8、非整数/非有限数，维持 64 KiB 上限及 `schema_version=1`。VM 内不使用依赖 panic/recover 的 YAML 解析器。TinyGo 构建固定 `-buildmode=wasi-legacy`，避免命令式 WASI 入口调用 `proc_exit`；ABI 检查同时拒绝套接字、文件系统和进程退出导入。
 
@@ -224,7 +221,7 @@ Consumer 按 Kafka 分区跨多次拉取攒批：达到 `max_batch_rows`（默�
 
 统计/查询 HTTP API 尚未实现。usage-worker 已实现基于日期通知的 T+1 日/月物化视图刷新和恢复；成功状态说明对应日期的已观察数据完成计算，不代表 Kafka 已消费到最新或不存在历史缺口。需同时核对消费凭据、offset 和 consumer_partition_gaps，不能把 Consumer 健康探针当作完整性证明。运行及回填见[Doris 调度与恢复](doris-summary-coordination.md)。
 
-固定指标不携带 UUID、身份或正文标签。Wasm 暴露选择/忽略、改写/取消原因与 active_streams/inflight_bytes/inflight_messages/active_rewrites/rewrite_reserved_bytes；Observer 暴露 active_streams/parser_reserved_bytes、定稿与发送结果；Consumer 暴露 batch_committed/batch_failure、partition_paused、audit/watermark 状态。服务均有 `/livez`、`/readyz`、`/metrics`。资源预算是记账上限，尚需加上 Go/VM heap、HTTP2/native buffer 及存活代数，不能等同于 RSS 承诺。
+固定指标不携带 UUID、身份或正文标签。Wasm 暴露选择/忽略、取消原因与 active_streams/inflight_bytes/inflight_messages；Observer 暴露 active_observations/parser_reserved_bytes、定稿与发送结果；Consumer 暴露 batch_committed/batch_failure、partition_paused、audit/watermark 状态。服务均有 `/livez`、`/readyz`、`/metrics`。资源预算是记账上限，尚需加上 Go/VM heap、HTTP2/native buffer 及存活代数，不能等同于 RSS 承诺。
 
 ## 验证记录与未完成门槛
 

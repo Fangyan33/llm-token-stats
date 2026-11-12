@@ -10,25 +10,19 @@
     "observer_cluster",
     "routes",
     "chunk_bytes",
-    "callback_max_bytes",
-    "callback_max_chunks",
-    "request_body_max_bytes",
-    "rewrite_timeout_ms",
-    "rewrite_reservation_bytes",
-    "root_rewrite_budget_bytes",
-    "root_max_rewrites",
     "response_body_max_bytes",
-    "stream_inflight_bytes",
-    "stream_inflight_messages",
-    "root_max_streams",
-    "root_inflight_bytes",
-    "root_inflight_messages",
     "ack_timeout_ms",
     "end_ack_timeout_ms",
     "observation_max_ms",
     "tick_ms",
     "metadata_max_bytes",
-    "ack_max_bytes"
+    "ack_max_bytes",
+    "pod_max_observations",
+    "pod_inflight_bytes",
+    "pod_inflight_messages",
+    "transport_streams_per_worker",
+    "transport_batch_max_bytes",
+    "transport_batch_max_frames"
   ],
   "properties": {
     "schema_version": {
@@ -98,80 +92,20 @@
       "minimum": 1,
       "maximum": 16384
     },
-    "callback_max_bytes": {
-      "type": "integer",
-      "minimum": 1,
-      "maximum": 4294967295
-    },
-    "callback_max_chunks": {
-      "type": "integer",
-      "minimum": 1,
-      "maximum": 4294967295
-    },
-    "request_body_max_bytes": {
-      "type": "integer",
-      "minimum": 1,
-      "maximum": 262144
-    },
-    "rewrite_timeout_ms": {
-      "type": "integer",
-      "minimum": 1,
-      "maximum": 450
-    },
-    "rewrite_reservation_bytes": {
-      "type": "integer",
-      "minimum": 1,
-      "maximum": 4294967295
-    },
-    "root_rewrite_budget_bytes": {
-      "type": "integer",
-      "minimum": 1,
-      "maximum": 9223372036854775807
-    },
-    "root_max_rewrites": {
-      "type": "integer",
-      "minimum": 1,
-      "maximum": 4294967295
-    },
     "response_body_max_bytes": {
       "type": "integer",
       "minimum": 1,
       "maximum": 8388608
     },
-    "stream_inflight_bytes": {
-      "type": "integer",
-      "minimum": 1,
-      "maximum": 4294967295
-    },
-    "stream_inflight_messages": {
-      "type": "integer",
-      "minimum": 1,
-      "maximum": 4294967295
-    },
-    "root_max_streams": {
-      "type": "integer",
-      "minimum": 1,
-      "maximum": 4294967295
-    },
-    "root_inflight_bytes": {
-      "type": "integer",
-      "minimum": 1,
-      "maximum": 9223372036854775807
-    },
-    "root_inflight_messages": {
-      "type": "integer",
-      "minimum": 1,
-      "maximum": 4294967295
-    },
     "ack_timeout_ms": {
       "type": "integer",
       "minimum": 1,
-      "maximum": 4294967295
+      "maximum": 2000
     },
     "end_ack_timeout_ms": {
       "type": "integer",
       "minimum": 1,
-      "maximum": 4294967295
+      "maximum": 2000
     },
     "observation_max_ms": {
       "type": "integer",
@@ -192,7 +126,7 @@
     "ack_max_bytes": {
       "type": "integer",
       "minimum": 1,
-      "maximum": 1024
+      "maximum": 32768
     },
     "accepted_request_hosts": {
       "description": "采集 Host 白名单：精确 DNS 域名、*.example.com（任意层级子域名，不含根域名）或 *（所有合法 DNS Host）。缺省或空数组不采集；规则转小写并去末尾根点，拒绝端口、IP、其他通配符和规范化后的重复项。",
@@ -244,6 +178,42 @@
         "maxLength": 128,
         "pattern": "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"
       }
+    },
+    "pod_max_observations": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 2147483647,
+      "default": 131072
+    },
+    "pod_inflight_bytes": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 2147483647,
+      "default": 268435456
+    },
+    "pod_inflight_messages": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 2147483647,
+      "default": 524288
+    },
+    "transport_streams_per_worker": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 16,
+      "default": 4
+    },
+    "transport_batch_max_bytes": {
+      "type": "integer",
+      "minimum": 32768,
+      "maximum": 32768,
+      "default": 32768
+    },
+    "transport_batch_max_frames": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 128,
+      "default": 128
     }
   }
 }

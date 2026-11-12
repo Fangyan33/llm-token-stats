@@ -99,6 +99,8 @@ class DistributionTests(unittest.TestCase):
                                             'topic': 'offline-events'})
         self.assertEqual(observer['observer']['deployment_environment'], 'dev')
         source = json.loads((bundle.ROOT / 'configs/observer.production.example.json').read_text())
+        self.assertNotIn('max_observation_ms', observer['observer'])
+        self.assertEqual(bundle.gateway_configuration(args)['observation_max_ms'], 1800000)
         for kind in ('service_lookup', 'customer_lookup'):
             self.assertEqual(observer['observer'][kind]['cache'], source['observer'][kind]['cache'])
         for settings in (observer['observer'], consumer['consumer']):

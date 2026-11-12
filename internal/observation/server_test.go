@@ -36,7 +36,7 @@ func TestObserveEOSAndOnceFinalization(t *testing.T) {
 			l := bufconn.Listen(1 << 20)
 			h := &health.State{}
 			k := &sink{}
-			srv := &Server{Cfg: config.Observer{ProducerID: "test", ClusterName: "test-cluster", DeploymentEnvironment: "stg", MaxActive: 4, ParserBudget: 64 << 20, MaxObservationMS: 5000, AcceptedConfigs: []string{"v1"}, AcceptedAdapters: []string{"chat_completions_v1"}}, Sink: k, Health: h, ServiceResolver: serviceFake{}, CustomerResolver: customerFake{}}
+			srv := &Server{Cfg: config.Observer{ProducerID: "test", ClusterName: "test-cluster", DeploymentEnvironment: "stg", MaxActive: 4, ParserBudget: 64 << 20, AcceptedConfigs: []string{"v1"}, AcceptedAdapters: []string{"chat_completions_v1"}}, Sink: k, Health: h, ServiceResolver: serviceFake{}, CustomerResolver: customerFake{}}
 			if mode == "unimplemented" {
 				srv.ServiceResolver = nil
 				srv.CustomerResolver = nil
@@ -186,7 +186,7 @@ func TestLookupDoesNotDelayAcksAndHasNoQueue(t *testing.T) {
 	}()
 	entered := make(chan struct{})
 	k := &sink{}
-	srv := &Server{Cfg: config.Observer{ProducerID: "test", ClusterName: "cluster", DeploymentEnvironment: "stg", MaxActive: 4, ParserBudget: 64 << 20, MaxObservationMS: 5000, LookupTimeoutMS: 1500, LookupConcurrency: 1, AcceptedConfigs: []string{"v1"}, AcceptedAdapters: []string{"chat_completions_v1"}}, Sink: k, Health: &health.State{}, CustomerResolver: customerFake{}}
+	srv := &Server{Cfg: config.Observer{ProducerID: "test", ClusterName: "cluster", DeploymentEnvironment: "stg", MaxActive: 4, ParserBudget: 64 << 20, LookupTimeoutMS: 1500, LookupConcurrency: 1, AcceptedConfigs: []string{"v1"}, AcceptedAdapters: []string{"chat_completions_v1"}}, Sink: k, Health: &health.State{}, CustomerResolver: customerFake{}}
 	disableLookupCache(srv)
 	srv.ServiceResolver = serviceFunc(func(ctx context.Context, _ identitylookup.ServiceLookupRequest) (identitylookup.ServiceIdentity, error) {
 		close(entered)

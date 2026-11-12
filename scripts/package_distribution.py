@@ -425,6 +425,11 @@ Wasm Host 白名单：{json.dumps(hosts, ensure_ascii=False)}，同时记录于 
 gateway/disabled/ 和 gateway/enabled/ 分别提供同一工作负载的关闭态与启用态配置。
 打包不查询 Kubernetes，不记录 Pod 名称或 UID。实例标识在运行时读取为 namespace/pod-name。
 
+采集时长只通过 Wasm 的 `observation_max_ms` 配置，省略时及模板默认均为 1800000 ms（30 分钟），
+显式配置范围为 1–3600000 ms（最多 1 小时）。Observer 不再接受 `max_observation_ms`，
+内部固定 1 小时＋5 秒兜底清理，正常结束或取消时立即清理。
+升级已有环境须从 Observer 的 ConfigMap 删除旧字段，先滚动完成 Observer，再更新 Wasm。
+
 归属 API 默认 URI 为空，使用占位实现。启用服务查询时，在 `k8s/20-config.yaml` 的
 `observer.json` 中保留实际 `service_lookup.uri`，将 `service_lookup.credential_env` 设为
 `METERING_SERVICE_LOOKUP_TOKEN`。`credential_env` 只能填写环境变量名，不能填写密钥；

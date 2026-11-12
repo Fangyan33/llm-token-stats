@@ -143,7 +143,7 @@ func testNamesThroughKafkaToDoris(t *testing.T, secure, cached bool) {
 		ttl, stale, retry := 2, 10, 1
 		cache.TTLSeconds, cache.StaleIfErrorSeconds, cache.StaleRetryIntervalSeconds = &ttl, &stale, &retry
 	}
-	pb.RegisterObservationServiceServer(server, &observation.Server{Cfg: config.Observer{ClusterName: "name-tests", DeploymentEnvironment: "dev", ProducerID: "name-tests", MaxActive: 4, ParserBudget: 64 << 20, MaxObservationMS: 5000, LookupTimeoutMS: 1000, LookupConcurrency: 2, ServiceLookup: config.Lookup{Cache: cache}, CustomerLookup: config.Lookup{Cache: cache}, AcceptedConfigs: []string{"collection-v1"}, AcceptedAdapters: []string{"chat_completions_v1"}}, Sink: sink, Health: h, ServiceResolver: service, CustomerResolver: customer})
+	pb.RegisterObservationServiceServer(server, &observation.Server{Cfg: config.Observer{ClusterName: "name-tests", DeploymentEnvironment: "dev", ProducerID: "name-tests", MaxActive: 4, ParserBudget: 64 << 20, LookupTimeoutMS: 1000, LookupConcurrency: 2, ServiceLookup: config.Lookup{Cache: cache}, CustomerLookup: config.Lookup{Cache: cache}, AcceptedConfigs: []string{"collection-v1"}, AcceptedAdapters: []string{"chat_completions_v1"}}, Sink: sink, Health: h, ServiceResolver: service, CustomerResolver: customer})
 	go server.Serve(listener)
 	defer server.Stop()
 	conn, err := grpc.NewClient("passthrough:///names", grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) { return listener.Dial() }), grpc.WithTransportCredentials(insecure.NewCredentials()))

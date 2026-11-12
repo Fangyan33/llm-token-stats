@@ -20,7 +20,7 @@
   "response_body_max_bytes": 8388608,
   "ack_timeout_ms": 2000,
   "end_ack_timeout_ms": 2000,
-  "observation_max_ms": 600000,
+  "observation_max_ms": 1800000,
   "tick_ms": 10,
   "metadata_max_bytes": 6144,
   "ack_max_bytes": 32768,

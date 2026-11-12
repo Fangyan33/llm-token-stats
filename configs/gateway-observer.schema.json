@@ -13,7 +13,6 @@
     "response_body_max_bytes",
     "ack_timeout_ms",
     "end_ack_timeout_ms",
-    "observation_max_ms",
     "tick_ms",
     "metadata_max_bytes",
     "ack_max_bytes",
@@ -110,7 +109,8 @@
     "observation_max_ms": {
       "type": "integer",
       "minimum": 1,
-      "maximum": 600000
+      "maximum": 3600000,
+      "default": 1800000
     },
     "tick_ms": {
       "type": "integer",

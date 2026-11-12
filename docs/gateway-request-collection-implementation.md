@@ -195,7 +195,7 @@ Pod 级 SharedData CAS 账本同时限制观察数、待发及未确认载荷、
 | response_body_max_bytes | 整数 | 8388608 |
 | ack_timeout_ms | 整数 | 2000 |
 | end_ack_timeout_ms | 整数 | 2000 |
-| observation_max_ms | 整数 | 600000 |
+| observation_max_ms | 整数 | 1800000 |
 | tick_ms | 整数 | 10 |
 | metadata_max_bytes | 整数 | 6144 |
 | ack_max_bytes | 整数 | 32768 |
@@ -208,6 +208,8 @@ Pod 级 SharedData CAS 账本同时限制观察数、待发及未确认载荷、
 
 默认总量为 131072 个观察、256 MiB 载荷、524288 条记录。它们不随 Worker 数或发布代数成倍增大；运行时只能使用同 vm_id 的共享账本。发布中须控制同时存活代数，旧新 Wasm 代码可能拥有独立 VM 状态，不能仅凭逻辑额度宣称 RSS 达标。
 
+采集时长只通过 Wasm 的 observation_max_ms 设置，省略时及模板默认均为 1800000 ms（30 分钟），显式配置允许范围 1–3600000 ms（最多 1 小时），0 和 null 不合法。从请求头进入开始计时，包含请求上传、上游等待及流式响应。正常结束立即清理；到期只停止该观察，业务继续透传。ACK 和结束确认超时仍分别受 2000 ms 上限约束，不随采集时长增加。
+
 额外 RSS 上限是每 Pod 2048 MiB，包含 Wasm heap、Envoy native 缓冲、HTTP/2 和元数据。256 MiB 载荷额度不是 RSS 硬上限。取消 hostcall 失败时保留未确认 native 缓冲的额度并重试；卸载时仍失败则保守保留共享额度直至 Pod 重启。VM/Envoy 故障和代码替换期 native 状态的实际释放仍须在目标镜像测量；业务优先。不要通过降低观察数来替代用户最新确认的单 Pod 200 QPS / 60 秒流容量目标。
 
 ## 5. Observer 解析及一次定稿
@@ -215,6 +217,8 @@ Pod 级 SharedData CAS 账本同时限制观察数、待发及未确认载荷、
 ### 5.1 状态管理
 
 每条共享流只有接收、ACK 写入和串行处理协程及有界队列，不按观察创建永久协程、ticker 或 gRPC 流。归属查询只在开始时产生独立有界任务。观察表及超时堆独立定稿，单次 ACK 最多 32 KiB/128 项，阻塞写超过 2 秒结束传输。
+
+Observer 不再接受 max_observation_ms 配置项。内部从接纳 Start 后固定 1 小时＋5 秒清理没有收到 End/Cancel 的观察，避免共享传输仍正常时残留观察永久占用额度；正常 End/Cancel 或传输故障仍会提前清理。更新部署时移除旧配置字段，先更新并确认 Observer 就绪，再更新 Wasm 配置及制品。该兜底不表示所有观察至少保留 1 小时。
 
 取消累计 100 ms 墙钟解析期限和输入 16 倍累计预留。每观察按必要状态及实际保留响应缓冲计账；分配前做有界临时预留，解析后按保留容量归还，较大的已完成 SSE 行/事件立即释放。parser_budget_bytes 默认 10 GiB、最大 64 GiB，按内存实际需要配置 Observer 资源；超过额度只取消采集。max_active_observations 默认/最大 1048576，max_connections 默认 1024、最大 4096。
 
@@ -480,7 +484,7 @@ Consumer/Doris 故障可以依赖 Kafka 72 小时保留恢复，与禁止采集�
   "response_body_max_bytes": 8388608,
   "ack_timeout_ms": 2000,
   "end_ack_timeout_ms": 2000,
-  "observation_max_ms": 600000,
+  "observation_max_ms": 1800000,
   "tick_ms": 10,
   "metadata_max_bytes": 6144,
   "ack_max_bytes": 32768,

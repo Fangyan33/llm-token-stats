@@ -19,13 +19,18 @@ import (
 )
 
 func TestResponseTimingEvents(t *testing.T) {
-	for _, mode := range []string{"sse", "missing_usage", "missing_first_time", "regressing_time", "json", "missing_end", "unsupported"} {
+	for _, mode := range []string{"sse", "hour", "missing_usage", "missing_first_time", "regressing_time", "json", "missing_end", "unsupported"} {
 		t.Run(mode, func(t *testing.T) {
 			k := &sink{}
-			srv := &Server{Cfg: config.Observer{ProducerID: "test", ClusterName: "test-cluster", DeploymentEnvironment: "dev", MaxActive: 4, ParserBudget: 64 << 20, MaxObservationMS: 5000, AcceptedConfigs: []string{"v1"}, AcceptedAdapters: []string{"chat_completions_v1"}}, Sink: k, Health: &health.State{}, CustomerResolver: customerFake{}, ServiceResolver: serviceFunc(func(ctx context.Context, r identitylookup.ServiceLookupRequest) (identitylookup.ServiceIdentity, error) {
+			srv := &Server{Cfg: config.Observer{ProducerID: "test", ClusterName: "test-cluster", DeploymentEnvironment: "dev", MaxActive: 4, ParserBudget: 64 << 20, AcceptedConfigs: []string{"v1"}, AcceptedAdapters: []string{"chat_completions_v1"}}, Sink: k, Health: &health.State{}, CustomerResolver: customerFake{}, ServiceResolver: serviceFunc(func(ctx context.Context, r identitylookup.ServiceLookupRequest) (identitylookup.ServiceIdentity, error) {
 				time.Sleep(40 * time.Millisecond)
 				return serviceFake{}.Resolve(ctx, r)
 			})}
+			if mode == "hour" {
+				// Exercise the fixed safety net near one hour without a wall-clock
+				// wait; it must still accept the final usage and int64 timings.
+				srv.observationNow = func() time.Time { return time.Now().Add(time.Hour) }
+			}
 			l := bufconn.Listen(1 << 20)
 			g := grpc.NewServer(grpc.ForceServerCodec(Codec{}))
 			pb.RegisterObservationServiceServer(g, srv)
@@ -74,8 +79,12 @@ func TestResponseTimingEvents(t *testing.T) {
 				pieces = []string{`{"usage":{"completion_tokens":5}}`}
 			}
 			var bytes uint64
+			elapsed := []int64{100000, 300000, 900000}
+			if mode == "hour" {
+				elapsed = []int64{3540000000, 3599000000, 3600000000}
+			}
 			for i, b := range pieces {
-				us := events.Ptr(int64([]int{100000, 300000, 900000}[i]))
+				us := events.Ptr(elapsed[i])
 				if mode == "missing_first_time" && i == 0 {
 					us = nil
 				}
@@ -86,7 +95,11 @@ func TestResponseTimingEvents(t *testing.T) {
 				bytes += uint64(len(b))
 			}
 			if mode != "missing_end" {
-				send(&pb.ObservationFrame{Payload: &pb.ObservationFrame_End{End: &pb.End{RequestFinishedAtMs: now + 1000, LastResponseBodySeq: uint64(len(pieces)), RequestBytesSeen: uint64(len(req)), ResponseBytesSeen: bytes, RequestEndStreamSeen: true, ResponseEndStreamSeen: true}}})
+				finished := now + 1000
+				if mode == "hour" {
+					finished = now + 3600000
+				}
+				send(&pb.ObservationFrame{Payload: &pb.ObservationFrame_End{End: &pb.End{RequestFinishedAtMs: finished, LastResponseBodySeq: uint64(len(pieces)), RequestBytesSeen: uint64(len(req)), ResponseBytesSeen: bytes, RequestEndStreamSeen: true, ResponseEndStreamSeen: true}}})
 			}
 			stream.CloseSend()
 			for {
@@ -118,10 +131,10 @@ func TestResponseTimingEvents(t *testing.T) {
 			if (e.FirstOutputElapsedUS != nil) != wantFirst || (e.LastOutputElapsedUS != nil) != wantLast {
 				t.Fatalf("timing nullability wrong: %#v", e)
 			}
-			if wantFirst && *e.FirstOutputElapsedUS != 100000 {
+			if wantFirst && *e.FirstOutputElapsedUS != elapsed[0] {
 				t.Fatal("first time changed")
 			}
-			if wantLast && *e.LastOutputElapsedUS != 300000 {
+			if wantLast && *e.LastOutputElapsedUS != elapsed[1] {
 				t.Fatal("usage tail counted as generation")
 			}
 			if mode == "unsupported" {

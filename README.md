@@ -646,7 +646,7 @@ Observer、Consumer、usage-worker 通过环境变量 `LOG_LEVEL=debug|info|warn
 | `response_body_max_bytes` | **8 MiB** | 单个请求允许累计采集的**响应正文**上限。超过后停止该请求的采集。 |
 | `ack_timeout_ms` | **2 秒** | 已发送批次等待 Observer 累计确认的超时。最早未确认批次超时后，关闭对应共享传输，其承载的观察会受到影响。 |
 | `end_ack_timeout_ms` | **2 秒** | 记录业务结束的 End 帧后，等待该观察关闭确认的时间。超时后清理该观察。 |
-| `observation_max_ms` | **10 分钟** | 单条观察的最长持续时间，从请求头进入时开始计时，包含上传、上游处理和流式响应阶段。 |
+| `observation_max_ms` | **30 分钟** | 单条观察的最长持续时间，可配置范围 1–3600000 ms（最多 1 小时）。从请求头进入时开始计时，包含上传、上游处理和流式响应阶段。 |
 | `tick_ms` | **10 毫秒** | 插件定时任务的调度间隔，用于发送未满批的数据、检查超时、分批清理等。实际执行可能受 Worker 忙碌影响。 |
 | `metadata_max_bytes` | **6 KiB** | 单条非正文采集帧的编码大小上限，包括 Start、响应头、End 等。它不限制业务 HTTP 请求头总大小。 |
 | `ack_max_bytes` | **32 KiB** | Wasm 接收的单条 ACK 批次消息大小上限。超限会按采集协议错误处理。 |
@@ -658,6 +658,8 @@ Observer、Consumer、usage-worker 通过环境变量 `LOG_LEVEL=debug|info|warn
 | `transport_batch_max_frames` | **128 帧** | 单个发送批次最多容纳的采集帧数量。同一批次可以包含多个请求的数据。 |
 
 批次达到**字节上限或帧数上限**时发送；未满批的数据由约 10 ms 的 tick 刷新。
+
+观察时长只在 Wasm 配置。Observer 已移除 `max_observation_ms`，内部固定 1 小时＋5 秒兜底清理；正常收到结束或取消时立即清理。更新旧部署需删除 Observer 配置中的该字段，并先更新 Observer、再更新 Wasm。
 
 需要特别注意：
 

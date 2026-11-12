@@ -30,6 +30,20 @@ class CollectionContractsTest(unittest.TestCase):
     def test_fixtures_and_repository_parity(self):
         contracts.validate_repository()
 
+    def test_observation_duration_bounds(self):
+        self.assertEqual(self.config['observation_max_ms'], 1800000)
+
+        config = copy.deepcopy(self.config)
+        del config['observation_max_ms']
+        contracts.validate_config(config)
+        self.assert_config_invalid(lambda c: c.update(observation_max_ms=None))
+        for ms in (1, 1800000, 3600000):
+            config = copy.deepcopy(self.config)
+            config['observation_max_ms'] = ms
+            contracts.validate_config(config)
+        for ms in (-1, 0, 3600001):
+            self.assert_config_invalid(lambda c: c.update(observation_max_ms=ms))
+
     def test_zero_is_reported_not_unknown(self):
         zero = contracts.load(ROOT / "testdata/collection/usage-zero.json")
         contracts.validate_event(zero)

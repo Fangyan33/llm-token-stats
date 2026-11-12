@@ -273,6 +273,10 @@ kubectl --context CONTEXT -n metering set env cronjob/llm-token-stats-usage-work
 
 ## 网关与 Observer 性能配置
 
+观察时长只通过 Wasm 的 `observation_max_ms` 配置：省略时及模板默认均为 1800000 ms（30 分钟），显式配置允许范围 1–3600000 ms（最多 1 小时），不接受 0 或 null。Observer 不接受 `max_observation_ms`，从接纳观察开始固定 1 小时＋5 秒执行兜底清理；正常结束、取消或传输失败会提前清理。升级时从旧 ConfigMap 删除该字段，先滚动完成 Observer，再更新 Wasm 及 EnvoyFilter。
+
+这不会改变 2 秒 ACK/结束确认期限、8 MiB 累计响应采集上限和 Pod 资源额度。调高上限不会让正常结束的请求额外驻留；实际长流的观察并发与 RSS 仍需单独验收，既有 60 秒负载结果不能替代 30 分钟或 1 小时容量验证。
+
 Wasm 的 `metrics_enabled` 默认 `false`，关闭插件自定义 Prometheus Counter/Gauge 的注册及更新，不关闭额度保护、usage、TTFT/TPOT 或 Observer 指标。启用后资源 Gauge 每秒汇总。隔离 Kubernetes 回归显式设为 `true` 以核验插件激活及 Host 筛选；容量对照使用默认关闭配置。
 
 Observer 的 `receive_queue_batches=4096`、`receive_queue_bytes=134217728` 为实例级接收队列总额度，每共享传输最多 128 个待处理批次。先预留解码对象及载荷的保守字节，成功入队后返回累计确认；解析和最终事件处理不阻塞接收确认，满队列只终止采集传输，不重发。累计确认不表示 Kafka 已持久化。

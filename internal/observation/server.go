@@ -33,6 +33,10 @@ import (
 
 type Codec struct{}
 
+// Independent safety net for observations whose End/Cancel never arrives on a
+// still-live shared transport. Wasm alone configures the collection duration.
+const maxObservationDuration = time.Hour + 5*time.Second
+
 func (Codec) Name() string                  { return "proto" }
 func (Codec) Marshal(v any) ([]byte, error) { return proto.Marshal(v.(proto.Message)) }
 func (Codec) Unmarshal(b []byte, v any) error {
@@ -63,6 +67,7 @@ type Server struct {
 	lookups          *lookupState
 	lookupInitErr    error
 	lookupNow        func() time.Time
+	observationNow   func() time.Time // Test clock for deadline expiration only.
 	queueMu          sync.Mutex
 	queueBytes       int64
 	queueBatches     int
@@ -551,6 +556,9 @@ func (s *Server) Observe(stream pb.ObservationService_ObserveServer) error {
 				return status.Error(codes.DeadlineExceeded, "ack_timeout")
 			}
 			now := time.Now()
+			if s.observationNow != nil {
+				now = s.observationNow()
+			}
 			for len(deadlines) > 0 && !deadlines[0].at.After(now) {
 				d := heap.Pop(&deadlines).(*observationDeadline)
 				if o := states[d.capture]; o != nil {
@@ -633,7 +641,7 @@ func (s *Server) Observe(stream pb.ObservationService_ObserveServer) error {
 						}
 						states[id] = o
 						pending[id] = o
-						o.timer = &observationDeadline{at: time.Now().Add(time.Duration(s.Cfg.MaxObservationMS) * time.Millisecond), capture: id, idx: -1}
+						o.timer = &observationDeadline{at: time.Now().Add(maxObservationDuration), capture: id, idx: -1}
 						heap.Push(&deadlines, o.timer)
 						acks[id] = &pb.ObservationAck{ObservationId: o.e.ObservationID, AcceptedFrameSeq: 1, Reason: "accepted"}
 					} else if o.reason == "" {

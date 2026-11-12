@@ -24,7 +24,6 @@
     "max_connections": 1024,
     "max_active_observations": 1048576,
     "parser_budget_bytes": 10737418240,
-    "max_observation_ms": 605000,
     "accepted_config_versions": [
       "collection-v1"
     ],

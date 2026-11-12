@@ -1,12 +1,46 @@
 package config
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
 )
+
+func TestObserverObservationDurationIsNotConfigurable(t *testing.T) {
+	t.Setenv("POD_UID", "observer-test")
+	for _, file := range []string{"../../configs/observer.local.json", "../../deploy/local/observer.json", "../../configs/observer.production.example.json"} {
+		c, err := Read(file)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err = c.ObserverDefaults(); err != nil {
+			t.Fatalf("config without timeout %s: %v", file, err)
+		}
+		b, err := os.ReadFile(file)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var raw map[string]any
+		if err := json.Unmarshal(b, &raw); err != nil {
+			t.Fatal(err)
+		}
+		raw["observer"].(map[string]any)["max_observation_ms"] = 1800000
+		b, err = json.Marshal(raw)
+		if err != nil {
+			t.Fatal(err)
+		}
+		path := filepath.Join(t.TempDir(), "observer.json")
+		if err = os.WriteFile(path, b, 0600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err = Read(path); err == nil || err.Error() != "config_invalid" {
+			t.Fatalf("removed timeout accepted for %s: %v", file, err)
+		}
+	}
+}
 
 func TestReadKafkaTopicIsolationAndInvalidNames(t *testing.T) {
 	for _, topic := range []string{"llm-metering-events", "llm-metering-k8s-0123456789ab", "", ".", "..", "bad/topic", "bad topic", "bad\nname", strings.Repeat("a", 250)} {

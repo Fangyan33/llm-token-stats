@@ -15,7 +15,7 @@ import (
 const MaxTickMS int64 = 10
 
 func Decode(b []byte) (Config, error) {
-	c := Config{UserIDHeader: []string{"user-id"}}
+	c := Config{UserIDHeader: []string{"user-id"}, ObservationMaxMS: 1800000}
 	var err error
 	b, err = configurationJSON(b)
 	if err != nil || strictjson.Decode(b, &c) != nil {
@@ -34,6 +34,9 @@ func Decode(b []byte) (Config, error) {
 		}
 	}
 	fields, _ := strictjson.Fields(b, 64, 100000)
+	if span, present := fields["observation_max_ms"]; present && strings.TrimSpace(string(b[span.Start:span.End])) == "null" {
+		return c, errors.New("config_limit")
+	}
 	if span, present := fields["metrics_enabled"]; present && strings.TrimSpace(string(b[span.Start:span.End])) == "null" {
 		return c, errors.New("config_metrics")
 	}
@@ -86,7 +89,7 @@ func Decode(b []byte) (Config, error) {
 			return c, errors.New("config_limit")
 		}
 	}
-	if c.ChunkBytes > 16384 || c.ResponseBodyMaxBytes > 8388608 || c.ObservationMaxMS > 600000 || c.TransportStreamsPerWorker > 16 || c.TransportBatchMaxBytes != 32768 || c.TransportBatchMaxFrames > 128 || c.PodInflightBytes < 65536 || c.PodInflightMessages < 128 || c.MetadataMaxBytes != 6144 || c.AckMaxBytes > 32768 || c.AckTimeoutMS > 2000 || c.EndAckTimeoutMS > 2000 || c.TickMS > MaxTickMS || c.TickMS > c.AckTimeoutMS || c.TickMS > c.EndAckTimeoutMS {
+	if c.ChunkBytes > 16384 || c.ResponseBodyMaxBytes > 8388608 || c.ObservationMaxMS > 3600000 || c.TransportStreamsPerWorker > 16 || c.TransportBatchMaxBytes != 32768 || c.TransportBatchMaxFrames > 128 || c.PodInflightBytes < 65536 || c.PodInflightMessages < 128 || c.MetadataMaxBytes != 6144 || c.AckMaxBytes > 32768 || c.AckTimeoutMS > 2000 || c.EndAckTimeoutMS > 2000 || c.TickMS > MaxTickMS || c.TickMS > c.AckTimeoutMS || c.TickMS > c.EndAckTimeoutMS {
 		return c, errors.New("config_budget")
 	}
 	return c, nil

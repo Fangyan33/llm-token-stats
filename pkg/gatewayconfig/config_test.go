@@ -9,6 +9,55 @@ import (
 	"testing"
 )
 
+func TestObservationDurationBounds(t *testing.T) {
+	data, err := os.ReadFile("../../configs/gateway-observer.example.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defaults, err := Decode(data)
+	if err != nil || defaults.ObservationMaxMS != 1800000 {
+		t.Fatalf("30 minute template default: %+v, %v", defaults, err)
+	}
+	var omitted map[string]any
+	if err := json.Unmarshal(data, &omitted); err != nil {
+		t.Fatal(err)
+	}
+	delete(omitted, "observation_max_ms")
+	b, err := json.Marshal(omitted)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := Decode(b); err != nil || got.ObservationMaxMS != 1800000 {
+		t.Fatalf("omitted duration default: %+v, %v", got, err)
+	}
+	omitted["observation_max_ms"] = nil
+	b, err = json.Marshal(omitted)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Decode(b); err == nil {
+		t.Fatal("explicit null duration accepted")
+	}
+	for _, ms := range []int64{-1, 0, 1, 1800000, 3600000, 3600001} {
+		t.Run(strconv.FormatInt(ms, 10), func(t *testing.T) {
+			var c map[string]any
+			if err := json.Unmarshal(data, &c); err != nil {
+				t.Fatal(err)
+			}
+			c["observation_max_ms"] = ms
+			b, err := json.Marshal(c)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, err := Decode(b)
+			valid := ms >= 1 && ms <= 3600000
+			if (err == nil) != valid || valid && got.ObservationMaxMS != ms {
+				t.Fatalf("duration %d: %+v, %v", ms, got, err)
+			}
+		})
+	}
+}
+
 func TestResponseTransportConfiguration(t *testing.T) {
 	data, _ := os.ReadFile("../../configs/gateway-observer.example.json")
 	for _, key := range []string{"request_body_max_bytes", "rewrite_timeout_ms", "stream_inflight_messages"} {

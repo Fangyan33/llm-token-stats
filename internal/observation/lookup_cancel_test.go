@@ -20,7 +20,7 @@ import (
 )
 
 func lookupServer(k *sink) *Server {
-	s := &Server{Cfg: config.Observer{ProducerID: "test", ClusterName: "cluster", DeploymentEnvironment: "dev", MaxActive: 4, ParserBudget: 64 << 20, MaxObservationMS: 5000, LookupTimeoutMS: 150, LookupConcurrency: 1, AcceptedConfigs: []string{"v1"}, AcceptedAdapters: []string{"chat_completions_v1"}}, Sink: k, Health: &health.State{}, ServiceResolver: serviceFake{}, CustomerResolver: customerFake{}}
+	s := &Server{Cfg: config.Observer{ProducerID: "test", ClusterName: "cluster", DeploymentEnvironment: "dev", MaxActive: 4, ParserBudget: 64 << 20, LookupTimeoutMS: 150, LookupConcurrency: 1, AcceptedConfigs: []string{"v1"}, AcceptedAdapters: []string{"chat_completions_v1"}}, Sink: k, Health: &health.State{}, ServiceResolver: serviceFake{}, CustomerResolver: customerFake{}}
 	disableLookupCache(s)
 	return s
 }
@@ -82,7 +82,7 @@ func TestCancelledStreamRetainsIndependentResults(t *testing.T) {
 			k := &sink{}
 			srv := lookupServer(k)
 			if mode == "observation_deadline" {
-				srv.Cfg.MaxObservationMS = 40
+				srv.observationNow = func() time.Time { return time.Now().Add(time.Hour + 5*time.Second - 40*time.Millisecond) }
 			}
 			entered := make(chan struct{}, 2)
 			release := make(chan struct{})

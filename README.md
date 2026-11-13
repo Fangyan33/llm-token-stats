@@ -12,7 +12,7 @@ LLM Token Stats 在网关旁路观察大模型请求和响应，提取模型返�
 当前请求标识分为：Observer 生成的内部 `observation_id`、Wasm 从 `logical_request_id_headers` 有序列表提取的可空客户端 `logical_request_id`，以及网关可见的 `x_request_id`。候选列表缺省或为空时不采集客户端 ID；最多 8 个头，取首个非空且匹配 `[A-Za-z0-9._:-]{1,128}` 的单值，跳过缺失、非法或重复头，不截断、不补值。配置示例按 `x-client-request-id`、`request_id` 排序。客户端 ID 可重复，内部关联和计数统一使用 `observation_id`；采集插件不再注入 `X-Metering-Request-Id`。Kafka 事件保持唯一的 `schema_version=1` 契约，当前模型直接采用上述字段语义。详情见[采集标识契约](docs/gateway-request-collection-implementation.md#22-请求标识及时间)。
 
 
-流式请求已增加网关首末有效生成内容时间观测，Doris 明细视图派生 TTFT/TPOT；不估算 token，缺少输出量时仅保留可测 TTFT，非流式两项为 NULL。见[请求性能指标](docs/request-performance.md)。
+流式请求已增加网关首末有效生成内容时间观测，Doris 明细视图派生 TTFT/TPOT；响应 token 不估算，缺少输出量时仅保留可测 TTFT，非流式两项为 NULL。见[请求性能指标](docs/request-performance.md)。
 
 ## 架构与组件职责
 
@@ -32,7 +32,7 @@ flowchart LR
 | 组件 | 职责 | 运行方式与实现情况 |
 | --- | --- | --- |
 | Istio / Envoy 网关 | 执行鉴权、路由和业务转发，向 Wasm 提供入口 Host、路由和 Bearer 凭证 | 复用现有入口网关；本地使用 `istio/proxyv2:1.13.5` 中的 Envoy |
-| Gateway Observer Wasm | 按 POST 与精确路径白名单选择请求，`route_name: "*"` 忽略路由名；跳过请求正文；有界旁路发送响应片段，在共享 gRPC 流中复用多个观察 | 已实现；在网关内加载和运行，不单独部署，也不直接连接 Kafka |
+| Gateway Observer Wasm | 按 POST 与精确路径白名单选择请求，`route_name: "*"` 忽略路由名；默认跳过请求正文，可显式开启请求体分片采集；有界旁路发送响应片段，在共享 gRPC 流中复用多个观察 | 已实现；在网关内加载和运行，不单独部署，也不直接连接 Kafka |
 | Observer | 接收观察流，分配请求 ID，解析 JSON / SSE usage，生成 `request_started`、`usage_observed` 事件，通过原生 Producer 发送 Kafka | 已实现；入口为 `cmd/observer/`，提供 gRPC、两类归属查询占位、健康检查、指标及独立 HTTP Wasm 下载端口 |
 | Kafka | 缓冲结构化事件，按分区保存消费位置，为 Consumer 重放提供数据 | 外部基础设施；本地由 Compose 启动 |
 | Consumer | 校验事件与摘要，去重并保留冲突证据；将明细、拒绝诊断、日期通知和批次凭据写入 Doris，确认全部可见后提交 offset | 已实现；入口为 `cmd/consumer/`，多个副本使用同一 consumer group 分摊分区 |
@@ -175,7 +175,7 @@ git push origin v0.1.0
 
 工作流先创建草稿并上传全部附件，上传成功才发布；含短横线的 tag（如 `v0.1.0-rc.1`）标记为预发布。已有 Release 时拒绝覆盖。上传失败可能留下草稿，删除该草稿后可以重跑；已发布版本的变更使用新 tag。构建失败时查看 Actions 日志，发布成功不代表生产部署验收完成。
 
-采集插件不读取或改写请求正文，`request_model` 保存为 null。模型服务应保证流式响应返回 usage；上游缺失时保持 null/unknown。Wasm 每 Worker 默认使用 4 条共享传输流，Pod 级默认限制为 131072 个观察、256 MiB 待发及未确认载荷、524288 条记录。输入 1M token 不引入正文采集副本；2048 MiB 额外 RSS 上限仍须完成带/不带插件的对照验收。回归使用 `make collection-regression`，容量使用 `make capacity-test`，见[测试说明](docs/collection-capacity-test.md)。详见[响应采集与资源边界](docs/gateway-request-collection-implementation.md)和[本轮验证结果](docs/spec/plan/gateway-response-collection-verification.md)。
+采集插件默认不读取请求正文；可选请求体分片采集由 `request_body_capture_enabled` 控制，始终不改写正文，开启后由 Observer 将合法 model 保存到请求事件的 `request_model`，关闭或未知为 null。模型服务应保证流式响应返回 usage；上游缺失时保持 null/unknown。Wasm 每 Worker 默认使用 4 条共享传输流，Pod 级默认限制为 131072 个观察、256 MiB 待发及未确认载荷、524288 条记录。关闭请求体采集时，输入 1M token 不引入正文采集副本；2048 MiB 额外 RSS 上限仍须完成带/不带插件的对照验收。回归使用 `make collection-regression`，容量使用 `make capacity-test`，见[测试说明](docs/collection-capacity-test.md)。详见[响应采集与资源边界](docs/gateway-request-collection-implementation.md)和[本轮验证结果](docs/spec/plan/gateway-response-collection-verification.md)。
 
 ### Wasm 打包、下载与摘要
 
@@ -642,6 +642,7 @@ Observer、Consumer、usage-worker 通过环境变量 `LOG_LEVEL=debug|info|warn
 
 | 配置项 | 当前值 | 含义 |
 |---|---:|---|
+| `request_body_capture_enabled` | **false** | 显式开启请求体有界旁路发送，Observer 估算输入 token 并仅写请求事件；不改写正文。 |
 | `chunk_bytes` | **16 KiB** | 每次旁路采集的响应正文分片上限。较大的响应回调会拆成多个采集帧。单位为字节。 |
 | `response_body_max_bytes` | **8 MiB** | 单个请求允许累计采集的**响应正文**上限。超过后停止该请求的采集。 |
 | `ack_timeout_ms` | **2 秒** | 已发送批次等待 Observer 累计确认的超时。最早未确认批次超时后，关闭对应共享传输，其承载的观察会受到影响。 |
@@ -669,3 +670,5 @@ Observer、Consumer、usage-worker 通过环境变量 `LOG_LEVEL=debug|info|warn
 - 当前实现存在硬校验：例如 `metadata_max_bytes` 必须为 **6144**、`transport_batch_max_bytes` 必须为 **32768**，不能任意调大。
 
 具体定义见[配置校验代码](/root/src/llm-token-stats/pkg/gatewayconfig/config.go:89)。
+
+请求输入计数使用 Observer 的 o200k_base 有界分词池，Wasm 默认关闭请求体采集。开启后只写正式 request_started 的 usage.input_tokens，source=estimated；响应仍只使用服务端 usage，汇总不使用请求估算。配置、事件顺序与上线步骤见[请求输入 token 估算](docs/request-body-tokens.md)，历史本地 RSS 结果见[原型阶段报告](docs/spec/plan/request-body-token-prototype-verification.md)。

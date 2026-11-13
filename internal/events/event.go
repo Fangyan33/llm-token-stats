@@ -95,7 +95,15 @@ func Decode(b, key []byte, now time.Time) (*Event, error) {
 		return nil, errors.New("event_timing")
 	}
 	if e.EventType == "request_started" {
+		if !requestUsageValid(&e) {
+			return nil, errors.New("event_request_usage")
+		}
 		return &e, nil
+	}
+	for _, t := range Tokens(e.Usage) {
+		if t.Source == "estimated" {
+			return nil, errors.New("event_response_estimate")
+		}
 	}
 	if !e.TerminalObserved && (!Has(e.AnomalyCodes, "missing_end") || *e.ObservationStatus == "complete" || *e.BusinessOutcome == "response_complete") {
 		return nil, errors.New("event_terminal")
@@ -123,6 +131,28 @@ func Decode(b, key []byte, now time.Time) (*Event, error) {
 		}
 	}
 	return &e, nil
+}
+
+func requestUsageValid(e *Event) bool {
+	if e.Usage == nil {
+		return e.UsageStatus == "not_applicable"
+	}
+	input := e.Usage.InputTokens
+	want := "unknown"
+	if input.Value != nil {
+		if input.Source != "estimated" {
+			return false
+		}
+		want = "partial"
+	} else if input.Source != "unknown" {
+		return false
+	}
+	for _, t := range Tokens(e.Usage)[1:] {
+		if t.Value != nil || t.Source != "unknown" {
+			return false
+		}
+	}
+	return e.UsageStatus == want
 }
 func Has(xs []string, x string) bool {
 	for _, v := range xs {

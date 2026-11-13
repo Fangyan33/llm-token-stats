@@ -219,6 +219,10 @@
       "type": "boolean",
       "default": false,
       "description": "启用 Wasm 自定义 metering_* 指标；默认关闭，不影响采集和额度控制。资源 Gauge 每秒汇总。"
+    },
+    "request_body_capture_enabled": {
+      "type": "boolean",
+      "default": false
     }
   }
 }

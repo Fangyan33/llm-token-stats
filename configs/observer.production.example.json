@@ -61,6 +61,10 @@
     "lookup_timeout_ms": 200,
     "lookup_max_concurrency": 64,
     "receive_queue_batches": 4096,
-    "receive_queue_bytes": 134217728
+    "receive_queue_bytes": 134217728,
+    "request_body_max_bytes": 33554432,
+    "request_tokenizer_workers": 0,
+    "request_tokenizer_queue_requests": 200,
+    "request_tokenizer_queue_bytes": 536870912
   }
 }

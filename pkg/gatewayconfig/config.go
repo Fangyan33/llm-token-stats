@@ -37,8 +37,10 @@ func Decode(b []byte) (Config, error) {
 	if span, present := fields["observation_max_ms"]; present && strings.TrimSpace(string(b[span.Start:span.End])) == "null" {
 		return c, errors.New("config_limit")
 	}
-	if span, present := fields["metrics_enabled"]; present && strings.TrimSpace(string(b[span.Start:span.End])) == "null" {
-		return c, errors.New("config_metrics")
+	for _, name := range []string{"metrics_enabled", "request_body_capture_enabled"} {
+		if span, present := fields[name]; present && strings.TrimSpace(string(b[span.Start:span.End])) == "null" {
+			return c, errors.New("config_metrics")
+		}
 	}
 	for _, name := range []string{"user_id_header", "extra_request_headers"} {
 		if span, present := fields[name]; present && strings.TrimSpace(string(b[span.Start:span.End])) == "null" {

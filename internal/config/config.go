@@ -99,25 +99,29 @@ func (c LookupCache) Settings() (LookupCacheSettings, error) {
 }
 
 type Observer struct {
-	ClusterName           string        `json:"cluster_name"`
-	DeploymentEnvironment string        `json:"deployment_environment"`
-	ServiceLookup         Lookup        `json:"service_lookup"`
-	CustomerLookup        Lookup        `json:"customer_lookup"`
-	LookupTimeoutMS       int           `json:"lookup_timeout_ms"`
-	LookupConcurrency     int           `json:"lookup_max_concurrency"`
-	WasmDownload          *WasmDownload `json:"wasm_download"`
-	Listen                string        `json:"listen"`
-	Health                string        `json:"health_listen"`
-	ProducerID            string        `json:"producer_id"`
-	MaxActive             int           `json:"max_active_observations"`
-	ParserBudget          int64         `json:"parser_budget_bytes"`
-	AcceptedConfigs       []string      `json:"accepted_config_versions"`
-	AcceptedAdapters      []string      `json:"accepted_adapter_ids"`
-	Flags                 []string      `json:"response_flags_allowlist"`
-	Details               []string      `json:"response_code_details_allowlist"`
-	MaxConnections        int           `json:"max_connections"`
-	ReceiveQueueBatches   int           `json:"receive_queue_batches"`
-	ReceiveQueueBytes     int64         `json:"receive_queue_bytes"`
+	ClusterName                   string        `json:"cluster_name"`
+	DeploymentEnvironment         string        `json:"deployment_environment"`
+	ServiceLookup                 Lookup        `json:"service_lookup"`
+	CustomerLookup                Lookup        `json:"customer_lookup"`
+	LookupTimeoutMS               int           `json:"lookup_timeout_ms"`
+	LookupConcurrency             int           `json:"lookup_max_concurrency"`
+	WasmDownload                  *WasmDownload `json:"wasm_download"`
+	Listen                        string        `json:"listen"`
+	Health                        string        `json:"health_listen"`
+	ProducerID                    string        `json:"producer_id"`
+	MaxActive                     int           `json:"max_active_observations"`
+	ParserBudget                  int64         `json:"parser_budget_bytes"`
+	AcceptedConfigs               []string      `json:"accepted_config_versions"`
+	AcceptedAdapters              []string      `json:"accepted_adapter_ids"`
+	Flags                         []string      `json:"response_flags_allowlist"`
+	Details                       []string      `json:"response_code_details_allowlist"`
+	MaxConnections                int           `json:"max_connections"`
+	ReceiveQueueBatches           int           `json:"receive_queue_batches"`
+	ReceiveQueueBytes             int64         `json:"receive_queue_bytes"`
+	RequestBodyMaxBytes           int64         `json:"request_body_max_bytes"`
+	RequestTokenizerWorkers       int           `json:"request_tokenizer_workers"`
+	RequestTokenizerQueueRequests int           `json:"request_tokenizer_queue_requests"`
+	RequestTokenizerQueueBytes    int64         `json:"request_tokenizer_queue_bytes"`
 }
 type WasmDownload struct {
 	Listen string `json:"listen"`
@@ -172,6 +176,9 @@ var kafkaTopicName = regexp.MustCompile(`^[A-Za-z0-9._-]{1,249}$`)
 
 func (c *Config) ObserverDefaults() error {
 	if err := c.Kafka.ProducerDefaults(); err != nil {
+		return err
+	}
+	if err := c.Observer.RequestTokenDefaults(); err != nil {
 		return err
 	}
 	if c.Observer.ReceiveQueueBatches == 0 {

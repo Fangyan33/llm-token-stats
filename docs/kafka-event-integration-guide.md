@@ -36,7 +36,7 @@ Observer 默认对两个接口分别缓存完整成功结果 30 分钟；仅瞬�
 1. `request_started`：Observer 接到有效请求开始观察消息后尝试发送。它说明观察到请求开始，不包含 token 用量。
 2. `usage_observed`：Observer 定稿时尝试发送，合并用量和网关可观察的终态。即使 token 未知或没有收到有效的网关 End，也可能发送这条事件。
 
-两条事件独立发送，可能只有一条到达；下游不能要求先看到 start 才处理 usage，也不能把 start 和 usage 算成两次模型调用。Kafka 重放可能带来物理重复。唯一请求标识是 `observation_id`，事件级标识是 `event_id`；`x_request_id` 仅供辅助排查。
+两条事件独立发送，可能只有一条到达；开启请求体采集后 start 等待冻结归属和计数结果，可能晚于 usage，只发送一次且不补写同 ID；下游不能要求先看到 start 才处理 usage，也不能把 start 和 usage 算成两次模型调用。Kafka 重放可能带来物理重复。唯一请求标识是 `observation_id`，事件级标识是 `event_id`；`x_request_id` 仅供辅助排查。
 
 ### 1.1 `observation_id` 由 Observer 生成
 
@@ -86,7 +86,7 @@ UUIDv4 不包含时间。`request_started_at_ms` 仍由网关观察并作为事�
 | `observation_ended_at_ms` | 整数 / 是 | Observer 结束本次观察的时间；start 尚未结束时为 `null`。它不等于网关确认业务请求结束。 |
 | `request_finished_at_ms` | 整数 / 是 | 网关有效 End 中取得的请求结束时间；未收到有效 End 时为 `null`，不能补当前时间。 |
 | `event_created_at_ms` | 整数 / 否 | Observer 创建此 Kafka 事件的时间；通常晚于请求开始时间。 |
-| `request_model` | 字符串 / 是 | 请求体中的模型名称或 ID；未可靠取得或无效时为 `null`。 |
+| `request_model` | 字符串 / 是 | 请求体顶层 model 的名称或 ID，仅请求事件保存；关闭请求体采集、未可靠取得或无效时为 null，响应事件此字段为 null。 |
 | `response_model` | 字符串 / 是 | 响应上报的模型名称或 ID；可能与请求值不同，未可靠取得时为 `null`。 |
 | `http_status` | 整数 / 是 | 网关可见的 HTTP 响应状态码；不是用量是否为零的判断依据。 |
 | `upstream_attempt_count` | 整数 / 是 | 网关能可靠取得的上游尝试次数；未知为 `null`，不能据此推算隐藏重试的 token。 |
@@ -95,9 +95,9 @@ UUIDv4 不包含时间。`request_started_at_ms` 仍由网关观察并作为事�
 | `business_outcome` | 字符串 / 是 | 有没有观察到响应完整结束？`response_complete` 表示观察到完整结束；`stream_incomplete` 表示已有部分请求或响应信息，但未观察到完整结束；`unknown` 表示信息不足，无法判断。start 为 `null`。不表示 HTTP 成功，也不保证采集完整。 |
 | `terminal_observed` | 布尔 / 否 | 是否收到有效网关 End；为 `false` 时 `request_finished_at_ms` 必须为 `null`。 |
 | `observation_status` | 字符串 / 是 | 结果事件为 `complete`（观察完整）、`partial`（缺片/截断等）或 `unknown`（只有有限元数据）；start 尚未定稿时为 `null`。 |
-| `usage_status` | 字符串 / 否 | token 数字有没有拿到，是否齐全、是否矛盾？start 为 `not_applicable`；结果事件中，`known` 表示输入、输出总量都有效；`partial` 表示输入输出尚未全部有效，但六个用量字段中至少一个有效；`unknown` 表示六字段全未知；`conflict` 表示用量存在矛盾，优先于其他状态。 |
+| `usage_status` | 字符串 / 否 | token 数字有没有拿到，是否齐全、是否矛盾？start 关闭请求体采集时为 `not_applicable`，开启后成功计数为 `partial`、未知为 `unknown`；结果事件中，`known` 表示输入、输出总量都有效；`partial` 表示输入输出尚未全部有效，但六个用量字段中至少一个有效；`unknown` 表示六字段全未知；`conflict` 表示用量存在矛盾，优先于其他状态。 |
 | `usage_eligible` | 布尔 / 否 | 这条用量是否符合有效统计条件，可以作为统计候选？一期仅在适配成功、`observation_status=complete`、`usage_status=known`，且无用量冲突及使结果失效的异常时为 `true`；否则为 `false`，start 固定为 `false`。不表示收费资格；下游仍须去重并排除事件或请求冲突。 |
-| `usage` | 对象 / 是 | start 固定为 `null`；结果事件为含六个 token 子字段的对象。即使用量未知，结果事件也保留各字段的 `value/source` 状态。 |
+| `usage` | 对象 / 是 | start 在请求体采集关闭时为 `null`，开启时为六项对象，仅 input_tokens 可为 estimated，其余项均为 null/unknown；结果事件为六项 reported/unknown 对象。 |
 | `raw_usage_json` | 字符串 / 否 | 白名单保留的上游 usage JSON 依据，最多 4 KiB；它是**JSON 字符串**，不是嵌套对象，也不是完整响应。无依据时为 `"{}"`。 |
 | `raw_usage_truncated` | 布尔 / 否 | usage 依据是否因过滤或大小限制丢弃内容；不表示模型回答被截断。 |
 | `anomaly_codes` | 字符串数组 / 否 | 固定异常码列表，无异常为 `[]`；已去重排序，不包含正文或错误堆栈。常见值包括 `missing_usage`、`missing_end`、`usage_conflict`、`protocol_incomplete`、`identity_invalid`。 |
@@ -106,11 +106,11 @@ UUIDv4 不包含时间。`request_started_at_ms` 仍由网关观察并作为事�
 
 ### 2.2 `usage` 对象中的每个字段
 
-每个子字段统一为 `{"value": 非负整数或 null, "source": "reported" 或 "unknown"}`。`reported` 表示有效的上游上报值；`unknown` 表示无法可靠取得，此时 `value=null`。上游明确上报的 `0` 必须保留为 `0/reported`，不能与未知混淆。当前采集子项不产生估算来源。
+每个子字段统一为 `{"value": 非负整数或 null, "source": "reported"、"estimated" 或 "unknown"}`。`reported` 仅用于响应事件，表示有效的上游上报值；`estimated` 仅允许请求事件的 input_tokens，使用固定 o200k_base / text_tools_v1 文本和工具估算；`unknown` 时 value 必须为 null。上游明确上报的 0 保留为 0/reported，合法空文本输入可为 0/estimated。请求估算不补齐响应 usage，不参与有效用量和日/月汇总。配置与计数范围见[请求输入 token 估算](request-body-tokens.md)。
 
 | `usage` 子字段 | 上游 Chat Completions 路径 | 含义与包含关系 |
 | --- | --- | --- |
-| `input_tokens` | `usage.prompt_tokens` | 本次请求的输入 token 总量，含已命中的缓存输入及已写入缓存的输入部分。 |
+| `input_tokens` | 响应 `usage.prompt_tokens`；请求为 Observer 文本估算 | 响应是上游输入总量，含缓存；请求是通用文本和工具估算，两者独立保存。 |
 | `output_tokens` | `usage.completion_tokens` | 本次请求的输出 token 总量，包含可单独报告的推理 token。 |
 | `cached_read_tokens` | `usage.prompt_tokens_details.cached_tokens` | 本次输入中从提示词缓存复用的 token 数，已包含在 `input_tokens` 中。 |
 | `cached_write_tokens` | `usage.prompt_tokens_details.cache_write_tokens`（可选） | **本次请求的输入中，有多少 token 对应的可复用前缀被写入提示词缓存。**已包含在 `input_tokens` 中；字段缺失为 `null/unknown`，不从文本或其他总量推断。 |
@@ -124,8 +124,8 @@ UUIDv4 不包含时间。`request_started_at_ms` 仍由网关观察并作为事�
 | 字段组 | `request_started` | `usage_observed` |
 | --- | --- | --- |
 | `event_id` | `<observation_id>:start` | `<observation_id>:usage` |
-| `usage` | `null` | 六个 `{value,source}` 子字段 |
-| `usage_status` / `usage_eligible` | `not_applicable` / `false` | 按定稿结果填写；仅满足有效用量统计候选条件时，`usage_eligible` 才为 `true` |
+| `usage` | 关闭采集为 null；开启后仅 input_tokens 为 estimated/unknown，其余子项 unknown | 六个 `{value,source}` 子字段，仅 reported/unknown |
+| `usage_status` / `usage_eligible` | 关闭为 not_applicable，开启为 partial/unknown；资格始终 false | 按定稿结果填写；仅满足有效用量统计候选条件时，`usage_eligible` 才为 `true` |
 | `raw_usage_json` | `"{}"` | 白名单 usage 依据；没有则 `"{}"` |
 | `observation_ended_at_ms` / `request_finished_at_ms` | `null` / `null` | 能取得时填写；没有有效 End 时后者为 `null` |
 | `terminal_observed` / `observation_status` | `false` / `null` | 按网关 End 和实际采集完整性填写 |
@@ -222,7 +222,7 @@ Kafka record 的 key 是上述 `observation_id`，不在 JSON 内另设 `kafka_k
 
 1. 用独立消费组订阅 Topic，关闭自动提交。新组从最早可用 offset 还是最新 offset 开始，须在接入时明确；示例从保留窗口内最早记录开始。
 2. 按 UTF-8 JSON 解析，校验最多 32 KiB、`schema_version=1`、`observation_id` 是规范小写 UUIDv4（`^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`）、Kafka key 与该 ID 一致、事件类型和 `event_id` 后缀。未知版本停止处理并报警，不能跳过后提交。
-3. 根据 `event_id` 做幂等处理；若同一 `event_id` 出现不同规范事件内容，隔离并报警，不能随意挑一条覆盖。用量只来自 `usage_observed`，而且是否进入正式统计还需检查 `usage_eligible` 和请求冲突。
+3. 根据 `event_id` 做幂等处理；若同一 `event_id` 出现不同规范事件内容，隔离并报警，不能随意挑一条覆盖。有效统计用量只来自 `usage_observed`，而且是否进入正式统计还需检查 `usage_eligible` 和请求冲突。
 4. 业务处理或持久化成功后再提交对应分区的下一个 offset。处理成功但提交失败会重放，所以幂等是必要条件；永久非法记录应走有界诊断流程，不能静默跳过。
 5. 监控每个分区的消费延迟与 72 小时保留窗口。单个请求缺少 start 或 usage 时保留“缺失/未知”状态，不用零值补齐。
 
@@ -292,9 +292,7 @@ func handle(r *kgo.Record) error {
     if suffix == "" || e.EventID != e.ObservationID+suffix {
         return fmt.Errorf("invalid event identity")
     }
-    if e.EventType == "request_started" && e.Usage != nil {
-        return fmt.Errorf("start event must have usage=null")
-    }
+    // start 可以包含输入 estimated；完整来源约束应使用事件 Schema 校验。
     if e.EventType == "usage_observed" && e.Usage == nil {
         return fmt.Errorf("usage event must have a usage object")
     }
@@ -405,7 +403,7 @@ public class MeteringConsumer {
             throw new IllegalArgumentException("invalid event identity");
         }
         JsonNode usage = event.path("usage");
-        if (type.equals("request_started") && !usage.isNull()
+        if (type.equals("request_started") && !(usage.isNull() || usage.isObject())
                 || type.equals("usage_observed") && !usage.isObject()) {
             throw new IllegalArgumentException("invalid usage for event type");
         }

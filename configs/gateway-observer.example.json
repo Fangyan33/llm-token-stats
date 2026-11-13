@@ -42,5 +42,6 @@
   "transport_streams_per_worker": 4,
   "transport_batch_max_bytes": 32768,
   "transport_batch_max_frames": 128,
-  "metrics_enabled": false
+  "metrics_enabled": false,
+  "request_body_capture_enabled": false
 }

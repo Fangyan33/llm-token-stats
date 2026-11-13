@@ -8,8 +8,10 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -32,15 +34,16 @@ import (
 )
 
 type result struct {
-	ID          string `json:"id"`
-	Input       int64  `json:"input"`
-	Bytes       int    `json:"body_bytes"`
-	Status      int    `json:"status"`
-	Done        bool   `json:"done"`
-	Usage       bool   `json:"usage"`
-	Elapsed     int64  `json:"elapsed_us"`
-	DispatchLag int64  `json:"dispatch_lag_us"`
-	Error       string `json:"error,omitempty"`
+	ID            string `json:"id"`
+	Input         int64  `json:"input"`
+	Bytes         int    `json:"body_bytes"`
+	Status        int    `json:"status"`
+	Done          bool   `json:"done"`
+	Usage         bool   `json:"usage"`
+	BodyUnchanged bool   `json:"body_unchanged"`
+	Elapsed       int64  `json:"elapsed_us"`
+	DispatchLag   int64  `json:"dispatch_lag_us"`
+	Error         string `json:"error,omitempty"`
 }
 
 var mixedInputTokens = [...]int64{100000, 200000, 500000, 1000000}
@@ -95,9 +98,11 @@ func fixture(args []string) error {
 		uploading.Add(1)
 		buffer := uploadBuffers.Get().([]byte)
 		var readErr error
+		digest := sha256.New()
 		for {
 			n, e := r.Body.Read(buffer)
 			uploadedBytes.Add(int64(n))
+			digest.Write(buffer[:n])
 			if e != nil {
 				readErr = e
 				break
@@ -125,6 +130,7 @@ func fixture(args []string) error {
 		bySecond[time.Now().Unix()]++
 		mu.Unlock()
 		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("X-Test-Body-SHA256", hex.EncodeToString(digest.Sum(nil)))
 		flush := w.(http.Flusher)
 		started := time.Now()
 		for i := 0; i < 128; i++ {
@@ -281,6 +287,8 @@ func load(args []string) error {
 			res, e = clients[i%len(clients)].Do(req)
 			if e == nil {
 				cr.Status = res.StatusCode
+				digest := sha256.Sum256(b.data)
+				cr.BodyUnchanged = res.Header.Get("X-Test-Body-SHA256") == hex.EncodeToString(digest[:])
 				scanner := bufio.NewScanner(res.Body)
 				scanner.Buffer(make([]byte, 4096), 32768)
 				for scanner.Scan() {
@@ -308,7 +316,7 @@ func load(args []string) error {
 		if e != nil {
 			cr.Error = e.Error()
 		}
-		if cr.Status != 200 || !cr.Done || cr.Error != "" || cr.Usage == *omit {
+		if cr.Status != 200 || !cr.Done || cr.Error != "" || cr.Usage == *omit || !cr.BodyUnchanged {
 			businessErrors.Add(1)
 		} else {
 			complete.Add(1)

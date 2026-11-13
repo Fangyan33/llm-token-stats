@@ -252,7 +252,17 @@ def validate_event(event, kafka_key=None, now_ms=None, input_size=None):
     if event["request_finished_at_ms"] is not None and event["request_finished_at_ms"] < started:
         require("clock_anomaly" in event["anomaly_codes"], "negative_duration_without_clock_anomaly")
     if event["event_type"] == "request_started":
+        usage = event['usage']
+        if usage is None:
+            require(event['usage_status'] == 'not_applicable', 'request_usage_status')
+        else:
+            incoming = usage['input_tokens']
+            known = incoming['value'] is not None
+            require(incoming['source'] == ('estimated' if known else 'unknown'), 'request_input_source')
+            require(event['usage_status'] == ('partial' if known else 'unknown'), 'request_usage_status')
+            require(all(usage[name] == {'value': None, 'source': 'unknown'} for name in TOKEN_NAMES[1:]), 'request_other_tokens')
         return
+    require(all(event['usage'][name]['source'] != 'estimated' for name in TOKEN_NAMES), 'response_estimate')
     if not event["terminal_observed"]:
         require("missing_end" in event["anomaly_codes"], "missing_end_code")
         require(event["observation_status"] != "complete", "complete_without_end")

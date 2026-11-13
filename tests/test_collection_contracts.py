@@ -58,6 +58,18 @@ class CollectionContractsTest(unittest.TestCase):
             with self.subTest(size=len(model)):
                 self.assert_event_invalid(lambda e: e.update(request_model=model))
 
+    def test_request_event_can_save_requested_model(self):
+        request = contracts.load(ROOT / 'testdata/collection/request-estimated.json')
+        for model in (None, 'requested-model', 'a' * 1024, '你' * 341 + 'a'):
+            event = copy.deepcopy(request)
+            event['request_model'] = model
+            contracts.validate_event(event)
+        for model in ('', 42, {}, 'a' * 1025, '你' * 342):
+            event = copy.deepcopy(request)
+            event['request_model'] = model
+            with self.assertRaises(contracts.ContractError):
+                contracts.validate_event(event)
+
     def test_missing_and_unknown_fields(self):
         self.assert_event_invalid(lambda e: e.pop("response_model"))
         self.assert_event_invalid(lambda e: e.update(messages=[]))
@@ -108,6 +120,28 @@ class CollectionContractsTest(unittest.TestCase):
         contracts.validate_event(event)
         self.assertIsNone(event["usage"]["input_tokens"]["value"])
         self.assertEqual(event["usage_status"], "partial")
+
+    def test_estimates_are_request_input_only(self):
+        estimated = contracts.load(ROOT / 'testdata/collection/request-estimated.json')
+        for value in (0, 1000000):
+            event = copy.deepcopy(estimated)
+            event['usage']['input_tokens']['value'] = value
+            contracts.validate_event(event)
+        for name in contracts.TOKEN_NAMES:
+            self.assert_event_invalid(lambda e: e['usage'][name].update(value=1, source='estimated'))
+        for name in contracts.TOKEN_NAMES[1:]:
+            event = copy.deepcopy(estimated)
+            event['usage'][name] = {'value': 1, 'source': 'estimated'}
+            with self.assertRaises(contracts.ContractError):
+                contracts.validate_event(event)
+        for source, value, status in (('reported', 1, 'partial'), ('estimated', None, 'unknown'),
+                                      ('estimated', 1, 'known'), ('unknown', 0, 'unknown'),
+                                      ('unknown', None, 'partial')):
+            event = copy.deepcopy(estimated)
+            event['usage']['input_tokens'] = {'value': value, 'source': source}
+            event['usage_status'] = status
+            with self.assertRaises(contracts.ContractError):
+                contracts.validate_event(event)
 
     def test_start_and_end_invariants(self):
         self.assert_event_invalid(lambda e: e.update(event_type="request_started", event_id=e["observation_id"] + ":start"))

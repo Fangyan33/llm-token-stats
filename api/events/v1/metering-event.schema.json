@@ -494,6 +494,7 @@
         "source": {
           "enum": [
             "reported",
+            "estimated",
             "unknown"
           ]
         }
@@ -542,9 +543,6 @@
           "request_finished_at_ms": {
             "const": null
           },
-          "request_model": {
-            "const": null
-          },
           "response_model": {
             "const": null
           },
@@ -567,10 +565,68 @@
             "const": null
           },
           "usage": {
-            "const": null
+            "anyOf": [
+              {
+                "type": "null"
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "input_tokens": {
+                    "properties": {
+                      "source": {
+                        "enum": [
+                          "estimated",
+                          "unknown"
+                        ]
+                      }
+                    }
+                  },
+                  "output_tokens": {
+                    "properties": {
+                      "source": {
+                        "const": "unknown"
+                      }
+                    }
+                  },
+                  "cached_read_tokens": {
+                    "properties": {
+                      "source": {
+                        "const": "unknown"
+                      }
+                    }
+                  },
+                  "cached_write_tokens": {
+                    "properties": {
+                      "source": {
+                        "const": "unknown"
+                      }
+                    }
+                  },
+                  "reasoning_tokens": {
+                    "properties": {
+                      "source": {
+                        "const": "unknown"
+                      }
+                    }
+                  },
+                  "reported_total_tokens": {
+                    "properties": {
+                      "source": {
+                        "const": "unknown"
+                      }
+                    }
+                  }
+                }
+              }
+            ]
           },
           "usage_status": {
-            "const": "not_applicable"
+            "enum": [
+              "not_applicable",
+              "partial",
+              "unknown"
+            ]
           },
           "usage_eligible": {
             "const": false
@@ -589,7 +645,69 @@
       "else": {
         "properties": {
           "usage": {
-            "type": "object"
+            "type": "object",
+            "properties": {
+              "input_tokens": {
+                "properties": {
+                  "source": {
+                    "enum": [
+                      "reported",
+                      "unknown"
+                    ]
+                  }
+                }
+              },
+              "output_tokens": {
+                "properties": {
+                  "source": {
+                    "enum": [
+                      "reported",
+                      "unknown"
+                    ]
+                  }
+                }
+              },
+              "cached_read_tokens": {
+                "properties": {
+                  "source": {
+                    "enum": [
+                      "reported",
+                      "unknown"
+                    ]
+                  }
+                }
+              },
+              "cached_write_tokens": {
+                "properties": {
+                  "source": {
+                    "enum": [
+                      "reported",
+                      "unknown"
+                    ]
+                  }
+                }
+              },
+              "reasoning_tokens": {
+                "properties": {
+                  "source": {
+                    "enum": [
+                      "reported",
+                      "unknown"
+                    ]
+                  }
+                }
+              },
+              "reported_total_tokens": {
+                "properties": {
+                  "source": {
+                    "enum": [
+                      "reported",
+                      "unknown"
+                    ]
+                  }
+                }
+              }
+            }
           },
           "observation_ended_at_ms": {
             "type": "integer"

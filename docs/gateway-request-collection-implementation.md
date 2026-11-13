@@ -6,9 +6,9 @@
 
 业务仍直接经过 Istio 网关到模型服务。Wasm 有界旁路发送响应，Observer 解析后使用原生 Producer 写 Kafka；Consumer 确认 Doris 可见后提交 offset。采集故障放行业务，可以漏采，禁止拒绝、终止或无限暂停业务请求。插件加载使用 ECDS 透明兜底；`fail_open: true` 不能替代加载故障的真实转发验证。
 
-支持 OpenAI 兼容 Chat Completions JSON/SSE。模型服务负责返回 usage；网关不添加或覆盖 include_usage，不读取、解析、复制或缓冲请求正文。未知用量保持 null/unknown，不估算、不补零。1M 上下文 token 不产生采集正文副本；32 MiB 只是透传边界测试，不是请求大小限制。网关原有请求上限继续由业务配置决定。
+支持 OpenAI 兼容 Chat Completions JSON/SSE。模型服务负责返回 usage；网关不添加或覆盖 include_usage；默认不读取请求正文，显式开启请求体采集时仅有界分片发送，仍禁止在 Wasm 中解析、校验、完整缓冲或改写正文。响应未知用量保持 null/unknown，不估算、不补零；请求输入估算仅写开始事件。关闭请求体采集时，1M 上下文 token 不产生采集正文副本；32 MiB 只是透传边界测试，不是请求大小限制。网关原有请求上限继续由业务配置决定。
 
-Wasm 保留请求头元数据、状态及时间事实，request_model 固定 null，response_model 仍来自响应。只观察入口服务的最终响应，不推测内部调用或隐藏重试的消耗。正文和密钥不写入日志、Kafka 或 Doris；响应只在有界旁路和 Observer 解析内存中临时存在。
+Wasm 保留请求头元数据、状态及时间事实，request_model 由 Observer 从已采集请求正文提取，仅写开始事件，关闭采集或未知为 null；response_model 仍来自响应。只观察入口服务的最终响应，不推测内部调用或隐藏重试的消耗。正文和密钥不写入日志、Kafka 或 Doris；响应只在有界旁路和 Observer 解析内存中临时存在。
 
 当前基线为 Go 1.25.0、TinyGo 0.40.1、固定 SDK v0.24.0 本地扩展。Kubernetes E2E 使用 kind-kind、Istio 1.13.5 和 proxyv2:1.14.6（Envoy 1.22.7-dev）；本地结果不等于私有生产镜像或生产容量验收。
 
@@ -89,11 +89,15 @@ message ObservationFrame {
     BodyChunk body_chunk = 12;
     End end = 13;
     Cancel cancel = 14;
+    RequestBodyStopped request_body_stopped = 15;
   }
 }
 
 // 采集取消不表示业务请求结束，不能替代有效 End。
 message Cancel {}
+
+// Stops only request-body capture, never the observation or business stream.
+message RequestBodyStopped {}
 
 message Start {
   reserved 5, 7, 8, 9, 10;
@@ -114,6 +118,7 @@ message Start {
   optional string user_id = 19; // 按候选头顺序提取，最多 512 UTF-8 字节
   optional string user_agent = 20; // 标准 User-Agent，最多 2048 UTF-8 字节
   map<string, string> request_headers = 21; // 小写白名单头名，最多 16 项
+  bool request_body_capture_enabled = 22;
 }
 
 message ResponseHeaders {
@@ -144,6 +149,8 @@ message End {
   optional uint32 upstream_attempt_count = 9;
   optional string response_flags = 10;
   optional string response_code_details = 11;
+  bool request_body_capture_complete = 12;
+  uint64 last_request_body_seq = 13;
 }
 
 message ObservationAck {
@@ -151,6 +158,7 @@ message ObservationAck {
   uint64 accepted_frame_seq = 2;   // 连续处理完成的最高 frame_seq
   bool close_stream = 3;          // 仅关闭该观察，不关闭共享传输流
   string reason = 4;              // 固定原因码，禁止透传异常文本
+  bool stop_request_body = 5;     // 单方向降级，不关闭观察
 }
 ```
 
@@ -159,11 +167,11 @@ message ObservationAck {
 批次累计确认表示连续批次已被 Observer 的有界接收队列接管，允许 Wasm 归还传输额度；不代表解析完成或 Kafka 持久化。普通响应分片不再逐观察回 ACK；接纳、结束和异常才返回 Capture ACK。接收队列同时受实例级 receive_queue_batches（默认 4096）与 receive_queue_bytes（默认 128 MiB）限制，每共享传输最多排队 128 批。字节预留包含 protobuf 对象及载荷的保守开销，处理完成或关闭时归还，队列满立即关闭采集传输。解析、身份冻结、最终事件处理和 Producer 由串行处理端执行，原始分片时间不受队列等待影响。
 
 
-每 Worker 默认 4 条长期双向 gRPC 流。各流批次序号从 1 连续递增；单批最多 32 KiB、128 个 CaptureFrame，tick 每 10 ms 刷新未满批。每个 capture 的帧序号从 1 连续递增：Start、ResponseHeaders、RESPONSE BodyChunk、End。请求正文不在协议上传输；REQUEST 方向保留枚举编号但服务端拒绝该方向。响应片段最多 16 KiB；只有原回调最后一个分片带 EOS，拆片保留相同原回调时间。
+每 Worker 默认 4 条长期双向 gRPC 流。各流批次序号从 1 连续递增；单批最多 32 KiB、128 个 CaptureFrame，tick 每 10 ms 刷新未满批。每个 capture 的帧序号从 1 连续递增：Start、ResponseHeaders、RESPONSE BodyChunk、End。请求正文默认不传输；显式开启 request_body_capture_enabled 时允许 REQUEST BodyChunk，独立停止该方向不会取消响应观察。响应片段最多 16 KiB；只有原回调最后一个分片带 EOS，拆片保留相同原回调时间。
 
 ObservationAckBatch 累计确认已处理的最高批次序号，释放待发及未确认记录的逻辑额度。它不保证 Kafka/Doris 持久化。CaptureAck 返回 UUID 和该观察已处理帧序号；close_stream 仅关闭该观察，不关闭共享 gRPC。Observer 按递增 capture_id 的高水位忽略已关闭观察的迟到片段，无长期 tombstone 表。
 
-Cancel 是独立控制帧，不声称业务 End 或 EOS。单条采集的解析/序号/超限错误定稿该观察，其他观察继续；批次协议错误或连接故障影响该传输中的观察。ACK 超过 2 秒关闭受影响传输，100 ms 后允许重新建立，不重传旧观察。Wasm 单条观察最长 600 秒，Observer 605 秒。有效 End 先保存，迟到 ACK 写失败不丢弃已见终态。
+Cancel 是独立控制帧，不声称业务 End 或 EOS。单条采集的解析/序号/超限错误定稿该观察，其他观察继续；批次协议错误或连接故障影响该传输中的观察。ACK 超过 2 秒关闭受影响传输，100 ms 后允许重新建立，不重传旧观察。Wasm 默认 30 分钟、最长 1 小时，Observer 内部固定 1 小时加 5 秒。有效 End 先保存，迟到 ACK 写失败不丢弃已见终态。
 
 ## 4. WASM 插件实现
 
@@ -173,7 +181,7 @@ Cancel 是独立控制帧，不声称业务 End 或 EOS。单条采集的解析/
 
 ### 4.2 上下文和状态机
 
-HTTP context 保存必要标志及轻量观察指针，Root 保存观察表、超时堆、固定传输及批次账本。Start 元数据最多 6144 字节。请求正文回调只统计 host 提供的字节数及 EOS，不读正文；所有回调 Continue。响应每次最多读取 16 KiB，逐片进入共享批次，不为每请求保留响应尾部窗口。
+HTTP context 保存必要标志及轻量观察指针，Root 保存观察表、超时堆、固定传输及批次账本。Start 元数据最多 6144 字节。请求正文默认只统计字节数及 EOS；显式开启时先申请总额度和四分之一请求体子额度，再读取最多 16 KiB 并旁路发送，不解析或校验 JSON。所有回调 Continue。响应每次最多读取 16 KiB，逐片进入共享批次，不为每请求保留响应尾部窗口。
 
 Wasm 直接向每条共享传输的固定上限批缓冲编码，先领取 Pod 额度再读取最多 16 KiB 响应；发送和接收缓冲使用后清零。普通确认单遍校验并复用 ACK 数组；累计确认清空记录中的引用并复用队列。通道故障先标记失效，回调最多回收 64 项，tick 合计另回收最多 256 项；通道观察通过双向链表定位，取消控制帧进入共享批次。取消未确认前继续持有 native 额度。卸载没有后续 tick，需要排空残余状态，不将这部分生命周期成本等同于正常回调上限。
 
@@ -226,7 +234,7 @@ Observer 不再接受 max_observation_ms 配置项。内部从接纳 Start 后�
 
 支持 application/json 与 text/event-stream、identity 或空 Content-Encoding。JSON 最大 1 MiB，单 SSE 事件最大 256 KiB，每观察响应累计最大 8 MiB；这些限制是响应采集边界，不是上下文输入限制。SSE usage 仅接受 choices=[] 的有效数字字段。缺字段、非法字段、冲突与不完整流按事件契约保留 null/unknown 和异常码。
 
-request_model 固定 null；response_model 及计时来自响应。解析不运行 tokenizer，也不以客户端请求值代替上游 reported usage。完整 End 与两个方向 EOS 用于判断业务完成；请求方向仅校验 End 的事实，不要求不存在的正文片序。
+request_model 仅在开始事件中由 Observer 复用请求正文解析提取；response_model 及计时来自响应。响应解析不运行 tokenizer，也不以客户端请求值代替上游 reported usage；可选请求体的 tokenizer 由独立工作池执行，只写开始事件的 usage.input_tokens，来源为 estimated/unknown。完整 End 与两个方向 EOS 用于判断业务完成；默认请求方向仅校验 End 的事实；启用请求体采集时另外校验请求分片与完整性。
 
 ### 5.3 字段归一化
 
@@ -320,7 +328,7 @@ usage 六类 token 的 value/source、raw_usage_json 安全白名单、资格及
 }
 ```
 
-两类事件使用相同固定字段集；`x_request_id` 在同一请求的开始与结果事件中相同，无法取得时显式为 null。start 的 `usage=null`、`usage_status=not_applicable`、`usage_eligible=false`、`raw_usage_json="{}"`，结束时间为 null、`terminal_observed=false`。结果事件同时保存用量、`terminal_observed` 和可取得的结束时间；未收到有效 End 时结束时间为 null，不填零或虚构完成状态。未获得模型、HTTP 状态等字段显式写 null；结果事件的 observation_status 反映采集完整性，不能因 HTTP 200 强行标 complete。
+两类事件使用相同固定字段集；`x_request_id` 在同一请求的开始与结果事件中相同，无法取得时显式为 null。关闭请求体采集时 start 的 `usage=null`、`usage_status=not_applicable`；开启时仅 input_tokens 可以是 estimated，其余子项为 null/unknown，状态为 partial 或 unknown。start 始终 `usage_eligible=false`、`raw_usage_json="{}"`，结束时间为 null、`terminal_observed=false`。请求事件等待冻结归属和输入计数后只发一次，可晚于响应结果事件到达。结果事件同时保存用量、`terminal_observed` 和可取得的结束时间；未收到有效 End 时结束时间为 null，不填零或虚构完成状态。未获得模型、HTTP 状态等字段显式写 null；结果事件的 observation_status 反映采集完整性，不能因 HTTP 200 强行标 complete。
 
 字段值由 Go 固定 struct 编码，字段顺序固定、无缩进，所有可选字段显式输出 null，字符串采用 Go encoding/json 默认转义；不接受同名重复 JSON key、未知顶层字段或自由扩展 map。Consumer 解码后按同一 schema struct 重编码为 `event_json`，计算 SHA-256 小写十六进制 `payload_hash`。摘要不含 Kafka 坐标/入库时间，包含 producer_id、事件时间和全部业务字段。重放保留原事件，不重新生成时间或 producer_id。
 
@@ -440,7 +448,7 @@ WHERE request_date = ? AND customer_id = ?;
 ### 8.1 消费处理顺序
 
 1. 使用独立 group `llm-metering-doris-v1`，禁用自动提交。每分区顺序处理，允许不同分区并行。遇到 Consumer 尚不支持的 Kafka 事件 `schema_version`，立即暂停该分区，保留当前未提交 offset，报警并等待 Consumer 升级；其他分区可继续处理。
-2. 对已支持版本校验大小、schema、白名单、ID 为规范小写 UUIDv4（`^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`）、Kafka key 与 ID 一致、ID/类型后缀、`request_started_at_ms` 为合法 Unix 毫秒、身份类型、token 类型和来源组合；只接受 `request_started`（:start）和 `usage_observed`（:usage）。start 出现非 null usage 一律拒绝；结果事件必须带有用量状态和终态标识，即使 token 未知也不能省略状态。若 `terminal_observed=false`，`request_finished_at_ms` 必须为 null。开始时间超出消费者当前时间 5 分钟以上进入拒绝诊断，不让远期分区无限保留；所有拒绝都有原因计数。
+2. 对已支持版本校验大小、schema、白名单、ID 为规范小写 UUIDv4（`^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`）、Kafka key 与 ID 一致、ID/类型后缀、`request_started_at_ms` 为合法 Unix 毫秒、身份类型、token 类型和来源组合；只接受 `request_started`（:start）和 `usage_observed`（:usage）。start 的 usage 可为 null，或仅输入 estimated/unknown、其余子项 unknown 的对象；响应禁止 estimated；结果事件必须带有用量状态和终态标识，即使 token 未知也不能省略状态。若 `terminal_observed=false`，`request_finished_at_ms` 必须为 null。开始时间超出消费者当前时间 5 分钟以上进入拒绝诊断，不让远期分区无限保留；所有拒绝都有原因计数。
 3. 规范化并计算 `payload_hash` 与稳定身份 `identity_hash`，按 `request_started_at_ms` 的 UTC 日期确定 `request_date`，从同一个已校验的事件对象展开类型化列并准备 `events_raw` 行。校验 `event_id` 与 `observation_id`/`event_type` 一致，所有可空字段按原事件 null 写 SQL NULL，token source 不从数值猜测；类型化列与保留的 `event_json` 必须表达同一事件。不在 Consumer 中重新提取服务 usage、补估算或改变定稿。
 4. 每个 Kafka 分区默认每批 5000 行/4 MiB，或等待 15 秒即通过 Doris Stream Load 写入；可配置上限分别为 20000 行、16 MiB、600000 ms（10 分钟），任一条件先满足即写入，计时不因后续事件重置。攒批不持续阻止分区移交，撤销时由新 owner 重放未提交记录；fetch 等待固定 5 秒，初次审计及分钟巡检不等待攒批清空。固定 label 为表名前缀加冻结批次规范元组（topic、partition、首末 offset、Stream Load 正文字节 SHA-256）的 SHA-256（前缀 + 64 位十六进制摘要，不超过 128 字符），重试沿用相同 label；设置 Expect: 100-continue、format=json、read_json_by_line=true、max_filter_ratio=0、timezone=+00:00，处理 FE 到 BE 的 307 重定向，并写入 UTC DATETIME(3) 字符串。响应成功、加载行数等于批次行数、过滤行数为 0 且事务可见后，才提交该分区连续成功记录的下一 offset。
 5. Stream Load 失败、Publish Timeout、行数不符或确认丢失时不提交 offset；同一执行期查明事务状态后以原 label 和原内容重试；重启/新 owner 重新冻结的内容或范围变化时生成新 label，依赖 Unique Key 消除已成功写入的行。Label Already Exists 本身不等于成功，须核实原批已可见。label 有有限保留期，长期重放依赖事件表 Unique Key；同一事件的不同摘要不得合并。同一连续 offset 范围内若既有合法事件又有拒绝诊断，分别写入两表，两个事务均确认可见后才提交该范围的 offset。
@@ -506,7 +514,8 @@ Consumer/Doris 故障可以依赖 Kafka 72 小时保留恢复，与禁止采集�
   "transport_streams_per_worker": 4,
   "transport_batch_max_bytes": 32768,
   "transport_batch_max_frames": 128,
-  "metrics_enabled": false
+  "metrics_enabled": false,
+  "request_body_capture_enabled": false
 }
 ```
 
@@ -538,4 +547,8 @@ active_streams 历史 Wasm 指标名现在表示观察数，inflight_bytes/messa
 
 ## 请求性能时间事实
 
-Wasm 在响应正文回调入口采集 `BodyChunk.observed_elapsed_us`，同一次回调拆片共用该时间。Observer 解析有效生成内容，仅在结果事件增加 `response_streaming`、`first_output_elapsed_us`、`last_output_elapsed_us`；开始事件均为 null。时间缺失或倒退只降级相应时间字段，不改变 usage 接纳。Consumer 按原值写入 Doris，明细视图计算 TTFT/TPOT；不使用 tokenizer，也不保存逐片段时间列表。详细口径、NULL 条件及查询示例见[请求性能指标](request-performance.md)。
+Wasm 在响应正文回调入口采集 `BodyChunk.observed_elapsed_us`，同一次回调拆片共用该时间。Observer 解析有效生成内容，仅在结果事件增加 `response_streaming`、`first_output_elapsed_us`、`last_output_elapsed_us`；开始事件均为 null。时间缺失或倒退只降级相应时间字段，不改变 usage 接纳。Consumer 按原值写入 Doris，明细视图计算 TTFT/TPOT；性能与用量链路不使用请求估算，也不保存逐片段时间列表。详细口径、NULL 条件及查询示例见[请求性能指标](request-performance.md)。
+
+## 请求体输入 token 采集
+
+`request_body_capture_enabled` 默认 false。Observer 使用 o200k_base / text_tools_v1，只记录到 request_started 的 usage.input_tokens，成功为 estimated，失败为 null/unknown；usage_observed 仍只接受 reported/unknown，不使用请求估算补齐。Consumer 原值写入现有 Doris token 列，统计视图只使用响应事件。配置、顺序及上线步骤见[请求输入 token 估算](request-body-tokens.md)。

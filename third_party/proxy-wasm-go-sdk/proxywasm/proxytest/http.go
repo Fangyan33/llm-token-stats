@@ -78,11 +78,19 @@ func (h *httpHostEmulator) httpHostEmulatorProxyGetBufferBytes(bt internal.Buffe
 		return internal.StatusBadArgument
 	}
 
-	*returnBufferData = &buf[start]
 	if maxSize > len(buf)-start {
 		*returnBufferSize = len(buf) - start
 	} else {
 		*returnBufferSize = maxSize
+	}
+	// Real hosts copy native HTTP bytes into Wasm linear memory. Returning an
+	// alias here makes clearing a read-only SDK buffer mutate business traffic
+	// in native tests, a behavior that cannot occur across the Wasm boundary.
+	copy := append([]byte(nil), buf[start:start+*returnBufferSize]...)
+	if len(copy) > 0 {
+		*returnBufferData = &copy[0]
+	} else {
+		*returnBufferData = nil
 	}
 	return internal.StatusOK
 }

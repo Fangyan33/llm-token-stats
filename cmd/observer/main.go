@@ -97,7 +97,9 @@ func run() error {
 	if err != nil {
 		return logging.WithCause("customer_lookup_initialization_failed", err)
 	}
-	pb.RegisterObservationServiceServer(server, &observation.Server{Cfg: c.Observer, Sink: p, Health: h, ServiceResolver: service, CustomerResolver: customer})
+	observer := &observation.Server{Cfg: c.Observer, Sink: p, Health: h, ServiceResolver: service, CustomerResolver: customer}
+	defer observer.CloseRequestTokens()
+	pb.RegisterObservationServiceServer(server, observer)
 	h.Ready.Store(true)
 	logging.Info("grpc_listening", "listen", l.Addr().String(), "max_connections", c.Observer.MaxConnections)
 	go func() {

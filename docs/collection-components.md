@@ -1,6 +1,6 @@
 # 网关采集组件运行说明
 
-更新日期：2026-11-09。[实现计划](spec/plan/gateway-collection-implementation.md)已落地到三个可构建组件。业务仍直接经过网关到模型服务；Wasm 旁路发送有界片段，Observer 解析后使用原生 Producer 写 Kafka，Consumer 确认 Doris 可见性后提交 offset。仅产生 `request_started`、`usage_observed`，未知值保留 null/unknown。
+更新日期：2026-11-13。[实现计划](spec/plan/gateway-collection-implementation.md)已落地到三个可构建组件。业务仍直接经过网关到模型服务；Wasm 旁路发送有界片段，Observer 解析后使用原生 Producer 写 Kafka，Consumer 确认 Doris 可见性后提交 offset。仅产生 `request_started`、`usage_observed`，未知值保留 null/unknown。
 
 本轮命令、故障处理及资源归零证据见[本地验证记录](spec/plan/gateway-collection-verification.md)，实际镜像 digest 见[镜像记录](../deploy/local/images.lock.json)。
 
@@ -124,13 +124,13 @@ Host 无效或不匹配时，在提取凭据、建立观察流、处理响应之
 
 ## 网关响应采集
 
-请求头和正文直接 Continue，不读取、解析、缓冲或改写请求正文。模型服务负责返回 usage；缺失时保存 null/unknown，request_model 固定 null。响应按最多 16 KiB 分片旁路发送，保留原回调时间；SSE/usage/TTFT/TPOT 解析均在 Observer。
+请求头和正文直接 Continue；默认不读取请求正文，显式开启 request_body_capture_enabled 时仅有界分片旁路发送，禁止在 Wasm 中解析、校验、完整缓冲或改写。模型服务负责返回 usage；缺失时保存 null/unknown，request_model 由 Observer 从已采集正文提取，仅写请求事件，关闭或未知为 null。响应按最多 16 KiB 分片旁路发送，保留原回调时间；SSE/usage/TTFT/TPOT 解析均在 Observer。
 
-每个 Worker 默认 4 条长期 gRPC 流复用独立观察；批次最多 32 KiB、128 帧或等待 10 ms，采用累计批次 ACK。单个观察的关闭不关闭共享传输；ACK 超过 2 秒、传输故障或 Pod 级额度不足时放弃受影响观察并放行业务。观察最大 600 秒，Observer 为 605 秒。
+每个 Worker 默认 4 条长期 gRPC 流复用独立观察；批次最多 32 KiB、128 帧或等待 10 ms，采用累计批次 ACK。单个观察的关闭不关闭共享传输；ACK 超过 2 秒、传输故障或 Pod 级额度不足时放弃受影响观察并放行业务。观察时长默认 30 分钟、最大 1 小时；Observer 内部固定 1 小时＋5 秒兜底。
 
 SharedData CAS 分块额度覆盖 Pod 中同 vm_id 的所有 Worker：默认 131072 个观察、256 MiB 待发及未确认载荷、524288 条记录。vm_id 必须稳定且该 Pod 只能安装一个采集实例；不能按 Worker 或发布代数重复配置额度。额度配置不同会停用新实例采集，调整额度须重启 Pod。详细协议、配置和 RSS 验收边界见[实现方案](gateway-request-collection-implementation.md)。
 
-本次直接替换 Wasm–Observer 内部协议，不兼容旧逐请求传输端点；两端必须配套更新。Kafka/Doris 事件格式不变，升级期间仍须验证业务透传。Observer 默认允许 1048576 个观察，parser_budget_bytes 为 10 GiB（实际保留内存按需计账），可配置至 64 GiB；生产应按实际响应并发配置资源和实例数。
+本次直接替换 Wasm–Observer 内部协议，不兼容旧逐请求传输端点；两端必须配套更新。请求事件可包含输入 estimated；响应事件格式及统计口径不变，升级期间仍须验证业务透传。Observer 默认允许 1048576 个观察，parser_budget_bytes 为 10 GiB（实际保留内存按需计账），可配置至 64 GiB；生产应按实际响应并发配置资源和实例数。
 
 ## 服务配置与部署
 
@@ -295,3 +295,7 @@ Kafka Producer 使用以下实例配置，应用 pending 与 franz-go 采用相�
 这些队列独立于 Wasm Pod 额度，所有故障继续 fail-open，未知用量保留 null。条数/字节/批量和期限须一起调整；逻辑额度不能替代网关 RSS 增量对照。
 
 Wasm 构建现在同时执行 SDK 的真实 TinyGo/Wasm 缓冲所有权回归，覆盖宿主 malloc 与 Go allocator 两条路径。固定 TinyGo 0.40.1 中，SDK 接管宿主缓冲时解除对应 C 分配登记，保留 Go 引用及零额外复制；升级工具链必须重新验证该运行时适配。SDK 修改记录见 [PATCHES](../third_party/proxy-wasm-go-sdk/PATCHES.md)。
+
+## 可选请求体输入计数
+
+新增 request_body_max_bytes、request_tokenizer_workers、request_tokenizer_queue_requests 和 request_tokenizer_queue_bytes 配置，均只作用于 Observer。分词不进入响应解析路径，只写正式请求事件的 usage.input_tokens（estimated/unknown）；响应仍只使用服务端 usage，估算不进入有效用量汇总。配置、事件顺序和升级步骤见[请求输入 token 估算](request-body-tokens.md)。

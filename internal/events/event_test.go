@@ -11,7 +11,7 @@ import (
 
 func TestFixturesGolden(t *testing.T) {
 	files, _ := filepath.Glob("../../testdata/collection/*.json")
-	if len(files) != 6 {
+	if len(files) != 8 {
 		t.Fatal(len(files))
 	}
 	for _, f := range files {

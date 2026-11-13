@@ -20,6 +20,7 @@ type Config struct {
 	SchemaVersion             int64    `json:"schema_version"`
 	Enabled                   bool     `json:"enabled"`
 	MetricsEnabled            bool     `json:"metrics_enabled"`
+	RequestBodyCaptureEnabled bool     `json:"request_body_capture_enabled"`
 	ConfigVersion             string   `json:"config_version"`
 	ObserverCluster           string   `json:"observer_cluster"`
 	AcceptedRequestHosts      []string `json:"accepted_request_hosts"`

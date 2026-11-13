@@ -53,8 +53,8 @@ Go 使用标准 `testing`，文件命名为 `*_test.go`、函数命名为 `TestX
 **业务正常转发优先于采集完整性，允许漏采，禁止因采集故障拒绝、终止或无限暂停业务请求。**
 
 - 覆盖插件加载、初始化、配置、正文改写、观测、指标及 Kafka/Doris 写入各阶段；采集链路必须有界、异步，故障时降级或跳过采集。插件加载不得成为业务网关可用的必需依赖，必须具备可验证的透传兜底。
-- 请求头、正文和响应回调直接 Continue。请求正文不得读取、解析、复制、缓冲或改写；usage 由模型服务保证返回，缺失时保存 `null/unknown`，不得估算或补零。`request_model` 因此保持 null。
-- Wasm 只按最多 16 KiB 分片旁路发送响应及原始回调时间；SSE、usage 和性能解析放在 Observer。每 Worker 使用固定数量共享 gRPC 传输流，单个观察关闭不得关闭共享流。
+- 请求头、正文和响应回调直接 Continue。请求正文默认不得读取；显式开启 request_body_capture_enabled 时只允许按最多 16 KiB 有界旁路发送，禁止解析、校验、完整缓冲或改写，JSON 和 tokenizer 仅在 Observer 处理。输入估算只写 request_started 的 usage.input_tokens，source 为 estimated，失败保留 null/unknown；响应 usage 只接受服务端 reported/unknown，缺失时不得用请求估算补齐或补零。请求估算不得进入有效用量汇总。`request_model` 仅在 Observer 从完整合法正文提取后写入 request_started；关闭采集、缺失或非法时为 null，响应事件该字段保持 null。
+- Wasm 按最多 16 KiB 分片旁路发送响应及原始回调时间；可选请求体也须有界分片发送；SSE、usage 和性能解析放在 Observer。每 Worker 使用固定数量共享 gRPC 传输流，单个观察关闭不得关闭共享流。
 - Pod 级 SharedData CAS 额度覆盖所有 Worker 的观察数及待发、未确认记录；不等待额度，不重发业务或旁路。共享传输失败、超时或资源不足时有界清理并继续业务。
 - 插件额外 RSS 的验收上限为每 Pod 2048 MiB，包含 Wasm 与 Envoy native 状态；逻辑字节额度不能替代 RSS 对照实测。容量目标为单 Pod 200 QPS、60 秒流，输入分布为 20% 1M、50% 200K、20% 500K、10% 100K；必须区分本地验证与生产同规格验收。
 - `fail_open: true` 不是全阶段保证。涉及加载或传输路径的变更必须验证故障下的真实转发，并明确 VM/Envoy 故障等未覆盖边界，禁止将配置开关或单元测试等同于完整验收。

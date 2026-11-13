@@ -58,25 +58,31 @@ type state struct {
 	ending          bool
 	started         time.Time
 	timer           *deadline
+	requestCaptured uint64
+	requestStopped  bool
+	requestStopSent bool
+	requestComplete bool
 }
 type batchRecord struct {
-	seq             uint64
-	bytes, messages int64
-	at              time.Time
+	seq                           uint64
+	bytes, messages               int64
+	at                            time.Time
+	requestBytes, requestMessages int64
 }
 type channel struct {
-	token           uint32
-	closing         bool
-	seq             uint64
-	batch           []byte
-	bytes, messages int64
-	records         []batchRecord
-	recordHead      int
-	retryAt         time.Time
-	head            *state
-	failed          bool
-	released        bool
-	cleanupReason   string
+	token                         uint32
+	closing                       bool
+	seq                           uint64
+	batch                         []byte
+	bytes, messages               int64
+	records                       []batchRecord
+	recordHead                    int
+	retryAt                       time.Time
+	head                          *state
+	failed                        bool
+	released                      bool
+	cleanupReason                 string
+	requestBytes, requestMessages int64
 }
 type root struct {
 	types.DefaultPluginContext
@@ -89,6 +95,7 @@ type root struct {
 	inflight, messages int64
 	q                  deadlines
 	budget             *podBudget
+	requestBudget      *podBudget
 	metrics            map[string]proxywasm.MetricCounter
 	gauges             map[string]proxywasm.MetricGauge
 	gaugeValues        [3]int64
@@ -195,6 +202,15 @@ func (r *root) OnPluginStart(_ int) types.OnPluginStartStatus {
 			r.cfg.Enabled = false
 			r.count("budget_unavailable")
 		}
+		if r.cfg.RequestBodyCaptureEnabled && r.cfg.Enabled {
+			requestCfg := r.cfg
+			requestCfg.PodInflightBytes /= 4
+			requestCfg.PodInflightMessages /= 4
+			r.requestBudget, budgetErr = newPodBudget(requestCfg, r.instanceID+"/request-body")
+			if budgetErr != nil {
+				r.cfg.RequestBodyCaptureEnabled = false
+			}
+		}
 		r.channels = make([]*channel, int(r.cfg.TransportStreamsPerWorker))
 	}
 	r.log(logsafe.Info, "plugin_configured", "enabled", strconv.FormatBool(r.cfg.Enabled), "config_version", r.cfg.ConfigVersion, "observer_cluster", r.cfg.ObserverCluster, "log_level", r.logs.level.String())
@@ -247,6 +263,14 @@ func (r *root) cleanup() {
 			// clears the uncertain native state and the ledger together.
 			r.budget.give(0, 0, 0)
 		}
+	}
+	if r.requestBudget != nil {
+		if r.inflight == 0 && r.messages == 0 {
+			r.requestBudget.close()
+		} else {
+			r.requestBudget.give(0, 0, 0)
+		}
+		r.requestBudget = nil
 	}
 	r.inflight = 0
 	r.messages = 0
@@ -315,11 +339,15 @@ func (r *root) releaseChannel(c *channel, reason string) {
 		r.inflight -= c.bytes
 		r.messages -= c.messages
 		r.budget.give(c.bytes, c.messages, 0)
+		if r.requestBudget != nil {
+			r.requestBudget.give(c.requestBytes, c.requestMessages, 0)
+		}
 		clear(c.batch)
 		if c.batch != nil {
 			c.batch = c.batch[:11]
 		}
 		c.bytes, c.messages = 0, 0
+		c.requestBytes, c.requestMessages = 0, 0
 		c.released = true
 	}
 	r.reapChannel(c, 64)
@@ -341,18 +369,24 @@ func (r *root) reapChannel(c *channel, limit int) int {
 		return used
 	}
 	var n, m int64
+	var rn, rm int64
 	for c.recordHead < len(c.records) && used < limit {
 		rec := c.records[c.recordHead]
 		c.records[c.recordHead] = batchRecord{}
 		c.recordHead++
 		n += rec.bytes
 		m += rec.messages
+		rn += rec.requestBytes
+		rm += rec.requestMessages
 		used++
 	}
 	if n != 0 || m != 0 {
 		r.inflight -= n
 		r.messages -= m
 		r.budget.give(n, m, 0)
+		if r.requestBudget != nil {
+			r.requestBudget.give(rn, rm, 0)
+		}
 	}
 	if c.head == nil && c.recordHead == len(c.records) {
 		c.records = c.records[:0]
@@ -388,9 +422,10 @@ func (r *root) flush(c *channel) bool {
 		c.records = c.records[:n]
 		c.recordHead = 0
 	}
-	c.records = append(c.records, batchRecord{c.seq, c.bytes, c.messages, time.Now()})
+	c.records = append(c.records, batchRecord{seq: c.seq, bytes: c.bytes, messages: c.messages, at: time.Now(), requestBytes: c.requestBytes, requestMessages: c.requestMessages})
 	c.bytes = 0
 	c.messages = 0
+	c.requestBytes, c.requestMessages = 0, 0
 	return true
 }
 func (r *root) send(s *state, kind int, b []byte, end bool) bool {
@@ -405,6 +440,9 @@ func (r *root) send(s *state, kind int, b []byte, end bool) bool {
 
 // prepare claims Pod credits before encoding or copying a response fragment.
 func (r *root) prepare(s *state, kind, payload int) (*channel, int64, bool) {
+	return r.prepareFrame(s, kind, payload, false)
+}
+func (r *root) prepareFrame(s *state, kind, payload int, request bool) (*channel, int64, bool) {
 	if !r.active(s) || s.ending && kind != 14 {
 		return nil, 0, false
 	}
@@ -421,7 +459,14 @@ func (r *root) prepare(s *state, kind, payload int) (*channel, int64, bool) {
 		}
 	}
 	n := int64(encoded + 16)
+	if request && (r.requestBudget == nil || !r.requestBudget.take(n, 1, 0)) {
+		return nil, 0, false
+	}
 	if !r.budget.take(n, 1, 0) {
+		if request {
+			r.requestBudget.give(n, 1, 0)
+			return nil, 0, false
+		}
 		r.count("resource_limit")
 		r.repeatedLog(logsafe.Warn, "observation_resource_limit", "limit_kind", "pod_budget", "action", "skip_observation")
 		if kind == 14 {
@@ -503,17 +548,22 @@ func (r *root) OnReceive(token uint32, size int) {
 		r.failChannel(c, "protocol_error")
 		return
 	}
-	var freedBytes, freedMessages int64
+	var freedBytes, freedMessages, requestBytes, requestMessages int64
 	for c.recordHead < len(c.records) && c.records[c.recordHead].seq <= a.Seq {
 		rec := c.records[c.recordHead]
 		c.records[c.recordHead] = batchRecord{}
 		c.recordHead++
 		freedBytes += rec.bytes
 		freedMessages += rec.messages
+		requestBytes += rec.requestBytes
+		requestMessages += rec.requestMessages
 	}
 	r.inflight -= freedBytes
 	r.messages -= freedMessages
 	r.budget.give(freedBytes, freedMessages, 0)
+	if r.requestBudget != nil {
+		r.requestBudget.give(requestBytes, requestMessages, 0)
+	}
 	if c.recordHead == len(c.records) {
 		c.records = c.records[:0]
 		c.recordHead = 0
@@ -532,6 +582,9 @@ func (r *root) OnReceive(token uint32, size int) {
 			continue
 		}
 		s.id = ack.ID
+		if ack.StopRequestBody {
+			s.requestStopped = true
+		}
 		if ack.Close {
 			r.drop(s, "closed")
 		}
@@ -695,6 +748,9 @@ func (h *httpContext) OnHttpRequestHeaders(_ int, eos bool) types.Action {
 }
 func (h *httpContext) OnHttpRequestBody(n int, eos bool) types.Action {
 	if n >= 0 && h.root.active(h.s) {
+		if h.cfg.RequestBodyCaptureEnabled {
+			h.observeRequest(n, eos)
+		}
 		h.s.offset[0] += uint64(n)
 		h.s.eos[0] = eos
 	}
@@ -702,6 +758,9 @@ func (h *httpContext) OnHttpRequestBody(n int, eos bool) types.Action {
 }
 func (h *httpContext) OnHttpRequestTrailers(_ int) types.Action {
 	if h.root.active(h.s) {
+		if h.cfg.RequestBodyCaptureEnabled {
+			h.observeRequest(0, true)
+		}
 		h.s.eos[0] = true
 	}
 	return types.ActionContinue
@@ -715,6 +774,7 @@ func (h *httpContext) OnHttpResponseHeaders(_ int, eos bool) types.Action {
 		return types.ActionContinue
 	}
 	h.status = n
+	h.sendRequestStop()
 	b := w.String(w.String(w.UInt(nil, 1, n), 2, responseHeader("content-type")), 3, responseHeader("content-encoding"))
 	if eos {
 		b = w.UInt(b, 4, 1)
@@ -797,6 +857,12 @@ func (h *httpContext) OnHttpStreamDone() {
 	b = w.UInt(b, 3, s.bodySeq[1])
 	b = w.UInt(b, 4, s.offset[0])
 	b = w.UInt(b, 5, s.offset[1])
+	if h.cfg.RequestBodyCaptureEnabled {
+		if s.requestComplete && !s.requestStopped {
+			b = w.UInt(b, 12, 1)
+		}
+		b = w.UInt(b, 13, s.bodySeq[0])
+	}
 	if s.eos[0] {
 		b = w.UInt(b, 6, 1)
 	}
@@ -835,6 +901,9 @@ func (h *httpContext) startPayload(now time.Time, eos bool, authority, route, ad
 	b = w.String(b, 11, "POST")
 	b = w.String(b, 12, ct)
 	b = w.String(b, 13, enc)
+	if h.cfg.RequestBodyCaptureEnabled {
+		b = w.UInt(b, 22, 1)
+	}
 	if eos {
 		b = w.UInt(b, 14, 1)
 	}

@@ -14,6 +14,7 @@ import (
 	"github.com/Fangyan33/llm-token-stats/internal/identitylookup"
 	"github.com/Fangyan33/llm-token-stats/internal/logging"
 	"github.com/Fangyan33/llm-token-stats/internal/producer"
+	"github.com/Fangyan33/llm-token-stats/internal/requesttokens"
 	"github.com/Fangyan33/llm-token-stats/pkg/credentials"
 	"github.com/Fangyan33/llm-token-stats/pkg/observationwire"
 	"github.com/Fangyan33/llm-token-stats/pkg/requesthost"
@@ -71,6 +72,9 @@ type Server struct {
 	queueMu          sync.Mutex
 	queueBytes       int64
 	queueBatches     int
+	tokenOnce        sync.Once
+	tokenPool        *requesttokens.Pool
+	requestBytes     atomic.Int64
 }
 
 func (s *Server) reserve(n int64) bool {
@@ -119,6 +123,8 @@ type observation struct {
 	reason            string
 	reservation, base int64
 	timer             *observationDeadline
+	request           *requestCapture
+	requestEvent      *requestEvent
 }
 type observationDeadline struct {
 	at      time.Time
@@ -186,8 +192,10 @@ func (s *Server) start(ctx context.Context, id uint64, f *pb.ObservationFrame) (
 	if st.RequestStartedAtMs < time.Now().UnixMilli()-300000 {
 		e.AnomalyCodes = events.Add(e.AnomalyCodes, "clock_anomaly")
 	}
-	o := &observation{s: s, capture: id, e: &e, p: chatcompletions.New(), lookup: lookup, started: time.Now(), seq: 1, base: base, reservation: base}
+	o := &observation{s: s, capture: id, e: &e, p: chatcompletions.New(), lookup: lookup, started: time.Now(), seq: 1, base: base, reservation: base,
+		requestEvent: &requestEvent{sink: s.Sink, captureEnabled: st.RequestBodyCaptureEnabled}}
 	o.eos[0] = st.RequestEndStream
+	o.startRequest(st)
 	return o, nil
 }
 func (o *observation) pollLookup() bool {
@@ -205,7 +213,7 @@ func (o *observation) pollLookup() bool {
 			e.AnomalyCodes = events.Add(e.AnomalyCodes, "identity_invalid")
 		}
 		copy := *e
-		o.s.Sink.Emit(&copy)
+		o.requestEvent.freeze(&copy)
 		o.frozen = true
 		o.lookup = nil
 		return true
@@ -225,6 +233,9 @@ func (o *observation) feed(f *pb.ObservationFrame) string {
 		o.seq = f.FrameSeq
 		return "transport_lost"
 	}
+	if f.GetRequestBodyStopped() != nil {
+		o.stopRequest("capture_incomplete")
+	}
 	if h := f.GetResponseHeaders(); h != nil {
 		if o.headers || h.HttpStatus < 200 || h.HttpStatus > 599 || len(h.ContentType) > 128 || len(h.ContentEncoding) > 128 {
 			return "protocol_error"
@@ -235,6 +246,11 @@ func (o *observation) feed(f *pb.ObservationFrame) string {
 		o.p.Content(h.ContentType, h.ContentEncoding)
 	}
 	if b := f.GetBodyChunk(); b != nil {
+		if b.Direction == pb.Direction_REQUEST {
+			o.feedRequest(b)
+			o.seq = f.FrameSeq
+			return ""
+		}
 		if b.Direction != pb.Direction_RESPONSE || !o.headers || o.eos[1] || b.BodySeq != o.bodySeq[1]+1 || b.Offset != o.offset[1] || len(b.Data) > 16384 || (len(b.Data) == 0 && !b.EndStream) {
 			return "protocol_error"
 		}
@@ -266,6 +282,9 @@ func (o *observation) feed(f *pb.ObservationFrame) string {
 		o.eos[1] = b.EndStream
 	}
 	if end := f.GetEnd(); end != nil {
+		if o.request != nil && (!end.RequestBodyCaptureComplete || end.LastRequestBodySeq != o.bodySeq[0] || end.RequestBytesSeen != o.offset[0]) {
+			o.stopRequest("capture_incomplete")
+		}
 		if end.LastResponseBodySeq != o.bodySeq[1] || end.ResponseBytesSeen != o.offset[1] || end.ResponseEndStreamSeen != o.eos[1] || end.RequestFinishedAtMs < 1 || end.RequestFinishedAtMs > 253402300799999 {
 			return "protocol_error"
 		}
@@ -286,6 +305,7 @@ func (o *observation) feed(f *pb.ObservationFrame) string {
 	return ""
 }
 func (o *observation) finalize() {
+	o.stopRequest("capture_incomplete")
 	s, e, p := o.s, o.e, o.p
 	end, reason := o.end, o.reason
 	bodySeq, offset, eos, headers, statusCode := o.bodySeq, o.offset, o.eos, o.headers, o.statusCode
@@ -306,7 +326,7 @@ func (o *observation) finalize() {
 	e.EventID = e.ObservationID + ":usage"
 	e.ObservationEndedAtMs = events.Ptr(time.Now().UnixMilli())
 	e.EventCreatedAtMs = time.Now().UnixMilli()
-	e.RequestModel = nil // Request bodies are deliberately never observed.
+	e.RequestModel = nil // Request-body metadata is kept only in the :start event.
 	e.ResponseModel = p.ResponseModel
 	e.HTTPStatus = statusCode
 	e.ResponseStreaming = p.ResponseStreaming
@@ -535,6 +555,7 @@ func (s *Server) Observe(stream pb.ObservationService_ObserveServer) error {
 		}
 		for id, o := range states {
 			delete(states, id)
+			o.stopRequest("transport_lost")
 			s.active.Add(-1)
 			s.bytes.Add(-o.reservation)
 		}
@@ -649,6 +670,10 @@ func (s *Server) Observe(stream pb.ObservationService_ObserveServer) error {
 							finish(o, reason)
 							acks[id] = &pb.ObservationAck{ObservationId: o.e.ObservationID, AcceptedFrameSeq: o.seq, Reason: "accepted"}
 						}
+					}
+					if o != nil && o.request != nil && o.request.notifyStop {
+						o.request.notifyStop = false
+						acks[id] = &pb.ObservationAck{ObservationId: o.e.ObservationID, AcceptedFrameSeq: o.seq, Reason: "accepted", StopRequestBody: true}
 					}
 				}
 				return nil

@@ -40,11 +40,15 @@ message ObservationFrame {
     BodyChunk body_chunk = 12;
     End end = 13;
     Cancel cancel = 14;
+    RequestBodyStopped request_body_stopped = 15;
   }
 }
 
 // 采集取消不表示业务请求结束，不能替代有效 End。
 message Cancel {}
+
+// Stops only request-body capture, never the observation or business stream.
+message RequestBodyStopped {}
 
 message Start {
   reserved 5, 7, 8, 9, 10;
@@ -65,6 +69,7 @@ message Start {
   optional string user_id = 19; // 按候选头顺序提取，最多 512 UTF-8 字节
   optional string user_agent = 20; // 标准 User-Agent，最多 2048 UTF-8 字节
   map<string, string> request_headers = 21; // 小写白名单头名，最多 16 项
+  bool request_body_capture_enabled = 22;
 }
 
 message ResponseHeaders {
@@ -95,6 +100,8 @@ message End {
   optional uint32 upstream_attempt_count = 9;
   optional string response_flags = 10;
   optional string response_code_details = 11;
+  bool request_body_capture_complete = 12;
+  uint64 last_request_body_seq = 13;
 }
 
 message ObservationAck {
@@ -102,4 +109,5 @@ message ObservationAck {
   uint64 accepted_frame_seq = 2;   // 连续处理完成的最高 frame_seq
   bool close_stream = 3;          // 仅关闭该观察，不关闭共享传输流
   string reason = 4;              // 固定原因码，禁止透传异常文本
+  bool stop_request_body = 5;     // 单方向降级，不关闭观察
 }

@@ -169,7 +169,7 @@ func Validate(b []byte, kind string) error {
 		seen[f.N] = true
 		if f.Wire == 0 {
 			uint32Field := kind == "frame" && f.N == 1 || kind == "headers" && f.N == 1 || kind == "chunk" && f.N == 1 || kind == "end" && (f.N == 8 || f.N == 9)
-			boolField := kind == "start" && f.N == 14 || kind == "headers" && f.N == 4 || kind == "chunk" && f.N == 5 || kind == "end" && (f.N == 6 || f.N == 7) || kind == "ack" && f.N == 3
+			boolField := kind == "start" && (f.N == 14 || f.N == 22) || kind == "headers" && f.N == 4 || kind == "chunk" && f.N == 5 || kind == "end" && (f.N == 6 || f.N == 7 || f.N == 12) || kind == "ack" && (f.N == 3 || f.N == 5)
 			if uint32Field && f.V > 4294967295 || boolField && f.V > 1 {
 				return Err
 			}
@@ -231,9 +231,11 @@ func descriptor(kind string, n int) (int, bool, string, bool) {
 			return 2, true, "end", false
 		case 14:
 			return 2, true, "cancel", false
+		case 15:
+			return 2, true, "request_stop", false
 		}
 	case "start":
-		if n == 1 || n == 14 {
+		if n == 1 || n == 14 || n == 22 {
 			return 0, true, "", false
 		}
 		if n == 5 || n == 7 || n == 8 || n == 9 || n == 10 {
@@ -270,7 +272,7 @@ func descriptor(kind string, n int) (int, bool, string, bool) {
 		if n == 2 {
 			return -1, true, "", false
 		}
-		if n >= 1 && n <= 9 {
+		if n >= 1 && n <= 9 || n == 12 || n == 13 {
 			return 0, true, "", false
 		}
 		if n == 10 || n == 11 {
@@ -280,7 +282,7 @@ func descriptor(kind string, n int) (int, bool, string, bool) {
 		if n == 1 || n == 4 {
 			return 2, true, "", true
 		}
-		if n == 2 || n == 3 {
+		if n == 2 || n == 3 || n == 5 {
 			return 0, true, "", false
 		}
 	}
@@ -288,10 +290,11 @@ func descriptor(kind string, n int) (int, bool, string, bool) {
 }
 
 type Ack struct {
-	ID     string
-	Seq    uint64
-	Close  bool
-	Reason string
+	ID              string
+	Seq             uint64
+	Close           bool
+	Reason          string
+	StopRequestBody bool
 }
 
 func DecodeAck(b []byte) (Ack, error) {
@@ -306,13 +309,13 @@ func DecodeAck(b []byte) (Ack, error) {
 		if err != nil {
 			return Ack{}, err
 		}
-		if f.N >= 1 && f.N <= 4 {
+		if f.N >= 1 && f.N <= 5 {
 			bit := uint8(1 << uint(f.N-1))
 			if seen&bit != 0 {
 				return Ack{}, Err
 			}
 			seen |= bit
-			if (f.N == 1 || f.N == 4) && (f.Wire != 2 || !utf8.Valid(f.B)) || (f.N == 2 || f.N == 3) && f.Wire != 0 {
+			if (f.N == 1 || f.N == 4) && (f.Wire != 2 || !utf8.Valid(f.B)) || (f.N == 2 || f.N == 3 || f.N == 5) && f.Wire != 0 {
 				return Ack{}, Err
 			}
 		}
@@ -328,6 +331,11 @@ func DecodeAck(b []byte) (Ack, error) {
 			a.Close = f.V == 1
 		case 4:
 			a.Reason = string(f.B)
+		case 5:
+			if f.V > 1 {
+				return a, Err
+			}
+			a.StopRequestBody = f.V == 1
 		}
 	}
 	if !UUID(a.ID) || a.Seq < 1 {

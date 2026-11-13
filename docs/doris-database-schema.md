@@ -136,20 +136,20 @@ flowchart TD
 | business_outcome | VARCHAR(32) | 是 | 未声明 | — | 有没有观察到响应完整结束？response_complete、stream_incomplete 或 unknown；start 为 NULL |
 | terminal_observed | TINYINT | 否 | 未声明 | — | 是否收到有效网关 End：1 是、0 否；为 0 时请求结束时间必须为 NULL |
 | observation_status | VARCHAR(16) | 是 | 未声明 | — | 观察完整度：complete、partial 或 unknown；start 为 NULL，不等于 HTTP 成功 |
-| usage_status | VARCHAR(16) | 否 | 未声明 | — | token 数字有没有拿到，是否齐全、是否矛盾？known、partial、unknown、conflict；start 为 not_applicable |
+| usage_status | VARCHAR(16) | 否 | 未声明 | — | 用量状态：响应为 known/partial/unknown/conflict；请求开启采集为 partial/unknown，关闭为 not_applicable |
 | usage_eligible | TINYINT | 否 | 未声明 | — | 这条用量是否符合有效统计条件，可以作为统计候选？1 是、0 否；不表示可收费 |
 | input_tokens | BIGINT | 是 | 未声明 | — | 输入 token 总量；NULL 表示未知，0 表示服务报告的有效零值；子项不与父项重复相加 |
-| input_tokens_source | VARCHAR(16) | 是 | 未声明 | — | 输入 token 总量的来源：reported 或 unknown；开始事件为 NULL，不实现估算 |
+| input_tokens_source | VARCHAR(16) | 是 | 未声明 | — | 输入 token 来源：响应为 reported/unknown；请求为 estimated/unknown，关闭请求体采集时为 NULL |
 | output_tokens | BIGINT | 是 | 未声明 | — | 输出 token 总量；NULL 表示未知，0 表示服务报告的有效零值；子项不与父项重复相加 |
-| output_tokens_source | VARCHAR(16) | 是 | 未声明 | — | 输出 token 总量的来源：reported 或 unknown；开始事件为 NULL，不实现估算 |
+| output_tokens_source | VARCHAR(16) | 是 | 未声明 | — | 输出 token 总量的来源：响应为 reported/unknown；请求仅 unknown，关闭请求体采集时为 NULL |
 | cached_read_tokens | BIGINT | 是 | 未声明 | — | 输入中的缓存读取 token 子项；NULL 表示未知，0 表示服务报告的有效零值；子项不与父项重复相加 |
-| cached_read_tokens_source | VARCHAR(16) | 是 | 未声明 | — | 输入中的缓存读取 token 子项的来源：reported 或 unknown；开始事件为 NULL，不实现估算 |
+| cached_read_tokens_source | VARCHAR(16) | 是 | 未声明 | — | 输入中的缓存读取 token 子项的来源：响应为 reported/unknown；请求仅 unknown，关闭请求体采集时为 NULL |
 | cached_write_tokens | BIGINT | 是 | 未声明 | — | 输入中的缓存写入 token 子项；NULL 表示未知，0 表示服务报告的有效零值；子项不与父项重复相加 |
-| cached_write_tokens_source | VARCHAR(16) | 是 | 未声明 | — | 输入中的缓存写入 token 子项的来源：reported 或 unknown；开始事件为 NULL，不实现估算 |
+| cached_write_tokens_source | VARCHAR(16) | 是 | 未声明 | — | 输入中的缓存写入 token 子项的来源：响应为 reported/unknown；请求仅 unknown，关闭请求体采集时为 NULL |
 | reasoning_tokens | BIGINT | 是 | 未声明 | — | 输出中的推理 token 子项；NULL 表示未知，0 表示服务报告的有效零值；子项不与父项重复相加 |
-| reasoning_tokens_source | VARCHAR(16) | 是 | 未声明 | — | 输出中的推理 token 子项的来源：reported 或 unknown；开始事件为 NULL，不实现估算 |
+| reasoning_tokens_source | VARCHAR(16) | 是 | 未声明 | — | 输出中的推理 token 子项的来源：响应为 reported/unknown；请求仅 unknown，关闭请求体采集时为 NULL |
 | reported_total_tokens | BIGINT | 是 | 未声明 | — | 服务单独上报的总 token 数；NULL 表示未知，0 表示服务报告的有效零值；子项不与父项重复相加 |
-| reported_total_tokens_source | VARCHAR(16) | 是 | 未声明 | — | 服务单独上报的总 token 数的来源：reported 或 unknown；开始事件为 NULL，不实现估算 |
+| reported_total_tokens_source | VARCHAR(16) | 是 | 未声明 | — | 服务单独上报的总 token 数的来源：响应为 reported/unknown；请求仅 unknown，关闭请求体采集时为 NULL |
 | raw_usage_json | STRING | 否 | 未声明 | — | 仅含白名单数字用量字段的规范 JSON，不含正文或密钥；最多 4096 字节 |
 | raw_usage_truncated | TINYINT | 否 | 未声明 | — | 原始用量 JSON 是否因界限截断：1 是、0 否 |
 | anomaly_codes | ARRAY<VARCHAR(64)> | 否 | 未声明 | — | 固定、排序且去重的异常码数组；不包含任意错误文本 |
@@ -487,20 +487,20 @@ GAP、未生成、过期与已确认零请求分别展示。
 | business_outcome | VARCHAR(32) | 是 | —（派生） | — | 有没有观察到响应完整结束？response_complete、stream_incomplete 或 unknown；start 为 NULL |
 | terminal_observed | TINYINT | 否 | —（派生） | — | 是否收到有效网关 End：1 是、0 否；为 0 时请求结束时间必须为 NULL |
 | observation_status | VARCHAR(16) | 是 | —（派生） | — | 观察完整度：complete、partial 或 unknown；start 为 NULL，不等于 HTTP 成功 |
-| usage_status | VARCHAR(16) | 否 | —（派生） | — | token 数字有没有拿到，是否齐全、是否矛盾？known、partial、unknown、conflict；start 为 not_applicable |
+| usage_status | VARCHAR(16) | 否 | —（派生） | — | 用量状态：响应为 known/partial/unknown/conflict；请求开启采集为 partial/unknown，关闭为 not_applicable |
 | usage_eligible | TINYINT | 否 | —（派生） | — | 这条用量是否符合有效统计条件，可以作为统计候选？1 是、0 否；不表示可收费 |
 | input_tokens | BIGINT | 是 | —（派生） | — | 输入 token 总量；NULL 表示未知，0 表示服务报告的有效零值；子项不与父项重复相加 |
-| input_tokens_source | VARCHAR(16) | 是 | —（派生） | — | 输入 token 总量的来源：reported 或 unknown；开始事件为 NULL，不实现估算 |
+| input_tokens_source | VARCHAR(16) | 是 | —（派生） | — | 输入 token 来源：响应为 reported/unknown；请求为 estimated/unknown，关闭请求体采集时为 NULL |
 | output_tokens | BIGINT | 是 | —（派生） | — | 输出 token 总量；NULL 表示未知，0 表示服务报告的有效零值；子项不与父项重复相加 |
-| output_tokens_source | VARCHAR(16) | 是 | —（派生） | — | 输出 token 总量的来源：reported 或 unknown；开始事件为 NULL，不实现估算 |
+| output_tokens_source | VARCHAR(16) | 是 | —（派生） | — | 输出 token 总量的来源：响应为 reported/unknown；请求仅 unknown，关闭请求体采集时为 NULL |
 | cached_read_tokens | BIGINT | 是 | —（派生） | — | 输入中的缓存读取 token 子项；NULL 表示未知，0 表示服务报告的有效零值；子项不与父项重复相加 |
-| cached_read_tokens_source | VARCHAR(16) | 是 | —（派生） | — | 输入中的缓存读取 token 子项的来源：reported 或 unknown；开始事件为 NULL，不实现估算 |
+| cached_read_tokens_source | VARCHAR(16) | 是 | —（派生） | — | 输入中的缓存读取 token 子项的来源：响应为 reported/unknown；请求仅 unknown，关闭请求体采集时为 NULL |
 | cached_write_tokens | BIGINT | 是 | —（派生） | — | 输入中的缓存写入 token 子项；NULL 表示未知，0 表示服务报告的有效零值；子项不与父项重复相加 |
-| cached_write_tokens_source | VARCHAR(16) | 是 | —（派生） | — | 输入中的缓存写入 token 子项的来源：reported 或 unknown；开始事件为 NULL，不实现估算 |
+| cached_write_tokens_source | VARCHAR(16) | 是 | —（派生） | — | 输入中的缓存写入 token 子项的来源：响应为 reported/unknown；请求仅 unknown，关闭请求体采集时为 NULL |
 | reasoning_tokens | BIGINT | 是 | —（派生） | — | 输出中的推理 token 子项；NULL 表示未知，0 表示服务报告的有效零值；子项不与父项重复相加 |
-| reasoning_tokens_source | VARCHAR(16) | 是 | —（派生） | — | 输出中的推理 token 子项的来源：reported 或 unknown；开始事件为 NULL，不实现估算 |
+| reasoning_tokens_source | VARCHAR(16) | 是 | —（派生） | — | 输出中的推理 token 子项的来源：响应为 reported/unknown；请求仅 unknown，关闭请求体采集时为 NULL |
 | reported_total_tokens | BIGINT | 是 | —（派生） | — | 服务单独上报的总 token 数；NULL 表示未知，0 表示服务报告的有效零值；子项不与父项重复相加 |
-| reported_total_tokens_source | VARCHAR(16) | 是 | —（派生） | — | 服务单独上报的总 token 数的来源：reported 或 unknown；开始事件为 NULL，不实现估算 |
+| reported_total_tokens_source | VARCHAR(16) | 是 | —（派生） | — | 服务单独上报的总 token 数的来源：响应为 reported/unknown；请求仅 unknown，关闭请求体采集时为 NULL |
 | ttft_ms | DOUBLE | 是 | —（派生） | — | 首有效输出延迟，毫秒；不可测为 NULL |
 | tpot_ms | DOUBLE | 是 | —（派生） | — | 请求整体每输出 token 耗时，毫秒；不可测为 NULL |
 | raw_usage_json | STRING | 否 | —（派生） | — | 仅含白名单数字用量字段的规范 JSON，不含正文或密钥；最多 4096 字节 |
@@ -628,20 +628,20 @@ GAP、未生成、过期与已确认零请求分别展示。
 | business_outcome | VARCHAR(32) | 是 | —（派生） | — | 有没有观察到响应完整结束？response_complete、stream_incomplete 或 unknown；start 为 NULL |
 | terminal_observed | TINYINT | 否 | —（派生） | — | 是否收到有效网关 End：1 是、0 否；为 0 时请求结束时间必须为 NULL |
 | observation_status | VARCHAR(16) | 是 | —（派生） | — | 观察完整度：complete、partial 或 unknown；start 为 NULL，不等于 HTTP 成功 |
-| usage_status | VARCHAR(16) | 否 | —（派生） | — | token 数字有没有拿到，是否齐全、是否矛盾？known、partial、unknown、conflict；start 为 not_applicable |
+| usage_status | VARCHAR(16) | 否 | —（派生） | — | 用量状态：响应为 known/partial/unknown/conflict；请求开启采集为 partial/unknown，关闭为 not_applicable |
 | usage_eligible | TINYINT | 否 | —（派生） | — | 这条用量是否符合有效统计条件，可以作为统计候选？1 是、0 否；不表示可收费 |
 | input_tokens | BIGINT | 是 | —（派生） | — | 输入 token 总量；NULL 表示未知，0 表示服务报告的有效零值；子项不与父项重复相加 |
-| input_tokens_source | VARCHAR(16) | 是 | —（派生） | — | 输入 token 总量的来源：reported 或 unknown；开始事件为 NULL，不实现估算 |
+| input_tokens_source | VARCHAR(16) | 是 | —（派生） | — | 输入 token 来源：响应为 reported/unknown；请求为 estimated/unknown，关闭请求体采集时为 NULL |
 | output_tokens | BIGINT | 是 | —（派生） | — | 输出 token 总量；NULL 表示未知，0 表示服务报告的有效零值；子项不与父项重复相加 |
-| output_tokens_source | VARCHAR(16) | 是 | —（派生） | — | 输出 token 总量的来源：reported 或 unknown；开始事件为 NULL，不实现估算 |
+| output_tokens_source | VARCHAR(16) | 是 | —（派生） | — | 输出 token 总量的来源：响应为 reported/unknown；请求仅 unknown，关闭请求体采集时为 NULL |
 | cached_read_tokens | BIGINT | 是 | —（派生） | — | 输入中的缓存读取 token 子项；NULL 表示未知，0 表示服务报告的有效零值；子项不与父项重复相加 |
-| cached_read_tokens_source | VARCHAR(16) | 是 | —（派生） | — | 输入中的缓存读取 token 子项的来源：reported 或 unknown；开始事件为 NULL，不实现估算 |
+| cached_read_tokens_source | VARCHAR(16) | 是 | —（派生） | — | 输入中的缓存读取 token 子项的来源：响应为 reported/unknown；请求仅 unknown，关闭请求体采集时为 NULL |
 | cached_write_tokens | BIGINT | 是 | —（派生） | — | 输入中的缓存写入 token 子项；NULL 表示未知，0 表示服务报告的有效零值；子项不与父项重复相加 |
-| cached_write_tokens_source | VARCHAR(16) | 是 | —（派生） | — | 输入中的缓存写入 token 子项的来源：reported 或 unknown；开始事件为 NULL，不实现估算 |
+| cached_write_tokens_source | VARCHAR(16) | 是 | —（派生） | — | 输入中的缓存写入 token 子项的来源：响应为 reported/unknown；请求仅 unknown，关闭请求体采集时为 NULL |
 | reasoning_tokens | BIGINT | 是 | —（派生） | — | 输出中的推理 token 子项；NULL 表示未知，0 表示服务报告的有效零值；子项不与父项重复相加 |
-| reasoning_tokens_source | VARCHAR(16) | 是 | —（派生） | — | 输出中的推理 token 子项的来源：reported 或 unknown；开始事件为 NULL，不实现估算 |
+| reasoning_tokens_source | VARCHAR(16) | 是 | —（派生） | — | 输出中的推理 token 子项的来源：响应为 reported/unknown；请求仅 unknown，关闭请求体采集时为 NULL |
 | reported_total_tokens | BIGINT | 是 | —（派生） | — | 服务单独上报的总 token 数；NULL 表示未知，0 表示服务报告的有效零值；子项不与父项重复相加 |
-| reported_total_tokens_source | VARCHAR(16) | 是 | —（派生） | — | 服务单独上报的总 token 数的来源：reported 或 unknown；开始事件为 NULL，不实现估算 |
+| reported_total_tokens_source | VARCHAR(16) | 是 | —（派生） | — | 服务单独上报的总 token 数的来源：响应为 reported/unknown；请求仅 unknown，关闭请求体采集时为 NULL |
 | ttft_ms | DOUBLE | 是 | —（派生） | — | 首有效输出延迟，毫秒；不可测为 NULL |
 | tpot_ms | DOUBLE | 是 | —（派生） | — | 请求整体每输出 token 耗时，毫秒；不可测为 NULL |
 | raw_usage_json | STRING | 否 | —（派生） | — | 仅含白名单数字用量字段的规范 JSON，不含正文或密钥；最多 4096 字节 |

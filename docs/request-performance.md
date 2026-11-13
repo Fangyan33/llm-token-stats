@@ -1,6 +1,6 @@
 # 请求级 TTFT 与 TPOT
 
-当前实现不估算 token。Wasm 记录响应正文回调时间，Observer 解析 SSE 并提取首末有效生成内容的时间，Consumer 按原值入库。TTFT、TPOT 仅由 Doris 普通明细视图计算，不作为 Kafka 字段或实体表列保存。
+性能指标只使用服务端上报的响应 token，不使用请求事件中的输入估算。Wasm 记录响应正文回调时间，Observer 解析 SSE 并提取首末有效生成内容的时间，Consumer 按原值入库。TTFT、TPOT 仅由 Doris 普通明细视图计算，不作为 Kafka 字段或实体表列保存。
 
 ## 时间事实
 

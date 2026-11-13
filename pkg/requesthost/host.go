@@ -1,7 +1,7 @@
 package requesthost
 
 import (
-	"errors"
+	"github.com/Fangyan33/llm-token-stats/pkg/configdiag"
 	"net"
 	"strconv"
 	"strings"
@@ -80,18 +80,20 @@ func NormalizePattern(pattern string) string {
 
 // NormalizePatterns validates a bounded allowlist at configuration load time.
 func NormalizePatterns(patterns []string) ([]string, error) {
-	if len(patterns) > 1024 {
-		return nil, errors.New("config_request_hosts")
-	}
+	r := &configdiag.Report{}
+	r.Number(int64(len(patterns)), 0, 1024, "config_request_hosts", "$")
 	result := make([]string, 0, len(patterns))
 	seen := map[string]bool{}
-	for _, pattern := range patterns {
+	for i, pattern := range patterns {
 		host := NormalizePattern(pattern)
-		if host == "" || seen[host] {
-			return nil, errors.New("config_request_hosts")
-		}
+		field := configdiag.Index("", i)
+		r.Check(host != "", "config_request_hosts", field, "invalid_host_pattern", "exact host, *.subdomain or * without port")
+		r.Check(!seen[host], "config_request_hosts", field, "duplicate_host_pattern", "unique normalized host pattern")
 		seen[host] = true
 		result = append(result, host)
+	}
+	if err := r.Err(); err != nil {
+		return nil, err
 	}
 	return result, nil
 }

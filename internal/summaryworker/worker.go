@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"github.com/Fangyan33/llm-token-stats/internal/logging"
+	"github.com/Fangyan33/llm-token-stats/pkg/configdiag"
 	"reflect"
 	"sort"
 	"strings"
@@ -42,23 +43,28 @@ func (w *Worker) Run(ctx context.Context, from, to string) (result error) {
 	cutoff := statwindow.Start(now)
 	start, e := ParseDate(w.Config.CollectionStartDate)
 	if e != nil {
-		return e
+		return configdiag.Prefix(e, "summary_worker.collection_start_date")
 	}
 	if start.Before(cutoff) {
 		start = cutoff
 	}
 	end := today
 	if start.After(today) {
-		return logging.WithCause("collection_start_in_future", nil)
+		return configdiag.New("collection_start_in_future", "summary_worker.collection_start_date", "date_in_future", "date no later than current UTC day", nil)
 	}
 	if from != "" || to != "" {
 		a, e := ParseDate(from)
 		if e != nil {
-			return e
+			return configdiag.Prefix(e, "--backfill-from")
 		}
 		b, e := ParseDate(to)
-		if e != nil || !b.After(a) || a.Before(start) || b.After(today) {
-			return logging.WithCause("invalid_backfill_range", nil)
+		if e != nil {
+			return configdiag.Prefix(e, "--backfill-to")
+		}
+		if !b.After(a) || a.Before(start) || b.After(today) {
+			r := configdiag.New("invalid_backfill_range", "--backfill-from", "invalid_date_range", "collection start <= from < to <= current UTC day", nil)
+			r.Issues[0].RelatedField = "--backfill-to"
+			return r
 		}
 		start = a
 		end = b

@@ -13,6 +13,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/Fangyan33/llm-token-stats/pkg/configdiag"
 	"github.com/Fangyan33/llm-token-stats/pkg/logsafe"
 )
 
@@ -115,7 +116,17 @@ func safeAttrs(fields []any) []slog.Attr {
 		default:
 			continue // Never call String or Error on arbitrary values.
 		}
-		attrs = append(attrs, a)
+		replaced := false
+		for n := range attrs {
+			if attrs[n].Key == key {
+				attrs[n] = a
+				replaced = true
+				break
+			}
+		}
+		if !replaced {
+			attrs = append(attrs, a)
+		}
 	}
 	return attrs
 }
@@ -161,8 +172,8 @@ func (l *Logger) Repeat(level slog.Level, event, scope string, fields ...any) bo
 	attrs := safeAttrs(fields)
 	key := scope + "/" + event
 	for _, a := range attrs {
-		if a.Key == "error_code" || a.Key == "error" {
-			key += "/" + a.Value.String()
+		if a.Key == "error_code" || a.Key == "error" || a.Key == "reason" || a.Key == "phase" || a.Key == "limit_kind" {
+			key += "/" + a.Key + "=" + a.Value.String()
 		}
 	}
 	l.mu.Lock()
@@ -254,7 +265,7 @@ func Init(component string) {
 	old := current.Swap(l)
 	old.Close()
 	if !valid {
-		l.Log(slog.LevelWarn, "invalid_log_level", "fallback", "info")
+		l.Log(slog.LevelWarn, "invalid_log_level", "config_field", "LOG_LEVEL", "reason", "invalid_enum", "expected", "debug, info, warn or error", "fallback", "info")
 	}
 	Info("starting", "log_level", level.String())
 }
@@ -265,6 +276,26 @@ func Warn(event, scope string, fields ...any) {
 	Default().Repeat(slog.LevelWarn, event, scope, fields...)
 }
 func Error(event string, err error, fields ...any) {
+	if r := configdiag.Find(err); r != nil {
+		for _, issue := range r.Issues {
+			pairs := issue.Fields()
+			detail := []any{"config_source", r.Source}
+			for n := 0; n+1 < len(pairs); n += 2 {
+				detail = append(detail, pairs[n], pairs[n+1])
+			}
+			detail = append(detail, ErrorFields(issue.Cause)...)
+			Default().Log(slog.LevelError, "configuration_validation_failed", detail...)
+		}
+		code := "config_invalid"
+		if len(r.Issues) > 0 {
+			code = r.Issues[0].Code
+		}
+		if outer, ok := err.(*diagnostic); ok {
+			code = outer.code
+		}
+		Default().Log(slog.LevelError, event, append(fields, "error_code", code, "config_source", r.Source, "error_count", r.Total, "omitted_count", r.Total-len(r.Issues))...)
+		return
+	}
 	Default().Log(slog.LevelError, event, append(fields, ErrorFields(err)...)...)
 }
 func Failure(event, scope string, err error, fields ...any) {

@@ -160,12 +160,14 @@ func (s *Server) start(ctx context.Context, id uint64, f *pb.ObservationFrame) (
 	if s.active.Add(1) > int64(s.Cfg.MaxActive) {
 		s.active.Add(-1)
 		clear(st.ApiKey)
+		logging.Warn("observation_admission_failed", "observer_admission", "reason", "active_observation_limit", "active_observations", s.active.Load(), "limit", s.Cfg.MaxActive, "action", "skip_observation")
 		return nil, errors.New("resource_limit")
 	}
 	base := int64(2048 + 2*proto.Size(st))
 	if !s.reserve(base) {
 		s.active.Add(-1)
 		clear(st.ApiKey)
+		logging.Warn("observation_admission_failed", "observer_admission", "reason", "parser_byte_limit", "reserved_bytes", s.bytes.Load(), "requested_bytes", base, "limit", s.Cfg.ParserBudget, "action", "skip_observation")
 		return nil, errors.New("resource_limit")
 	}
 	uuid, err := s.newID()
@@ -398,12 +400,28 @@ type batchReceived struct {
 	reserved int64
 }
 
-func (s *Server) Observe(stream pb.ObservationService_ObserveServer) error {
+func (s *Server) Observe(stream pb.ObservationService_ObserveServer) (result error) {
+	phase := "reserve_transport"
+	defer func() {
+		if result == nil || stream.Context().Err() != nil {
+			return
+		}
+		code := status.Code(result)
+		if code == codes.Canceled {
+			return
+		}
+		if code == codes.ResourceExhausted || code == codes.InvalidArgument {
+			logging.Warn("observation_transport_rejected", "observer_transport/"+phase, "phase", phase, "grpc_status", int(code), "action", "close_observation_transport")
+		} else {
+			logging.Failure("observation_transport_failed", "observer_transport/"+phase, result, "phase", phase, "action", "close_observation_transport")
+		}
+	}()
 	s.Health.GaugeFunc("observer_active_observations", s.active.Load)
 	s.Health.GaugeFunc("observer_parser_reserved_bytes", s.bytes.Load)
 	s.Health.GaugeFunc("observer_receive_queue_bytes", func() int64 { s.queueMu.Lock(); defer s.queueMu.Unlock(); return s.queueBytes })
 	s.Health.GaugeFunc("observer_receive_queue_batches", func() int64 { s.queueMu.Lock(); defer s.queueMu.Unlock(); return int64(s.queueBatches) })
 	if !s.reserve(3 * 32768) {
+		logging.Warn("observer_transport_reservation_failed", "observer_transport_reserve", "reserved_bytes", s.bytes.Load(), "requested_bytes", 3*32768, "limit", s.Cfg.ParserBudget, "action", "close_observation_transport")
 		return status.Error(codes.ResourceExhausted, "resource_limit")
 	}
 	defer s.bytes.Add(-3 * 32768)
@@ -567,12 +585,15 @@ func (s *Server) Observe(stream pb.ObservationService_ObserveServer) error {
 		case <-ctx.Done():
 			return ctx.Err()
 		case err := <-receiveErrors:
+			phase = "receive_batch"
 			return err
 		case err := <-writeErrors:
+			phase = "write_ack"
 			s.Health.Count("ack_write_failure")
 			return err
 		case <-ticker.C:
 			if at := writing.Load(); at > 0 && time.Now().UnixNano()-at > int64(2*time.Second) {
+				phase = "write_ack_timeout"
 				s.Health.Count("ack_write_failure")
 				return status.Error(codes.DeadlineExceeded, "ack_timeout")
 			}
@@ -589,6 +610,7 @@ func (s *Server) Observe(stream pb.ObservationService_ObserveServer) error {
 			drain()
 			flush()
 		case rec := <-recv:
+			phase = "receive_batch"
 			if rec.err != nil {
 				if rec.err == io.EOF {
 					for _, o := range states {
@@ -626,6 +648,7 @@ func (s *Server) Observe(stream pb.ObservationService_ObserveServer) error {
 				}
 				return rec.err
 			}
+			phase = "process_batch"
 			processErr := func() error {
 				defer q.release(rec)
 				defer clearBatch(rec)

@@ -1,8 +1,10 @@
 package main
 
 import (
+	"github.com/Fangyan33/llm-token-stats/pkg/logsafe"
 	w "github.com/Fangyan33/llm-token-stats/pkg/observationwire"
 	"github.com/tetratelabs/proxy-wasm-go-sdk/proxywasm"
+	"strconv"
 )
 
 func (h *httpContext) sendRequestStop() {
@@ -50,6 +52,7 @@ func (h *httpContext) observeRequest(size int, eos bool) {
 			b, err = proxywasm.GetHttpRequestBody(from, count)
 		}
 		if err != nil || len(b) != count {
+			r.repeatedLog(logsafe.Error, "request_body_read_failed", "host_status", hostError(err), "expected_bytes", strconv.Itoa(count), "actual_bytes", strconv.Itoa(len(b)), "action", "skip_request_body_capture")
 			clear(b)
 			r.budget.give(credit, 1, 0)
 			r.requestBudget.give(credit, 1, 0)

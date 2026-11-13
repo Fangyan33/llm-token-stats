@@ -2,8 +2,8 @@ package consumer
 
 import (
 	"context"
-	"errors"
 	"github.com/Fangyan33/llm-token-stats/internal/events"
+	"github.com/Fangyan33/llm-token-stats/internal/logging"
 	"sort"
 )
 
@@ -26,7 +26,7 @@ func (p *Processor) load(ctx context.Context, t string, b *Batch, rows []map[str
 		return nil
 	}
 	if !p.Owns() {
-		return errors.New("owner_revoked")
+		return logging.WithCause("owner_revoked", nil)
 	}
 	if body == nil {
 		body = EncodeRows(rows)

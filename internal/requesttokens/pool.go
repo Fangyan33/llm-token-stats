@@ -1,6 +1,8 @@
 package requesttokens
 
 import (
+	"errors"
+	"github.com/Fangyan33/llm-token-stats/internal/logging"
 	"sync"
 )
 
@@ -54,6 +56,9 @@ func (p *Pool) Submit(j Job) bool {
 func (p *Pool) worker() {
 	defer p.done.Done()
 	c, initErr := NewCounter()
+	if initErr != nil {
+		logging.Failure("tokenizer_initialization_failed", "tokenizer_initialization", initErr, "reason", "encoding_initialization_failed", "encoding", Encoding, "action", "input_estimate_unknown")
+	}
 	for j := range p.jobs {
 		p.mu.Lock()
 		p.queuedBytes -= j.Reserved
@@ -88,8 +93,11 @@ func (p *Pool) worker() {
 			if err == nil {
 				result.Value = &n
 				reason = "known"
+			} else if errors.Is(err, ErrBody) {
+				reason = "invalid_body"
 			} else {
-				reason = err.Error()
+				reason = "tokenizer_error"
+				logging.Failure("tokenizer_count_failed", "tokenizer_count", err, "encoding", Encoding, "action", "input_estimate_unknown")
 			}
 			p.release(scratch)
 		}

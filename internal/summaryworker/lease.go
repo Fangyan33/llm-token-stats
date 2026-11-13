@@ -6,11 +6,12 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
-	"fmt"
 	"github.com/Fangyan33/llm-token-stats/internal/logging"
+	"github.com/Fangyan33/llm-token-stats/pkg/configdiag"
 	"io"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -46,16 +47,22 @@ type lease struct {
 
 func KubernetesGuard(ctx context.Context, name string, store *Store) (Guard, error) {
 	ns, pod, uid := os.Getenv("POD_NAMESPACE"), os.Getenv("POD_NAME"), os.Getenv("POD_UID")
-	if ns == "" || pod == "" || uid == "" {
-		return nil, logging.WithCause("pod_identity_required", nil)
+	r := &configdiag.Report{Source: "environment"}
+	for _, pair := range [][2]string{{"POD_NAMESPACE", ns}, {"POD_NAME", pod}, {"POD_UID", uid}} {
+		if pair[1] == "" {
+			r.Merge(configdiag.Environment("pod_identity_required", pair[0], pair[0], "environment_variable_empty", "Kubernetes Pod identity"))
+		}
+	}
+	if err := r.Err(); err != nil {
+		return nil, err
 	}
 	ca, e := os.ReadFile("/var/run/secrets/kubernetes.io/serviceaccount/ca.crt")
 	if e != nil {
-		return nil, logging.WithCause("kubernetes_ca", e)
+		return nil, logging.WithFields("kubernetes_ca", e, "phase", "read_serviceaccount_ca", "reason", "file_read_failed")
 	}
 	pool := x509.NewCertPool()
 	if !pool.AppendCertsFromPEM(ca) {
-		return nil, logging.WithCause("kubernetes_ca", nil)
+		return nil, logging.WithFields("kubernetes_ca", nil, "phase", "parse_serviceaccount_ca", "reason", "invalid_ca_pem")
 	}
 	g := &kubeGuard{client: &http.Client{Timeout: 10 * time.Second, Transport: &http.Transport{TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12, RootCAs: pool}}}, base: "https://kubernetes.default.svc", path: "/apis/coordination.k8s.io/v1/namespaces/" + ns + "/leases/" + name, namespace: ns, owner: pod + "/" + uid + "/" + newID(), stop: make(chan struct{}), done: make(chan struct{}), store: store}
 	var l lease
@@ -158,7 +165,7 @@ func (g *kubeGuard) api(ctx context.Context, method, path string, in, out any) (
 	}
 	token, e := os.ReadFile("/var/run/secrets/kubernetes.io/serviceaccount/token")
 	if e != nil {
-		return 0, logging.WithCause("kubernetes_token", e)
+		return 0, logging.WithFields("kubernetes_token", e, "phase", "read_serviceaccount_token", "reason", "file_read_failed")
 	}
 	req, e := http.NewRequestWithContext(ctx, method, g.base+path, bytes.NewReader(b))
 	if e != nil {
@@ -168,23 +175,23 @@ func (g *kubeGuard) api(ctx context.Context, method, path string, in, out any) (
 	req.Header.Set("Content-Type", "application/json")
 	res, e := g.client.Do(req)
 	if e != nil {
-		logging.Failure("kubernetes_request_failed", "kubernetes_api", e, "method", method)
+		logging.Failure("kubernetes_request_failed", "kubernetes_api/"+kubernetesResource(path), e, "method", method, "resource_kind", kubernetesResource(path))
 		return 0, logging.WithCause("kubernetes_request", e)
 	}
 	defer res.Body.Close()
 	if res.StatusCode < 200 || res.StatusCode >= 300 {
 		if res.StatusCode != http.StatusNotFound {
-			logging.Failure("kubernetes_response_failed", "kubernetes_api", nil, "method", method, "http_status", res.StatusCode)
+			logging.Failure("kubernetes_response_failed", "kubernetes_api/"+kubernetesResource(path), nil, "method", method, "resource_kind", kubernetesResource(path), "http_status", res.StatusCode)
 		}
-		return res.StatusCode, fmt.Errorf("kubernetes_status_%d", res.StatusCode)
+		return res.StatusCode, logging.WithFields("kubernetes_status_"+strconv.Itoa(res.StatusCode), nil, "method", method, "resource_kind", kubernetesResource(path), "http_status", res.StatusCode)
 	}
 	if out != nil {
 		if e = json.NewDecoder(io.LimitReader(res.Body, 1<<20)).Decode(out); e != nil {
-			logging.Failure("kubernetes_response_failed", "kubernetes_api", e, "phase", "decode", "http_status", res.StatusCode)
+			logging.Failure("kubernetes_response_failed", "kubernetes_api/"+kubernetesResource(path), e, "resource_kind", kubernetesResource(path), "phase", "decode", "http_status", res.StatusCode)
 			return res.StatusCode, logging.WithCause("kubernetes_response", e)
 		}
 	}
-	logging.Recovered("kubernetes_api", "kubernetes_api_recovered")
+	logging.Recovered("kubernetes_api/"+kubernetesResource(path), "kubernetes_api_recovered")
 	return res.StatusCode, nil
 }
 func (g *kubeGuard) Check(ctx context.Context) error {
@@ -253,4 +260,14 @@ func sqlIdle(rows []map[string]string, database string) error {
 		}
 	}
 	return nil
+}
+
+func kubernetesResource(path string) string {
+	if strings.HasPrefix(path, "/apis/coordination.k8s.io/") {
+		return "lease"
+	}
+	if strings.Contains(path, "/pods/") {
+		return "pod"
+	}
+	return "unknown"
 }

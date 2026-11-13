@@ -12,6 +12,7 @@ import (
 	"github.com/Fangyan33/llm-token-stats/internal/observation"
 	"github.com/Fangyan33/llm-token-stats/internal/producer"
 	"github.com/Fangyan33/llm-token-stats/internal/wasmdownload"
+	"github.com/Fangyan33/llm-token-stats/pkg/configdiag"
 	"google.golang.org/grpc"
 	"net"
 	"net/http"
@@ -51,12 +52,19 @@ func (l *limited) Accept() (net.Conn, error) {
 func run() error {
 	path := flag.String("config", "configs/observer.local.json", "配置文件")
 	flag.Parse()
-	c, err := config.Read(*path)
+	c, err := config.ReadObserver(*path)
 	if err != nil {
 		return logging.WithCause("configuration_failed", err)
 	}
-	if err = c.ObserverDefaults(); err != nil {
-		return logging.WithCause(err.Error(), nil)
+	service, serviceErr := identitylookup.NewService(c.Observer.ServiceLookup)
+	customer, customerErr := identitylookup.NewCustomer(c.Observer.CustomerLookup)
+	_, kafkaErr := producer.Options(c.Kafka)
+	initialization := &configdiag.Report{Source: *path}
+	initialization.Merge(serviceErr)
+	initialization.Merge(customerErr)
+	initialization.Merge(kafkaErr)
+	if err := initialization.Err(); err != nil {
+		return err
 	}
 	logging.Info("configuration_loaded", "listen", c.Observer.Listen, "health_listen", c.Observer.Health, "kafka_topic", c.Kafka.Topic,
 		"service_lookup_enabled", c.Observer.ServiceLookup.URI != "", "customer_lookup_enabled", c.Observer.CustomerLookup.URI != "")
@@ -69,7 +77,7 @@ func run() error {
 	if c.Observer.WasmDownload != nil {
 		downloads, err = wasmdownload.New(*c.Observer.WasmDownload, h)
 		if err != nil {
-			return err
+			return configdiag.Source(err, *path)
 		}
 		go func() {
 			if err := downloads.Serve(); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -86,17 +94,9 @@ func run() error {
 	defer p.Close()
 	l, err := net.Listen("tcp", c.Observer.Listen)
 	if err != nil {
-		return logging.WithCause("listen_failure", err)
+		return logging.WithFields("listen_failure", err, "config_field", "observer.listen", "phase", "bind_listener")
 	}
 	server := grpc.NewServer(grpc.ForceServerCodec(observation.Codec{}), grpc.MaxRecvMsgSize(32768), grpc.MaxConcurrentStreams(128), grpc.InitialWindowSize(65535), grpc.InitialConnWindowSize(65535))
-	service, err := identitylookup.NewService(c.Observer.ServiceLookup)
-	if err != nil {
-		return logging.WithCause("service_lookup_initialization_failed", err)
-	}
-	customer, err := identitylookup.NewCustomer(c.Observer.CustomerLookup)
-	if err != nil {
-		return logging.WithCause("customer_lookup_initialization_failed", err)
-	}
 	observer := &observation.Server{Cfg: c.Observer, Sink: p, Health: h, ServiceResolver: service, CustomerResolver: customer}
 	defer observer.CloseRequestTokens()
 	pb.RegisterObservationServiceServer(server, observer)

@@ -446,6 +446,10 @@ kubectl -n {args.namespace} rollout status deployment/llm-token-stats-observer -
 ```
 
 `config_lookup` 表示归属查询参数或凭据变量名校验失败；变量名合法但对应密钥缺失时，报 `lookup_credential`。
+查看 `event=configuration_validation_failed` 的 `config_field`、`reason` 和 `expected` 定位具体配置项；数值错误带 `actual`，数组字段带下标。
+成功解码后每阶段最多列出 32 条明细，退出摘要带 `error_count` 与 `omitted_count`；语法或类型错误先修复解码问题。
+`environment_variable_empty` 表示对应环境变量为空，`invalid_dsn` 表示 DSN 格式错误，`database_mismatch` 表示 DSN 数据库与 `doris.database` 不一致。
+日志可记录合法环境变量名，不输出密钥值、完整 DSN 或配置原文。Wasm 配置错误的 `action=passthrough` 表示已跳过采集并继续转发业务。
 将同一修正同步到留存的 YAML；包内空 Secret 用于初次部署，提供真实密钥后不要用空内容覆盖它。
 
 在本目录校验：

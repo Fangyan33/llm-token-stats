@@ -7,13 +7,14 @@ import (
 	"fmt"
 	"github.com/Fangyan33/llm-token-stats/internal/config"
 	"github.com/Fangyan33/llm-token-stats/internal/events"
+	"github.com/Fangyan33/llm-token-stats/internal/logging"
 	"github.com/Fangyan33/llm-token-stats/pkg/statwindow"
 	"github.com/twmb/franz-go/pkg/kgo"
 	"sort"
 	"time"
 )
 
-var ErrPause = errors.New("partition_paused")
+var ErrPause = logging.WithCause("partition_paused", nil)
 
 type Batch struct {
 	Topic         string

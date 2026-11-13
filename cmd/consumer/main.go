@@ -8,6 +8,8 @@ import (
 	"github.com/Fangyan33/llm-token-stats/internal/health"
 	"github.com/Fangyan33/llm-token-stats/internal/ingestworker"
 	"github.com/Fangyan33/llm-token-stats/internal/logging"
+	"github.com/Fangyan33/llm-token-stats/internal/producer"
+	"github.com/Fangyan33/llm-token-stats/pkg/configdiag"
 	"os"
 	"os/signal"
 	"syscall"
@@ -16,12 +18,20 @@ import (
 func run() error {
 	p := flag.String("config", "configs/consumer.local.json", "配置文件")
 	flag.Parse()
-	c, err := config.Read(*p)
+	c, err := config.ReadConsumer(*p)
 	if err != nil {
 		return logging.WithCause("configuration_failed", err)
 	}
-	if err = c.ConsumerDefaults(); err != nil {
-		return logging.WithCause(err.Error(), nil)
+	s, dorisErr := doris.New(c.Doris)
+	if s != nil {
+		defer s.DB.Close()
+	}
+	_, kafkaErr := producer.Options(c.Kafka)
+	initialization := &configdiag.Report{Source: *p}
+	initialization.Merge(dorisErr)
+	initialization.Merge(kafkaErr)
+	if err := initialization.Err(); err != nil {
+		return err
 	}
 	logging.Info("configuration_loaded", "health_listen", c.Consumer.Health, "kafka_topic", c.Kafka.Topic, "group", c.Consumer.Group,
 		"max_batch_rows", c.Consumer.Rows, "max_batch_bytes", c.Consumer.Bytes, "flush_interval_ms", c.Consumer.FlushMS)
@@ -29,11 +39,6 @@ func run() error {
 	defer cancel()
 	h := &health.State{}
 	health.Start(ctx, c.Consumer.Health, h)
-	s, err := doris.New(c.Doris)
-	if err != nil {
-		return logging.WithCause("doris_initialization_failed", err)
-	}
-	defer s.DB.Close()
 	w, err := ingestworker.New(c, s, h)
 	if err != nil {
 		return logging.WithCause("consumer_initialization_failed", err)

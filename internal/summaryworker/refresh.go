@@ -180,7 +180,7 @@ func (w *Worker) refresh(ctx context.Context, r *Run) error {
 			r.Status = "UNCERTAIN"
 			r.ErrorCode = "refresh_timeout"
 			_ = w.Store.saveRun(context.WithoutCancel(ctx), *r)
-			return logging.WithCause("refresh_timeout", nil)
+			return logging.WithFields("refresh_timeout", nil, "view", r.View, "partition", r.Partition, "task_id", r.TaskID, "timeout_seconds", w.Config.RefreshTimeoutSeconds)
 		case <-poll.C:
 		}
 	}
@@ -279,11 +279,11 @@ func (w *Worker) validate(ctx context.Context, r Run) error {
 		return e
 	}
 	if count != 0 {
-		return logging.WithCause("summary_invariant", nil)
+		return logging.WithFields("summary_invariant", nil, "view", r.View, "partition", r.Partition, "reason", "invalid_summary_rows", "invalid_row_count", count)
 	}
 	if r.Kind == "MONTH" {
 		if r.InputCount != len(r.DailyVersions) || r.InputDigest != events.Tuple(r.DailyVersions) {
-			return logging.WithCause("monthly_input_digest", nil)
+			return logging.WithFields("monthly_input_digest", nil, "view", r.View, "partition", r.Partition, "expected_input_count", r.InputCount, "actual_input_count", len(r.DailyVersions))
 		}
 		for date, version := range r.DailyVersions {
 			state, e := w.Store.state(ctx, "DAY", date)
@@ -308,7 +308,7 @@ func (w *Worker) validate(ctx context.Context, r Run) error {
 			return e
 		}
 		if count != 0 {
-			return logging.WithCause("monthly_daily_mismatch", nil)
+			return logging.WithFields("monthly_daily_mismatch", nil, "view", r.View, "partition", r.Partition, "reason", "monthly_daily_rows_differ", "difference_count", count)
 		}
 	}
 	return nil

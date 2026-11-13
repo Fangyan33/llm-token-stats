@@ -122,7 +122,7 @@ func (w *Worker) processPartition(ctx context.Context, fp kgo.FetchTopicPartitio
 							for _, p := range t.Partitions {
 								if p.ErrorCode != 0 {
 									logging.Failure("offset_commit_failed", "offset_commit/"+strconv.Itoa(int(fp.Partition)), nil, "kafka_error_code", int(p.ErrorCode), "partition", p.Partition)
-									err = errors.New("commit_failure")
+									err = logging.WithCause("commit_failure", nil)
 								}
 							}
 						}

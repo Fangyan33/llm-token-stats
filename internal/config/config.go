@@ -3,12 +3,13 @@ package config
 import (
 	"crypto/tls"
 	"crypto/x509"
-	"fmt"
-	"github.com/Fangyan33/llm-token-stats/internal/logging"
+	"errors"
+	"github.com/Fangyan33/llm-token-stats/pkg/configdiag"
 	"github.com/Fangyan33/llm-token-stats/pkg/strictjson"
 	"net/url"
 	"os"
 	"regexp"
+	"strings"
 	"time"
 	"unicode/utf8"
 )
@@ -48,10 +49,16 @@ func (k *Kafka) ProducerDefaults() error {
 	if k.ProducerWatchdogMS == 0 {
 		k.ProducerWatchdogMS = k.ProducerDeliveryMS + 2000
 	}
-	if k.ProducerMaxRecords < 1 || k.ProducerMaxRecords > 1048576 || k.ProducerMaxBytes < 32768 || k.ProducerMaxBytes > 1<<30 || k.ProducerBatchBytes < 1024 || k.ProducerBatchBytes > k.ProducerMaxBytes || k.ProducerBatchBytes > 4<<20 || k.ProducerLingerMS < 0 || k.ProducerLingerMS > 1000 || k.ProducerDeliveryMS < 1000 || k.ProducerDeliveryMS > 60000 || k.ProducerWatchdogMS <= k.ProducerDeliveryMS || k.ProducerWatchdogMS > 120000 {
-		return logging.WithCause("config_producer", nil)
-	}
-	return nil
+	r := &configdiag.Report{}
+	r.Number(int64(k.ProducerMaxRecords), 1, 1048576, "config_producer", "kafka.producer_max_records")
+	r.Number(int64(k.ProducerMaxBytes), 32768, 1<<30, "config_producer", "kafka.producer_max_bytes")
+	r.Number(int64(k.ProducerBatchBytes), 1024, 4<<20, "config_producer", "kafka.producer_batch_bytes")
+	r.Relation(k.ProducerBatchBytes <= k.ProducerMaxBytes, "config_producer", "kafka.producer_batch_bytes", "kafka.producer_max_bytes", "producer_batch_bytes <= producer_max_bytes", int64(k.ProducerBatchBytes))
+	r.Number(int64(k.ProducerLingerMS), 0, 1000, "config_producer", "kafka.producer_linger_ms")
+	r.Number(int64(k.ProducerDeliveryMS), 1000, 60000, "config_producer", "kafka.producer_delivery_timeout_ms")
+	r.Number(int64(k.ProducerWatchdogMS), 1, 120000, "config_producer", "kafka.producer_watchdog_timeout_ms")
+	r.Relation(k.ProducerWatchdogMS > k.ProducerDeliveryMS, "config_producer", "kafka.producer_watchdog_timeout_ms", "kafka.producer_delivery_timeout_ms", "watchdog timeout > delivery timeout", int64(k.ProducerWatchdogMS))
+	return r.Err()
 }
 
 type Lookup struct {
@@ -79,7 +86,8 @@ type LookupCacheSettings struct {
 	RetryInterval time.Duration
 }
 
-func (c LookupCache) Settings() (LookupCacheSettings, error) {
+func (c LookupCache) Settings() (LookupCacheSettings, error) { return c.settings("cache") }
+func (c LookupCache) settings(prefix string) (LookupCacheSettings, error) {
 	value := func(p *int, fallback int) int {
 		if p != nil {
 			return *p
@@ -88,8 +96,13 @@ func (c LookupCache) Settings() (LookupCacheSettings, error) {
 	}
 	entries, ttl := value(c.MaxEntries, 10000), value(c.TTLSeconds, 1800)
 	stale, retry := value(c.StaleIfErrorSeconds, 900), value(c.StaleRetryIntervalSeconds, 5)
-	if entries < 1 || entries > 100000 || ttl < 1 || ttl > 86400 || stale < 0 || stale > 86400 || retry < 1 || retry > 300 {
-		return LookupCacheSettings{}, logging.WithCause("config_lookup_cache", nil)
+	r := &configdiag.Report{}
+	r.Number(int64(entries), 1, 100000, "config_lookup_cache", prefix+".max_entries")
+	r.Number(int64(ttl), 1, 86400, "config_lookup_cache", prefix+".ttl_seconds")
+	r.Number(int64(stale), 0, 86400, "config_lookup_cache", prefix+".stale_if_error_seconds")
+	r.Number(int64(retry), 1, 300, "config_lookup_cache", prefix+".stale_retry_interval_seconds")
+	if err := r.Err(); err != nil {
+		return LookupCacheSettings{}, err
 	}
 	return LookupCacheSettings{
 		Enabled:    c.Enabled == nil || *c.Enabled,
@@ -160,13 +173,21 @@ func Read(path string) (Config, error) {
 	var c Config
 	b, err := os.ReadFile(path)
 	if err != nil {
-		return c, logging.WithCause("config_file", err)
+		return c, configdiag.Source(configdiag.New("config_file", "$", "file_read_failed", "readable configuration file", err), path)
 	}
-	if len(b) > 65536 || strictjson.Decode(b, &c) != nil {
-		return c, logging.WithCause("config_invalid", nil)
+	if len(b) > 65536 {
+		r := &configdiag.Report{}
+		r.Number(int64(len(b)), 0, 65536, "config_invalid", "$")
+		return c, configdiag.Source(r, path)
 	}
-	if !kafkaTopicName.MatchString(c.Kafka.Topic) || c.Kafka.Topic == "." || c.Kafka.Topic == ".." || len(c.Kafka.Brokers) == 0 {
-		return c, logging.WithCause("config_kafka", nil)
+	if err := strictjson.DecodeConfig(b, &c); err != nil {
+		return c, configdiag.Source(err, path)
+	}
+	r := &configdiag.Report{Source: path}
+	r.Check(kafkaTopicName.MatchString(c.Kafka.Topic) && c.Kafka.Topic != "." && c.Kafka.Topic != "..", "config_kafka", "kafka.topic", "invalid_topic", "1..249 ASCII letters, digits, '.', '_' or '-'; not '.' or '..'")
+	r.Check(len(c.Kafka.Brokers) > 0, "config_kafka", "kafka.bootstrap_servers", "empty_list", "at least one broker")
+	if err := r.Err(); err != nil {
+		return c, err
 	}
 	return c, nil
 }
@@ -175,60 +196,46 @@ func Read(path string) (Config, error) {
 var kafkaTopicName = regexp.MustCompile(`^[A-Za-z0-9._-]{1,249}$`)
 
 func (c *Config) ObserverDefaults() error {
-	if err := c.Kafka.ProducerDefaults(); err != nil {
-		return err
-	}
-	if err := c.Observer.RequestTokenDefaults(); err != nil {
-		return err
-	}
+	r := &configdiag.Report{}
+	r.Merge(c.Kafka.ProducerDefaults())
+	r.Merge(c.Observer.RequestTokenDefaults())
 	if c.Observer.ReceiveQueueBatches == 0 {
 		c.Observer.ReceiveQueueBatches = 4096
 	}
 	if c.Observer.ReceiveQueueBytes == 0 {
 		c.Observer.ReceiveQueueBytes = 128 << 20
 	}
-	if c.Observer.ReceiveQueueBatches < 1 || c.Observer.ReceiveQueueBatches > 65536 || c.Observer.ReceiveQueueBytes < 32768 || c.Observer.ReceiveQueueBytes > 4<<30 {
-		return logging.WithCause("config_observer_queue", nil)
-	}
+	r.Number(int64(c.Observer.ReceiveQueueBatches), 1, 65536, "config_observer_queue", "observer.receive_queue_batches")
+	r.Number(c.Observer.ReceiveQueueBytes, 32768, 4<<30, "config_observer_queue", "observer.receive_queue_bytes")
 	if c.Observer.LookupTimeoutMS == 0 {
 		c.Observer.LookupTimeoutMS = 200
 	}
 	if c.Observer.LookupConcurrency == 0 {
 		c.Observer.LookupConcurrency = 64
 	}
-	if c.Observer.LookupTimeoutMS < 1 || c.Observer.LookupTimeoutMS > 2000 {
-		return fmt.Errorf("config_lookup: observer.lookup_timeout_ms must be in [1, 2000]")
-	}
-	if c.Observer.LookupConcurrency < 1 || c.Observer.LookupConcurrency > 256 {
-		return fmt.Errorf("config_lookup: observer.lookup_max_concurrency must be in [1, 256]")
-	}
+	r.Number(int64(c.Observer.LookupTimeoutMS), 1, 2000, "config_lookup", "observer.lookup_timeout_ms")
+	r.Number(int64(c.Observer.LookupConcurrency), 1, 256, "config_lookup", "observer.lookup_max_concurrency")
 	for _, named := range []struct {
 		name   string
 		lookup Lookup
 	}{{"service_lookup", c.Observer.ServiceLookup}, {"customer_lookup", c.Observer.CustomerLookup}} {
 		lookup := named.lookup
-		if _, err := lookup.Cache.Settings(); err != nil {
-			return err
-		}
-		if lookup.MaxRPS < 0 || lookup.MaxRPS > 100000 {
-			return fmt.Errorf("config_lookup: observer.%s.max_requests_per_second must be in [0, 100000]", named.name)
-		}
+		prefix := "observer." + named.name
+		_, cacheErr := lookup.Cache.settings(prefix + ".cache")
+		r.Merge(cacheErr)
+		r.Number(int64(lookup.MaxRPS), 0, 100000, "config_lookup", prefix+".max_requests_per_second")
 		if lookup.URI != "" {
-			if !regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`).MatchString(lookup.CredentialEnv) {
-				return fmt.Errorf("config_lookup: observer.%s.credential_env must be an environment variable name", named.name)
-			}
-			if lookup.CAFile != "" && !text(lookup.CAFile, 4096) {
-				return fmt.Errorf("config_lookup: observer.%s.ca_file must be valid UTF-8 and at most 4096 bytes", named.name)
-			}
+			r.Check(regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`).MatchString(lookup.CredentialEnv), "config_lookup", prefix+".credential_env", "invalid_environment_name", "environment variable name")
+			r.Check(lookup.CAFile == "" || text(lookup.CAFile, 4096), "config_lookup", prefix+".ca_file", "invalid_text", "UTF-8 path of at most 4096 bytes")
 		}
+		r.Check(LookupURI(lookup.URI), "config_observer", prefix+".uri", "invalid_uri", "empty or HTTP(S) URI without credentials, query or fragment")
 	}
 	if w := c.Observer.WasmDownload; w != nil {
 		if w.Listen == "" {
 			w.Listen = ":9093"
 		}
-		if !text(w.File, 4096) || !text(w.Listen, 256) {
-			return logging.WithCause("config_wasm_download", nil)
-		}
+		r.Check(text(w.File, 4096), "config_wasm_download", "observer.wasm_download.file", "invalid_text", "nonempty UTF-8 path of at most 4096 bytes")
+		r.Check(text(w.Listen, 256), "config_wasm_download", "observer.wasm_download.listen", "invalid_text", "nonempty UTF-8 address of at most 256 bytes")
 	}
 	if c.Observer.Listen == "" {
 		c.Observer.Listen = ":9090"
@@ -248,10 +255,17 @@ func (c *Config) ObserverDefaults() error {
 	if c.Observer.ProducerID == "" {
 		c.Observer.ProducerID = os.Getenv("POD_UID")
 	}
-	if !text(c.Observer.ClusterName, 128) || !Environment(c.Observer.DeploymentEnvironment) || !LookupURI(c.Observer.ServiceLookup.URI) || !LookupURI(c.Observer.CustomerLookup.URI) || !text(c.Observer.ProducerID, 128) || c.Observer.MaxActive < 1 || c.Observer.MaxActive > 1048576 || c.Observer.ParserBudget < 3*32768 || c.Observer.ParserBudget > 64<<30 || c.Observer.MaxConnections < 1 || c.Observer.MaxConnections > 4096 || !registration(c.Observer.AcceptedConfigs) || len(c.Observer.AcceptedAdapters) != 1 || c.Observer.AcceptedAdapters[0] != "chat_completions_v1" || !codes(c.Observer.Flags) || !codes(c.Observer.Details) {
-		return logging.WithCause("config_observer", nil)
-	}
-	return nil
+	r.Check(text(c.Observer.ClusterName, 128), "config_observer", "observer.cluster_name", "invalid_text", "nonempty UTF-8 string of at most 128 bytes")
+	r.Check(Environment(c.Observer.DeploymentEnvironment), "config_observer", "observer.deployment_environment", "invalid_enum", "prd, stg or dev")
+	r.Check(text(c.Observer.ProducerID, 128), "config_observer", "observer.producer_id", "invalid_text", "nonempty UTF-8 string of at most 128 bytes; defaults to POD_UID")
+	r.Number(int64(c.Observer.MaxActive), 1, 1048576, "config_observer", "observer.max_active_observations")
+	r.Number(c.Observer.ParserBudget, 3*32768, 64<<30, "config_observer", "observer.parser_budget_bytes")
+	r.Number(int64(c.Observer.MaxConnections), 1, 4096, "config_observer", "observer.max_connections")
+	validateStrings(r, c.Observer.AcceptedConfigs, 1, 1024, "config_observer", "observer.accepted_config_versions")
+	r.Check(len(c.Observer.AcceptedAdapters) == 1 && c.Observer.AcceptedAdapters[0] == "chat_completions_v1", "config_observer", "observer.accepted_adapter_ids", "invalid_adapter", "exactly [chat_completions_v1]")
+	validateStrings(r, c.Observer.Flags, 0, 128, "config_observer", "observer.response_flags_allowlist")
+	validateStrings(r, c.Observer.Details, 0, 128, "config_observer", "observer.response_code_details_allowlist")
+	return r.Err()
 }
 func (c *Config) ConsumerDefaults() error {
 	if c.Consumer.Health == "" {
@@ -272,72 +286,115 @@ func (c *Config) ConsumerDefaults() error {
 	if c.Doris.Database == "" {
 		c.Doris.Database = "metering"
 	}
-	if !text(c.Consumer.Group, 128) || c.Consumer.Rows < 1 || c.Consumer.Rows > 20000 || c.Consumer.Bytes < 32768 || c.Consumer.Bytes > 16<<20 || c.Consumer.FlushMS < 1 || c.Consumer.FlushMS > 600000 || !DatabaseName(c.Doris.Database) || !registration(c.Consumer.AcceptedConfigs) || len(c.Doris.AllowedHosts) == 0 || !codes(c.Consumer.Flags) || !codes(c.Consumer.Details) {
-		return logging.WithCause("config_consumer", nil)
-	}
-	for _, ps := range [][]Position{c.Consumer.Initial, c.Consumer.Resume} {
+	r := &configdiag.Report{}
+	r.Check(text(c.Consumer.Group, 128), "config_consumer", "consumer.group_id", "invalid_text", "nonempty UTF-8 string of at most 128 bytes")
+	r.Number(int64(c.Consumer.Rows), 1, 20000, "config_consumer", "consumer.max_batch_rows")
+	r.Number(int64(c.Consumer.Bytes), 32768, 16<<20, "config_consumer", "consumer.max_batch_bytes")
+	r.Number(int64(c.Consumer.FlushMS), 1, 600000, "config_consumer", "consumer.flush_interval_ms")
+	r.Check(DatabaseName(c.Doris.Database), "config_consumer", "doris.database", "invalid_identifier", "ASCII letter followed by up to 63 letters, digits or underscores")
+	validateStrings(r, c.Consumer.AcceptedConfigs, 1, 1024, "config_consumer", "consumer.accepted_config_versions")
+	r.Check(len(c.Doris.AllowedHosts) > 0, "config_consumer", "doris.allowed_load_hosts", "empty_list", "at least one allowed load host")
+	validateStrings(r, c.Consumer.Flags, 0, 128, "config_consumer", "consumer.response_flags_allowlist")
+	validateStrings(r, c.Consumer.Details, 0, 128, "config_consumer", "consumer.response_code_details_allowlist")
+	for j, ps := range [][]Position{c.Consumer.Initial, c.Consumer.Resume} {
+		field := []string{"consumer.initial_offsets", "consumer.gap_resume_offsets"}[j]
 		seen := map[int32]bool{}
-		for _, p := range ps {
-			if p.Partition < 0 || p.Offset < 0 || seen[p.Partition] {
-				return logging.WithCause("config_offsets", nil)
-			}
+		for i, p := range ps {
+			prefix := configdiag.Index(field, i)
+			r.Number(int64(p.Partition), 0, 2147483647, "config_offsets", prefix+".partition")
+			r.Number(p.Offset, 0, 9223372036854775807, "config_offsets", prefix+".offset")
+			r.Check(!seen[p.Partition], "config_offsets", prefix+".partition", "duplicate_partition", "unique partition within this offset list")
 			seen[p.Partition] = true
 		}
 	}
-	return nil
+	return r.Err()
+}
+
+func validateStrings(r *configdiag.Report, xs []string, low, high int64, code, field string) {
+	r.Number(int64(len(xs)), low, high, code, field)
+	seen := map[string]bool{}
+	for i, s := range xs {
+		name := configdiag.Index(field, i)
+		r.Check(text(s, 128), code, name, "invalid_text", "nonempty UTF-8 string of at most 128 bytes")
+		r.Check(!seen[s], code, name, "duplicate_value", "unique list entry")
+		seen[s] = true
+	}
+}
+
+// ReadObserver and ReadConsumer aggregate common and component-specific checks
+// after decoding succeeds. Syntax/type errors never trigger validation of a
+// partially decoded configuration.
+func ReadObserver(path string) (Config, error) { return readComponent(path, true) }
+func ReadConsumer(path string) (Config, error) { return readComponent(path, false) }
+func readComponent(path string, observer bool) (Config, error) {
+	c, err := Read(path)
+	if err != nil {
+		d := configdiag.Find(err)
+		if d == nil || len(d.Issues) == 0 || d.Issues[0].Code != "config_kafka" {
+			return c, err
+		}
+	}
+	r := &configdiag.Report{Source: path}
+	r.Merge(err)
+	if observer {
+		r.Merge(c.ObserverDefaults())
+	} else {
+		r.Merge(c.ConsumerDefaults())
+	}
+	return c, r.Err()
 }
 
 func text(s string, max int) bool { return len(s) > 0 && len(s) <= max && utf8.ValidString(s) }
-func codes(xs []string) bool {
-	if len(xs) > 128 {
-		return false
-	}
-	seen := map[string]bool{}
-	for _, s := range xs {
-		if !text(s, 128) || seen[s] {
-			return false
-		}
-		seen[s] = true
-	}
-	return true
-}
-func registration(configs []string) bool {
-	return len(configs) > 0 && len(configs) <= 1024 && codesConfig(configs)
-}
-func codesConfig(xs []string) bool {
-	seen := map[string]bool{}
-	for _, s := range xs {
-		if !text(s, 128) || seen[s] {
-			return false
-		}
-		seen[s] = true
-	}
-	return true
-}
 func (k Kafka) TLS() (*tls.Config, error) {
 	if k.CAFile == "" && k.CertFile == "" {
 		return nil, nil
 	}
 	t := &tls.Config{MinVersion: tls.VersionTLS12}
+	r := &configdiag.Report{}
 	if k.CAFile != "" {
 		b, err := os.ReadFile(k.CAFile)
 		if err != nil {
-			return nil, logging.WithCause("kafka_tls", err)
-		}
-		t.RootCAs = x509.NewCertPool()
-		if !t.RootCAs.AppendCertsFromPEM(b) {
-			return nil, logging.WithCause("kafka_tls", nil)
+			r.Merge(configdiag.New("kafka_tls", "kafka.ca_file", "file_read_failed", "readable PEM CA certificate file", err))
+		} else {
+			t.RootCAs = x509.NewCertPool()
+			r.Check(t.RootCAs.AppendCertsFromPEM(b), "kafka_tls", "kafka.ca_file", "invalid_ca_pem", "PEM CA certificate file")
 		}
 	}
 	if k.CertFile != "" {
 		cert, err := tls.LoadX509KeyPair(k.CertFile, k.KeyFile)
 		if err != nil {
-			return nil, logging.WithCause("kafka_tls", err)
+			field, related, reason := "kafka.cert_file", "kafka.key_file", "invalid_certificate"
+			var pe *os.PathError
+			if errors.As(err, &pe) {
+				reason = "file_read_failed"
+				if pe.Path == k.KeyFile {
+					field, related = related, field
+				}
+			} else {
+				// Classify only local TLS diagnostics. PEM labels and parser error
+				// text themselves must never become log fields.
+				message := err.Error()
+				if strings.Contains(message, "certificate input") {
+					reason = "invalid_certificate_pem"
+				} else if strings.Contains(message, "does not match") {
+					field, related, reason = "kafka.key_file", "kafka.cert_file", "certificate_key_mismatch"
+				} else if strings.Contains(message, "key input") || strings.Contains(message, "private key") {
+					field, related, reason = "kafka.key_file", "kafka.cert_file", "invalid_private_key"
+				}
+			}
+			d := configdiag.New("kafka_tls", field, reason, "readable matching PEM certificate and private key", err)
+			d.Issues[0].RelatedField = related
+			r.Merge(d)
+		} else {
+			t.Certificates = []tls.Certificate{cert}
 		}
-		t.Certificates = []tls.Certificate{cert}
+	}
+	if err := r.Err(); err != nil {
+		return nil, err
 	}
 	return t, nil
 }
+
 func Duration(ms int) time.Duration { return time.Duration(ms) * time.Millisecond }
 
 // DatabaseName is the only accepted unquoted SQL identifier grammar.

@@ -253,6 +253,18 @@ Observer、Consumer 和 usage-worker 在启动时读取环境变量 `LOG_LEVEL`�
 
 日志使用单行可读文本，Go 服务写 stderr，Wasm 写 Envoy 日志。字段包括时间、等级、组件、事件及调用阶段、耗时、协议状态和安全提取的错误原因。DEBUG 用于观察生命周期、缓存、批次 offset、刷新任务及阶段耗时；不输出正文、密钥、认证头、完整 DSN、SQL 或 SQL 参数。SQL 错误记录错误码和 SQLState，不直接打印可能含数据或凭据的服务端消息。
 
+配置校验失败逐条记录 `event=configuration_validation_failed`，包含 `config_source`、`config_field`、`error_code`、`reason` 和 `expected`；数值超限附带 `actual`，字段之间的约束附带 `related_field`。字段使用完整路径及从 0 开始的数组下标，例如 `observer.service_lookup.cache.ttl_seconds`、`consumer.initial_offsets[1].offset`、`routes[0].paths[2]`。成功解码后，汇总当前校验阶段的独立错误；静态配置通过后再检查本地凭据和证书。每阶段最多输出 32 条明细，退出摘要包含 `error_count` 和 `omitted_count`。文件不存在、JSON 语法或类型错误导致无法完整解码时，先报告该错误；JSON 错误尽可能附带 `byte_offset`、`line` 和按字节计数的 `column`，不校验未完整解码的配置。Envoy Struct 的字段类型错误同样定位到配置字段，但其中的 JSON 位置指转换后的 JSON，不是源 YAML 行号。
+
+```text
+level=ERROR event=configuration_validation_failed component=consumer config_source=configs/consumer.json error_code=config_consumer config_field=consumer.max_batch_rows reason=out_of_range expected="[1, 20000]" actual=20001
+level=ERROR event=configuration_validation_failed component=consumer config_source=configs/consumer.json error_code=doris_dsn config_field=doris.dsn_env reason=environment_variable_empty expected="nonempty Doris DSN" env_name=DORIS_DSN
+level=ERROR event=plugin_configuration_failed component=wasm error_count="3" omitted_count="0" action="passthrough"
+```
+
+`environment_variable_empty` 表示对应环境变量未设置或为空；`invalid_dsn` 表示 DSN 格式错误；`database_mismatch` 表示 DSN 中的数据库与 `doris.database` 不一致。`file_read_failed`、`invalid_ca_pem`、`certificate_key_mismatch` 分别表示文件读取、CA 格式和证书密钥配对问题，读取错误保留安全的系统原因。环境变量只记录合法变量名；配置字符串、凭据值、URL 和 DSN 不作为出错值输出，未知字段名只显示有界的标识符。先修正配置字段或 Secret，再重启对应组件。Wasm 配置失败仍返回初始化成功并禁用采集，日志明确标记 `action=passthrough`。
+
+运行时日志区分额度类型及当前占用、Producer 不可用与队列条数/字节不足、gRPC host 状态与关闭状态、Doris 已知写入状态和行数差异、归属响应校验原因、汇总任务阶段及 Lease 资源类型。未知服务端状态归类为 `unrecognized`，不原样输出。资源不足导致漏采为 WARN，依赖操作失败为 ERROR；正常关闭、采集关闭和正常缺失 usage 不新增错误日志。`action` 说明跳过观察、停止请求体采集、保留额度或暂停分区等实际处理。
+
 ```sh
 LOG_LEVEL=debug ./dist/observer --config configs/observer.local.json
 LOG_LEVEL=debug ./dist/consumer --config configs/consumer.local.json

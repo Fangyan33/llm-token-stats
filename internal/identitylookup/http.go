@@ -18,6 +18,7 @@ import (
 
 	"github.com/Fangyan33/llm-token-stats/internal/config"
 	"github.com/Fangyan33/llm-token-stats/internal/logging"
+	"github.com/Fangyan33/llm-token-stats/pkg/configdiag"
 	"github.com/Fangyan33/llm-token-stats/pkg/strictjson"
 )
 
@@ -43,34 +44,45 @@ type remote struct {
 type serviceRemote struct{ *remote }
 type customerRemote struct{ *remote }
 
-func newRemote(c config.Lookup) (*remote, error) {
+func newRemote(c config.Lookup) (*remote, error) { return newRemoteAt(c, "lookup") }
+func newRemoteAt(c config.Lookup, prefix string) (*remote, error) {
 	u, err := url.Parse(c.URI)
-	if err != nil || c.URI == "" || !config.LookupURI(c.URI) || c.MaxRPS < 0 || c.MaxRPS > 100000 {
-		return nil, logging.WithCause("lookup_config", nil)
-	}
+	r := &configdiag.Report{}
+	r.Check(err == nil && c.URI != "" && config.LookupURI(c.URI), "lookup_config", prefix+".uri", "invalid_uri", "HTTP(S) URI without credentials, query or fragment")
+	r.Number(int64(c.MaxRPS), 0, 100000, "lookup_config", prefix+".max_requests_per_second")
 	credential := os.Getenv(c.CredentialEnv)
-	if len(credential) == 0 || len(credential) > 4096 {
-		return nil, logging.WithCause("lookup_credential", nil)
-	}
-	for _, b := range []byte(credential) {
-		if b <= ' ' || b >= 127 {
-			return nil, logging.WithCause("lookup_credential", nil)
+	reason := ""
+	if len(credential) == 0 {
+		reason = "environment_variable_empty"
+	} else if len(credential) > 4096 {
+		reason = "credential_too_long"
+	} else {
+		for _, b := range []byte(credential) {
+			if b <= ' ' || b >= 127 {
+				reason = "credential_invalid_character"
+				break
+			}
 		}
+	}
+	if reason != "" {
+		r.Merge(configdiag.Environment("lookup_credential", prefix+".credential_env", c.CredentialEnv, reason, "1..4096 printable ASCII bytes without whitespace"))
 	}
 	tlsConfig := &tls.Config{MinVersion: tls.VersionTLS12}
-	if u.Scheme == "https" && c.CAFile != "" {
+	if u != nil && u.Scheme == "https" && c.CAFile != "" {
 		pem, err := os.ReadFile(c.CAFile)
 		if err != nil {
-			return nil, logging.WithCause("lookup_ca", err)
+			r.Merge(configdiag.New("lookup_ca", prefix+".ca_file", "file_read_failed", "readable PEM CA certificate file", err))
+		} else {
+			pool, err := x509.SystemCertPool()
+			if err != nil {
+				pool = x509.NewCertPool()
+			}
+			r.Check(pool.AppendCertsFromPEM(pem), "lookup_ca", prefix+".ca_file", "invalid_ca_pem", "PEM CA certificate file")
+			tlsConfig.RootCAs = pool
 		}
-		pool, err := x509.SystemCertPool()
-		if err != nil {
-			pool = x509.NewCertPool()
-		}
-		if !pool.AppendCertsFromPEM(pem) {
-			return nil, logging.WithCause("lookup_ca", nil)
-		}
-		tlsConfig.RootCAs = pool
+	}
+	if err := r.Err(); err != nil {
+		return nil, err
 	}
 	// No environment proxy, redirects, cookies, tracing or automatic retries.
 	// Transport may continue connecting after the request has returned. Bound
@@ -92,7 +104,7 @@ func NewService(c config.Lookup) (ServiceResolver, error) {
 	if c.URI == "" {
 		return UnimplementedServiceResolver{}, nil
 	}
-	r, err := newRemote(c)
+	r, err := newRemoteAt(c, "observer.service_lookup")
 	if err != nil {
 		return nil, err
 	}
@@ -102,7 +114,7 @@ func NewCustomer(c config.Lookup) (CustomerResolver, error) {
 	if c.URI == "" {
 		return UnimplementedCustomerResolver{}, nil
 	}
-	r, err := newRemote(c)
+	r, err := newRemoteAt(c, "observer.customer_lookup")
 	if err != nil {
 		return nil, err
 	}
@@ -111,6 +123,7 @@ func NewCustomer(c config.Lookup) (CustomerResolver, error) {
 
 func (r *remote) post(ctx context.Context, input, output any, record *responseRecord) error {
 	if !r.allow() {
+		record.Diagnostic = []any{"reason", "endpoint_rate_limit", "limit", r.maxRPS}
 		return failure("lookup_overloaded")
 	}
 	body, err := json.Marshal(input)
@@ -147,12 +160,14 @@ func (r *remote) post(ctx context.Context, input, output any, record *responseRe
 		reportFailure(ctx, failure("lookup_unavailable"))
 	}
 	if res.StatusCode >= 500 {
+		record.Diagnostic = []any{"reason", "http_server_error"}
 		if res.StatusCode < 600 {
 			return transientFailure("lookup_unavailable")
 		}
 		return failure("lookup_unavailable")
 	}
 	if res.StatusCode == 403 {
+		record.Diagnostic = []any{"reason", "http_authentication_rejected"}
 		return failure("lookup_unavailable")
 	}
 	raw, err := io.ReadAll(io.LimitReader(res.Body, maxResponseBytes+1))
@@ -168,6 +183,7 @@ func (r *remote) post(ctx context.Context, input, output any, record *responseRe
 				*record = candidate
 			}
 		}
+		record.Diagnostic = []any{"reason", "http_authentication_rejected"}
 		return failure("lookup_unavailable")
 	}
 	if err != nil {
@@ -181,23 +197,32 @@ func (r *remote) post(ctx context.Context, input, output any, record *responseRe
 		}
 		return transientFailure("lookup_unavailable")
 	}
-	if mediaErr != nil || kind != "application/json" || len(raw) > maxResponseBytes {
+	if mediaErr != nil || kind != "application/json" {
+		record.Diagnostic = []any{"reason", "invalid_content_type", "expected", "application/json"}
+		return failure("lookup_invalid_response")
+	}
+	if len(raw) > maxResponseBytes {
+		record.Diagnostic = []any{"reason", "response_too_large", "limit", maxResponseBytes}
 		return failure("lookup_invalid_response")
 	}
 	if res.StatusCode == 200 {
 		data, err := decodeResponseEnvelope(raw, record)
 		if err != nil {
+			record.Diagnostic = []any{"reason", "invalid_response_envelope"}
 			return failure("lookup_invalid_response")
 		}
 		if record.ResponseCode == "000000" {
 			if !*record.Success || emptyResponseData(data) || strictjson.Decode(data, output) != nil {
+				record.Diagnostic = []any{"reason", "invalid_success_payload"}
 				return failure("lookup_invalid_response")
 			}
 			return nil
 		}
 		if *record.Success || !emptyResponseData(data) {
+			record.Diagnostic = []any{"reason", "inconsistent_failure_envelope"}
 			return failure("lookup_invalid_response")
 		}
+		record.Diagnostic = []any{"reason", "business_response_rejected"}
 		switch record.ResponseCode {
 		case "100001":
 			return failure("lookup_unavailable")
@@ -215,6 +240,7 @@ func (r *remote) post(ctx context.Context, input, output any, record *responseRe
 		} `json:"error"`
 	}
 	if strictjson.Decode(raw, &result) != nil {
+		record.Diagnostic = []any{"reason", "invalid_error_envelope"}
 		return failure("lookup_invalid_response")
 	}
 	switch {

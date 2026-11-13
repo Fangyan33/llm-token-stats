@@ -2,7 +2,6 @@ package ingestworker
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"github.com/Fangyan33/llm-token-stats/internal/config"
 	"github.com/Fangyan33/llm-token-stats/internal/consumer"
@@ -89,14 +88,14 @@ func (w *Worker) positions(ctx context.Context, p int32) (int64, int64, error) {
 	resp := r.(*kmsg.OffsetFetchResponse)
 	if resp.ErrorCode != 0 {
 		logging.Failure("kafka_offset_failed", "kafka_offset", nil, "kafka_error_code", int(resp.ErrorCode), "partition", p)
-		return 0, 0, errors.New("kafka_offset")
+		return 0, 0, logging.WithCause("kafka_offset", nil)
 	}
 	committed := int64(-1)
 	for _, t := range resp.Topics {
 		for _, v := range t.Partitions {
 			if v.ErrorCode != 0 {
 				logging.Failure("kafka_offset_failed", "kafka_offset", nil, "kafka_error_code", int(v.ErrorCode), "partition", p)
-				return 0, 0, errors.New("kafka_offset")
+				return 0, 0, logging.WithCause("kafka_offset", nil)
 			}
 			committed = v.Offset
 		}
@@ -115,12 +114,12 @@ func (w *Worker) positions(ctx context.Context, p int32) (int64, int64, error) {
 		for _, v := range t.Partitions {
 			if v.ErrorCode != 0 {
 				logging.Failure("kafka_offset_failed", "kafka_offset", nil, "kafka_error_code", int(v.ErrorCode), "partition", p)
-				return 0, 0, errors.New("kafka_offset")
+				return 0, 0, logging.WithCause("kafka_offset", nil)
 			}
 			return committed, v.Offset, nil
 		}
 	}
-	return 0, 0, errors.New("kafka_offset")
+	return 0, 0, logging.WithCause("kafka_offset", nil)
 }
 func (w *Worker) setup(ctx context.Context, p int32) (int64, error) {
 	commit, earliest, err := w.positions(ctx, p)
@@ -136,7 +135,7 @@ func (w *Worker) setup(ctx context.Context, p int32) (int64, error) {
 		var n int64
 		if rows.Scan(&n) != nil {
 			rows.Close()
-			return 0, errors.New("origin_query")
+			return 0, logging.WithCause("origin_query", nil)
 		}
 		origins = append(origins, n)
 	}
@@ -327,12 +326,12 @@ func (w *Worker) watermarks(ctx context.Context) bool {
 		for rs.Next() {
 			var r consumer.Range
 			if rs.Scan(&r.First, &r.Next) != nil {
-				err = errors.New("watermark_query")
+				err = logging.WithCause("watermark_query", nil)
 				break
 			}
 			ranges = append(ranges, r)
 			if len(ranges) > 100000 {
-				err = errors.New("watermark_limit")
+				err = logging.WithCause("watermark_limit", nil)
 				break
 			}
 		}

@@ -2,7 +2,7 @@
 package requestid
 
 import (
-	"errors"
+	"github.com/Fangyan33/llm-token-stats/pkg/configdiag"
 	"strings"
 )
 
@@ -25,26 +25,26 @@ func Valid(value string) bool {
 
 // NormalizeHeaders preserves priority while normalizing HTTP field names.
 func NormalizeHeaders(headers []string) ([]string, error) {
-	if len(headers) > MaxHeaders {
-		return nil, errors.New("config_request_id_headers")
-	}
+	r := &configdiag.Report{}
+	r.Number(int64(len(headers)), 0, MaxHeaders, "config_request_id_headers", "$")
 	out := make([]string, 0, len(headers))
 	seen := map[string]bool{}
-	for _, header := range headers {
-		if len(header) == 0 || len(header) > MaxBytes {
-			return nil, errors.New("config_request_id_headers")
-		}
+	for i, header := range headers {
+		valid := len(header) > 0 && len(header) <= MaxBytes
 		for _, c := range header {
 			if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || strings.ContainsRune("!#$%&'*+-.^_`|~", c)) {
-				return nil, errors.New("config_request_id_headers")
+				valid = false
 			}
 		}
+		field := configdiag.Index("", i)
+		r.Check(valid, "config_request_id_headers", field, "invalid_header_name", "HTTP token of 1..128 bytes")
 		header = strings.ToLower(header)
-		if seen[header] {
-			return nil, errors.New("config_request_id_headers")
-		}
+		r.Check(!seen[header], "config_request_id_headers", field, "duplicate_header", "case-insensitively unique header")
 		seen[header] = true
 		out = append(out, header)
+	}
+	if err := r.Err(); err != nil {
+		return nil, err
 	}
 	return out, nil
 }

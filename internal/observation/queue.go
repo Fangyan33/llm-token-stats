@@ -1,6 +1,7 @@
 package observation
 
 import (
+	"github.com/Fangyan33/llm-token-stats/internal/logging"
 	"google.golang.org/protobuf/proto"
 	"sync"
 )
@@ -34,7 +35,13 @@ func (q *receiveQueue) push(rec batchReceived) bool {
 	}
 	q.s.queueMu.Lock()
 	if q.s.queueBytes+n > maxBytes || q.s.queueBatches >= maxBatches {
+		usedBytes, usedBatches := q.s.queueBytes, q.s.queueBatches
 		q.s.queueMu.Unlock()
+		reason := "byte_limit"
+		if usedBatches >= maxBatches {
+			reason = "batch_limit"
+		}
+		logging.Warn("observer_receive_queue_full", "observer_receive_queue", "reason", reason, "queued_bytes", usedBytes, "batch_bytes", n, "byte_limit", maxBytes, "queued_batches", usedBatches, "batch_limit", maxBatches, "action", "close_observation_transport")
 		return false
 	}
 	q.s.queueBytes += n
@@ -46,8 +53,10 @@ func (q *receiveQueue) push(rec batchReceived) bool {
 	if !q.closed {
 		select {
 		case q.ch <- rec:
+			logging.Recovered("observer_receive_queue", "observer_receive_queue_recovered")
 			return true
 		default:
+			logging.Warn("observer_receive_queue_full", "observer_receive_queue", "reason", "transport_batch_limit", "batch_limit", cap(q.ch), "action", "close_observation_transport")
 		}
 	}
 	q.release(rec)

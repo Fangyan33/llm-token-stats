@@ -2,7 +2,7 @@
 package requestmeta
 
 import (
-	"errors"
+	"github.com/Fangyan33/llm-token-stats/pkg/configdiag"
 	"strings"
 	"unicode/utf8"
 
@@ -24,22 +24,24 @@ func Allowed(name string) bool {
 }
 
 func Normalize(names []string, max int) ([]string, error) {
-	if len(names) > max {
-		return nil, errors.New("config_request_headers")
-	}
-	// Reuse the HTTP token grammar and case-insensitive duplicate detection.
+	r := &configdiag.Report{}
+	r.Number(int64(len(names)), 0, int64(max), "config_request_headers", "$")
 	out := make([]string, 0, len(names))
 	seen := map[string]bool{}
-	for _, name := range names {
+	for i, name := range names {
+		field := configdiag.Index("", i)
 		n, err := requestid.NormalizeHeaders([]string{name})
-		if err != nil || !Allowed(name) {
-			return nil, errors.New("config_request_headers")
+		r.Check(err == nil, "config_request_headers", field, "invalid_header_name", "HTTP token of 1..128 bytes")
+		r.Check(Allowed(name), "config_request_headers", field, "sensitive_header", "header outside the sensitive-header denylist")
+		if err != nil {
+			continue
 		}
-		if seen[n[0]] {
-			return nil, errors.New("config_request_headers")
-		}
+		r.Check(!seen[n[0]], "config_request_headers", field, "duplicate_header", "case-insensitively unique header")
 		seen[n[0]] = true
 		out = append(out, n[0])
+	}
+	if err := r.Err(); err != nil {
+		return nil, err
 	}
 	return out, nil
 }

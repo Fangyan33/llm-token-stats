@@ -6,13 +6,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"github.com/Fangyan33/llm-token-stats/internal/logging"
-	"os"
+	"github.com/Fangyan33/llm-token-stats/pkg/configdiag"
 	"regexp"
 	"strings"
 	"time"
 
 	"github.com/Fangyan33/llm-token-stats/internal/config"
-	"github.com/go-sql-driver/mysql"
 )
 
 var identifier = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_-]{0,62}$`)
@@ -25,11 +24,11 @@ type Store struct {
 
 func Open(c config.Doris) (*Store, error) {
 	if !config.DatabaseName(c.Database) {
-		return nil, logging.WithCause("invalid_database", nil)
+		return nil, configdiag.New("invalid_database", "doris.database", "invalid_identifier", "valid database identifier", nil)
 	}
-	d, err := mysql.ParseDSN(os.Getenv(c.DSNEnv))
-	if err != nil || d.DBName != c.Database {
-		return nil, logging.WithCause("summary_dsn", nil)
+	d, err := c.ParseDSN("summary_dsn")
+	if err != nil {
+		return nil, err
 	}
 	if d.Params == nil {
 		d.Params = map[string]string{}
@@ -42,7 +41,7 @@ func Open(c config.Doris) (*Store, error) {
 	d.Timeout = 5 * time.Second
 	db, err := sql.Open("mysql", d.FormatDSN())
 	if err != nil {
-		return nil, logging.WithCause("summary_connect", nil)
+		return nil, configdiag.Environment("summary_connect", "doris.dsn_env", c.DSNEnv, "driver_initialization_failed", "supported MySQL connection options")
 	}
 	db.SetMaxOpenConns(2)
 	return &Store{db, c.Database}, nil
@@ -55,10 +54,10 @@ func (s *Store) rows(ctx context.Context, q string, args ...any) ([]map[string]s
 		logging.Failure("summary_sql_failed", "summary_sql", err, "operation", sqlOperation(q), "duration_ms", time.Since(started).Milliseconds())
 		return nil, err
 	}
-	logging.Recovered("summary_sql", "summary_sql_recovered")
 	defer rows.Close()
 	cols, err := rows.Columns()
 	if err != nil {
+		logging.Failure("summary_sql_failed", "summary_sql", err, "operation", sqlOperation(q), "phase", "columns")
 		return nil, err
 	}
 	out := []map[string]string{}
@@ -69,6 +68,7 @@ func (s *Store) rows(ctx context.Context, q string, args ...any) ([]map[string]s
 			ptrs[i] = &vals[i]
 		}
 		if err = rows.Scan(ptrs...); err != nil {
+			logging.Failure("summary_sql_failed", "summary_sql", err, "operation", sqlOperation(q), "phase", "scan")
 			return nil, err
 		}
 		m := map[string]string{}
@@ -77,7 +77,12 @@ func (s *Store) rows(ctx context.Context, q string, args ...any) ([]map[string]s
 		}
 		out = append(out, m)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		logging.Failure("summary_sql_failed", "summary_sql", err, "operation", sqlOperation(q), "phase", "read_rows")
+		return out, err
+	}
+	logging.Recovered("summary_sql", "summary_sql_recovered")
+	return out, nil
 }
 
 func sqlOperation(q string) string {

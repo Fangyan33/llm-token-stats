@@ -5,6 +5,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Fangyan33/llm-token-stats/pkg/configdiag"
 	"github.com/Fangyan33/llm-token-stats/pkg/logsafe"
 	"github.com/tetratelabs/proxy-wasm-go-sdk/proxywasm"
 	"github.com/tetratelabs/proxy-wasm-go-sdk/proxywasm/types"
@@ -40,7 +41,7 @@ func (r *root) initLogging() {
 		r.logs.repeated = map[string]*wasmRepeat{}
 	}
 	if !valid {
-		r.log(logsafe.Warn, "invalid_log_level", "fallback", "info")
+		r.log(logsafe.Warn, "invalid_log_level", "config_field", "LOG_LEVEL", "reason", "invalid_enum", "expected", "debug, info, warn or error", "fallback", "info")
 	}
 }
 func (r *root) log(level logsafe.Level, event string, fields ...string) {
@@ -53,13 +54,23 @@ func (r *root) log(level logsafe.Level, event string, fields ...string) {
 	}
 	var b strings.Builder
 	b.WriteString("level=" + level.String() + " component=wasm event=" + event)
-	for i := 0; i+1 < len(fields) && i < 20; i += 2 {
+	for i := 0; i+1 < len(fields) && i < 32; i += 2 {
 		b.WriteByte(' ')
 		b.WriteString(fields[i])
 		b.WriteByte('=')
 		b.WriteString(strconv.Quote(logsafe.Clean(fields[i+1])))
 	}
 	r.logs.pending = append(r.logs.pending, wasmLog{level, b.String()})
+}
+func (r *root) logConfiguration(err error) {
+	if report := configdiag.Find(err); report != nil {
+		for _, issue := range report.Issues {
+			r.log(logsafe.Error, "configuration_validation_failed", append(issue.Fields(), "config_source", "plugin_configuration", "action", "passthrough")...)
+		}
+		r.log(logsafe.Error, "plugin_configuration_failed", "error_count", strconv.Itoa(report.Total), "omitted_count", strconv.Itoa(report.Total-len(report.Issues)), "action", "passthrough")
+		return
+	}
+	r.log(logsafe.Error, "plugin_configuration_failed", "reason", "configuration_read_failed", "host_status", hostError(err), "action", "passthrough")
 }
 func (r *root) repeatedLog(level logsafe.Level, event string, fields ...string) {
 	if level < r.logs.level {
@@ -69,7 +80,8 @@ func (r *root) repeatedLog(level logsafe.Level, event string, fields ...string) 
 		r.logs.repeated = map[string]*wasmRepeat{}
 	}
 	// Events are fixed call-site labels, never request IDs or dynamic error text.
-	if previous := r.logs.repeated[event]; previous != nil {
+	key := repeatKey(event, fields)
+	if previous := r.logs.repeated[key]; previous != nil {
 		previous.count++
 		previous.fields = append(previous.fields[:0], fields...)
 		return
@@ -78,15 +90,61 @@ func (r *root) repeatedLog(level logsafe.Level, event string, fields ...string) 
 		r.logs.dropped++
 		return
 	}
-	r.logs.repeated[event] = &wasmRepeat{level: level, event: event, fields: append([]string(nil), fields...), at: time.Now()}
+	r.logs.repeated[key] = &wasmRepeat{level: level, event: event, fields: append([]string(nil), fields...), at: time.Now()}
 	r.log(level, event, fields...)
 }
+func repeatKey(event string, fields []string) string {
+	key := event
+	for n := 0; n+1 < len(fields); n += 2 {
+		switch fields[n] {
+		case "reason", "phase", "limit_kind", "metric", "transport_slot":
+			key += "/" + fields[n+1]
+		}
+	}
+	return key
+}
 func (r *root) logRecovered(event string) {
-	if previous := r.logs.repeated[event]; previous != nil {
-		r.logSummary(previous)
-		delete(r.logs.repeated, event)
+	found := false
+	for key, previous := range r.logs.repeated {
+		if previous.event == event {
+			r.logSummary(previous)
+			delete(r.logs.repeated, key)
+			found = true
+		}
+	}
+	if found {
 		r.log(logsafe.Info, event+"_recovered")
 	}
+}
+func (r *root) logTransportRecovered(event string, c *channel) {
+	if len(r.logs.repeated) == 0 {
+		return
+	}
+	slot, found := r.transportSlot(c), false
+	for key, previous := range r.logs.repeated {
+		if previous.event != event {
+			continue
+		}
+		for n := 0; n+1 < len(previous.fields); n += 2 {
+			if previous.fields[n] == "transport_slot" && previous.fields[n+1] == slot {
+				r.logSummary(previous)
+				delete(r.logs.repeated, key)
+				found = true
+				break
+			}
+		}
+	}
+	if found {
+		r.log(logsafe.Info, event+"_recovered", "transport_slot", slot)
+	}
+}
+func (r *root) transportSlot(c *channel) string {
+	for n, candidate := range r.channels {
+		if candidate == c {
+			return strconv.Itoa(n)
+		}
+	}
+	return "unassigned"
 }
 func (r *root) logSummary(previous *wasmRepeat) {
 	if previous.count > 0 {

@@ -7,6 +7,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/Fangyan33/llm-token-stats/pkg/configdiag"
 	"github.com/Fangyan33/llm-token-stats/pkg/credentials"
 	"github.com/Fangyan33/llm-token-stats/pkg/gatewayconfig"
 	"github.com/Fangyan33/llm-token-stats/pkg/logsafe"
@@ -174,7 +175,7 @@ func (r *root) OnPluginStart(_ int) types.OnPluginStartStatus {
 		r.cfg, err = gatewayconfig.Decode(b)
 	}
 	if err != nil {
-		r.log(logsafe.Error, "plugin_configuration_failed", "reason", "invalid_configuration", "action", "passthrough")
+		r.logConfiguration(err)
 		r.cfg.Enabled = false
 		r.count("config_invalid")
 		return types.OnPluginStartStatusOK
@@ -184,7 +185,7 @@ func (r *root) OnPluginStart(_ int) types.OnPluginStartStatus {
 		// Pod template. Resolve once per root, never from request headers or config.
 		r.instanceID = gatewayInstanceID(property("node", "metadata", "NAMESPACE"), property("node", "metadata", "NAME"))
 		if r.instanceID == "" {
-			r.log(logsafe.Error, "gateway_identity_unavailable", "action", "passthrough")
+			r.log(logsafe.Error, "gateway_identity_unavailable", "reason", "missing_or_invalid_node_metadata", "required_metadata", "node.metadata.NAMESPACE,node.metadata.NAME", "action", "passthrough")
 			r.cfg.Enabled = false
 			r.count("gateway_identity_unavailable")
 			return types.OnPluginStartStatusOK
@@ -199,8 +200,11 @@ func (r *root) OnPluginStart(_ int) types.OnPluginStartStatus {
 		var budgetErr error
 		r.budget, budgetErr = newPodBudget(r.cfg, r.instanceID)
 		if budgetErr != nil {
+			r.logBudgetInitialization(budgetErr, "observation", "passthrough")
 			r.cfg.Enabled = false
 			r.count("budget_unavailable")
+		} else {
+			r.budget.owner = r
 		}
 		if r.cfg.RequestBodyCaptureEnabled && r.cfg.Enabled {
 			requestCfg := r.cfg
@@ -208,7 +212,10 @@ func (r *root) OnPluginStart(_ int) types.OnPluginStartStatus {
 			requestCfg.PodInflightMessages /= 4
 			r.requestBudget, budgetErr = newPodBudget(requestCfg, r.instanceID+"/request-body")
 			if budgetErr != nil {
+				r.logBudgetInitialization(budgetErr, "request_body", "skip_request_body_capture")
 				r.cfg.RequestBodyCaptureEnabled = false
+			} else {
+				r.requestBudget.owner = r
 			}
 		}
 		r.channels = make([]*channel, int(r.cfg.TransportStreamsPerWorker))
@@ -238,6 +245,12 @@ func (r *root) drop(s *state, reason string) {
 	}
 	r.budget.give(0, 0, 1)
 	r.count("dropped_" + reason)
+	switch reason {
+	case "body_limit", "metadata_limit", "resource_limit", "observation_timeout":
+		r.repeatedLog(logsafe.Warn, "observation_dropped", "reason", reason, "action", "skip_observation")
+	case "body_read_failed", "protocol_error":
+		r.repeatedLog(logsafe.Error, "observation_dropped", "reason", reason, "action", "skip_observation")
+	}
 	r.resourceMetrics()
 }
 func (r *root) cleanup() {
@@ -299,13 +312,13 @@ func (r *root) openChannel(c *channel) bool {
 	if err != nil {
 		c.retryAt = time.Now().Add(100 * time.Millisecond)
 		r.count("dropped_open_failed")
-		r.repeatedLog(logsafe.Error, "grpc_open_failed", "host_status", hostError(err))
+		r.repeatedLog(logsafe.Error, "grpc_open_failed", "transport_slot", r.transportSlot(c), "host_status", hostError(err), "action", "skip_observation")
 		return false
 	}
 	c.token = token
 	c.seq = 0
 	c.released = false
-	r.logRecovered("grpc_open_failed")
+	r.logTransportRecovered("grpc_open_failed", c)
 	return true
 }
 func (r *root) failChannel(c *channel, reason string) {
@@ -351,7 +364,7 @@ func (r *root) releaseChannel(c *channel, reason string) {
 		c.released = true
 	}
 	r.reapChannel(c, 64)
-	if reason != "shutdown" {
+	if reason != "shutdown" && c.cleanupReason != "shutdown" {
 		r.repeatedLog(logsafe.Error, "observation_"+reason, "action", "skip_observation")
 	}
 	r.resourceMetrics()
@@ -409,10 +422,12 @@ func (r *root) flush(c *channel) bool {
 	copy(c.batch[start:11], prefix)
 	b := c.batch[start:]
 	if err := proxywasm.SendGrpcMessage(c.token, b, false); err != nil {
+		r.repeatedLog(logsafe.Error, "grpc_send_failed", "transport_slot", r.transportSlot(c), "host_status", hostError(err), "action", "skip_observation")
 		clear(b)
 		r.failChannel(c, "send_failed")
 		return false
 	}
+	r.logTransportRecovered("grpc_send_failed", c)
 	clear(c.batch)
 	c.batch = c.batch[:11]
 	c.seq++
@@ -460,15 +475,17 @@ func (r *root) prepareFrame(s *state, kind, payload int, request bool) (*channel
 	}
 	n := int64(encoded + 16)
 	if request && (r.requestBudget == nil || !r.requestBudget.take(n, 1, 0)) {
+		r.requestBudget.logFailure(r, "request_capture_resource_limit", "skip_request_body_capture")
 		return nil, 0, false
 	}
 	if !r.budget.take(n, 1, 0) {
 		if request {
+			r.budget.logFailure(r, "request_capture_resource_limit", "skip_request_body_capture")
 			r.requestBudget.give(n, 1, 0)
 			return nil, 0, false
 		}
 		r.count("resource_limit")
-		r.repeatedLog(logsafe.Warn, "observation_resource_limit", "limit_kind", "pod_budget", "action", "skip_observation")
+		r.budget.logFailure(r, "observation_resource_limit", "skip_observation")
 		if kind == 14 {
 			r.failChannel(c, "resource_limit")
 		} else {
@@ -533,11 +550,13 @@ func (r *root) OnReceive(token uint32, size int) {
 		return
 	}
 	if size < 1 || int64(size) > r.cfg.AckMaxBytes {
+		r.repeatedLog(logsafe.Error, "grpc_ack_rejected", "transport_slot", r.transportSlot(c), "reason", "invalid_ack_size", "actual_bytes", strconv.Itoa(size), "limit", strconv.FormatInt(r.cfg.AckMaxBytes, 10), "action", "skip_observation")
 		r.failChannel(c, "protocol_error")
 		return
 	}
 	b, err := proxywasm.GetGrpcReceiveBuffer(size)
 	if err != nil {
+		r.repeatedLog(logsafe.Error, "grpc_receive_failed", "transport_slot", r.transportSlot(c), "phase", "read_receive_buffer", "host_status", hostError(err), "action", "skip_observation")
 		r.failChannel(c, "protocol_error")
 		return
 	}
@@ -545,9 +564,17 @@ func (r *root) OnReceive(token uint32, size int) {
 	clear(b)
 	defer clear(r.ackStorage[:])
 	if err != nil || a.Seq > c.seq {
+		reason := "invalid_ack_encoding"
+		if err == nil {
+			reason = "ack_sequence_ahead"
+		}
+		r.repeatedLog(logsafe.Error, "grpc_ack_rejected", "transport_slot", r.transportSlot(c), "reason", reason, "action", "skip_observation")
 		r.failChannel(c, "protocol_error")
 		return
 	}
+	r.logTransportRecovered("grpc_receive_failed", c)
+	r.logTransportRecovered("grpc_ack_rejected", c)
+	r.logTransportRecovered("grpc_stream_closed", c)
 	var freedBytes, freedMessages, requestBytes, requestMessages int64
 	for c.recordHead < len(c.records) && c.records[c.recordHead].seq <= a.Seq {
 		rec := c.records[c.recordHead]
@@ -594,6 +621,9 @@ func (r *root) OnReceive(token uint32, size int) {
 func (r *root) OnClose(token, status uint32) {
 	for _, c := range r.channels {
 		if c != nil && c.token == token {
+			if !c.closing && !c.failed && (status != 0 || c.head != nil || c.recordHead < len(c.records)) {
+				r.repeatedLog(logsafe.Error, "grpc_stream_closed", "transport_slot", r.transportSlot(c), "grpc_status", strconv.FormatUint(uint64(status), 10), "action", "skip_observation")
+			}
 			r.releaseChannel(c, "transport_lost")
 			return
 		}
@@ -712,6 +742,7 @@ func (h *httpContext) OnHttpRequestHeaders(_ int, eos bool) types.Action {
 	h.instanceID = r.instanceID
 	r.count("requests_selected")
 	if r.budget == nil || !r.budget.take(0, 0, 1) {
+		r.budget.logFailure(r, "observation_admission_failed", "skip_observation")
 		r.count("dropped_stream_limit")
 		return types.ActionContinue
 	}
@@ -812,6 +843,7 @@ func (h *httpContext) observeResponse(n int, eos bool, at time.Time) {
 			if err != nil || len(b) != count {
 				clear(b)
 				h.root.budget.give(credit, 1, 0)
+				h.root.repeatedLog(logsafe.Error, "response_body_read_failed", "host_status", hostError(err), "expected_bytes", strconv.Itoa(count), "actual_bytes", strconv.Itoa(len(b)), "action", "skip_observation")
 				h.root.cancel(s, "body_read_failed")
 				return
 			}
@@ -1003,4 +1035,10 @@ func (h *httpContext) requestMetadata(b []byte, seq uint64) []byte {
 		clear(value)
 	}
 	return b
+}
+
+func (r *root) logBudgetInitialization(err error, kind, action string) {
+	if report := configdiag.Find(err); report != nil && len(report.Issues) > 0 {
+		r.log(logsafe.Error, "budget_initialization_failed", append(report.Issues[0].Fields(), "budget_kind", kind, "action", action)...)
+	}
 }

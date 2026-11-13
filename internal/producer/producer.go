@@ -3,15 +3,16 @@ package producer
 import (
 	"context"
 	"errors"
-	"fmt"
 	"github.com/Fangyan33/llm-token-stats/internal/config"
 	"github.com/Fangyan33/llm-token-stats/internal/events"
 	"github.com/Fangyan33/llm-token-stats/internal/health"
 	"github.com/Fangyan33/llm-token-stats/internal/logging"
+	"github.com/Fangyan33/llm-token-stats/pkg/configdiag"
 	"github.com/twmb/franz-go/pkg/kerr"
 	"github.com/twmb/franz-go/pkg/kgo"
 	"github.com/twmb/franz-go/pkg/sasl/plain"
 	"os"
+	"strconv"
 	"sync"
 	"time"
 )
@@ -36,18 +37,23 @@ type pendingRecord struct {
 func Options(k config.Kafka) ([]kgo.Opt, error) {
 	o := []kgo.Opt{kgo.SeedBrokers(k.Brokers...), kgo.WithHooks(logging.KafkaHooks{})}
 	t, err := k.TLS()
-	if err != nil {
-		return nil, err
-	}
+	r := &configdiag.Report{}
+	r.Merge(err)
 	if t != nil {
 		o = append(o, kgo.DialTLSConfig(t))
 	}
 	if k.UsernameEnv != "" {
 		u, p := os.Getenv(k.UsernameEnv), os.Getenv(k.PasswordEnv)
-		if u == "" || p == "" {
-			return nil, fmt.Errorf("kafka_sasl")
+		if u == "" {
+			r.Merge(configdiag.Environment("kafka_sasl", "kafka.username_env", k.UsernameEnv, "environment_variable_empty", "nonempty SASL username"))
+		}
+		if p == "" {
+			r.Merge(configdiag.Environment("kafka_sasl", "kafka.password_env", k.PasswordEnv, "environment_variable_empty", "nonempty SASL password"))
 		}
 		o = append(o, kgo.SASL(plain.Auth{User: u, Pass: p}.AsMechanism()))
+	}
+	if err := r.Err(); err != nil {
+		return nil, err
 	}
 	return o, nil
 }
@@ -77,9 +83,16 @@ func (p *Producer) Emit(e *events.Event) {
 	// Claim the record slot before JSON encoding, so a full sink does no work.
 	p.mu.Lock()
 	if p.closed || p.c == nil || p.pendingCount >= p.cfg.ProducerMaxRecords {
+		reason := "record_limit"
+		if p.closed {
+			reason = "producer_closed"
+		} else if p.c == nil {
+			reason = "client_unavailable"
+		}
+		pending := p.pendingCount
 		p.mu.Unlock()
 		p.h.Count("producer_dropped")
-		logging.Warn("producer_event_dropped", "producer_capacity", "reason", "unavailable_or_full", "capacity", p.cfg.ProducerMaxRecords)
+		logging.Warn("producer_event_dropped", "producer_capacity/records", "reason", reason, "pending_records", pending, "limit", p.cfg.ProducerMaxRecords, "action", "drop_event")
 		return
 	}
 	p.pendingCount++
@@ -99,9 +112,16 @@ func (p *Producer) Emit(e *events.Event) {
 	n := int64(len(r.Key) + len(r.Value))
 	if p.closed || p.c != c || p.pendingBytes+n > int64(p.cfg.ProducerMaxBytes) {
 		p.pendingCount--
+		reason := "byte_limit"
+		if p.closed {
+			reason = "producer_closed"
+		} else if p.c != c {
+			reason = "client_changed"
+		}
+		pending := p.pendingBytes
 		p.mu.Unlock()
 		p.h.Count("producer_dropped")
-		logging.Warn("producer_event_dropped", "producer_capacity", "reason", "unavailable_or_full", "capacity", p.cfg.ProducerMaxBytes)
+		logging.Warn("producer_event_dropped", "producer_capacity/bytes", "reason", reason, "pending_bytes", pending, "record_bytes", n, "limit", p.cfg.ProducerMaxBytes, "action", "drop_event")
 		return
 	}
 	p.pending[r] = pendingRecord{time.Now(), n}
@@ -109,6 +129,8 @@ func (p *Producer) Emit(e *events.Event) {
 	p.h.Gauge("producer_pending_events", int64(p.pendingCount))
 	p.h.Gauge("producer_pending_bytes", p.pendingBytes)
 	p.mu.Unlock()
+	logging.Recovered("producer_capacity/records", "producer_capacity_recovered", "limit_kind", "records")
+	logging.Recovered("producer_capacity/bytes", "producer_capacity_recovered", "limit_kind", "bytes")
 	c.TryProduce(context.Background(), r, func(r *kgo.Record, err error) {
 		p.mu.Lock()
 		if rec, ok := p.pending[r]; ok {
@@ -121,10 +143,10 @@ func (p *Producer) Emit(e *events.Event) {
 		p.mu.Unlock()
 		if err == nil {
 			p.h.Count("producer_success")
-			logging.Recovered("producer_delivery", "producer_delivery_recovered", "topic", p.cfg.Topic)
+			logging.Recovered("producer_delivery/"+strconv.Itoa(int(r.Partition)), "producer_delivery_recovered", "topic", p.cfg.Topic)
 			logging.Debug("producer_delivered", "topic", r.Topic, "partition", r.Partition, "offset", r.Offset)
 		} else {
-			logging.Failure("producer_delivery_failed", "producer_delivery", err, "topic", r.Topic, "partition", r.Partition)
+			logging.Failure("producer_delivery_failed", "producer_delivery/"+strconv.Itoa(int(r.Partition)), err, "topic", r.Topic, "partition", r.Partition)
 			if errors.Is(err, kgo.ErrMaxBuffered) || errors.Is(err, kerr.UnknownTopicOrPartition) {
 				p.h.Count("producer_definite_failure")
 			} else {

@@ -14,22 +14,31 @@ import (
 	"os"
 	"syscall"
 
+	"github.com/Fangyan33/llm-token-stats/pkg/configdiag"
 	"github.com/go-sql-driver/mysql"
 	"github.com/twmb/franz-go/pkg/kerr"
 	"github.com/twmb/franz-go/pkg/kgo"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // Diagnostic preserves an existing public error code while retaining its cause
 // for safe logs. Error text and callers' string-based classifications stay stable.
 type diagnostic struct {
-	code  string
-	cause error
+	code   string
+	cause  error
+	fields []any
 }
 
 func (e diagnostic) Error() string             { return e.code }
 func (e diagnostic) Unwrap() error             { return e.cause }
-func WithCause(code string, cause error) error { return diagnostic{code, cause} }
-func errorsCanceled(err error) bool            { return errors.Is(err, context.Canceled) }
+func WithCause(code string, cause error) error { return &diagnostic{code: code, cause: cause} }
+func WithFields(code string, cause error, fields ...any) error {
+	return &diagnostic{code: code, cause: cause, fields: fields}
+}
+func errorsCanceled(err error) bool {
+	return errors.Is(err, context.Canceled) || status.Code(err) == codes.Canceled
+}
 
 // ErrorFields deliberately does not print arbitrary error strings. HTTP URLs,
 // SQL values, server responses and credentials may occur inside those strings.
@@ -39,11 +48,41 @@ func ErrorFields(err error) []any {
 		return nil
 	}
 	fields := []any{"error_type", fmt.Sprintf("%T", err)}
+	codeCount := 0
+	addCode := func(code string) {
+		codeCount++
+		if codeCount == 1 {
+			fields = append(fields, "error_code", code)
+			return
+		}
+		for n := 0; n+1 < len(fields); n += 2 {
+			if fields[n] == "cause_code" {
+				fields[n+1] = code
+				return
+			}
+		}
+		fields = append(fields, "cause_code", code)
+	}
 	for depth := 0; err != nil && depth < 12; depth++ {
 		switch e := err.(type) {
-		case diagnostic:
-			fields = append(fields, "error_code", e.code)
+		case *diagnostic:
+			addCode(e.code)
+			fields = append(fields, e.fields...)
 			err = e.cause
+			continue
+		case *configdiag.Report:
+			if e.Source != "" {
+				fields = append(fields, "config_source", e.Source)
+			}
+			if len(e.Issues) > 0 {
+				i := e.Issues[0]
+				addCode(i.Code)
+				pairs := i.Fields()
+				for n := 2; n+1 < len(pairs); n += 2 {
+					fields = append(fields, pairs[n], pairs[n+1])
+				}
+			}
+			err = e.Cause
 			continue
 		case *url.Error:
 			fields = append(fields, "operation", e.Op)
@@ -87,7 +126,10 @@ func ErrorFields(err error) []any {
 		case *json.SyntaxError:
 			return append(fields, "error", "invalid_json", "byte_offset", e.Offset)
 		case *json.UnmarshalTypeError:
-			return append(fields, "error", "json_type_mismatch", "byte_offset", e.Offset)
+			return append(fields, "error", "json_type_mismatch", "byte_offset", e.Offset, "expected_type", e.Type.String())
+		}
+		if s, ok := status.FromError(err); ok {
+			return append(fields, "error", "grpc_failure", "grpc_status", int(s.Code()))
 		}
 		switch {
 		case errors.Is(err, kgo.ErrRecordTimeout):

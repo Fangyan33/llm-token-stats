@@ -11,6 +11,7 @@ import (
 
 	"github.com/Fangyan33/llm-token-stats/internal/logging"
 	"github.com/Fangyan33/llm-token-stats/internal/summaryworker"
+	"github.com/Fangyan33/llm-token-stats/pkg/configdiag"
 )
 
 func run() error {
@@ -20,7 +21,7 @@ func run() error {
 	to := flag.String("backfill-to", "", "回填结束 UTC 日期，不包含")
 	flag.Parse()
 	if !*once {
-		return logging.WithCause("once_required", nil)
+		return configdiag.Source(configdiag.New("once_required", "--once", "required", "--once=true", nil), "command_line")
 	}
 	c, e := summaryworker.ReadConfig(*path)
 	if e != nil {

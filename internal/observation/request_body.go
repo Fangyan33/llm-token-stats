@@ -8,6 +8,7 @@ import (
 
 	pb "github.com/Fangyan33/llm-token-stats/gen/observation/v1"
 	"github.com/Fangyan33/llm-token-stats/internal/events"
+	"github.com/Fangyan33/llm-token-stats/internal/logging"
 	"github.com/Fangyan33/llm-token-stats/internal/producer"
 	"github.com/Fangyan33/llm-token-stats/internal/requesttokens"
 )
@@ -100,6 +101,16 @@ func (s *Server) reserveRequest(n int64) bool {
 func (s *Server) releaseRequest(n int64) { s.requestBytes.Add(-n); s.bytes.Add(-n) }
 func (s *Server) reportToken(r requesttokens.Result) {
 	s.Health.Count("request_tokens_" + r.Reason)
+	switch r.Reason {
+	case "resource_limit", "queue_full", "body_limit", "capture_incomplete", "transport_lost":
+		logging.Warn("request_input_estimate_unavailable", "request_input_estimate", "reason", r.Reason, "action", "input_estimate_unknown", "request_body_limit", s.Cfg.RequestBodyMaxBytes, "queue_request_limit", s.Cfg.RequestTokenizerQueueRequests, "queue_byte_limit", s.Cfg.RequestTokenizerQueueBytes)
+	case "tokenizer_error":
+		logging.Failure("request_input_estimate_failed", "request_input_estimate", nil, "reason", "tokenizer_error", "action", "input_estimate_unknown")
+	case "known":
+		logging.Recovered("request_input_estimate", "request_input_estimate_recovered")
+	case "invalid_body", "unsupported_encoding", "missing_body":
+		logging.Debug("request_input_estimate_skipped", "reason", r.Reason, "action", "input_estimate_unknown")
+	}
 }
 func (o *observation) unknownRequestTokens(reason string) {
 	r := requesttokens.Result{Reason: reason}

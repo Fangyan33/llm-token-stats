@@ -11,6 +11,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/Fangyan33/llm-token-stats/internal/events"
 )
 
 func TestWasmLogLevelsAndFailOpen(t *testing.T) {
@@ -76,5 +78,75 @@ func TestWasmLogLevelsAndFailOpen(t *testing.T) {
 				t.Fatal("invalid LOG_LEVEL did not warn and fall back")
 			}
 		})
+	}
+}
+
+func TestWasmConfigurationDiagnosticsAndFailOpen(t *testing.T) {
+	raw, err := os.ReadFile("../../dist/envoy.remote.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, format := range []string{"json", "struct"} {
+		for _, failure := range []string{"multiple_fields", "field_type"} {
+			t.Run(format+"/"+failure, func(t *testing.T) {
+				var cfg map[string]any
+				if err := json.Unmarshal(raw, &cfg); err != nil {
+					t.Fatal(err)
+				}
+				resources := cfg["static_resources"].(map[string]any)
+				hcm := resources["listeners"].([]any)[0].(map[string]any)["filter_chains"].([]any)[0].(map[string]any)["filters"].([]any)[0].(map[string]any)["typed_config"].(map[string]any)
+				plugin := hcm["http_filters"].([]any)[1].(map[string]any)["typed_config"].(map[string]any)["config"].(map[string]any)
+				plugin["vm_config"].(map[string]any)["code"] = map[string]any{"local": map[string]any{"filename": "/wasm/observer.wasm"}}
+				var settings map[string]any
+				if err := json.Unmarshal([]byte(plugin["configuration"].(map[string]any)["value"].(string)), &settings); err != nil {
+					t.Fatal(err)
+				}
+				const secret = "SYNTHETIC-CONFIGURATION-PRIVACY-SECRET"
+				wanted := []string{"config_field=\"schema_version\"", "reason=\"type_mismatch\""}
+				if failure == "multiple_fields" {
+					settings["chunk_bytes"], settings["tick_ms"] = 16385, 11
+					settings["routes"].([]any)[0].(map[string]any)["paths"] = []any{"/private?" + secret}
+					wanted = []string{"config_field=\"chunk_bytes\"", "config_field=\"tick_ms\"", "config_field=\"routes[0].paths[0]\"", "actual=\"16385\""}
+				} else {
+					settings["schema_version"] = secret
+				}
+				if format == "struct" {
+					plugin["configuration"] = map[string]any{"@type": "type.googleapis.com/google.protobuf.Struct", "value": settings}
+				} else {
+					encoded, _ := json.Marshal(settings)
+					plugin["configuration"].(map[string]any)["value"] = string(encoded)
+				}
+				base, _, stop := startEnvoyWithLogLevel(t, cfg, true, "error")
+				defer stop()
+				body := []byte(`{"stream":true,"stream_options":{"include_usage":true},"messages":[{"role":"user","content":"` + secret + `"}]}`)
+				req, _ := http.NewRequest("POST", base+"/v1/chat/completions", bytes.NewReader(body))
+				req.Host = "model.example.invalid"
+				req.Header.Set("Content-Type", "application/json")
+				req.Header.Set("Authorization", "Bearer "+secret)
+				res, err := (&http.Client{Timeout: 10 * time.Second}).Do(req)
+				if err != nil {
+					t.Fatal(err)
+				}
+				response, readErr := io.ReadAll(res.Body)
+				res.Body.Close()
+				if readErr != nil || res.StatusCode != 200 || res.Header.Get("x-test-body-sha256") != events.Hash(body) || !bytes.Contains(response, []byte("[DONE]")) {
+					t.Fatal("invalid configuration changed business forwarding", res.StatusCode, readErr)
+				}
+				pod := cfg["node"].(map[string]any)["id"].(string)
+				var logs string
+				eventually(t, func() bool {
+					logs = string(kubeRequest(t, "GET", "pods/"+pod+"/log?container=envoy", nil))
+					return strings.Contains(logs, "event=plugin_configuration_failed")
+				})
+				for _, want := range append(wanted, `action="passthrough"`) {
+					if !strings.Contains(logs, want) {
+						t.Fatalf("missing %s: %s", want, logs)
+					}
+				}
+				if strings.Contains(logs, secret) {
+					t.Fatal("configuration, body or token leaked")
+				}
+			})
+		}
 	}
 }

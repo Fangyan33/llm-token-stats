@@ -10,11 +10,11 @@ import (
 	"github.com/Fangyan33/llm-token-stats/internal/config"
 	"github.com/Fangyan33/llm-token-stats/internal/consumer"
 	"github.com/Fangyan33/llm-token-stats/internal/logging"
+	"github.com/Fangyan33/llm-token-stats/pkg/configdiag"
 	"github.com/go-sql-driver/mysql"
 	"io"
 	"net/http"
 	"net/url"
-	"os"
 	"strings"
 	"time"
 )
@@ -29,19 +29,15 @@ type Store struct {
 
 func New(c config.Doris) (*Store, error) {
 	if !config.DatabaseName(c.Database) {
-		return nil, logging.WithCause("doris_database", nil)
+		return nil, configdiag.New("doris_database", "doris.database", "invalid_identifier", "valid database identifier", nil)
 	}
-	dsn := os.Getenv(c.DSNEnv)
-	if dsn == "" {
-		return nil, logging.WithCause("doris_dsn", nil)
-	}
-	parsed, err := mysql.ParseDSN(dsn)
-	if err != nil || parsed.DBName != c.Database {
-		return nil, logging.WithCause("doris_dsn", nil)
-	}
-	db, err := sql.Open("mysql", dsn)
+	parsed, err := c.ParseDSN("doris_dsn")
 	if err != nil {
-		return nil, logging.WithCause("doris_dsn", nil)
+		return nil, err
+	}
+	db, err := sql.Open("mysql", parsed.FormatDSN())
+	if err != nil {
+		return nil, configdiag.Environment("doris_dsn", "doris.dsn_env", c.DSNEnv, "driver_initialization_failed", "supported MySQL connection options")
 	}
 	db.SetMaxOpenConns(8)
 	db.SetMaxIdleConns(4)
@@ -51,7 +47,7 @@ func New(c config.Doris) (*Store, error) {
 	s := &Store{DB: db, Cfg: c, username: parsed.User, password: parsed.Passwd}
 	s.HTTP = &http.Client{Timeout: 15 * time.Second, CheckRedirect: func(r *http.Request, via []*http.Request) error {
 		if len(via) > 3 || !s.allowed(r.URL) || r.Method != "PUT" || len(via) > 0 && via[0].URL.Scheme == "https" && r.URL.Scheme != "https" {
-			return logging.WithCause("doris_redirect", nil)
+			return logging.WithFields("doris_redirect", nil, "config_field", "doris.allowed_load_hosts", "reason", "redirect_policy_rejected", "expected", "allowed HTTP(S) PUT target without downgrade, at most 3 redirects")
 		}
 		r.SetBasicAuth(s.username, s.password)
 		return nil
@@ -166,11 +162,11 @@ func (s *Store) Load(ctx context.Context, table, label string, body []byte, rows
 	}
 	u, err := url.Parse(strings.TrimRight(s.Cfg.FE, "/") + "/api/" + s.Cfg.Database + "/" + table + "/_stream_load")
 	if err != nil || !s.allowed(u) {
-		return logging.WithCause("doris_target", nil)
+		return configdiag.New("doris_target", "doris.fe_url", "invalid_or_disallowed_target", "HTTP(S) target included in doris.allowed_load_hosts", nil)
 	}
 	r, err := http.NewRequestWithContext(ctx, "PUT", u.String(), bytes.NewReader(body))
 	if err != nil {
-		return logging.WithCause("doris_request", nil)
+		return logging.WithFields("doris_request", err, "phase", "create_stream_load_request")
 	}
 	r.SetBasicAuth(s.username, s.password)
 	for k, v := range map[string]string{"label": label, "Expect": "100-continue", "format": "json", "read_json_by_line": "true", "max_filter_ratio": "0", "timezone": "+00:00", "strict_mode": "true", "timeout": "10"} {
@@ -193,16 +189,16 @@ func (s *Store) Load(ctx context.Context, table, label string, body []byte, rows
 			if cause == nil {
 				cause = decodeErr
 			}
-			logging.Failure("doris_stream_load_response_failed", "doris_http", cause, "table", table, "label", label, "http_status", res.StatusCode, "duration_ms", time.Since(started).Milliseconds())
+			logging.Failure("doris_stream_load_response_failed", "doris_http", cause, "table", table, "label", label, "http_status", res.StatusCode, "phase", "read_or_decode_response", "duration_ms", time.Since(started).Milliseconds())
 			result.Status = "uncertain"
 		}
 		if result.Status == "Success" || result.Status == "Publish Timeout" {
 			if result.NumberTotalRows != len(rows) || result.NumberLoadedRows != len(rows) || result.NumberFilteredRows != 0 || result.NumberUnselectedRows != 0 {
-				logging.Failure("doris_stream_load_row_count_failed", "doris_load_rows", nil, "table", table, "label", label, "expected_rows", len(rows), "loaded_rows", result.NumberLoadedRows, "filtered_rows", result.NumberFilteredRows)
+				logging.Failure("doris_stream_load_row_count_failed", "doris_load_rows", nil, "table", table, "label", label, "expected_rows", len(rows), "loaded_rows", result.NumberLoadedRows, "filtered_rows", result.NumberFilteredRows, "total_rows", result.NumberTotalRows, "unselected_rows", result.NumberUnselectedRows, "load_status", loadStatus(result.Status))
 				return logging.WithCause("doris_row_count", nil)
 			}
 		} else if result.Status != "Label Already Exists" && result.Status != "uncertain" {
-			logging.Failure("doris_stream_load_rejected", "doris_http", nil, "table", table, "label", label, "http_status", res.StatusCode)
+			logging.Failure("doris_stream_load_rejected", "doris_http", nil, "table", table, "label", label, "http_status", res.StatusCode, "load_status", loadStatus(result.Status), "reason", "load_rejected", "action", "pause_partition")
 			return logging.WithCause("doris_load", nil)
 		}
 	}
@@ -225,7 +221,7 @@ func (s *Store) Load(ctx context.Context, table, label string, body []byte, rows
 		select {
 		case <-ctx.Done():
 			logging.Failure("doris_load_visibility_timeout", "doris_visibility", ctx.Err(), "table", table, "label", label, "duration_ms", time.Since(started).Milliseconds())
-			return logging.WithCause("transaction_unknown", nil)
+			return logging.WithCause("transaction_unknown", ctx.Err())
 		case <-ticker.C:
 		}
 	}
@@ -279,3 +275,14 @@ const NameKeySQL = "CAST(JSON_ARRAY(service_name, provider_name, customer_name) 
 
 // Database is a validated SQL identifier; New rejects arbitrary SQL fragments.
 func (s *Store) Database() string { return "`" + s.Cfg.Database + "`" }
+
+func loadStatus(status string) string {
+	switch status {
+	case "Success", "Publish Timeout", "Label Already Exists", "Fail", "Cancelled", "uncertain":
+		return status
+	case "":
+		return "missing"
+	default:
+		return "unrecognized"
+	}
+}

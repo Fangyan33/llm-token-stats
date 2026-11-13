@@ -15,6 +15,7 @@ import (
 	"github.com/Fangyan33/llm-token-stats/internal/config"
 	"github.com/Fangyan33/llm-token-stats/internal/health"
 	"github.com/Fangyan33/llm-token-stats/internal/logging"
+	"github.com/Fangyan33/llm-token-stats/pkg/configdiag"
 )
 
 const Path = "/wasm/gateway-observer-v1.wasm"
@@ -32,7 +33,7 @@ type handler struct {
 func open(path string, h *health.State) (*handler, error) {
 	f, err := os.Open(path)
 	if err != nil {
-		return nil, logging.WithCause("wasm_file_unreadable", err)
+		return nil, configdiag.New("wasm_file_unreadable", "observer.wasm_download.file", "file_read_failed", "readable Wasm file", err)
 	}
 	valid := false
 	defer func() {
@@ -41,16 +42,22 @@ func open(path string, h *health.State) (*handler, error) {
 		}
 	}()
 	info, err := f.Stat()
-	if err != nil || !info.Mode().IsRegular() {
-		return nil, logging.WithCause("wasm_file_invalid", nil)
+	if err != nil {
+		return nil, configdiag.New("wasm_file_invalid", "observer.wasm_download.file", "file_stat_failed", "regular Wasm file", err)
+	}
+	if !info.Mode().IsRegular() {
+		return nil, configdiag.New("wasm_file_invalid", "observer.wasm_download.file", "not_regular_file", "regular Wasm file", nil)
 	}
 	var header [8]byte
-	if _, err := f.ReadAt(header[:], 0); err != nil || !bytes.Equal(header[:], []byte{0, 'a', 's', 'm', 1, 0, 0, 0}) {
-		return nil, logging.WithCause("wasm_file_invalid", nil)
+	if _, err := f.ReadAt(header[:], 0); err != nil {
+		return nil, configdiag.New("wasm_file_invalid", "observer.wasm_download.file", "header_read_failed", "Wasm v1 header", err)
+	}
+	if !bytes.Equal(header[:], []byte{0, 'a', 's', 'm', 1, 0, 0, 0}) {
+		return nil, configdiag.New("wasm_file_invalid", "observer.wasm_download.file", "invalid_wasm_header", "Wasm v1 header", nil)
 	}
 	digest := sha256.New()
 	if _, err := io.Copy(digest, io.NewSectionReader(f, 0, info.Size())); err != nil {
-		return nil, logging.WithCause("wasm_file_unreadable", nil)
+		return nil, configdiag.New("wasm_file_unreadable", "observer.wasm_download.file", "digest_read_failed", "readable complete Wasm file", err)
 	}
 	valid = true
 	return &handler{file: f, size: info.Size(), modified: info.ModTime(), etag: fmt.Sprintf(`"%x"`, digest.Sum(nil)), slots: make(chan struct{}, maxDownloads), health: h}, nil
@@ -100,7 +107,7 @@ func New(c config.WasmDownload, h *health.State) (*Server, error) {
 	l, err := net.Listen("tcp", c.Listen)
 	if err != nil {
 		handler.file.Close()
-		return nil, logging.WithCause("wasm_http_listen_failure", err)
+		return nil, configdiag.New("wasm_http_listen_failure", "observer.wasm_download.listen", "listener_bind_failed", "available TCP listen address", err)
 	}
 	return &Server{
 		http:     &http.Server{Handler: handler, ReadHeaderTimeout: 3 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 30 * time.Second, MaxHeaderBytes: 8192},
